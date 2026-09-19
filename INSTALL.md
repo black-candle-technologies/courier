@@ -154,6 +154,10 @@ re-pin with `courier init --repin` after confirming the new published value.
   Plain `http://` relays skip certificate pinning (useful for local testing).
 - Config also stores your inbox cursor (last message id seen) and the pinned
   relay certificate fingerprint.
+- If you are behind an HTTP(S) egress proxy, the client honors the standard
+  `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` environment variables
+  automatically. Certificate pinning still applies end-to-end through the
+  proxy's CONNECT tunnel.
 
 ## Security notes (read once)
 

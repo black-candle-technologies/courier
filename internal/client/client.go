@@ -10,6 +10,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -158,6 +159,11 @@ func (c *Client) httpClient() (*http.Client, error) {
 	return &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
+			// Honor HTTPS_PROXY etc. so agents behind egress proxies can
+			// reach the relay. The proxy only tunnels bytes (CONNECT);
+			// TLS still terminates at the relay and the pin below applies
+			// end-to-end.
+			Proxy: http.ProxyFromEnvironment,
 			TLSClientConfig: &tls.Config{
 				// Certificate authority validation is skipped: trust comes
 				// from the pinned fingerprint checked below, not from CAs.
@@ -180,7 +186,7 @@ func (c *Client) httpClient() (*http.Client, error) {
 // FetchRelayFingerprint dials an https relay and returns the hex SHA256 of
 // the certificate it presents, without trusting it. This is the TOFU step:
 // the caller must show the fingerprint to the user for verification before
-// saving it. Returns "" for non-https relays.
+// saving it. Returns "" for non-https relays. Honors HTTPS_PROXY.
 func FetchRelayFingerprint(relayURL string) (string, error) {
 	u, err := url.Parse(relayURL)
 	if err != nil {
@@ -189,22 +195,33 @@ func FetchRelayFingerprint(relayURL string) (string, error) {
 	if u.Scheme != "https" {
 		return "", nil
 	}
-	host := u.Hostname()
-	port := u.Port()
-	if port == "" {
-		port = "443"
+	var peer *x509.Certificate
+	tr := &http.Transport{
+		Proxy:           http.ProxyFromEnvironment,
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := (&tls.Dialer{Config: &tls.Config{InsecureSkipVerify: true}}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if tc, ok := conn.(*tls.Conn); ok {
+				if pcs := tc.ConnectionState().PeerCertificates; len(pcs) > 0 {
+					peer = pcs[0]
+				}
+			}
+			return conn, nil
+		},
 	}
-	conn, err := tls.Dial("tcp", net.JoinHostPort(host, port),
-		&tls.Config{InsecureSkipVerify: true, ServerName: host})
+	hc := &http.Client{Transport: tr, Timeout: 30 * time.Second}
+	resp, err := hc.Get(relayURL + "/v1/health")
 	if err != nil {
 		return "", fmt.Errorf("relay unreachable: %w", err)
 	}
-	defer conn.Close()
-	peer := conn.ConnectionState().PeerCertificates
-	if len(peer) == 0 {
+	resp.Body.Close()
+	if peer == nil {
 		return "", errors.New("relay presented no certificate")
 	}
-	sum := sha256.Sum256(peer[0].Raw)
+	sum := sha256.Sum256(peer.Raw)
 	return hex.EncodeToString(sum[:]), nil
 }
 
