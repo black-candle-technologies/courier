@@ -523,3 +523,65 @@ func TestPWAAssets(t *testing.T) {
 		t.Fatalf("/app missing install button")
 	}
 }
+
+func registerRaw(t *testing.T, srv *Server, username, password string, id *crypto.Identity) *httptest.ResponseRecorder {
+	t.Helper()
+	addr := crypto.FormatAddress(id.EdPub[:])
+	sig := id.Sign(envelope.DashboardRegister(username, id.EdPub[:]))
+	body, _ := json.Marshal(map[string]string{
+		"username": username,
+		"password": password,
+		"address":  addr,
+		"sig":      b64.EncodeToString(sig),
+	})
+	req := httptest.NewRequest("POST", "/v1/dashboard/register", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	return rec
+}
+
+// TestRegisterPasswordByteLimit enforces the 72-byte bcrypt limit at
+// registration (F15). bcrypt errors past 72 bytes, so the server must
+// reject with a clear message instead of failing at hash time.
+func TestRegisterPasswordByteLimit(t *testing.T) {
+	srv := testServer(t)
+
+	// 73 bytes: rejected.
+	if rec := registerRaw(t, srv, "lane", strings.Repeat("x", 73), testIdentity(t)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("73-byte password: got %d, want 400", rec.Code)
+	} else if !strings.Contains(rec.Body.String(), "72") {
+		t.Fatalf("no byte-limit message: %s", rec.Body.String())
+	}
+	// Exactly 72 bytes: accepted (proves the boundary via the helper's
+	// 201 assertion). Multibyte rune that pushes past 72 bytes: rejected
+	// (the limit is bytes, not runes).
+	register(t, srv, "lane72", strings.Repeat("x", 72), testIdentity(t))
+	if rec := registerRaw(t, srv, "laneuni", strings.Repeat("é", 37), testIdentity(t)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("37 multibyte runes (74 bytes): got %d, want 400", rec.Code)
+	}
+	register(t, srv, "laneuniok", strings.Repeat("é", 36), testIdentity(t)) // 72 bytes
+}
+
+// TestChangePasswordByteLimit enforces the 72-byte bcrypt limit on the
+// change-password form (F15).
+func TestChangePasswordByteLimit(t *testing.T) {
+	srv := testServer(t)
+	register(t, srv, "lane", "temporary-password-123", testIdentity(t))
+	cookie := login(t, srv, "lane", "temporary-password-123")
+
+	long := strings.Repeat("y", 73)
+	form := url.Values{"password": {long}, "confirm": {long}}
+	req := httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("73-byte password: got %d, want 200 (form re-rendered with error)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "72 bytes") {
+		t.Fatalf("no byte-limit error in response")
+	}
+	// The password must be unchanged: the old temp password still logs in.
+	login(t, srv, "lane", "temporary-password-123")
+}
