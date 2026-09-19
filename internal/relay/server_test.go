@@ -201,12 +201,17 @@ func TestKeyAnnounceRoundtrip(t *testing.T) {
 		Address   string `json:"address"`
 		X25519Pub string `json:"x25519_pub"`
 		Epoch     int64  `json:"epoch"`
+		Sig       string `json:"sig"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
 		t.Fatal(err)
 	}
 	if out.Address != addr || out.X25519Pub != ann["x25519_pub"] || out.Epoch != 1000 {
 		t.Fatalf("lookup mismatch: %+v", out)
+	}
+	// F1: the signed announcement must round-trip so senders can verify it.
+	if out.Sig != ann["sig"] {
+		t.Fatalf("lookup did not return the announcement signature")
 	}
 }
 

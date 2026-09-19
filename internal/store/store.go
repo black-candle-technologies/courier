@@ -51,7 +51,8 @@ CREATE INDEX IF NOT EXISTS idx_envelopes_recipient ON envelopes(recipient, id);
 CREATE TABLE IF NOT EXISTS keys (
 	address    TEXT PRIMARY KEY,
 	x25519_pub TEXT NOT NULL,
-	epoch      INTEGER NOT NULL
+	epoch      INTEGER NOT NULL,
+	signature  TEXT NOT NULL DEFAULT ''
 );
 
 -- v0.6.0: web dashboard accounts. One dashboard user per Courier address.
@@ -107,6 +108,11 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN peer TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	// v0.6.11: key announcements now carry their Ed25519 signature so
+	// senders can authenticate the directory response (F1).
+	if err := addColumn(`ALTER TABLE keys ADD COLUMN signature TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	// v0.6.9: per-thread read state for unread badges.
@@ -204,6 +210,7 @@ type KeyAnnouncement struct {
 	Address   string
 	X25519Pub string // base64url 32-byte X25519 public key
 	Epoch     int64  // unix seconds of rotation; strictly increasing
+	Sig       string // base64url Ed25519 signature over the announcement
 }
 
 // SaveKey stores a key announcement, replacing the previous one only if the
@@ -218,9 +225,9 @@ func (s *Store) SaveKey(k *KeyAnnouncement) (bool, error) {
 		return false, nil // stale or replayed announcement
 	}
 	if _, err := s.db.Exec(
-		`INSERT INTO keys (address, x25519_pub, epoch) VALUES (?, ?, ?)
-		 ON CONFLICT(address) DO UPDATE SET x25519_pub = excluded.x25519_pub, epoch = excluded.epoch`,
-		k.Address, k.X25519Pub, k.Epoch,
+		`INSERT INTO keys (address, x25519_pub, epoch, signature) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(address) DO UPDATE SET x25519_pub = excluded.x25519_pub, epoch = excluded.epoch, signature = excluded.signature`,
+		k.Address, k.X25519Pub, k.Epoch, k.Sig,
 	); err != nil {
 		return false, fmt.Errorf("save key: %w", err)
 	}
@@ -232,9 +239,9 @@ func (s *Store) SaveKey(k *KeyAnnouncement) (bool, error) {
 func (s *Store) GetKey(address string) (*KeyAnnouncement, error) {
 	var k KeyAnnouncement
 	err := s.db.QueryRow(
-		`SELECT address, x25519_pub, epoch FROM keys WHERE address = ?`,
+		`SELECT address, x25519_pub, epoch, signature FROM keys WHERE address = ?`,
 		address,
-	).Scan(&k.Address, &k.X25519Pub, &k.Epoch)
+	).Scan(&k.Address, &k.X25519Pub, &k.Epoch, &k.Sig)
 	if err != nil {
 		return nil, err
 	}

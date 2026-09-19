@@ -4,12 +4,14 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/black-candle-technologies/courier/internal/crypto"
+	"github.com/black-candle-technologies/courier/internal/envelope"
 )
 
 func testTLSServer(t *testing.T) (*httptest.Server, string) {
@@ -141,8 +143,19 @@ func TestContactsValidation(t *testing.T) {
 
 // ---- v0.5.0: rotation ----
 
+// fakeAnn is one canned key-directory announcement served by keyDirServer.
+// When sig is empty and signer is set, the server signs the announcement
+// properly; noSig forces an unsigned (legacy/malicious) response.
+type fakeAnn struct {
+	pub    string
+	epoch  int64
+	signer *crypto.Identity
+	sig    string
+	noSig  bool
+}
+
 // keyDirServer is a fake relay implementing only the key directory.
-func keyDirServer(t *testing.T, store map[string]string) *httptest.Server {
+func keyDirServer(t *testing.T, store map[string]fakeAnn) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/keys", func(w http.ResponseWriter, r *http.Request) {
@@ -151,12 +164,30 @@ func keyDirServer(t *testing.T, store map[string]string) *httptest.Server {
 	})
 	mux.HandleFunc("GET /v1/keys/", func(w http.ResponseWriter, r *http.Request) {
 		addr := strings.TrimPrefix(r.URL.Path, "/v1/keys/")
-		pub, ok := store[addr]
+		a, ok := store[addr]
 		if !ok {
 			http.NotFound(w, r)
 			return
 		}
-		w.Write([]byte(`{"address":"` + addr + `","x25519_pub":"` + pub + `","epoch":1}`))
+		sig := a.sig
+		if sig == "" && !a.noSig && a.signer != nil {
+			toEd, err := crypto.ParseAddress(addr)
+			if err != nil {
+				t.Errorf("bad canned address: %v", err)
+				http.NotFound(w, r)
+				return
+			}
+			pubRaw, err := base64.RawURLEncoding.DecodeString(a.pub)
+			if err != nil {
+				t.Errorf("bad canned pub: %v", err)
+				http.NotFound(w, r)
+				return
+			}
+			sig = base64.RawURLEncoding.EncodeToString(
+				a.signer.Sign(envelope.KeyAnnounce(toEd[:], pubRaw, a.epoch)))
+		}
+		fmt.Fprintf(w, `{"address":%q,"x25519_pub":%q,"epoch":%d,"sig":%q}`,
+			addr, a.pub, a.epoch, sig)
 	})
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
@@ -166,7 +197,7 @@ func keyDirServer(t *testing.T, store map[string]string) *httptest.Server {
 func TestRotatePublishesAndTrialDecrypt(t *testing.T) {
 	cfg := testConfig(t)
 	oldPub := cfg.EncKeys[0].Pub
-	ts := keyDirServer(t, map[string]string{})
+	ts := keyDirServer(t, map[string]fakeAnn{})
 	cfg.RelayURL = ts.URL
 	cl := New(cfg)
 
@@ -206,7 +237,7 @@ func TestRotatePublishesAndTrialDecrypt(t *testing.T) {
 
 func TestRecipientKeyFallbackToDerived(t *testing.T) {
 	cfg := testConfig(t)
-	ts := keyDirServer(t, map[string]string{}) // empty: 404s
+	ts := keyDirServer(t, map[string]fakeAnn{}) // empty: 404s
 	cfg.RelayURL = ts.URL
 	cl := New(cfg)
 
@@ -233,7 +264,14 @@ func TestRecipientKeyUsesAnnouncement(t *testing.T) {
 	cfg := testConfig(t)
 	peer, _ := NewIdentity("")
 	announcedPub := peer.EncKeys[0].Pub
-	ts := keyDirServer(t, map[string]string{peer.Address: announcedPub})
+	// The peer signs its own announcement, as the real relay requires.
+	peerID, err := peer.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := keyDirServer(t, map[string]fakeAnn{
+		peer.Address: {pub: announcedPub, epoch: 7, signer: peerID},
+	})
 	cfg.RelayURL = ts.URL
 	cl := New(cfg)
 
@@ -247,4 +285,88 @@ func TestRecipientKeyUsesAnnouncement(t *testing.T) {
 	if got != want {
 		t.Fatal("did not use the announced key")
 	}
+	// The verified epoch is recorded for rollback detection.
+	if cfg.VerifiedKeyEpochs[peer.Address] != 7 {
+		t.Fatalf("verified epoch not recorded: %+v", cfg.VerifiedKeyEpochs)
+	}
 }
+
+func TestRecipientKeyRejectsUnsignedAnnouncement(t *testing.T) {
+	cfg := testConfig(t)
+	peer, _ := NewIdentity("")
+	ts := keyDirServer(t, map[string]fakeAnn{
+		peer.Address: {pub: peer.EncKeys[0].Pub, epoch: 1, noSig: true},
+	})
+	cfg.RelayURL = ts.URL
+	cl := New(cfg)
+
+	if _, err := cl.recipientKey(peer.Address); err == nil {
+		t.Fatal("unsigned announcement was accepted; want rejection")
+	}
+}
+
+func TestRecipientKeyRejectsForgedAnnouncement(t *testing.T) {
+	cfg := testConfig(t)
+	peer, _ := NewIdentity("")
+	attacker, _ := NewIdentity("")
+	attackerID, err := attacker.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Announcement for peer.Address, but signed by the attacker's key:
+	// exactly what a malicious relay would serve.
+	ts := keyDirServer(t, map[string]fakeAnn{
+		peer.Address: {pub: peer.EncKeys[0].Pub, epoch: 1, signer: attackerID},
+	})
+	cfg.RelayURL = ts.URL
+	cl := New(cfg)
+
+	if _, err := cl.recipientKey(peer.Address); err == nil {
+		t.Fatal("forged announcement was accepted; want rejection")
+	}
+}
+
+func TestRecipientKeyRejectsRollback(t *testing.T) {
+	cfg := testConfig(t)
+	peer, _ := NewIdentity("")
+	peerID, err := peer.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	announcedPub := peer.EncKeys[0].Pub
+	ts := keyDirServer(t, map[string]fakeAnn{
+		peer.Address: {pub: announcedPub, epoch: 9, signer: peerID},
+	})
+	cfg.RelayURL = ts.URL
+	cl := New(cfg)
+
+	if _, err := cl.recipientKey(peer.Address); err != nil {
+		t.Fatal(err)
+	}
+	// A validly signed but older announcement must be rejected.
+	if _, err := cl.verifyKeyAnnouncement(peer.Address, announcedPub, 4,
+		signAnn(t, peerID, peer.Address, announcedPub, 4)); err == nil {
+		t.Fatal("rollback to older epoch was accepted; want rejection")
+	}
+	// Same epoch (re-announcement) is fine.
+	if _, err := cl.verifyKeyAnnouncement(peer.Address, announcedPub, 9,
+		signAnn(t, peerID, peer.Address, announcedPub, 9)); err != nil {
+		t.Fatalf("same-epoch re-announcement rejected: %v", err)
+	}
+}
+
+// signAnn builds a valid announcement signature for tests.
+func signAnn(t *testing.T, id *crypto.Identity, address, pub string, epoch int64) string {
+	t.Helper()
+	toEd, err := crypto.ParseAddress(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(
+		id.Sign(envelope.KeyAnnounce(toEd[:], raw, epoch)))
+}
+

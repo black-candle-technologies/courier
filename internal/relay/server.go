@@ -190,6 +190,7 @@ func (s *Server) handleKeyAnnounce(w http.ResponseWriter, r *http.Request) {
 	}
 	ok, err := s.store.SaveKey(&store.KeyAnnouncement{
 		Address: req.Address, X25519Pub: req.X25519Pub, Epoch: req.Epoch,
+		Sig: req.Sig,
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "store failed")
@@ -218,6 +219,7 @@ func (s *Server) handleKeyLookup(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"address": k.Address, "x25519_pub": k.X25519Pub, "epoch": k.Epoch,
+		"sig": k.Sig,
 	})
 }
 

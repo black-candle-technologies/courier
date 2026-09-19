@@ -83,6 +83,12 @@ type Config struct {
 	DashboardCursor      int64  `json:"dashboard_cursor,omitempty"`
 	// v0.6.5: sent-message log cursor for dashboard threading.
 	DashboardSentCursor int64 `json:"dashboard_sent_cursor,omitempty"`
+	// v0.6.11: highest verified key-directory epoch per recipient address
+	// (F1). The relay's key announcement is only trusted after its
+	// Ed25519 signature verifies under the recipient's address, and an
+	// announcement with a lower epoch than recorded is rejected as a
+	// rollback — so a malicious relay cannot substitute keys.
+	VerifiedKeyEpochs map[string]int64 `json:"verified_key_epochs,omitempty"`
 }
 
 func configPath() (string, error) {
@@ -335,6 +341,12 @@ func (c *Client) PublishKey() error {
 // recipientKey returns the X25519 public key to seal for: the recipient's
 // published (rotated) key if they announced one, else the key derived from
 // their address (pre-v0.5.0 peers and anyone who never rotated).
+//
+// v0.6.11 (F1): a directory hit is only trusted after its Ed25519
+// signature verifies against the recipient's address, and its epoch must
+// not be lower than the highest previously verified epoch for that
+// address. A relay that substitutes keys — or omits the signature — fails
+// closed instead of silently downgrading confidentiality.
 func (c *Client) recipientKey(address string) ([32]byte, error) {
 	var out [32]byte
 	hc, err := c.httpClient()
@@ -359,13 +371,50 @@ func (c *Client) recipientKey(address string) ([32]byte, error) {
 	}
 	var ann struct {
 		X25519Pub string `json:"x25519_pub"`
+		Epoch     int64  `json:"epoch"`
+		Sig       string `json:"sig"`
 	}
 	if err := json.Unmarshal(data, &ann); err != nil {
 		return out, fmt.Errorf("bad relay response: %w", err)
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(ann.X25519Pub)
+	return c.verifyKeyAnnouncement(address, ann.X25519Pub, ann.Epoch, ann.Sig)
+}
+
+// verifyKeyAnnouncement authenticates one key-directory announcement and
+// returns the X25519 key to seal for. It records the highest verified
+// epoch per recipient so rollbacks are rejected.
+func (c *Client) verifyKeyAnnouncement(address, x25519Pub string, epoch int64, sig string) ([32]byte, error) {
+	var out [32]byte
+	toEd, err := crypto.ParseAddress(address)
+	if err != nil {
+		return out, fmt.Errorf("bad address: %w", err)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(x25519Pub)
 	if err != nil || len(raw) != 32 {
 		return out, fmt.Errorf("bad relay response: invalid x25519_pub")
+	}
+	sigRaw, err := base64.RawURLEncoding.DecodeString(sig)
+	if err != nil || len(sigRaw) != 64 {
+		return out, fmt.Errorf("bad relay response: key announcement is not signed (refusing to encrypt to an unauthenticated key)")
+	}
+	canon := envelope.KeyAnnounce(toEd[:], raw, epoch)
+	if !crypto.Verify(toEd[:], canon, sigRaw) {
+		return out, fmt.Errorf("key announcement signature verification failed for %s: refusing to encrypt", address)
+	}
+	if epoch <= 0 {
+		return out, fmt.Errorf("bad relay response: invalid announcement epoch")
+	}
+	if max, ok := c.cfg.VerifiedKeyEpochs[address]; ok && epoch < max {
+		return out, fmt.Errorf("key announcement epoch %d is older than the verified epoch %d for %s: possible rollback, refusing to encrypt", epoch, max, address)
+	}
+	if c.cfg.VerifiedKeyEpochs == nil {
+		c.cfg.VerifiedKeyEpochs = map[string]int64{}
+	}
+	if epoch > c.cfg.VerifiedKeyEpochs[address] {
+		c.cfg.VerifiedKeyEpochs[address] = epoch
+		// Best effort: a lost epoch record only weakens rollback
+		// detection, never confidentiality of this send.
+		_ = c.cfg.Save()
 	}
 	copy(out[:], raw)
 	return out, nil
