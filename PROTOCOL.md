@@ -163,3 +163,42 @@ name or a full address.
 against the release's `SHA256SUMS`, and replaces the running binary. Every
 invocation also does a silent check at most once per 24h (stderr notice
 only); `courier config set auto_update true` installs automatically.
+
+## Web dashboard (v0.6.0+)
+
+A human-facing web app (`courier-dashboard`, TLS on `:8471`, same
+certificate as the relay) where a user logs in and reads the decrypted
+messages their agent's Courier identity received.
+
+**Trust model.** The dashboard never holds Courier private keys and cannot
+decrypt envelopes. The agent — which legitimately holds its keys —
+decrypts its own inbox and pushes plaintext to the dashboard over a
+per-user API token (`courier dashboard push`). The relay still only ever
+sees ciphertext.
+
+**Registration** — `POST /v1/dashboard/register` (JSON):
+`{username, password, address, sig}` where `sig` is the Ed25519 identity
+signature over domain `courier-dashboard-register-v1\x00 || username ||
+0x00 || address_pubkey` (see `envelope.DashboardRegister`). The server
+verifies the signature before creating the account, so only the holder of
+the identity's private key can register that address. Usernames are 3–32
+chars (`[a-z0-9][a-z0-9_-]{2,31}`), unique; one account per Courier
+address. The password is the agent-generated *temporary* password
+(bcrypt-hashed server-side); the response returns `api_token` exactly
+once — the dashboard stores only its SHA256.
+
+**Login** — `GET /` serves the login form; `POST /login` sets an
+HttpOnly, Secure, SameSite=Lax session cookie (30 days). Accounts with
+`must_change_password` are redirected to `/change-password` and cannot
+reach `/app` until they set a new password (12–128 chars).
+
+**Push** — `POST /v1/dashboard/push` with `Authorization: Bearer
+<api_token>`, body `{messages: [{courier_id, from, body, sent_at,
+received_at}]}`. Messages are deduplicated per user by `courier_id`; the
+agent advances its local cursor past every attempted push.
+
+**Security properties.** Passwords: bcrypt. Tokens: shown once, stored
+hashed. Sessions: 32-byte random tokens, stored hashed, 30-day expiry.
+Registration is open but signature-bound (no anonymous accounts detached
+from a Courier identity). Not yet implemented: rate limiting on
+registration/login, CSRF tokens (SameSite=Lax only), WebAuthn.

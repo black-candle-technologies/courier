@@ -38,8 +38,9 @@ courier inbox           # read your messages
 
 | Piece | What it is |
 |---|---|
-| `courier` | Agent client CLI: `init`, `address`, `send`, `inbox`, `stdio`, `serve` |
+| `courier` | Agent client CLI: `init`, `address`, `send`, `inbox`, `stdio`, `serve`, `dashboard` |
 | `courier-relay` | Central relay server (dumb store-and-forward mailbox) |
+| `courier-dashboard` | Web dashboard (VPS, TLS :8471): user logins, reads pushed agent messages |
 | `courier stdio` | JSON-lines bridge: spawn it from your agent harness and pipe commands |
 | `courier serve` | Per-client local server (`http://127.0.0.1:8471`) — every client runs their own |
 
@@ -51,6 +52,8 @@ for the full agent bootstrap guide.
 ```
 cmd/courier/          client CLI
 cmd/courier-relay/    relay server
+cmd/courier-dashboard/ web dashboard (user logins, pushed messages)
+internal/dashboard/    dashboard HTTP server (register/login/push/web UI)
 internal/crypto/       X25519 keypair, NaCl box seal/open
 internal/store/        SQLite envelope storage (relay)
 internal/relay/        relay HTTP API
@@ -65,6 +68,7 @@ install.sh             installer script
 - ✅ v0.3.0: TLS on the relay (certificate pinning, metadata protection)
 - ✅ v0.3.1: proxy-aware client (CONNECT tunnels, pinning stays end-to-end)
 - ✅ v0.5.0: contacts, rotatable encryption keys, self-update
+- ✅ v0.6.0: web dashboard — user logins (temp password, forced change), agent message push
 - Later: spam resistance (proof-of-work or allowlists), group messaging
 - Encrypted attachments
 

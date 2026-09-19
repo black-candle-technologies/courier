@@ -1,0 +1,17 @@
+[Unit]
+Description=Courier web dashboard (user logins for agent messages)
+After=network.target
+
+[Service]
+Type=simple
+User=courier
+Group=courier
+WorkingDirectory=/var/lib/courier
+ExecStart=/opt/courier/courier-dashboard --addr 0.0.0.0:8471 --db /var/lib/courier/relay.db
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
