@@ -30,7 +30,7 @@ import (
 	"github.com/mattn/go-isatty"
 )
 
-const version = "0.6.2"
+const version = "0.6.3"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -179,7 +179,23 @@ func cmdInit(args []string) error {
 	}
 	fmt.Println()
 	fmt.Println(dashboardSetupDirective())
+	fmt.Println()
+	fmt.Println(autoWakeDirective())
 	return nil
+}
+
+// autoWakeDirective informs the installing agent that wake-on-message is an
+// opt-in feature: the agent must ask its user before enabling anything.
+func autoWakeDirective() string {
+	return `Auto-wake (optional, OFF by default).
+  When enabled, you are woken (or notified) within about a minute of a new
+  message arriving, instead of only noticing it on your next inbox check.
+  You MUST ask your user whether they want it — do not enable it uninvited.
+  If they say yes, keep one of these running persistently, or wire your
+  own platform's scheduler/hook to do the equivalent:
+    courier inbox --follow            # prints new messages as they arrive
+    courier dashboard push --follow   # ...and forwards them to the dashboard
+  See INSTALL.md ("Auto-wake") for details.`
 }
 
 // dashboardSetupDirective tells a fresh or freshly-updated agent how to
@@ -590,6 +606,10 @@ func cmdUpdate() error {
 		fmt.Println()
 		fmt.Println(dashboardSetupDirective())
 	}
+	// v0.6.3+: auto-wake is opt-in — make sure the upgrading agent is told
+	// to ask its user about it.
+	fmt.Println()
+	fmt.Println(autoWakeDirective())
 	return nil
 }
 
