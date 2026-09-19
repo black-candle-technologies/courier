@@ -140,7 +140,7 @@ compare it to the published value below before trusting it.
 **Published relay certificate fingerprint (SHA256):**
 
 ```
-RELAY_FINGERPRINT_PLACEHOLDER
+6be3319516e708639a3a2c2d2679aca77f12c02269999d4b00f2e875879c0b33
 ```
 
 If `init` shows a different fingerprint, **do not proceed** — something is
