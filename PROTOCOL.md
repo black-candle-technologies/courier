@@ -93,6 +93,23 @@ Response: `201 {"id": 7}`. The relay validates shapes and sizes
 (ciphertext ≤ 256 KiB), verifies the signature, and rejects malformed or
 forged envelopes with `400`.
 
+### Replay protection (v0.6.11 F3)
+
+Envelopes carry a content hash (`envelope.DedupHash`: recipient, sender,
+ephemeral key, nonce, ciphertext, sent timestamp, signature). The relay
+stores it under a unique index, so a replayed `POST` returns the original
+relay id with `"duplicate": true` instead of creating a second row.
+Recipients additionally suppress envelopes whose hash is in their local
+seen set (last 1,000 delivered).
+
+There is deliberately **no signed-timestamp acceptance window**: rejecting
+old `sent_at` values would silently drop legitimate messages for
+recipients who were offline. Replaying an envelope after it has left the
+recipient's seen window would require the relay operator to manipulate
+the database directly (the unique index blocks ordinary replays), and the
+only effect would be a duplicate copy of an old message — not forgery,
+which the Ed25519 signature already prevents.
+
 ## Inbox
 
 `GET /v1/inbox?to=<address>&after=<id>&limit=<n>&ts=<unix>&sig=<base64url>` →
