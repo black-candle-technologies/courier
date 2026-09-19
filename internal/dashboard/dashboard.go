@@ -473,8 +473,17 @@ func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/app", http.StatusSeeOther)
 		return
 	}
-	// Opening a thread marks it read up to the newest message shown.
-	if err := s.store.MarkThreadSeen(u.ID, peer, msgs[len(msgs)-1].ID); err != nil {
+	// Opening a thread marks it read up to the newest message actually
+	// displayed. The maximum ID is computed explicitly (F14) rather than
+	// taken from an assumed array position, so the watermark always
+	// reflects what the user saw even if the display order changes.
+	var maxID int64
+	for _, m := range msgs {
+		if m.ID > maxID {
+			maxID = m.ID
+		}
+	}
+	if err := s.store.MarkThreadSeen(u.ID, peer, maxID); err != nil {
 		http.Error(w, "store failed", http.StatusInternalServerError)
 		return
 	}
