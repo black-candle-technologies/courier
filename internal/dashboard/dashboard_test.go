@@ -690,3 +690,86 @@ func TestChangePasswordRequiresCurrent(t *testing.T) {
 	}
 	login(t, srv, "lane", "third-password-1")
 }
+
+// TestThreadSeenWatermark verifies F14: opening a thread marks
+// last_seen_id to the maximum DISPLAYED message ID and clears the
+// unread badge. With >500 messages, the watermark is the newest
+// displayed message, not the oldest in the thread.
+func TestThreadSeenWatermark(t *testing.T) {
+	srv := testServer(t)
+	id := testIdentity(t)
+	peerID := testIdentity(t)
+	peer := crypto.FormatAddress(peerID.EdPub[:])
+	self := crypto.FormatAddress(id.EdPub[:])
+	token := register(t, srv, "lane", "temporary-password-123", id)
+
+	// 600 inbound messages; only the newest 500 are displayed (F12).
+	// The push endpoint caps at 200 messages per request.
+	for start := 1; start <= 600; start += 200 {
+		msgs := make([]map[string]any, 0, 200)
+		for i := start; i < start+200 && i <= 600; i++ {
+			msgs = append(msgs, map[string]any{
+				"courier_id": i, "from": peer, "body": "m",
+				"sent_at": i, "received_at": i,
+			})
+		}
+		payload, _ := json.Marshal(map[string]any{"messages": msgs})
+		req := httptest.NewRequest("POST", "/v1/dashboard/push", bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("push: got %d", rec.Code)
+		}
+	}
+
+	// Log in (forced password change), using the fresh F6 session.
+	cookie := sessionCookieFromRec(t, postChangePassword(t, srv,
+		login(t, srv, "lane", "temporary-password-123"),
+		url.Values{"password": {"a-brand-new-password"}, "confirm": {"a-brand-new-password"}}))
+
+	// Badge shows unread before opening.
+	u, err := srv.store.DashboardUserByName("lane")
+	if err != nil {
+		t.Fatal(err)
+	}
+	threads, err := srv.store.DashboardThreads(u.ID, self, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(threads) != 1 || threads[0].Unread != 600 {
+		t.Fatalf("unread before open = %+v, want 600", threads)
+	}
+
+	// Open the thread.
+	if r := get(t, srv, "/app/thread?with="+url.QueryEscape(peer), cookie); r.Code != http.StatusOK {
+		t.Fatalf("open thread: got %d", r.Code)
+	}
+
+	// Watermark = the maximum displayed message ID (the 600th message),
+	// and the unread badge is cleared.
+	lastSeen, err := srv.store.ThreadSeenID(u.ID, peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	displayed, err := srv.store.DashboardThreadMessages(u.ID, peer, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var maxShown int64
+	for _, m := range displayed {
+		if m.ID > maxShown {
+			maxShown = m.ID
+		}
+	}
+	if lastSeen != maxShown {
+		t.Fatalf("last_seen_id = %d, want max displayed %d", lastSeen, maxShown)
+	}
+	threads, err = srv.store.DashboardThreads(u.ID, self, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(threads) != 1 || threads[0].Unread != 0 {
+		t.Fatalf("unread after open = %+v, want 0", threads)
+	}
+}

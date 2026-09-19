@@ -554,6 +554,22 @@ func (s *Store) MarkThreadSeen(userID int64, peer string, lastID int64) error {
 	return err
 }
 
+// ThreadSeenID returns the last_seen_id watermark for a thread, or 0 if
+// the thread was never opened.
+func (s *Store) ThreadSeenID(userID int64, peer string) (int64, error) {
+	var id sql.NullInt64
+	err := s.db.QueryRow(
+		`SELECT last_seen_id FROM dashboard_seen WHERE user_id = ? AND peer = ?`,
+		userID, peer).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return id.Int64, nil
+}
+
 // escapeLike escapes LIKE metacharacters in a user search string.
 func escapeLike(q string) string {
 	q = strings.ReplaceAll(q, `\`, `\\`)
