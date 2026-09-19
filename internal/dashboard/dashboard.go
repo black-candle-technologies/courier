@@ -172,8 +172,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "username must be 3-32 chars: lowercase letters, digits, - and _")
 		return
 	}
-	if len(req.Password) < 16 || len(req.Password) > 128 {
-		writeErr(w, http.StatusBadRequest, "password must be 16-128 characters")
+	// bcrypt errors past 72 bytes, so enforce the byte limit here with a
+	// clear message instead of failing at hash time (F15).
+	if len(req.Password) < 16 || len(req.Password) > 72 {
+		writeErr(w, http.StatusBadRequest, "password must be 16-72 bytes")
 		return
 	}
 	addr, err := crypto.ParseAddress(req.Address)
@@ -511,8 +513,10 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pw := r.FormValue("password")
-	if len(pw) < 12 || len(pw) > 128 {
-		render(w, changeTmpl, map[string]any{"Forced": u.MustChange, "Error": "Password must be 12-128 characters."})
+	// bcrypt errors past 72 bytes: enforce the byte limit up front (F15).
+	// len() on a string counts bytes, which is what bcrypt cares about.
+	if len(pw) < 12 || len(pw) > 72 {
+		render(w, changeTmpl, map[string]any{"Forced": u.MustChange, "Error": "Password must be 12-72 characters (max 72 bytes)."})
 		return
 	}
 	if pw != r.FormValue("confirm") {
@@ -770,12 +774,12 @@ const changeTmpl = pageHead + `
 <div class="card">
 <form method="post" action="/change-password">
 <div class="field">
-<label for="pw">New password (12+ characters)</label>
-<input id="pw" type="password" name="password" autocomplete="new-password" required>
+<label for="pw">New password (12+ characters, max 72 bytes)</label>
+<input id="pw" type="password" name="password" autocomplete="new-password" minlength="12" maxlength="72" required>
 </div>
 <div class="field">
 <label for="cf">Confirm new password</label>
-<input id="cf" type="password" name="confirm" autocomplete="new-password" required>
+<input id="cf" type="password" name="confirm" autocomplete="new-password" minlength="12" maxlength="72" required>
 </div>
 {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
 <button class="btn btn-block" type="submit">Set password</button>
