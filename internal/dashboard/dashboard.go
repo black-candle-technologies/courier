@@ -339,7 +339,6 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 	}
 	type threadView struct {
 		store.DashboardThread
-		PeerArg string // url-escaped peer for the thread link
 		Preview string // truncated last-message preview
 	}
 	views := make([]threadView, 0, len(threads))
@@ -353,7 +352,6 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 		}
 		views = append(views, threadView{
 			DashboardThread: th,
-			PeerArg:         url.QueryEscape(th.Peer),
 			Preview:         preview,
 		})
 	}
@@ -685,7 +683,7 @@ const appTmpl = pageHead + `
 </div></header>
 <div class="wrap">
 {{if .Threads}}
-{{range .Threads}}<a class="thread" href="/app/thread?with={{.PeerArg}}">
+{{range .Threads}}<a class="thread" href="/app/thread?with={{.Peer}}">
 <span class="avatar" style="background:hsl({{senderHue .Peer}} 55% 38%)" aria-hidden="true">{{senderInitials .Peer}}</span>
 <div class="thread-main">
 <div class="thread-top">
