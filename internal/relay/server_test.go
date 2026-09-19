@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -307,5 +309,64 @@ func TestSendReplayIsIdempotent(t *testing.T) {
 	}
 	if len(out.Messages) != 1 || out.Messages[0].ID != f.ID {
 		t.Fatalf("want exactly the original message, got %+v", out.Messages)
+	}
+}
+
+func TestInboxPageBoundedByBytes(t *testing.T) {
+	srv := testServer(t)
+	alice, _ := crypto.GenerateIdentity()
+	bob, _ := crypto.GenerateIdentity()
+	bobAddr := crypto.FormatAddress(bob.EdPub[:])
+
+	// Ten large envelopes (~190 KiB plaintext each, ~260 KiB encoded —
+	// near the 256 KiB per-message cap, within the send body limit). A
+	// count-bounded page of 200 such messages would far exceed the
+	// client's 8 MiB read limit; the byte bound must split them across
+	// pages.
+	const n = 10
+	bigBody := strings.Repeat("x", 190*1024)
+	for i := 0; i < n; i++ {
+		if rec := postSend(t, srv, makeEnvelope(t, alice, bob, bigBody)); rec.Code != http.StatusCreated {
+			t.Fatalf("send %d: got %d", i, rec.Code)
+		}
+	}
+
+	var total, pages int
+	var after int64
+	for {
+		req := httptest.NewRequest("GET",
+			fmt.Sprintf("/v1/inbox?to=%s&after=%d&limit=200", bobAddr, after), nil)
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("inbox: got %d", rec.Code)
+		}
+		if len(rec.Body.Bytes()) > MaxInboxPageBytes {
+			t.Fatalf("page %d: %d bytes exceeds the %d-byte bound",
+				pages, len(rec.Body.Bytes()), MaxInboxPageBytes)
+		}
+		var out struct {
+			Messages []struct {
+				ID int64 `json:"id"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		if len(out.Messages) == 0 {
+			break
+		}
+		pages++
+		total += len(out.Messages)
+		after = out.Messages[len(out.Messages)-1].ID
+		if pages > n+1 {
+			t.Fatal("pagination did not terminate")
+		}
+	}
+	if total != n {
+		t.Fatalf("got %d messages across pages, want %d", total, n)
+	}
+	if pages < 2 {
+		t.Fatalf("expected multiple pages for large envelopes, got %d", pages)
 	}
 }
