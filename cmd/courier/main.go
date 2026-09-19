@@ -704,6 +704,7 @@ func cmdDashboardSetup(args []string) error {
 	fs := flag.NewFlagSet("dashboard setup", flag.ContinueOnError)
 	username := fs.String("username", "", "dashboard login username (3-32 chars: a-z, 0-9, -, _)")
 	dashURL := fs.String("dashboard-url", "", "dashboard URL (default "+client.DefaultDashboardURL+")")
+	fingerprint := fs.String("fingerprint", "", "expected dashboard certificate SHA256 fingerprint (required when the dashboard does not share the relay certificate)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -726,7 +727,7 @@ func cmdDashboardSetup(args []string) error {
 	if *dashURL != "" {
 		cfg.DashboardURL = *dashURL
 	}
-	temp, err := client.New(cfg).DashboardSetup(name)
+	temp, err := client.New(cfg).DashboardSetup(name, *fingerprint)
 	if err != nil {
 		return err
 	}
