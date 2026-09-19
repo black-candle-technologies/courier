@@ -336,6 +336,26 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "store failed", http.StatusInternalServerError)
 		return
 	}
+	// Optional search: keep only threads with a message matching q.
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q != "" {
+		peers, err := s.store.SearchThreadPeers(u.ID, q)
+		if err != nil {
+			http.Error(w, "store failed", http.StatusInternalServerError)
+			return
+		}
+		keep := make(map[string]bool, len(peers))
+		for _, p := range peers {
+			keep[p] = true
+		}
+		filtered := threads[:0]
+		for _, th := range threads {
+			if keep[th.Peer] {
+				filtered = append(filtered, th)
+			}
+		}
+		threads = filtered
+	}
 	type threadView struct {
 		store.DashboardThread
 		Preview string // truncated last-message preview
@@ -354,7 +374,7 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 			Preview:         preview,
 		})
 	}
-	render(w, appTmpl, map[string]any{"User": u.Username, "Threads": views})
+	render(w, appTmpl, map[string]any{"User": u.Username, "Threads": views, "Q": q})
 }
 
 // handleThread shows one conversation: every message exchanged with a
@@ -382,6 +402,11 @@ func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(msgs) == 0 {
 		http.Redirect(w, r, "/app", http.StatusSeeOther)
+		return
+	}
+	// Opening a thread marks it read up to the newest message shown.
+	if err := s.store.MarkThreadSeen(u.ID, peer, msgs[len(msgs)-1].ID); err != nil {
+		http.Error(w, "store failed", http.StatusInternalServerError)
 		return
 	}
 	type msgView struct {
@@ -605,6 +630,16 @@ input:focus{border-color:var(--accent);outline:none}
 .count{flex:none;min-width:1.6rem;height:1.6rem;border-radius:999px;background:var(--line);
   color:var(--muted);font-size:.78rem;font-weight:700;display:flex;align-items:center;
   justify-content:center;padding:0 .45rem}
+.unread{flex:none;min-width:1.6rem;height:1.6rem;border-radius:999px;background:var(--accent);
+  color:var(--accent-ink);font-size:.78rem;font-weight:700;display:flex;align-items:center;
+  justify-content:center;padding:0 .45rem}
+.search{display:flex;gap:.5rem;margin:0 0 .75rem}
+.search input{flex:1;min-width:0;min-height:44px;border:1px solid var(--line);border-radius:12px;
+  background:var(--card);color:var(--ink);padding:.6rem .9rem;font-size:1rem}
+.search input:focus{outline:2px solid var(--accent);outline-offset:1px}
+.search .clear{flex:none;display:inline-flex;align-items:center;justify-content:center;
+  width:44px;min-height:44px;border-radius:12px;background:var(--card);color:var(--muted);
+  text-decoration:none;font-size:1.4rem;line-height:1;border:1px solid var(--line)}
 /* conversation */
 .back{flex:none;display:inline-flex;align-items:center;justify-content:center;
   width:44px;height:44px;font-size:1.6rem;color:var(--ink);text-decoration:none;
@@ -681,18 +716,29 @@ const appTmpl = pageHead + `
 <form method="post" action="/logout"><button class="btn-ghost btn" type="submit">Log out</button></form>
 </div></header>
 <div class="wrap">
+<form class="search" method="get" action="/app" role="search">
+<input type="search" name="q" value="{{.Q}}" placeholder="Search messages" aria-label="Search messages" autocomplete="off">
+{{if .Q}}<a class="clear" href="/app" aria-label="Clear search">×</a>{{end}}
+</form>
 {{if .Threads}}
 {{range .Threads}}<a class="thread" href="/app/thread?with={{.Peer}}">
 <span class="avatar" style="background:hsl({{senderHue .Peer}} 55% 38%)" aria-hidden="true">{{senderInitials .Peer}}</span>
 <div class="thread-main">
 <div class="thread-top">
 <span class="sender" title="{{.Peer}}">{{senderShort .Peer}}</span>
-<span class="when">{{ago .LastTS}}</span>
+<span class="when" data-ts="{{.LastTS}}">{{ago .LastTS}}</span>
 </div>
 <p class="preview">{{.Preview}}</p>
 </div>
-{{if gt .Count 1}}<span class="count" aria-label="{{.Count}} messages">{{.Count}}</span>{{end}}
+{{if gt .Unread 0}}<span class="unread" aria-label="{{.Unread}} unread">{{.Unread}}</span>{{else if gt .Count 1}}<span class="count" aria-label="{{.Count}} messages">{{.Count}}</span>{{end}}
 </a>{{end}}
+{{else}}
+{{if .Q}}
+<div class="card empty">
+<div class="empty-mark" aria-hidden="true">🔍</div>
+<h2>No matches</h2>
+<p>No messages contain “{{.Q}}”.</p>
+</div>
 {{else}}
 <div class="card empty">
 <div class="empty-mark" aria-hidden="true">✉</div>
@@ -700,8 +746,31 @@ const appTmpl = pageHead + `
 <p>Your agent pushes new Courier messages here with <code>courier dashboard push</code>.</p>
 </div>
 {{end}}
+{{end}}
 <footer class="foot">Courier dashboard · messages are decrypted by your agent, never on this server</footer>
-</div></body></html>`
+</div>` + pageFoot
+
+// pageFoot closes the page and converts server-rendered relative times
+// (data-ts = unix seconds) to the viewer's local time. Without JS the
+// relative times remain.
+const pageFoot = `<script>
+(function(){try{
+var els=document.querySelectorAll('[data-ts]');
+if(!els.length)return;
+function fmt(ms){
+  var d=new Date(ms),t=d.toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+  var day=new Date(d.getFullYear(),d.getMonth(),d.getDate()).getTime();
+  var now=new Date();now=new Date(now.getFullYear(),now.getMonth(),now.getDate()).getTime();
+  var diff=Math.round((now-day)/864e5);
+  if(diff<=0)return t;
+  if(diff===1)return 'Yesterday '+t;
+  if(diff<7)return d.toLocaleDateString([], {weekday:'short'})+' '+t;
+  return d.toLocaleDateString([], {month:'short',day:'numeric'})+' '+t;
+}
+for(var i=0;i<els.length;i++){var e=els[i];e.textContent=fmt(1e3*+e.getAttribute('data-ts'));}
+}catch(e){}})();
+</script>
+</body></html>`
 
 const threadTmpl = pageHead + `
 <header class="appbar"><div class="appbar-inner">
@@ -713,8 +782,8 @@ const threadTmpl = pageHead + `
 {{range .Messages}}<div class="row{{if .Out}} out{{end}}">
 <div class="bubble">
 <p class="msg-body">{{.Body}}</p>
-<span class="when">{{ago .TS}}</span>
+<span class="when" data-ts="{{.TS}}">{{ago .TS}}</span>
 </div>
 </div>{{end}}
 <footer class="foot">Courier dashboard · messages are decrypted by your agent, never on this server</footer>
-</div></body></html>`
+</div>` + pageFoot

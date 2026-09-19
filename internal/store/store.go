@@ -109,6 +109,14 @@ func migrate(db *sql.DB) error {
 	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN peer TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
+	// v0.6.9: per-thread read state for unread badges.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS dashboard_seen(
+		user_id      INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
+		peer         TEXT NOT NULL,
+		last_seen_id INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (user_id, peer))`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -370,20 +378,30 @@ type DashboardThread struct {
 	Count    int64
 	LastTS   int64
 	LastBody string
-	LastOut  bool // the latest message was sent by the user
+	LastOut  bool  // the latest message was sent by the user
+	Unread   int64 // inbound messages newer than the user's last visit
 }
 
 // DashboardThreads returns the user's threads, most recently active first.
 func (s *Store) DashboardThreads(userID int64, userAddr string, limit int) ([]DashboardThread, error) {
+	// tpeer is the thread key qualified for the inner table alias.
+	const tpeer = `COALESCE(NULLIF(t.peer,''), t.sender)`
 	rows, err := s.db.Query(
-		`SELECT p, body, sender, cnt, ts FROM (
-		   SELECT `+peerExpr+` AS p, body, sender,
-		          COUNT(*) OVER (PARTITION BY `+peerExpr+`) AS cnt,
-		          COALESCE(sent_at, received_at) AS ts,
-		          ROW_NUMBER() OVER (PARTITION BY `+peerExpr+` ORDER BY COALESCE(sent_at, received_at) DESC, id DESC) AS rn
-		   FROM dashboard_messages WHERE user_id = ?
+		`SELECT p, body, sender, cnt, ts, unread FROM (
+		   SELECT `+tpeer+` AS p, t.body AS body, t.sender AS sender,
+		          COUNT(*) OVER (PARTITION BY `+tpeer+`) AS cnt,
+		          COALESCE(t.sent_at, t.received_at) AS ts,
+		          COALESCE((SELECT COUNT(*) FROM dashboard_messages m
+		                    WHERE m.user_id = ?
+		                      AND COALESCE(NULLIF(m.peer,''), m.sender) = `+tpeer+`
+		                      AND m.sender != ?
+		                      AND m.id > COALESCE((SELECT s.last_seen_id FROM dashboard_seen s
+		                                          WHERE s.user_id = ? AND s.peer = `+tpeer+`), 0)), 0) AS unread,
+		          ROW_NUMBER() OVER (PARTITION BY `+tpeer+`
+		                             ORDER BY COALESCE(t.sent_at, t.received_at) DESC, t.id DESC) AS rn
+		   FROM dashboard_messages t WHERE t.user_id = ?
 		 ) WHERE rn = 1 ORDER BY ts DESC, p ASC LIMIT ?`,
-		userID, limit)
+		userID, userAddr, userID, userID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -392,11 +410,54 @@ func (s *Store) DashboardThreads(userID int64, userAddr string, limit int) ([]Da
 	for rows.Next() {
 		var th DashboardThread
 		var sender string
-		if err := rows.Scan(&th.Peer, &th.LastBody, &sender, &th.Count, &th.LastTS); err != nil {
+		if err := rows.Scan(&th.Peer, &th.LastBody, &sender, &th.Count, &th.LastTS, &th.Unread); err != nil {
 			return nil, err
 		}
 		th.LastOut = sender == userAddr
 		out = append(out, th)
+	}
+	return out, rows.Err()
+}
+
+// MarkThreadSeen records that the user has viewed a thread up to lastID.
+func (s *Store) MarkThreadSeen(userID int64, peer string, lastID int64) error {
+	_, err := s.db.Exec(
+		`INSERT INTO dashboard_seen(user_id, peer, last_seen_id) VALUES(?, ?, ?)
+		 ON CONFLICT(user_id, peer) DO UPDATE SET last_seen_id = MAX(last_seen_id, excluded.last_seen_id)`,
+		userID, peer, lastID)
+	return err
+}
+
+// escapeLike escapes LIKE metacharacters in a user search string.
+func escapeLike(q string) string {
+	q = strings.ReplaceAll(q, `\`, `\\`)
+	q = strings.ReplaceAll(q, `%`, `\%`)
+	q = strings.ReplaceAll(q, `_`, `\_`)
+	return q
+}
+
+// SearchThreadPeers returns the distinct thread peers having any message
+// whose body, sender, or peer contains q (case-insensitive).
+func (s *Store) SearchThreadPeers(userID int64, q string) ([]string, error) {
+	like := "%" + escapeLike(q) + "%"
+	rows, err := s.db.Query(
+		`SELECT DISTINCT `+peerExpr+` FROM dashboard_messages
+		 WHERE user_id = ?
+		   AND (body LIKE ? ESCAPE '\'
+		        OR sender LIKE ? ESCAPE '\'
+		        OR COALESCE(NULLIF(peer,''), '') LIKE ? ESCAPE '\')`,
+		userID, like, like, like)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
 	}
 	return out, rows.Err()
 }
