@@ -1,0 +1,17 @@
+[Unit]
+Description=Courier encrypted agent messaging relay
+After=network.target
+
+[Service]
+Type=simple
+User=courier
+Group=courier
+WorkingDirectory=/var/lib/courier
+ExecStart=/opt/courier/courier-relay --addr 0.0.0.0:8470 --db /var/lib/courier/relay.db --retain-days 30
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
