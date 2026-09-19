@@ -571,6 +571,12 @@ func cmdUpdate() error {
 	}
 	if !update.NewerThan(version, rel.Tag) {
 		fmt.Printf("already up to date (courier %s).\n", version)
+		// v0.6.0+: agents that updated via an older binary never saw
+		// the dashboard setup directive, so surface it here too.
+		if cfg, err := client.LoadConfig(); err == nil && cfg.DashboardToken == "" {
+			fmt.Println()
+			fmt.Println(dashboardSetupDirective())
+		}
 		return nil
 	}
 	fmt.Printf("updating courier %s -> %s...\n", version, rel.Tag)
