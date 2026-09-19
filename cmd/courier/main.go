@@ -30,7 +30,7 @@ import (
 	"github.com/mattn/go-isatty"
 )
 
-const version = "0.6.4"
+const version = "0.6.5"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -794,5 +794,6 @@ func cmdDashboardStatus() error {
 	fmt.Printf("user:     %s\n", cfg.DashboardUser)
 	fmt.Printf("url:      %s\n", cfg.DashboardURL)
 	fmt.Printf("cursor:   %d (last pushed courier message id)\n", cfg.DashboardCursor)
+	fmt.Printf("sent:     %d (last pushed sent message id)\n", cfg.DashboardSentCursor)
 	return nil
 }

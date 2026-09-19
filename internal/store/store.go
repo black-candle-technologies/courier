@@ -77,6 +77,8 @@ CREATE TABLE IF NOT EXISTS dashboard_messages (
 	user_id     INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
 	courier_id  INTEGER NOT NULL,
 	sender      TEXT NOT NULL,
+	recipient   TEXT NOT NULL DEFAULT '',
+	peer        TEXT NOT NULL DEFAULT '',
 	body        TEXT NOT NULL,
 	sent_at     INTEGER NOT NULL,
 	received_at INTEGER NOT NULL,
@@ -88,8 +90,23 @@ CREATE INDEX IF NOT EXISTS idx_dashboard_messages_user ON dashboard_messages(use
 // migrate adds columns introduced after the table was first created.
 // Old rows keep empty defaults; v0.2.0+ always writes sig.
 func migrate(db *sql.DB) error {
-	_, err := db.Exec(`ALTER TABLE envelopes ADD COLUMN sig TEXT NOT NULL DEFAULT ''`)
-	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+	addColumn := func(stmt string) error {
+		_, err := db.Exec(stmt)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return err
+		}
+		return nil
+	}
+	if err := addColumn(`ALTER TABLE envelopes ADD COLUMN sig TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	// v0.6.5: thread support. recipient is the other side of an outbound
+	// message ('' for inbound); peer is the counterparty address, computed
+	// at insert. Old rows predate peer, so queries fall back to sender.
+	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN recipient TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN peer TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	return nil
@@ -316,28 +333,74 @@ type DashboardMessage struct {
 	ID         int64
 	CourierID  int64
 	Sender     string
+	Recipient  string // other side of an outbound message; '' for inbound
 	Body       string
 	SentAt     int64
 	ReceivedAt int64
 }
 
 // SaveDashboardMessage stores a pushed message; duplicates (same user +
-// courier id) are ignored.
-func (s *Store) SaveDashboardMessage(userID, courierID int64, sender, body string, sentAt, receivedAt int64) error {
+// courier id) are ignored. peer is the counterparty address: the sender
+// for inbound messages, the recipient for outbound ones.
+func (s *Store) SaveDashboardMessage(userID, courierID int64, sender, recipient, peer, body string, sentAt, receivedAt int64) error {
 	_, err := s.db.Exec(
 		`INSERT OR IGNORE INTO dashboard_messages
-		 (user_id, courier_id, sender, body, sent_at, received_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		userID, courierID, sender, body, sentAt, receivedAt)
+		 (user_id, courier_id, sender, recipient, peer, body, sent_at, received_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		userID, courierID, sender, recipient, peer, body, sentAt, receivedAt)
 	return err
 }
 
-// DashboardMessages returns the user's messages, newest first.
-func (s *Store) DashboardMessages(userID int64, limit int) ([]DashboardMessage, error) {
+// peerExpr resolves the counterparty of a message row. Rows written before
+// v0.6.5 have no peer value; those are all inbound, so sender is the peer.
+const peerExpr = `COALESCE(NULLIF(peer,''), sender)`
+
+// DashboardThread is one conversation: all messages exchanged with a
+// single counterparty address.
+type DashboardThread struct {
+	Peer     string
+	Count    int64
+	LastTS   int64
+	LastBody string
+	LastOut  bool // the latest message was sent by the user
+}
+
+// DashboardThreads returns the user's threads, most recently active first.
+func (s *Store) DashboardThreads(userID int64, userAddr string, limit int) ([]DashboardThread, error) {
 	rows, err := s.db.Query(
-		`SELECT id, courier_id, sender, body, sent_at, received_at
-		 FROM dashboard_messages WHERE user_id = ? ORDER BY courier_id DESC LIMIT ?`,
+		`SELECT p, body, sender, cnt, ts FROM (
+		   SELECT `+peerExpr+` AS p, body, sender,
+		          COUNT(*) OVER (PARTITION BY `+peerExpr+`) AS cnt,
+		          COALESCE(sent_at, received_at) AS ts,
+		          ROW_NUMBER() OVER (PARTITION BY `+peerExpr+` ORDER BY COALESCE(sent_at, received_at) DESC, id DESC) AS rn
+		   FROM dashboard_messages WHERE user_id = ?
+		 ) WHERE rn = 1 ORDER BY ts DESC, p ASC LIMIT ?`,
 		userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DashboardThread
+	for rows.Next() {
+		var th DashboardThread
+		var sender string
+		if err := rows.Scan(&th.Peer, &th.LastBody, &sender, &th.Count, &th.LastTS); err != nil {
+			return nil, err
+		}
+		th.LastOut = sender == userAddr
+		out = append(out, th)
+	}
+	return out, rows.Err()
+}
+
+// DashboardThreadMessages returns one thread's messages, oldest first.
+func (s *Store) DashboardThreadMessages(userID int64, peer string, limit int) ([]DashboardMessage, error) {
+	rows, err := s.db.Query(
+		`SELECT id, courier_id, sender, recipient, body, sent_at, received_at
+		 FROM dashboard_messages
+		 WHERE user_id = ? AND `+peerExpr+` = ?
+		 ORDER BY COALESCE(sent_at, received_at) ASC, id ASC LIMIT ?`,
+		userID, peer, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +408,7 @@ func (s *Store) DashboardMessages(userID int64, limit int) ([]DashboardMessage, 
 	var out []DashboardMessage
 	for rows.Next() {
 		var m DashboardMessage
-		if err := rows.Scan(&m.ID, &m.CourierID, &m.Sender, &m.Body, &m.SentAt, &m.ReceivedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.CourierID, &m.Sender, &m.Recipient, &m.Body, &m.SentAt, &m.ReceivedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

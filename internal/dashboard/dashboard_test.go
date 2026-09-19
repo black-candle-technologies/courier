@@ -100,12 +100,99 @@ func TestRegisterAndPush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	msgs, err := srv.store.DashboardMessages(u.ID, 100)
+	threads, err := srv.store.DashboardThreads(u.ID, addr, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(msgs) != 2 || msgs[0].Body != "world" {
-		t.Fatalf("messages = %+v", msgs)
+	// Both pushed messages have no "to", so each thread's peer is the sender
+	// (here the user's own address — a self-thread in this synthetic test).
+	if len(threads) != 1 || threads[0].Count != 2 || threads[0].LastBody != "world" {
+		t.Fatalf("threads = %+v", threads)
+	}
+}
+
+// TestThreads groups inbound and outbound messages into per-counterparty
+// threads and renders the conversation oldest-first.
+func TestThreads(t *testing.T) {
+	srv := testServer(t)
+	id := testIdentity(t)
+	other := testIdentity(t)
+	me := crypto.FormatAddress(id.EdPub[:])
+	them := crypto.FormatAddress(other.EdPub[:])
+	token := register(t, srv, "lane", "temporary-password-123", id)
+
+	push := func(msgs ...map[string]any) {
+		t.Helper()
+		payload, _ := json.Marshal(map[string]any{"messages": msgs})
+		req := httptest.NewRequest("POST", "/v1/dashboard/push", bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("push: got %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	// Inbound from them, outbound to them, inbound from a third party.
+	push(
+		map[string]any{"courier_id": 1, "from": them, "body": "hey", "sent_at": 100, "received_at": 101},
+		map[string]any{"courier_id": 2, "from": me, "to": them, "body": "hi back", "sent_at": 102, "received_at": 102},
+	)
+	third := testIdentity(t)
+	push(map[string]any{"courier_id": 3, "from": crypto.FormatAddress(third.EdPub[:]), "body": "other person", "sent_at": 103, "received_at": 104})
+
+	// An outbound message forged from someone else's address is skipped.
+	push(map[string]any{"courier_id": 4, "from": them, "to": me, "body": "forged", "sent_at": 105, "received_at": 105})
+
+	u, err := srv.store.DashboardUserByName("lane")
+	if err != nil {
+		t.Fatal(err)
+	}
+	threads, err := srv.store.DashboardThreads(u.ID, me, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(threads) != 2 {
+		t.Fatalf("threads = %+v, want 2", threads)
+	}
+	// Most recent thread first: the third party (ts 104) before them (ts 102).
+	if threads[0].Peer != crypto.FormatAddress(third.EdPub[:]) || threads[1].Peer != them {
+		t.Fatalf("thread order/peers = %+v", threads)
+	}
+	if threads[1].Count != 2 || !threads[1].LastOut || threads[1].LastBody != "hi back" {
+		t.Fatalf("thread with them = %+v", threads[1])
+	}
+
+	msgs, err := srv.store.DashboardThreadMessages(u.ID, them, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 || msgs[0].Body != "hey" || msgs[1].Body != "hi back" {
+		t.Fatalf("thread messages = %+v", msgs)
+	}
+	if msgs[0].Sender != them || msgs[1].Recipient != them {
+		t.Fatalf("directions wrong: %+v", msgs)
+	}
+
+	// The /app thread list and /app/thread pages render.
+	cookie := login(t, srv, "lane", "temporary-password-123")
+	// Password must be changed first; do it, then re-login.
+	form := url.Values{"password": {"a-new-password-123"}, "confirm": {"a-new-password-123"}}
+	req := httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("change-password: got %d", rec.Code)
+	}
+	cookie = login(t, srv, "lane", "a-new-password-123")
+	rec = get(t, srv, "/app", cookie)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "hi back") {
+		t.Fatalf("/app: got %d, body missing thread preview", rec.Code)
+	}
+	rec = get(t, srv, "/app/thread?with="+url.QueryEscape(them), cookie)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "hey") {
+		t.Fatalf("/app/thread: got %d", rec.Code)
 	}
 }
 

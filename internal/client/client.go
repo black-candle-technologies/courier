@@ -81,6 +81,8 @@ type Config struct {
 	DashboardToken       string `json:"dashboard_token,omitempty"`
 	DashboardFingerprint string `json:"dashboard_fingerprint,omitempty"`
 	DashboardCursor      int64  `json:"dashboard_cursor,omitempty"`
+	// v0.6.5: sent-message log cursor for dashboard threading.
+	DashboardSentCursor int64 `json:"dashboard_sent_cursor,omitempty"`
 }
 
 func configPath() (string, error) {
@@ -554,7 +556,85 @@ func (c *Client) Send(toOrName, body string) (int64, error) {
 	if err := json.Unmarshal(data, &out); err != nil {
 		return 0, fmt.Errorf("bad relay response: %w", err)
 	}
+	// Best-effort local record so the dashboard can thread the
+	// conversation. A logging failure must never fail the send itself.
+	_ = appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: body, SentAt: sentAt})
 	return out.ID, nil
+}
+
+// SentEntry is one locally recorded outbound message: the plaintext the
+// agent sent, kept so `courier dashboard push` can thread conversations.
+// It lives next to config.json (mode 0600 material already lives there).
+type SentEntry struct {
+	CourierID int64  `json:"courier_id"` // relay envelope id
+	To        string `json:"to"`
+	Body      string `json:"body"`
+	SentAt    int64  `json:"sent_at"`
+}
+
+// maxSentLog is the cap on the local sent log; older entries are dropped.
+const maxSentLog = 1000
+
+func sentLogPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".courier", "sent.jsonl"), nil
+}
+
+// readSentLog returns all logged sent entries, oldest first.
+func readSentLog() ([]SentEntry, error) {
+	p, err := sentLogPath()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []SentEntry
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var e SentEntry
+		if err := json.Unmarshal(line, &e); err != nil {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// appendSentLog records a sent message, pruning the log to maxSentLog.
+func appendSentLog(e SentEntry) error {
+	p, err := sentLogPath()
+	if err != nil {
+		return err
+	}
+	entries, err := readSentLog()
+	if err != nil {
+		return err
+	}
+	entries = append(entries, e)
+	if len(entries) > maxSentLog {
+		entries = entries[len(entries)-maxSentLog:]
+	}
+	var buf bytes.Buffer
+	for _, en := range entries {
+		line, _ := json.Marshal(en)
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(p, buf.Bytes(), 0o600)
 }
 
 // Message is one decrypted, signature-verified inbox message.
@@ -807,18 +887,21 @@ func (c *Client) DashboardSetup(username string) (tempPassword string, err error
 	return tempPassword, nil
 }
 
-// pushMsg is one decrypted message forwarded to the dashboard.
+// pushMsg is one decrypted message forwarded to the dashboard. To is set
+// for outbound messages the agent sent; it is empty for inbox messages.
 type pushMsg struct {
 	CourierID  int64  `json:"courier_id"`
 	From       string `json:"from"`
+	To         string `json:"to,omitempty"`
 	Body       string `json:"body"`
 	SentAt     int64  `json:"sent_at"`
 	ReceivedAt int64  `json:"received_at"`
 }
 
 // DashboardPush decrypts new inbox messages and pushes them to the
-// dashboard for the user to read. It advances the dashboard cursor past
-// every message it attempted, so a retry never re-pushes.
+// dashboard for the user to read, along with newly sent messages so the
+// dashboard can thread each conversation. It advances the dashboard cursors
+// past every message it attempted, so a retry never re-pushes.
 func (c *Client) DashboardPush() (pushed int, err error) {
 	hc, err := c.dashboardHTTPClient()
 	if err != nil {
@@ -834,6 +917,22 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 			CourierID: m.ID, From: m.From, Body: m.Body,
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
 		})
+	}
+	// Outbound messages, oldest first, from the local sent log.
+	var sentMax int64
+	if sent, err := readSentLog(); err == nil {
+		for _, e := range sent {
+			if e.CourierID <= c.cfg.DashboardSentCursor {
+				continue
+			}
+			batch = append(batch, pushMsg{
+				CourierID: e.CourierID, From: c.cfg.Address, To: e.To,
+				Body: e.Body, SentAt: e.SentAt, ReceivedAt: e.SentAt,
+			})
+			if e.CourierID > sentMax {
+				sentMax = e.CourierID
+			}
+		}
 	}
 	if len(batch) > 0 {
 		body, _ := json.Marshal(map[string]any{"messages": batch})
@@ -863,6 +962,9 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 		pushed = out.Stored
 	}
 	c.cfg.DashboardCursor = int64(next)
+	if sentMax > c.cfg.DashboardSentCursor {
+		c.cfg.DashboardSentCursor = sentMax
+	}
 	_ = c.cfg.Save()
 	return pushed, nil
 }

@@ -21,6 +21,7 @@ import (
 	"hash/fnv"
 	"html/template"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -32,7 +33,7 @@ import (
 )
 
 // Version of the dashboard server.
-const Version = "0.6.2"
+const Version = "0.6.5"
 
 // sessionTTL is how long a login session lasts.
 const sessionTTL = 30 * 24 * time.Hour
@@ -61,6 +62,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /", s.handleIndex)
 	mux.HandleFunc("POST /login", s.handleLogin)
 	mux.HandleFunc("GET /app", s.handleApp)
+	mux.HandleFunc("GET /app/thread", s.handleThread)
 	mux.HandleFunc("GET /change-password", s.handleChangePasswordForm)
 	mux.HandleFunc("POST /change-password", s.handleChangePassword)
 	mux.HandleFunc("POST /logout", s.handleLogout)
@@ -166,6 +168,7 @@ func newAPIToken() (token, hash string, err error) {
 type pushMessage struct {
 	CourierID  int64  `json:"courier_id"`
 	From       string `json:"from"`
+	To         string `json:"to,omitempty"` // set for outbound messages the agent sent
 	Body       string `json:"body"`
 	SentAt     int64  `json:"sent_at"`
 	ReceivedAt int64  `json:"received_at"`
@@ -214,7 +217,21 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		if _, err := crypto.ParseAddress(m.From); err != nil {
 			continue
 		}
-		if err := s.store.SaveDashboardMessage(user.ID, m.CourierID, m.From, m.Body, m.SentAt, m.ReceivedAt); err != nil {
+		// peer is the counterparty: the sender for inbound messages, the
+		// recipient for outbound ones the agent sent itself.
+		peer := m.From
+		recipient := ""
+		if m.To != "" {
+			if _, err := crypto.ParseAddress(m.To); err != nil {
+				continue
+			}
+			if m.From != user.CourierAddress {
+				continue // agents only push their own sent mail
+			}
+			recipient = m.To
+			peer = m.To
+		}
+		if err := s.store.SaveDashboardMessage(user.ID, m.CourierID, m.From, recipient, peer, m.Body, m.SentAt, m.ReceivedAt); err != nil {
 			writeErr(w, http.StatusInternalServerError, "store failed")
 			return
 		}
@@ -312,12 +329,75 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/change-password", http.StatusSeeOther)
 		return
 	}
-	msgs, err := s.store.DashboardMessages(u.ID, 200)
+	threads, err := s.store.DashboardThreads(u.ID, u.CourierAddress, 100)
 	if err != nil {
 		http.Error(w, "store failed", http.StatusInternalServerError)
 		return
 	}
-	render(w, appTmpl, map[string]any{"User": u.Username, "Messages": msgs})
+	type threadView struct {
+		store.DashboardThread
+		PeerArg string // url-escaped peer for the thread link
+		Preview string // truncated last-message preview
+	}
+	views := make([]threadView, 0, len(threads))
+	for _, th := range threads {
+		preview := th.LastBody
+		if th.LastOut {
+			preview = "You: " + preview
+		}
+		if len([]rune(preview)) > 120 {
+			preview = string([]rune(preview)[:120]) + "…"
+		}
+		views = append(views, threadView{
+			DashboardThread: th,
+			PeerArg:         url.QueryEscape(th.Peer),
+			Preview:         preview,
+		})
+	}
+	render(w, appTmpl, map[string]any{"User": u.Username, "Threads": views})
+}
+
+// handleThread shows one conversation: every message exchanged with a
+// single counterparty address, oldest first, with the user's own messages
+// on the right.
+func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
+	u := s.sessionUser(r)
+	if u == nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	if u.MustChange {
+		http.Redirect(w, r, "/change-password", http.StatusSeeOther)
+		return
+	}
+	peer := r.URL.Query().Get("with")
+	if _, err := crypto.ParseAddress(peer); err != nil {
+		http.Redirect(w, r, "/app", http.StatusSeeOther)
+		return
+	}
+	msgs, err := s.store.DashboardThreadMessages(u.ID, peer, 500)
+	if err != nil {
+		http.Error(w, "store failed", http.StatusInternalServerError)
+		return
+	}
+	if len(msgs) == 0 {
+		http.Redirect(w, r, "/app", http.StatusSeeOther)
+		return
+	}
+	type msgView struct {
+		store.DashboardMessage
+		Out bool
+		TS  int64
+	}
+	views := make([]msgView, 0, len(msgs))
+	for _, m := range msgs {
+		ts := m.SentAt
+		if m.ReceivedAt > ts {
+			ts = m.ReceivedAt
+		}
+		views = append(views, msgView{DashboardMessage: m, Out: m.Sender == u.CourierAddress, TS: ts})
+	}
+	render(w, threadTmpl, map[string]any{"User": u.Username, "Peer": peer, "Messages": views})
 }
 
 func (s *Server) handleChangePasswordForm(w http.ResponseWriter, r *http.Request) {
@@ -505,18 +585,42 @@ input:focus{border-color:var(--accent);outline:none}
 .appbar h1{flex:1;min-width:6rem}
 .user{font-size:.85rem;color:var(--muted);max-width:11rem;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
-/* messages */
-.msg{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
-  padding:.95rem 1rem;margin:0 0 .75rem}
-@media(min-width:700px){.msg{padding:1.1rem 1.25rem}}
-.msg-head{display:flex;align-items:center;gap:.65rem;margin-bottom:.45rem;min-width:0}
+/* threads */
 .avatar{flex:none;width:2.3rem;height:2.3rem;border-radius:50%;color:#fff;
   display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.78rem}
-.msg-meta{flex:1;min-width:0}
 .sender{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.84rem;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .when{font-size:.78rem;color:var(--muted)}
 .msg-body{margin:.3rem 0 0;white-space:pre-wrap;word-break:break-word;font-size:.95rem}
+.thread{display:flex;align-items:center;gap:.75rem;background:var(--card);
+  border:1px solid var(--line);border-radius:var(--radius);padding:.85rem 1rem;
+  margin:0 0 .6rem;color:inherit;text-decoration:none;min-height:44px}
+@media(min-width:700px){.thread{padding:.95rem 1.15rem}}
+.thread:active{background:var(--line)}
+.thread-main{flex:1;min-width:0}
+.thread-top{display:flex;align-items:baseline;gap:.6rem;justify-content:space-between}
+.thread-top .sender{flex:1;min-width:0}
+.preview{margin:.25rem 0 0;font-size:.9rem;color:var(--muted);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.count{flex:none;min-width:1.6rem;height:1.6rem;border-radius:999px;background:var(--line);
+  color:var(--muted);font-size:.78rem;font-weight:700;display:flex;align-items:center;
+  justify-content:center;padding:0 .45rem}
+/* conversation */
+.back{flex:none;display:inline-flex;align-items:center;justify-content:center;
+  width:44px;height:44px;font-size:1.6rem;color:var(--ink);text-decoration:none;
+  border-radius:10px}
+.thread-title{flex:1;min-width:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:.95rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.thread-wrap{display:flex;flex-direction:column;gap:.5rem}
+.row{display:flex;justify-content:flex-start}
+.row.out{justify-content:flex-end}
+.bubble{max-width:78%;background:var(--card);border:1px solid var(--line);
+  border-radius:var(--radius);padding:.6rem .85rem}
+@media(min-width:700px){.bubble{max-width:68%}}
+.row.out .bubble{background:var(--accent);border-color:transparent}
+.row.out .bubble .msg-body{color:var(--accent-ink)}
+.row.out .bubble .when{color:var(--accent-ink);opacity:.75}
+.bubble .when{display:block;margin-top:.3rem;font-size:.75rem;text-align:right}
 /* empty state */
 .empty{text-align:center;padding:3rem 1.5rem;color:var(--muted)}
 .empty-mark{font-size:2.5rem;margin-bottom:.5rem}
@@ -577,17 +681,18 @@ const appTmpl = pageHead + `
 <form method="post" action="/logout"><button class="btn-ghost btn" type="submit">Log out</button></form>
 </div></header>
 <div class="wrap">
-{{if .Messages}}
-{{range .Messages}}<article class="msg">
-<div class="msg-head">
-<span class="avatar" style="background:hsl({{senderHue .Sender}} 55% 38%)" aria-hidden="true">{{senderInitials .Sender}}</span>
-<div class="msg-meta">
-<span class="sender" title="{{.Sender}}">{{senderShort .Sender}}</span>
-<span class="when">{{ago .ReceivedAt}} · courier #{{.CourierID}}</span>
+{{if .Threads}}
+{{range .Threads}}<a class="thread" href="/app/thread?with={{.PeerArg}}">
+<span class="avatar" style="background:hsl({{senderHue .Peer}} 55% 38%)" aria-hidden="true">{{senderInitials .Peer}}</span>
+<div class="thread-main">
+<div class="thread-top">
+<span class="sender" title="{{.Peer}}">{{senderShort .Peer}}</span>
+<span class="when">{{ago .LastTS}}</span>
 </div>
+<p class="preview">{{.Preview}}</p>
 </div>
-<p class="msg-body">{{.Body}}</p>
-</article>{{end}}
+{{if gt .Count 1}}<span class="count" aria-label="{{.Count}} messages">{{.Count}}</span>{{end}}
+</a>{{end}}
 {{else}}
 <div class="card empty">
 <div class="empty-mark" aria-hidden="true">✉</div>
@@ -595,5 +700,21 @@ const appTmpl = pageHead + `
 <p>Your agent pushes new Courier messages here with <code>courier dashboard push</code>.</p>
 </div>
 {{end}}
+<footer class="foot">Courier dashboard · messages are decrypted by your agent, never on this server</footer>
+</div></body></html>`
+
+const threadTmpl = pageHead + `
+<header class="appbar"><div class="appbar-inner">
+<a class="back" href="/app" aria-label="Back to threads">‹</a>
+<h1 class="thread-title" title="{{.Peer}}">{{senderShort .Peer}}</h1>
+<span class="user" title="{{.User}}">{{.User}}</span>
+</div></header>
+<div class="wrap thread-wrap">
+{{range .Messages}}<div class="row{{if .Out}} out{{end}}">
+<div class="bubble">
+<p class="msg-body">{{.Body}}</p>
+<span class="when">{{ago .TS}}</span>
+</div>
+</div>{{end}}
 <footer class="foot">Courier dashboard · messages are decrypted by your agent, never on this server</footer>
 </div></body></html>`
