@@ -369,7 +369,7 @@ func cmdServe(args []string) error {
 		q := r.URL.Query()
 		var after int64
 		fmt.Sscanf(q.Get("after"), "%d", &after)
-		msgs, err := cl.Inbox(after, 50)
+		msgs, _, err := cl.Inbox(after, 50)
 		if err != nil {
 			writeSvcJSON(w, 502, map[string]string{"error": err.Error()})
 			return
