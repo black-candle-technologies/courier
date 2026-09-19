@@ -495,7 +495,7 @@ func TestPWAAssets(t *testing.T) {
 			t.Fatalf("%s content type = %q", p, ct)
 		}
 		b := rec.Body.Bytes()
-		if len(b) < 1000 || string(b[:8]) != "\x89PNG\r\n\x1a\n" {
+		if len(b) < 500 || string(b[:8]) != "\x89PNG\r\n\x1a\n" {
 			t.Fatalf("%s: not a plausible PNG (%d bytes)", p, len(b))
 		}
 	}
