@@ -512,6 +512,18 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
+	// F6: a non-forced change must prove the current password, so anyone
+	// holding only a stale session (or a leaked temp password after the
+	// owner already changed it) cannot lock the owner out. The forced
+	// first-login flow is authenticated by the temporary password
+	// itself, so it is exempt — but its sessions are still revoked below.
+	if !u.MustChange {
+		cur := r.FormValue("current")
+		if cur == "" || bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(cur)) != nil {
+			render(w, changeTmpl, map[string]any{"Forced": false, "Error": "Current password is incorrect."})
+			return
+		}
+	}
 	pw := r.FormValue("password")
 	// bcrypt errors past 72 bytes: enforce the byte limit up front (F15).
 	// len() on a string counts bytes, which is what bcrypt cares about.
@@ -528,8 +540,14 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "hash failed", http.StatusInternalServerError)
 		return
 	}
-	if err := s.store.SetDashboardPassword(u.ID, string(hash)); err != nil {
+	if err := s.store.ChangeDashboardPassword(u.ID, string(hash)); err != nil {
 		http.Error(w, "store failed", http.StatusInternalServerError)
+		return
+	}
+	// F6: every session was revoked above (including the requester's), so
+	// issue a fresh one to keep the requester logged in.
+	if err := s.setSession(w, u.ID); err != nil {
+		http.Error(w, "session failed", http.StatusInternalServerError)
 		return
 	}
 	http.Redirect(w, r, "/app", http.StatusSeeOther)
@@ -773,6 +791,12 @@ const changeTmpl = pageHead + `
 </header>
 <div class="card">
 <form method="post" action="/change-password">
+{{if not .Forced}}
+<div class="field">
+<label for="cur">Current password</label>
+<input id="cur" type="password" name="current" autocomplete="current-password" required>
+</div>
+{{end}}
 <div class="field">
 <label for="pw">New password (12+ characters, max 72 bytes)</label>
 <input id="pw" type="password" name="password" autocomplete="new-password" minlength="12" maxlength="72" required>
