@@ -907,7 +907,7 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 	if err != nil {
 		return 0, err
 	}
-	msgs, next, err := c.Inbox(c.cfg.DashboardCursor, 200)
+	msgs, _, err := c.Inbox(c.cfg.DashboardCursor, 200)
 	if err != nil {
 		return 0, err
 	}
@@ -961,7 +961,10 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 		_ = json.Unmarshal(raw, &out)
 		pushed = out.Stored
 	}
-	c.cfg.DashboardCursor = int64(next)
+	// Advance past every message attempted: inbox order is ascending by id.
+	if len(msgs) > 0 {
+		c.cfg.DashboardCursor = msgs[len(msgs)-1].ID
+	}
 	if sentMax > c.cfg.DashboardSentCursor {
 		c.cfg.DashboardSentCursor = sentMax
 	}

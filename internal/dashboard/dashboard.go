@@ -33,7 +33,7 @@ import (
 )
 
 // Version of the dashboard server.
-const Version = "0.6.5"
+const Version = "0.6.6"
 
 // sessionTTL is how long a login session lasts.
 const sessionTTL = 30 * 24 * time.Hour
@@ -231,11 +231,14 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 			recipient = m.To
 			peer = m.To
 		}
-		if err := s.store.SaveDashboardMessage(user.ID, m.CourierID, m.From, recipient, peer, m.Body, m.SentAt, m.ReceivedAt); err != nil {
+		inserted, err := s.store.SaveDashboardMessage(user.ID, m.CourierID, m.From, recipient, peer, m.Body, m.SentAt, m.ReceivedAt)
+		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "store failed")
 			return
 		}
-		stored++
+		if inserted {
+			stored++
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"stored": stored})
 }

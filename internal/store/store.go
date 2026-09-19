@@ -340,15 +340,23 @@ type DashboardMessage struct {
 }
 
 // SaveDashboardMessage stores a pushed message; duplicates (same user +
-// courier id) are ignored. peer is the counterparty address: the sender
-// for inbound messages, the recipient for outbound ones.
-func (s *Store) SaveDashboardMessage(userID, courierID int64, sender, recipient, peer, body string, sentAt, receivedAt int64) error {
-	_, err := s.db.Exec(
+// courier id) are ignored. It reports whether the row was actually
+// inserted. peer is the counterparty address: the sender for inbound
+// messages, the recipient for outbound ones.
+func (s *Store) SaveDashboardMessage(userID, courierID int64, sender, recipient, peer, body string, sentAt, receivedAt int64) (bool, error) {
+	res, err := s.db.Exec(
 		`INSERT OR IGNORE INTO dashboard_messages
 		 (user_id, courier_id, sender, recipient, peer, body, sent_at, received_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		userID, courierID, sender, recipient, peer, body, sentAt, receivedAt)
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // peerExpr resolves the counterparty of a message row. Rows written before
