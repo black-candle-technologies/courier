@@ -21,7 +21,6 @@ import (
 	"hash/fnv"
 	"html/template"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strings"
 	"time"
