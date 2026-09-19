@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/crypto"
@@ -113,8 +114,15 @@ func ConfigExists() bool {
 	return err == nil
 }
 
-// LoadConfig reads the local identity.
-func LoadConfig() (*Config, error) {
+// configMu serializes in-process config access across goroutines.
+// withConfigLock holds it for the whole read-modify-write cycle, and the
+// flock serializes across processes; together they make Update atomic
+// against every other Courier config writer on the machine.
+var configMu sync.Mutex
+
+// loadConfigRaw reads and parses the config file: version check and
+// defaults, but no migrations and no writes.
+func loadConfigRaw() (*Config, error) {
 	p, err := configPath()
 	if err != nil {
 		return nil, err
@@ -133,40 +141,123 @@ func LoadConfig() (*Config, error) {
 	if c.RelayURL == "" {
 		c.RelayURL = DefaultRelay
 	}
-	// v0.5.0 lazy migration: identities created before rotatable keys
-	// derive their single encryption key from the seed (epoch 0).
-	if len(c.EncKeys) == 0 {
-		id, err := c.Identity()
-		if err != nil {
-			return nil, err
-		}
-		now := time.Now().Unix()
-		c.EncKeys = []EncKey{{
-			Pub:       base64.RawURLEncoding.EncodeToString(id.XPub[:]),
-			Priv:      base64.RawURLEncoding.EncodeToString(id.XPriv[:]),
-			Epoch:     0,
-			CreatedAt: now,
-		}}
-		// Best effort: persist the migration so it only happens once.
-		_ = c.Save()
-	}
 	return &c, nil
 }
 
-// Save writes the config with mode 0600.
-func (c *Config) Save() error {
+// migrateEncKeys applies the v0.5.0 lazy migration: identities created
+// before rotatable keys derive their single encryption key from the seed
+// (epoch 0).
+func migrateEncKeys(c *Config) error {
+	if len(c.EncKeys) != 0 {
+		return nil
+	}
+	id, err := c.Identity()
+	if err != nil {
+		return err
+	}
+	now := time.Now().Unix()
+	c.EncKeys = []EncKey{{
+		Pub:       base64.RawURLEncoding.EncodeToString(id.XPub[:]),
+		Priv:      base64.RawURLEncoding.EncodeToString(id.XPriv[:]),
+		Epoch:     0,
+		CreatedAt: now,
+	}}
+	return nil
+}
+
+// LoadConfig reads the local identity.
+func LoadConfig() (*Config, error) {
+	c, err := loadConfigRaw()
+	if err != nil {
+		return nil, err
+	}
+	if len(c.EncKeys) == 0 {
+		if err := migrateEncKeys(c); err != nil {
+			return nil, err
+		}
+		// Best effort: persist the migration so it only happens once.
+		_ = c.Save()
+	}
+	return c, nil
+}
+
+// saveAtomic writes the config via temp file + rename in the same
+// directory, so a crash can never leave a partially written config.
+func (c *Config) saveAtomic() error {
 	p, err := configPath()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	raw, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(p, raw, 0o600)
+	tmp, err := os.CreateTemp(dir, "config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename succeeded
+	if _, err := tmp.Write(raw); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, p)
+}
+
+// Save writes the config with mode 0600: atomically (temp file + rename)
+// and serialized against other Courier processes via the config lock.
+//
+// NOTE: Save persists the in-memory struct as-is. Code that mutates a
+// long-lived Config (e.g. advancing a cursor in a --follow loop) must use
+// Update instead, which reloads the freshest on-disk state first —
+// otherwise fields another process changed meanwhile (e.g. rotated
+// encryption keys) are silently clobbered.
+func (c *Config) Save() error {
+	return withConfigLock(func() error { return c.saveAtomic() })
+}
+
+// Update performs an atomic read-modify-write: it takes the cross-process
+// config lock, reloads the freshest on-disk state, applies fn, and saves
+// atomically. On success the receiver is refreshed to the saved state.
+// This is the correct way to mutate config from long-running processes;
+// mutating a stale in-memory Config and calling Save would clobber fields
+// another process wrote meanwhile (v0.6.11 F5).
+func (c *Config) Update(fn func(*Config) error) error {
+	return withConfigLock(func() error {
+		fresh, err := loadConfigRaw()
+		if err != nil {
+			return err
+		}
+		if len(fresh.EncKeys) == 0 {
+			if err := migrateEncKeys(fresh); err != nil {
+				return err
+			}
+		}
+		if err := fn(fresh); err != nil {
+			return err
+		}
+		if err := fresh.saveAtomic(); err != nil {
+			return err
+		}
+		*c = *fresh
+		return nil
+	})
 }
 
 // NewIdentity generates a fresh v0.2.0 identity (not yet saved).
@@ -415,10 +506,19 @@ func (c *Client) verifyKeyAnnouncement(address, x25519Pub string, epoch int64, s
 		c.cfg.VerifiedKeyEpochs = map[string]int64{}
 	}
 	if epoch > c.cfg.VerifiedKeyEpochs[address] {
-		c.cfg.VerifiedKeyEpochs[address] = epoch
 		// Best effort: a lost epoch record only weakens rollback
-		// detection, never confidentiality of this send.
-		_ = c.cfg.Save()
+		// detection, never confidentiality of this send. Update
+		// reloads fresh state so a concurrent rotation's keys are not
+		// clobbered (v0.6.11 F5).
+		_ = c.cfg.Update(func(fresh *Config) error {
+			if fresh.VerifiedKeyEpochs == nil {
+				fresh.VerifiedKeyEpochs = map[string]int64{}
+			}
+			if epoch > fresh.VerifiedKeyEpochs[address] {
+				fresh.VerifiedKeyEpochs[address] = epoch
+			}
+			return nil
+		})
 	}
 	copy(out[:], raw)
 	return out, nil
@@ -844,19 +944,26 @@ func (c *Client) recordSeenEnvelopes(hashes []string) {
 	if len(hashes) == 0 {
 		return
 	}
-	known := c.seenEnvelopeSet()
-	for _, h := range hashes {
-		if !known[h] {
-			known[h] = true
-			c.cfg.SeenEnvelopeHashes = append(c.cfg.SeenEnvelopeHashes, h)
-		}
-	}
-	if len(c.cfg.SeenEnvelopeHashes) > maxSeenEnvelopeHashes {
-		c.cfg.SeenEnvelopeHashes = c.cfg.SeenEnvelopeHashes[len(c.cfg.SeenEnvelopeHashes)-maxSeenEnvelopeHashes:]
-	}
 	// Best effort: losing the set only weakens replay suppression,
-	// never message delivery.
-	_ = c.cfg.Save()
+	// never message delivery. Update reloads fresh state so hashes
+	// recorded by a concurrent process are merged, not clobbered
+	// (v0.6.11 F5).
+	_ = c.cfg.Update(func(fresh *Config) error {
+		known := make(map[string]bool, len(fresh.SeenEnvelopeHashes))
+		for _, h := range fresh.SeenEnvelopeHashes {
+			known[h] = true
+		}
+		for _, h := range hashes {
+			if !known[h] {
+				known[h] = true
+				fresh.SeenEnvelopeHashes = append(fresh.SeenEnvelopeHashes, h)
+			}
+		}
+		if len(fresh.SeenEnvelopeHashes) > maxSeenEnvelopeHashes {
+			fresh.SeenEnvelopeHashes = fresh.SeenEnvelopeHashes[len(fresh.SeenEnvelopeHashes)-maxSeenEnvelopeHashes:]
+		}
+		return nil
+	})
 }
 
 // Ping checks the relay is reachable.
@@ -1140,12 +1247,18 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 	// Advance past every message attempted — including undecryptable
 	// ones, so a poisoned page never wedges the push cursor (v0.6.11
 	// F4). Inbox order is ascending by id, so lastID is monotonic.
-	if lastID > c.cfg.DashboardCursor {
-		c.cfg.DashboardCursor = lastID
-	}
-	if sentMax > c.cfg.DashboardSentCursor {
-		c.cfg.DashboardSentCursor = sentMax
-	}
-	_ = c.cfg.Save()
+	// Read-modify-write via Update: a long-running --follow loop must
+	// not clobber fields (e.g. rotated encryption keys) another process
+	// wrote since this config was loaded (v0.6.11 F5). Cursors only move
+	// forward, so taking the max is safe.
+	_ = c.cfg.Update(func(fresh *Config) error {
+		if lastID > fresh.DashboardCursor {
+			fresh.DashboardCursor = lastID
+		}
+		if sentMax > fresh.DashboardSentCursor {
+			fresh.DashboardSentCursor = sentMax
+		}
+		return nil
+	})
 	return pushed, nil
 }

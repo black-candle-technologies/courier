@@ -295,10 +295,13 @@ func cmdInbox(args []string) error {
 		}
 		// Advance past every inspected envelope, including
 		// undecryptable ones, so a poisoned page never wedges
-		// pagination (v0.6.11 F4).
+		// pagination (v0.6.11 F4). Read-modify-write via Update so a
+		// concurrent rotation's keys survive our cursor save (F5).
 		after = lastID
-		cfg.Cursor = after
-		_ = cfg.Save()
+		_ = cfg.Update(func(fresh *client.Config) error {
+			fresh.Cursor = after
+			return nil
+		})
 		if len(msgs) == 0 {
 			if skipped > 0 {
 				fmt.Fprintf(os.Stderr, "(%d message(s) failed signature/decryption and were dropped)\n", skipped)
