@@ -289,10 +289,16 @@ func cmdInbox(args []string) error {
 		after = 0
 	}
 	poll := func() (bool, error) {
-		msgs, skipped, err := cl.Inbox(after, *limit)
+		msgs, lastID, skipped, err := cl.Inbox(after, *limit)
 		if err != nil {
 			return false, err
 		}
+		// Advance past every inspected envelope, including
+		// undecryptable ones, so a poisoned page never wedges
+		// pagination (v0.6.11 F4).
+		after = lastID
+		cfg.Cursor = after
+		_ = cfg.Save()
 		if len(msgs) == 0 {
 			if skipped > 0 {
 				fmt.Fprintf(os.Stderr, "(%d message(s) failed signature/decryption and were dropped)\n", skipped)
@@ -303,9 +309,6 @@ func cmdInbox(args []string) error {
 		if skipped > 0 {
 			fmt.Fprintf(os.Stderr, "(%d message(s) failed signature/decryption and were dropped)\n", skipped)
 		}
-		after = msgs[len(msgs)-1].ID
-		cfg.Cursor = after
-		_ = cfg.Save()
 		return true, nil
 	}
 	if got, err := poll(); err != nil {
@@ -396,7 +399,7 @@ func cmdStdio() error {
 			if limit <= 0 {
 				limit = 50
 			}
-			msgs, _, err := cl.Inbox(req.After, limit)
+			msgs, _, _, err := cl.Inbox(req.After, limit)
 			if err != nil {
 				reply(stdioResp{ID: req.ID, OK: false, Error: err.Error()})
 				continue
@@ -468,7 +471,7 @@ func cmdServe(args []string) error {
 		q := r.URL.Query()
 		var after int64
 		fmt.Sscanf(q.Get("after"), "%d", &after)
-		msgs, _, err := cl.Inbox(after, 50)
+		msgs, _, _, err := cl.Inbox(after, 50)
 		if err != nil {
 			writeSvcJSON(w, 502, map[string]string{"error": err.Error()})
 			return
