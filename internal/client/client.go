@@ -10,7 +10,6 @@ package client
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -21,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -199,18 +197,6 @@ func FetchRelayFingerprint(relayURL string) (string, error) {
 	tr := &http.Transport{
 		Proxy:           http.ProxyFromEnvironment,
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := (&tls.Dialer{Config: &tls.Config{InsecureSkipVerify: true}}).DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, err
-			}
-			if tc, ok := conn.(*tls.Conn); ok {
-				if pcs := tc.ConnectionState().PeerCertificates; len(pcs) > 0 {
-					peer = pcs[0]
-				}
-			}
-			return conn, nil
-		},
 	}
 	hc := &http.Client{Transport: tr, Timeout: 30 * time.Second}
 	resp, err := hc.Get(relayURL + "/v1/health")
@@ -218,9 +204,11 @@ func FetchRelayFingerprint(relayURL string) (string, error) {
 		return "", fmt.Errorf("relay unreachable: %w", err)
 	}
 	resp.Body.Close()
-	if peer == nil {
+	// The presented certificate is captured from the completed TLS session.
+	if resp.TLS == nil || len(resp.TLS.PeerCertificates) == 0 {
 		return "", errors.New("relay presented no certificate")
 	}
+	peer = resp.TLS.PeerCertificates[0]
 	sum := sha256.Sum256(peer.Raw)
 	return hex.EncodeToString(sum[:]), nil
 }
