@@ -4,10 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -624,5 +627,256 @@ func TestNewIdentityAnnouncementVerifies(t *testing.T) {
 	}
 	if !crypto.Verify(toEd[:], canon, sig) {
 		t.Fatal("initial key announcement does not verify against the identity address")
+	}
+}
+
+// ---- F11: size/count-bounded dashboard push batches ----
+
+// pushTestEnvelope builds a real sealed+signed envelope addressed to cfg
+// with the given relay id, for feeding a fake relay inbox.
+func pushTestEnvelope(t *testing.T, sender *crypto.Identity, cfg *Config, id int64, body string) map[string]any {
+	t.Helper()
+	toEd, err := crypto.ParseAddress(cfg.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, _, _, err := cfg.currentEncKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	eph, nonce, ct, err := crypto.Seal(&pub, []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentAt := int64(1700000000) + id
+	sig := sender.Sign(envelope.Canonical(toEd[:], sender.EdPub[:], eph, nonce, sentAt, ct))
+	enc := base64.RawURLEncoding.EncodeToString
+	return map[string]any{
+		"id": id, "from": crypto.FormatAddress(sender.EdPub[:]),
+		"eph": enc(eph), "nonce": enc(nonce), "ct": enc(ct),
+		"sent_at": sentAt, "received_at": sentAt, "sig": enc(sig),
+	}
+}
+
+// pushCapture is a fake dashboard /v1/dashboard/push endpoint that
+// records each batch's message count and encoded byte size, and can be
+// told to fail every batch after the first N successes.
+type pushCapture struct {
+	batchSizes  []int
+	batchCounts []int
+	batches     int
+	failAfter   int
+}
+
+func (pc *pushCapture) handler(envs []map[string]any) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/inbox":
+			// Honor the client's `after` cursor and `limit` like the
+			// real relay.
+			after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+			limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+			var out []map[string]any
+			for _, e := range envs {
+				if e["id"].(int64) > after {
+					out = append(out, e)
+				}
+			}
+			if limit > 0 && len(out) > limit {
+				out = out[:limit]
+			}
+			raw, _ := json.Marshal(map[string]any{"messages": out})
+			w.Write(raw)
+		case "/v1/dashboard/push":
+			raw, _ := io.ReadAll(r.Body)
+			pc.batches++
+			if pc.failAfter > 0 && pc.batches > pc.failAfter {
+				http.Error(w, `{"error":"boom"}`, http.StatusInternalServerError)
+				return
+			}
+			var req struct {
+				Messages []json.RawMessage `json:"messages"`
+			}
+			_ = json.Unmarshal(raw, &req)
+			pc.batchSizes = append(pc.batchSizes, len(raw))
+			pc.batchCounts = append(pc.batchCounts, len(req.Messages))
+			fmt.Fprintf(w, `{"stored":%d}`, len(req.Messages))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+}
+
+func TestSplitPushBatchesBounds(t *testing.T) {
+	var items []pushItem
+	// 450 small messages: forces a count split (200/200/50).
+	for i := 0; i < 450; i++ {
+		items = append(items, pushItem{msg: pushMsg{CourierID: int64(i + 1), From: "a", Body: "x"}})
+	}
+	// 100 messages with 10 KiB bodies: forces byte-size splits.
+	for i := 0; i < 100; i++ {
+		items = append(items, pushItem{sent: true, msg: pushMsg{
+			CourierID: int64(1000 + i), From: "a", To: "b",
+			Body: strings.Repeat("y", 10<<10),
+		}})
+	}
+	batches := splitPushBatches(items)
+	total := 0
+	var lastID int64
+	for bi, b := range batches {
+		if len(b) == 0 {
+			t.Fatalf("batch %d is empty", bi)
+		}
+		if len(b) > maxPushBatchMessages {
+			t.Fatalf("batch %d has %d messages, want <= %d", bi, len(b), maxPushBatchMessages)
+		}
+		msgs := make([]pushMsg, 0, len(b))
+		for _, it := range b {
+			msgs = append(msgs, it.msg)
+			if it.msg.CourierID <= lastID {
+				t.Fatalf("batch %d breaks ordering at id %d", bi, it.msg.CourierID)
+			}
+			lastID = it.msg.CourierID
+		}
+		raw, _ := json.Marshal(map[string]any{"messages": msgs})
+		if len(raw) > maxPushBatchBytes {
+			t.Fatalf("batch %d encodes to %d bytes, want <= %d", bi, len(raw), maxPushBatchBytes)
+		}
+		total += len(b)
+	}
+	if total != len(items) {
+		t.Fatalf("batches cover %d of %d messages", total, len(items))
+	}
+	if len(batches) < 4 { // 3 count batches + several byte batches
+		t.Fatalf("expected several batches, got %d", len(batches))
+	}
+
+	// A single message larger than the byte bound still makes progress.
+	huge := []pushItem{{msg: pushMsg{CourierID: 1, From: "a", Body: strings.Repeat("z", maxPushBatchBytes)}}}
+	if got := splitPushBatches(huge); len(got) != 1 || len(got[0]) != 1 {
+		t.Fatalf("oversized single message produced %d batches", len(got))
+	}
+}
+
+func TestDashboardPushBatchesLargeBacklog(t *testing.T) {
+	cfg := testConfig(t)
+	sender, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 200 inbox messages (a full relay page) with small bodies.
+	var envs []map[string]any
+	for i := int64(1); i <= 200; i++ {
+		envs = append(envs, pushTestEnvelope(t, sender, cfg, i, fmt.Sprintf("hello %d", i)))
+	}
+	// 150 sent messages with 8 KiB bodies: combined with the inbox
+	// page this would be a ~1.4 MiB single request without batching.
+	for i := int64(1); i <= 150; i++ {
+		if err := appendSentLog(SentEntry{
+			CourierID: i, To: "ed25519:peer",
+			Body: strings.Repeat("s", 8<<10), SentAt: 1700000000 + i,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pc := &pushCapture{}
+	ts := httptest.NewServer(pc.handler(envs))
+	t.Cleanup(ts.Close)
+	cfg.RelayURL = ts.URL
+	cfg.DashboardURL = ts.URL
+	cfg.DashboardToken = "test-token"
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	cl := New(cfg)
+
+	pushed, err := cl.DashboardPush()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pushed != 350 {
+		t.Fatalf("pushed = %d, want 350", pushed)
+	}
+	if len(pc.batchCounts) < 2 {
+		t.Fatalf("expected multiple batches, got %d", len(pc.batchCounts))
+	}
+	total := 0
+	for i, n := range pc.batchCounts {
+		if n > maxPushBatchMessages {
+			t.Fatalf("batch %d has %d messages, want <= %d", i, n, maxPushBatchMessages)
+		}
+		if pc.batchSizes[i] > maxPushBatchBytes {
+			t.Fatalf("batch %d is %d bytes, want <= %d", i, pc.batchSizes[i], maxPushBatchBytes)
+		}
+		total += n
+	}
+	if total != 350 {
+		t.Fatalf("batches covered %d messages, want 350", total)
+	}
+	if cfg.DashboardCursor != 200 {
+		t.Fatalf("DashboardCursor = %d, want 200", cfg.DashboardCursor)
+	}
+	if cfg.DashboardSentCursor != 150 {
+		t.Fatalf("DashboardSentCursor = %d, want 150", cfg.DashboardSentCursor)
+	}
+}
+
+func TestDashboardPushFailedBatchKeepsAckedCursors(t *testing.T) {
+	cfg := testConfig(t)
+	sender, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 200 inbox messages with 2 KiB bodies: the byte bound splits the
+	// relay page into two batches within a single push call.
+	var envs []map[string]any
+	for i := int64(1); i <= 200; i++ {
+		envs = append(envs, pushTestEnvelope(t, sender, cfg, i, strings.Repeat("m", 2<<10)))
+	}
+
+	pc := &pushCapture{failAfter: 1} // second batch fails
+	ts := httptest.NewServer(pc.handler(envs))
+	t.Cleanup(ts.Close)
+	cfg.RelayURL = ts.URL
+	cfg.DashboardURL = ts.URL
+	cfg.DashboardToken = "test-token"
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	cl := New(cfg)
+
+	pushed, err := cl.DashboardPush()
+	if err == nil {
+		t.Fatal("expected an error from the failed batch")
+	}
+	if pc.batches != 2 {
+		t.Fatalf("expected 2 batch attempts, got %d", pc.batches)
+	}
+	if len(pc.batchCounts) != 1 {
+		t.Fatalf("expected 1 acknowledged batch, got %d", len(pc.batchCounts))
+	}
+	first := pc.batchCounts[0]
+	if pushed != first {
+		t.Fatalf("pushed = %d, want %d (first batch only)", pushed, first)
+	}
+	if cfg.DashboardCursor != int64(first) {
+		t.Fatalf("DashboardCursor = %d, want %d after partial failure", cfg.DashboardCursor, first)
+	}
+
+	// Server recovers: the retry re-fetches the failed batch (its
+	// envelopes were never marked seen) and completes the backlog.
+	pc.failAfter = 0
+	pushed, err = cl.DashboardPush()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pushed != 200-first {
+		t.Fatalf("pushed = %d, want %d (remainder only)", pushed, 200-first)
+	}
+	if cfg.DashboardCursor != 200 {
+		t.Fatalf("DashboardCursor = %d, want 200", cfg.DashboardCursor)
 	}
 }

@@ -821,18 +821,32 @@ type Message struct {
 // callers must persist it as their cursor: a page of only undecryptable
 // messages must not wedge pagination (v0.6.11 F4). lastID is at least
 // `after`.
+// Inbox fetches and decrypts messages after the given id. See inbox for
+// the lastID contract. Delivered envelopes are marked seen so they are
+// never delivered twice (v0.6.11 F3).
 func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, error) {
+	msgs, lastID, skipped, _, err := c.inbox(after, limit, true)
+	return msgs, lastID, skipped, err
+}
+
+// inbox is Inbox with control over replay bookkeeping. Push consumers
+// (dashboard push) pass markSeen=false and record hashes themselves,
+// but only for batches the server acknowledges — so a failed batch's
+// messages stay re-fetchable on retry instead of being suppressed as
+// replays while the cursor advances past them (v0.6.11 F11). It returns
+// the dedup hashes of the delivered messages for that bookkeeping.
+func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64, int, []string, error) {
 	hc, err := c.httpClient()
 	if err != nil {
-		return nil, after, 0, err
+		return nil, after, 0, nil, err
 	}
 	id, err := c.cfg.Identity()
 	if err != nil {
-		return nil, after, 0, err
+		return nil, after, 0, nil, err
 	}
 	toEd, err := crypto.ParseAddress(c.cfg.Address)
 	if err != nil {
-		return nil, after, 0, fmt.Errorf("bad address: %w", err)
+		return nil, after, 0, nil, fmt.Errorf("bad address: %w", err)
 	}
 	// v0.6.11 (F10): the inbox request is signed by the recipient, so
 	// the relay serves ciphertext only to the address owner. after and
@@ -844,12 +858,12 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, error) {
 		base64.RawURLEncoding.EncodeToString(sig))
 	resp, err := hc.Get(url)
 	if err != nil {
-		return nil, after, 0, fmt.Errorf("relay unreachable: %w", err)
+		return nil, after, 0, nil, fmt.Errorf("relay unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, after, 0, relayErr(data)
+		return nil, after, 0, nil, relayErr(data)
 	}
 	var in struct {
 		Messages []struct {
@@ -864,7 +878,7 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, error) {
 		} `json:"messages"`
 	}
 	if err := json.Unmarshal(data, &in); err != nil {
-		return nil, after, 0, fmt.Errorf("bad relay response: %w", err)
+		return nil, after, 0, nil, fmt.Errorf("bad relay response: %w", err)
 	}
 	var out []Message
 	skipped := 0
@@ -932,8 +946,10 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, error) {
 		seen[h] = true
 		newHashes = append(newHashes, h)
 	}
-	c.recordSeenEnvelopes(newHashes)
-	return out, lastID, skipped, nil
+	if markSeen {
+		c.recordSeenEnvelopes(newHashes)
+	}
+	return out, lastID, skipped, newHashes, nil
 }
 
 // maxSeenEnvelopeHashes bounds the client-side replay-suppression set.
@@ -1193,68 +1209,126 @@ type pushMsg struct {
 	ReceivedAt int64  `json:"received_at"`
 }
 
+// Bounds for a single dashboard push request (v0.6.11 F11). The
+// dashboard rejects batches over 200 messages; the byte bound keeps
+// each request far under the dashboard's 4 MiB body limit and keeps
+// memory use predictable on the push side.
+const (
+	maxPushBatchMessages = 200
+	maxPushBatchBytes    = 256 << 10 // 256 KiB of encoded JSON
+)
+
+// pushItem is one message queued for the dashboard; sent marks entries
+// from the local sent log (advancing DashboardSentCursor) as opposed to
+// inbox messages (advancing DashboardCursor). hash is the envelope dedup
+// hash for inbox messages, recorded as seen only once the batch carrying
+// it is acknowledged (v0.6.11 F11).
+type pushItem struct {
+	msg  pushMsg
+	sent bool
+	hash string
+}
+
+// splitPushBatches partitions queued messages into batches bounded by
+// both message count and encoded JSON size, preserving order. A single
+// message larger than the byte bound still forms its own batch so
+// progress is always made.
+func splitPushBatches(items []pushItem) [][]pushItem {
+	var batches [][]pushItem
+	var cur []pushItem
+	curBytes := 0
+	flush := func() {
+		if len(cur) > 0 {
+			batches = append(batches, cur)
+			cur = nil
+			curBytes = 0
+		}
+	}
+	for _, it := range items {
+		raw, _ := json.Marshal(it.msg)
+		n := len(raw) + 1 // +1 for the array separator
+		if len(cur) >= maxPushBatchMessages ||
+			(len(cur) > 0 && curBytes+n > maxPushBatchBytes) {
+			flush()
+		}
+		cur = append(cur, it)
+		curBytes += n
+	}
+	flush()
+	return batches
+}
+
 // DashboardPush decrypts new inbox messages and pushes them to the
 // dashboard for the user to read, along with newly sent messages so the
-// dashboard can thread each conversation. It advances the dashboard cursors
-// past every message it attempted, so a retry never re-pushes.
+// dashboard can thread each conversation.
+//
+// v0.6.11 (F11): messages go out in batches bounded by both count (200)
+// and encoded size (256 KiB). Cursors and replay bookkeeping advance
+// only through batches the dashboard acknowledges, so a failed batch is
+// retried on the next run instead of wedging or re-pushing the backlog.
 func (c *Client) DashboardPush() (pushed int, err error) {
 	hc, err := c.dashboardHTTPClient()
 	if err != nil {
 		return 0, err
 	}
-	msgs, lastID, _, err := c.Inbox(c.cfg.DashboardCursor, 200)
+	// Fetch without marking seen (v0.6.11 F11): envelopes are recorded
+	// as seen only inside acknowledged push batches below, so a failed
+	// batch's messages are re-fetched on retry instead of being
+	// suppressed as replays while the cursor advances past them.
+	msgs, lastID, _, hashes, err := c.inbox(c.cfg.DashboardCursor, 200, false)
 	if err != nil {
 		return 0, err
 	}
-	var batch []pushMsg
-	for _, m := range msgs {
-		batch = append(batch, pushMsg{
+	var items []pushItem
+	for i, m := range msgs {
+		items = append(items, pushItem{hash: hashes[i], msg: pushMsg{
 			CourierID: m.ID, From: m.From, Body: m.Body,
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
-		})
+		}})
 	}
 	// Outbound messages, oldest first, from the local sent log.
-	var sentMax int64
 	if sent, err := readSentLog(); err == nil {
 		for _, e := range sent {
 			if e.CourierID <= c.cfg.DashboardSentCursor {
 				continue
 			}
-			batch = append(batch, pushMsg{
+			items = append(items, pushItem{sent: true, msg: pushMsg{
 				CourierID: e.CourierID, From: c.cfg.Address, To: e.To,
 				Body: e.Body, SentAt: e.SentAt, ReceivedAt: e.SentAt,
-			})
-			if e.CourierID > sentMax {
-				sentMax = e.CourierID
-			}
+			}})
 		}
 	}
-	if len(batch) > 0 {
-		body, _ := json.Marshal(map[string]any{"messages": batch})
-		req, _ := http.NewRequest(http.MethodPost, c.cfg.DashboardURL+"/v1/dashboard/push", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+c.cfg.DashboardToken)
-		resp, err := hc.Do(req)
+	// Push in bounded batches (v0.6.11 F11): the dashboard rejects
+	// oversized requests, so each batch is capped by both message count
+	// and encoded byte size. Cursors advance only through batches the
+	// server acknowledges — never all-or-nothing — so a failed batch is
+	// retried next run instead of re-pushing (or forever retrying) the
+	// whole backlog.
+	for _, batch := range splitPushBatches(items) {
+		n, inboxMax, sentMax, err := c.pushBatch(hc, batch)
 		if err != nil {
-			return 0, fmt.Errorf("push: %w", err)
+			return pushed, err
 		}
-		defer resp.Body.Close()
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-		if resp.StatusCode != http.StatusOK {
-			var er struct {
-				Error string `json:"error"`
+		pushed += n
+		// Envelopes are marked seen only now that the dashboard has
+		// them: a failed batch stays re-fetchable, and replay
+		// suppression still works across ticks (v0.6.11 F3).
+		var hashes []string
+		for _, it := range batch {
+			if !it.sent && it.hash != "" {
+				hashes = append(hashes, it.hash)
 			}
-			_ = json.Unmarshal(raw, &er)
-			if er.Error == "" {
-				er.Error = resp.Status
+		}
+		c.recordSeenEnvelopes(hashes)
+		_ = c.cfg.Update(func(fresh *Config) error {
+			if inboxMax > fresh.DashboardCursor {
+				fresh.DashboardCursor = inboxMax
 			}
-			return 0, fmt.Errorf("push failed: %s", er.Error)
-		}
-		var out struct {
-			Stored int `json:"stored"`
-		}
-		_ = json.Unmarshal(raw, &out)
-		pushed = out.Stored
+			if sentMax > fresh.DashboardSentCursor {
+				fresh.DashboardSentCursor = sentMax
+			}
+			return nil
+		})
 	}
 	// Advance past every message attempted — including undecryptable
 	// ones, so a poisoned page never wedges the push cursor (v0.6.11
@@ -1267,10 +1341,50 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 		if lastID > fresh.DashboardCursor {
 			fresh.DashboardCursor = lastID
 		}
-		if sentMax > fresh.DashboardSentCursor {
-			fresh.DashboardSentCursor = sentMax
-		}
 		return nil
 	})
 	return pushed, nil
+}
+
+// pushBatch POSTs one bounded batch of messages to the dashboard and
+// returns the server's stored count plus the batch's inbox/sent cursor
+// maxima. The batch is acknowledged (HTTP 200) or it isn't — callers
+// advance cursors only on success.
+func (c *Client) pushBatch(hc *http.Client, batch []pushItem) (stored int, inboxMax, sentMax int64, err error) {
+	msgs := make([]pushMsg, 0, len(batch))
+	for _, it := range batch {
+		msgs = append(msgs, it.msg)
+		if it.sent {
+			if it.msg.CourierID > sentMax {
+				sentMax = it.msg.CourierID
+			}
+		} else if it.msg.CourierID > inboxMax {
+			inboxMax = it.msg.CourierID
+		}
+	}
+	body, _ := json.Marshal(map[string]any{"messages": msgs})
+	req, _ := http.NewRequest(http.MethodPost, c.cfg.DashboardURL+"/v1/dashboard/push", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.cfg.DashboardToken)
+	resp, err := hc.Do(req)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("push: %w", err)
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var er struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(raw, &er)
+		if er.Error == "" {
+			er.Error = resp.Status
+		}
+		return 0, 0, 0, fmt.Errorf("push failed: %s", er.Error)
+	}
+	var out struct {
+		Stored int `json:"stored"`
+	}
+	_ = json.Unmarshal(raw, &out)
+	return out.Stored, inboxMax, sentMax, nil
 }
