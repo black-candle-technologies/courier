@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -370,3 +371,51 @@ func signAnn(t *testing.T, id *crypto.Identity, address, pub string, epoch int64
 		id.Sign(envelope.KeyAnnounce(toEd[:], raw, epoch)))
 }
 
+
+func TestExpectedDashboardFingerprint(t *testing.T) {
+	newCfg := func(relay, dash, pin string) *Config {
+		return &Config{RelayURL: relay, DashboardURL: dash, RelayFingerprint: pin}
+	}
+	pin := strings.Repeat("ab", 32)
+	// Same host: the relay pin applies.
+	c := New(newCfg("https://relay.example:8470", "https://relay.example:8471", pin))
+	if got := c.expectedDashboardFingerprint(""); got != pin {
+		t.Fatalf("same host: got %q, want relay pin", got)
+	}
+	// Explicit fingerprint always wins.
+	if got := c.expectedDashboardFingerprint("cc"); got != "cc" {
+		t.Fatalf("explicit: got %q, want cc", got)
+	}
+	// Different host: TOFU.
+	c = New(newCfg("https://relay.example:8470", "https://dash.example:8471", pin))
+	if got := c.expectedDashboardFingerprint(""); got != "" {
+		t.Fatalf("different host: got %q, want TOFU", got)
+	}
+	// No relay pin: TOFU.
+	c = New(newCfg("https://relay.example:8470", "https://relay.example:8471", ""))
+	if got := c.expectedDashboardFingerprint(""); got != "" {
+		t.Fatalf("no pin: got %q, want TOFU", got)
+	}
+}
+
+func TestDashboardSetupRejectsPinMismatch(t *testing.T) {
+	cfg := testConfig(t)
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/dashboard/register" {
+			t.Error("registration must not be attempted after a pin mismatch")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(ts.Close)
+	cfg.DashboardURL = ts.URL
+	// Same host as the relay (127.0.0.1), but a wrong pinned relay
+	// fingerprint: the setup must fail closed before registering.
+	u, _ := url.Parse(ts.URL)
+	cfg.RelayURL = "https://" + u.Hostname() + ":8470"
+	cfg.RelayFingerprint = strings.Repeat("00", 32)
+
+	_, err := New(cfg).DashboardSetup("someuser", "")
+	if err == nil || !strings.Contains(err.Error(), "mismatch") {
+		t.Fatalf("got %v, want a certificate mismatch error", err)
+	}
+}

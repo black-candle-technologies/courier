@@ -859,7 +859,15 @@ func GenerateTempPassword() (string, error) {
 // It returns the temporary password, which the agent must hand to the
 // user: it is never stored server-side and must be changed on first
 // login.
-func (c *Client) DashboardSetup(username string) (tempPassword string, err error) {
+//
+// expectedFingerprint, when non-empty, is the dashboard certificate
+// fingerprint the setup must see (fail closed on mismatch). When empty,
+// the setup requires the dashboard certificate to match the already
+// pinned relay fingerprint whenever the dashboard shares the relay's
+// host (the documented deployment shares the relay's certificate);
+// otherwise it falls back to TOFU, printing the fingerprint for the
+// user to verify.
+func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassword string, err error) {
 	if !dashboardUsernameRe.MatchString(username) {
 		return "", fmt.Errorf("username must be 3-32 chars: lowercase letters, digits, - and _")
 	}
@@ -884,14 +892,22 @@ func (c *Client) DashboardSetup(username string) (tempPassword string, err error
 	}
 	sig := id.Sign(canon)
 
-	// Pin the dashboard certificate (TOFU). The dashboard shares the
-	// relay's certificate, so the fingerprint should match the published
-	// relay value; print it for verification.
+	// Pin the dashboard certificate. v0.6.11 (F2): authenticate it
+	// instead of trusting the first certificate seen. An explicitly
+	// provided fingerprint always wins; otherwise, when the dashboard
+	// shares the relay's host (the documented deployment shares the
+	// relay's certificate), the fetched fingerprint must equal the
+	// already-pinned relay fingerprint. Anything else is TOFU with the
+	// fingerprint printed for human verification.
 	fp, err := FetchRelayFingerprint(c.cfg.DashboardURL)
 	if err != nil {
 		return "", fmt.Errorf("dashboard unreachable: %w", err)
 	}
+	want := c.expectedDashboardFingerprint(expectedFingerprint)
 	fmt.Fprintf(os.Stderr, "dashboard certificate SHA256: %s\n", fp)
+	if want != "" && !strings.EqualFold(fp, want) {
+		return "", fmt.Errorf("dashboard certificate mismatch: got SHA256 %s, want %s; refusing to register (possible MITM or rotated certificate — verify and re-run with --fingerprint)", fp, want)
+	}
 
 	hc, err := pinnedTransport(fp)
 	if err != nil {
@@ -934,6 +950,34 @@ func (c *Client) DashboardSetup(username string) (tempPassword string, err error
 		return "", fmt.Errorf("save config: %w", err)
 	}
 	return tempPassword, nil
+}
+
+// expectedDashboardFingerprint returns the dashboard certificate
+// fingerprint the setup must see, or "" to fall back to TOFU. An
+// explicitly provided fingerprint always wins; otherwise the pinned relay
+// fingerprint applies when the dashboard shares the relay's host (the
+// documented deployment shares the relay's certificate).
+func (c *Client) expectedDashboardFingerprint(expected string) string {
+	if expected != "" {
+		return expected
+	}
+	if c.cfg.RelayFingerprint != "" && sameURLHost(c.cfg.DashboardURL, c.cfg.RelayURL) {
+		return c.cfg.RelayFingerprint
+	}
+	return ""
+}
+
+// sameURLHost reports whether two URLs share a hostname (ignoring port).
+func sameURLHost(a, b string) bool {
+	ua, err := url.Parse(a)
+	if err != nil {
+		return false
+	}
+	ub, err := url.Parse(b)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(ua.Hostname(), ub.Hostname())
 }
 
 // pushMsg is one decrypted message forwarded to the dashboard. To is set
