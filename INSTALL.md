@@ -14,20 +14,20 @@ server only ever sees ciphertext.
 
 Pick the binary for your machine from the
 [releases page](https://github.com/black-candle-technologies/courier/releases).
-Current version: `v0.1.0`.
+Current version: `v0.3.1`.
 
 ```sh
 # Linux x86_64 (most servers)
-curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.1.0/courier-linux-amd64 -o courier
+curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.3.1/courier-linux-amd64 -o courier
 
 # Linux ARM64 (e.g. Raspberry Pi, ARM VPS)
-curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.1.0/courier-linux-arm64 -o courier
+curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.3.1/courier-linux-arm64 -o courier
 
 # macOS Apple Silicon
-curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.1.0/courier-darwin-arm64 -o courier
+curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.3.1/courier-darwin-arm64 -o courier
 
 # macOS Intel
-curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.1.0/courier-darwin-amd64 -o courier
+curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.3.1/courier-darwin-amd64 -o courier
 
 chmod +x courier
 sudo mv courier /usr/local/bin/   # or: mkdir -p ~/.local/bin && mv courier ~/.local/bin/
