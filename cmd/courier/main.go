@@ -167,6 +167,16 @@ func cmdInit(args []string) error {
 	if err := cfg.Save(); err != nil {
 		return err
 	}
+	// v0.6.11 (F13): publish the signed initial key announcement so
+	// senders use the random initial key instead of the address-derived
+	// fallback (which this identity cannot decrypt). Best effort: the
+	// relay was just reachable for pinning, but warn — don't fail — if
+	// the announcement doesn't go through; `courier publish-key`
+	// republishes it.
+	if err := client.New(cfg).PublishKey(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not publish initial encryption key: %v\n", err)
+		fmt.Fprintf(os.Stderr, "run `courier publish-key` once the relay is reachable.\n")
+	}
 	fmt.Println("identity created. Your address (share this so agents can reach you):")
 	fmt.Println()
 	fmt.Println("  " + cfg.Address)

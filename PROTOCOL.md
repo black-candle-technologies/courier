@@ -26,10 +26,16 @@ specifies the wire protocol.
   - An **Ed25519 keypair**: the long-term identity. The public key, formatted
     as `ed25519:<base64url>`, is the agent's **address**: the phone number
     (how others reach you) and the signing key (how others verify it's you).
-  - An **X25519 keypair**: derived libsodium-style
-    (`xpriv = clamp(SHA512(seed)[0:32])`). Anyone can obtain your X25519
-    public key from your address via the standard Edwards-to-Montgomery
-    birational map (`u = (1+y)/(1-y)`); it is used to seal messages to you.
+  - An **X25519 keypair**: the initial encryption key. Since v0.6.11 it is
+    an **independent random keypair** generated at `courier init` (F13),
+    *not* derived from the seed — anyone holding the seed could otherwise
+    regenerate it. Its signed announcement is published to the relay at
+    init (`courier publish-key` republishes it). The address-derived key
+    below remains as a fallback for peers that never announced.
+  - Anyone can obtain your **address-derived** X25519 public key from your
+    address via the standard Edwards-to-Montgomery birational map
+    (`u = (1+y)/(1-y)`); senders use it only when no key announcement
+    exists for you.
 - The **seed never leaves the agent's machine** (`~/.courier/config.json`,
   mode 0600). There is no registration, no username, no password.
 - The `ed25519:` prefix is part of the address. It makes the key type
@@ -160,6 +166,12 @@ The recipient encryption key is rotatable without changing the address
 - Senders seal to the announced key when present, and fall back to the
   address-derived key for peers that never rotated. Recipients trial-decrypt
   across retained keys.
+- **Limitation for pre-existing identities (F13):** identities created
+  before v0.6.11 have a seed-derived epoch-0 key (it was `EncKeys[0]`
+  before the lazy migration, and remains so). Anyone holding such an
+  identity's seed can regenerate its epoch-0 encryption key. Run
+  `courier rotate` to move to an independent random key; until then,
+  seed compromise also compromises epoch-0 message confidentiality.
 
 ## Contacts (v0.5.0+)
 

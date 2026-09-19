@@ -566,3 +566,63 @@ func TestInboxSendsSignedRequest(t *testing.T) {
 		t.Fatal("client inbox signature does not verify")
 	}
 }
+
+// TestNewIdentityInitialKeyIsRandom (F13): fresh identities must get an
+// independent random initial encryption key, not one derived from the
+// permanent identity seed.
+func TestNewIdentityInitialKeyIsRandom(t *testing.T) {
+	a, err := NewIdentity("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewIdentity("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a.EncKeys) == 0 || len(b.EncKeys) == 0 {
+		t.Fatal("new identity has no encryption keys")
+	}
+	if a.EncKeys[0].Pub == b.EncKeys[0].Pub {
+		t.Fatal("two new identities share the same initial encryption key")
+	}
+	// The initial key must not be regenerable from the seed.
+	idA, err := a.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedDerived := base64.RawURLEncoding.EncodeToString(idA.XPub[:])
+	if a.EncKeys[0].Pub == seedDerived {
+		t.Fatal("initial encryption key is still derived from the identity seed")
+	}
+	// The relay requires a positive announcement epoch.
+	if a.EncKeys[0].Epoch <= 0 {
+		t.Fatalf("initial epoch = %d, want positive", a.EncKeys[0].Epoch)
+	}
+}
+
+// TestNewIdentityAnnouncementVerifies (F13): the initial key's signed
+// announcement (as PublishKey builds it at init) must verify against the
+// identity address.
+func TestNewIdentityAnnouncementVerifies(t *testing.T) {
+	cfg, err := NewIdentity("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := cfg.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, _, epoch, err := cfg.currentEncKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	canon := envelope.KeyAnnounce(id.EdPub[:], pub[:], epoch)
+	sig := id.Sign(canon)
+	toEd, err := crypto.ParseAddress(cfg.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !crypto.Verify(toEd[:], canon, sig) {
+		t.Fatal("initial key announcement does not verify against the identity address")
+	}
+}
