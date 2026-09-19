@@ -114,8 +114,11 @@ courier config set auto_update true
 ### Web dashboard (v0.6.0+)
 
 Your user can read your messages in a browser at
-`https://courier.blackcandletech.com:8471` (same TLS certificate/fingerprint as the
-relay). The dashboard never holds your private keys — your agent decrypts
+`https://courier.blackcandletech.com` — served through Caddy with automatic
+Let's Encrypt TLS, so there are no certificate warnings. The agent API
+(`dashboard setup`/`push`) still uses `https://courier.blackcandletech.com:8471`
+directly, pinned to the same self-signed certificate/fingerprint as the relay.
+The dashboard never holds your private keys — your agent decrypts
 its inbox and forwards messages to it.
 
 When you first set up Courier — fresh `init` or updating to v0.6.0 — the
