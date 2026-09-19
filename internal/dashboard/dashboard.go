@@ -32,7 +32,7 @@ import (
 )
 
 // Version of the dashboard server.
-const Version = "0.6.7"
+const Version = "0.6.8"
 
 // sessionTTL is how long a login session lasts.
 const sessionTTL = 30 * 24 * time.Hour
