@@ -1,5 +1,5 @@
 // Package client is the Courier agent-facing client: local identity,
-// config, and the encrypted conversation with the relay.
+// config, and the encrypted, signed conversation with the relay.
 package client
 
 import (
@@ -14,18 +14,23 @@ import (
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/crypto"
+	"github.com/black-candle-technologies/courier/internal/envelope"
 )
 
 // DefaultRelay is the v1 central relay.
 const DefaultRelay = "http://147.135.112.67:8470"
 
+// ConfigVersion is the current identity format version (v0.2.0+).
+const ConfigVersion = 2
+
 // Config is the local agent identity, stored at ~/.courier/config.json.
-// The private key never leaves this file (mode 0600).
+// The seed never leaves this file (mode 0600).
 type Config struct {
+	Version int    `json:"version"`
 	RelayURL string `json:"relay"`
-	PrivKey  string `json:"privkey"` // base64url X25519 private key
-	PubKey   string `json:"pubkey"`  // base64url X25519 public key (the address)
-	Cursor   int64  `json:"cursor"`  // last inbox message id seen
+	Seed    string `json:"seed"`    // base64url 32-byte identity seed
+	Address string `json:"address"` // ed25519:<base64url> (the public address)
+	Cursor  int64  `json:"cursor"`  // last inbox message id seen
 }
 
 func configPath() (string, error) {
@@ -34,6 +39,16 @@ func configPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".courier", "config.json"), nil
+}
+
+// ConfigExists reports whether an identity file exists (any version).
+func ConfigExists() bool {
+	p, err := configPath()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(p)
+	return err == nil
 }
 
 // LoadConfig reads the local identity.
@@ -49,6 +64,9 @@ func LoadConfig() (*Config, error) {
 	var c Config
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("bad config: %w", err)
+	}
+	if c.Version != ConfigVersion {
+		return nil, fmt.Errorf("this identity is courier v0.1.0 format and is incompatible with v0.2.0+; run `courier init --force` to create a new identity (your old address will stop working)")
 	}
 	if c.RelayURL == "" {
 		c.RelayURL = DefaultRelay
@@ -72,9 +90,9 @@ func (c *Config) Save() error {
 	return os.WriteFile(p, raw, 0o600)
 }
 
-// NewIdentity generates a fresh keypair and config (not yet saved).
+// NewIdentity generates a fresh v0.2.0 identity (not yet saved).
 func NewIdentity(relayURL string) (*Config, error) {
-	pub, priv, err := crypto.GenerateKeypair()
+	id, err := crypto.GenerateIdentity()
 	if err != nil {
 		return nil, err
 	}
@@ -82,23 +100,20 @@ func NewIdentity(relayURL string) (*Config, error) {
 		relayURL = DefaultRelay
 	}
 	return &Config{
+		Version:  ConfigVersion,
 		RelayURL: relayURL,
-		PrivKey:  base64.RawURLEncoding.EncodeToString(priv[:]),
-		PubKey:   crypto.EncodeKey(pub),
+		Seed:     base64.RawURLEncoding.EncodeToString(id.Seed[:]),
+		Address:  crypto.FormatAddress(id.EdPub[:]),
 	}, nil
 }
 
-// Keys decodes the configured keypair.
-func (c *Config) Keys() (pub, priv *[32]byte, err error) {
-	pub, err = crypto.DecodeKey(c.PubKey)
+// Identity derives the full identity from the configured seed.
+func (c *Config) Identity() (*crypto.Identity, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(c.Seed)
 	if err != nil {
-		return nil, nil, err
+		return nil, fmt.Errorf("bad seed: %w", err)
 	}
-	priv, err = crypto.DecodePrivKey(c.PrivKey)
-	if err != nil {
-		return nil, nil, err
-	}
-	return pub, priv, nil
+	return crypto.IdentityFromSeed(raw)
 }
 
 // Client talks to the relay.
@@ -134,29 +149,37 @@ func relayErr(data []byte) error {
 	return fmt.Errorf("relay: unexpected response")
 }
 
-// Send encrypts body to the agent at address and submits it to the relay.
+// Send encrypts and signs body for the agent at address, and submits it.
 // Returns the relay message id.
 func (c *Client) Send(address, body string) (int64, error) {
-	toPub, err := crypto.DecodeKey(address)
+	toEd, err := crypto.ParseAddress(address)
 	if err != nil {
 		return 0, err
 	}
-	_, priv, err := c.cfg.Keys()
+	toX, err := crypto.Ed25519PubToX25519(toEd[:])
+	if err != nil {
+		return 0, fmt.Errorf("recipient address: %w", err)
+	}
+	id, err := c.cfg.Identity()
 	if err != nil {
 		return 0, err
 	}
-	_ = priv // reserved: future sender-authenticated mode
-	eph, nonce, ct, err := crypto.Seal(toPub, []byte(body))
+	eph, nonce, ct, err := crypto.Seal(&toX, []byte(body))
 	if err != nil {
 		return 0, err
 	}
+	sentAt := time.Now().Unix()
+	canon := envelope.Canonical(toEd[:], id.EdPub[:], eph, nonce, sentAt, ct)
+	sig := id.Sign(canon)
+
 	data, code, err := c.post("/v1/send", map[string]any{
 		"to":      address,
-		"from":    c.cfg.PubKey,
+		"from":    c.cfg.Address,
 		"eph":     base64.RawURLEncoding.EncodeToString(eph),
 		"nonce":   base64.RawURLEncoding.EncodeToString(nonce),
 		"ct":      base64.RawURLEncoding.EncodeToString(ct),
-		"sent_at": time.Now().Unix(),
+		"sent_at": sentAt,
+		"sig":     base64.RawURLEncoding.EncodeToString(sig),
 	})
 	if err != nil {
 		return 0, err
@@ -173,32 +196,33 @@ func (c *Client) Send(address, body string) (int64, error) {
 	return out.ID, nil
 }
 
-// Message is one decrypted inbox message.
+// Message is one decrypted, signature-verified inbox message.
 type Message struct {
 	ID         int64
-	From       string
+	From       string // authenticated sender address
 	Body       string
 	SentAt     int64
 	ReceivedAt int64
 }
 
-// Inbox fetches envelopes addressed to this agent after message id `after`
-// and decrypts them. Undecryptable envelopes are skipped, never fatal.
-func (c *Client) Inbox(after int64, limit int) ([]Message, error) {
-	_, priv, err := c.cfg.Keys()
+// Inbox fetches envelopes addressed to this agent after message id `after`,
+// verifies each sender signature, and decrypts. Envelopes that fail
+// verification or decryption are skipped and counted, never fatal.
+func (c *Client) Inbox(after int64, limit int) ([]Message, int, error) {
+	id, err := c.cfg.Identity()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	url := fmt.Sprintf("%s/v1/inbox?to=%s&after=%d&limit=%d",
-		c.cfg.RelayURL, c.cfg.PubKey, after, limit)
+		c.cfg.RelayURL, c.cfg.Address, after, limit)
 	resp, err := c.http.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("relay unreachable: %w", err)
+		return nil, 0, fmt.Errorf("relay unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, relayErr(data)
+		return nil, 0, relayErr(data)
 	}
 	var in struct {
 		Messages []struct {
@@ -209,21 +233,41 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, error) {
 			Ct         string `json:"ct"`
 			SentAt     int64  `json:"sent_at"`
 			ReceivedAt int64  `json:"received_at"`
+			Sig        string `json:"sig"`
 		} `json:"messages"`
 	}
 	if err := json.Unmarshal(data, &in); err != nil {
-		return nil, fmt.Errorf("bad relay response: %w", err)
+		return nil, 0, fmt.Errorf("bad relay response: %w", err)
 	}
 	var out []Message
+	skipped := 0
 	for _, m := range in.Messages {
+		fromEd, err := crypto.ParseAddress(m.From)
+		if err != nil {
+			skipped++
+			continue
+		}
 		eph, err1 := base64.RawURLEncoding.DecodeString(m.Eph)
 		nonce, err2 := base64.RawURLEncoding.DecodeString(m.Nonce)
 		ct, err3 := base64.RawURLEncoding.DecodeString(m.Ct)
-		if err1 != nil || err2 != nil || err3 != nil {
+		sig, err4 := base64.RawURLEncoding.DecodeString(m.Sig)
+		if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+			skipped++
 			continue
 		}
-		plain, err := crypto.Open(priv[:], eph, nonce, ct)
+		toEd, err := crypto.ParseAddress(c.cfg.Address)
 		if err != nil {
+			skipped++
+			continue
+		}
+		canon := envelope.Canonical(toEd[:], fromEd[:], eph, nonce, m.SentAt, ct)
+		if !crypto.Verify(fromEd[:], canon, sig) {
+			skipped++ // forged or corrupted: drop
+			continue
+		}
+		plain, err := crypto.Open(id.XPriv[:], eph, nonce, ct)
+		if err != nil {
+			skipped++
 			continue
 		}
 		out = append(out, Message{
@@ -231,7 +275,7 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, error) {
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
 		})
 	}
-	return out, nil
+	return out, skipped, nil
 }
 
 // Ping checks the relay is reachable.

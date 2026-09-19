@@ -6,6 +6,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -14,13 +15,14 @@ import (
 // Envelope is one stored message, ciphertext only.
 type Envelope struct {
 	ID         int64
-	To         string // base64url recipient public key (address)
-	From       string // base64url sender public key (reply address, self-asserted)
-	Eph        string // base64url ephemeral public key
+	To         string // v0.2.0+ "ed25519:<base64url>" address
+	From       string // sender address (signature-authenticated in v0.2.0+)
+	Eph        string // base64url ephemeral X25519 public key
 	Nonce      string // base64url nonce
 	Ct         string // base64url ciphertext
 	SentAt     int64  // unix seconds, sender's clock
 	ReceivedAt int64  // unix seconds, relay's clock
+	Sig        string // base64url Ed25519 signature (v0.2.0+)
 }
 
 // Store wraps a SQLite database.
@@ -37,10 +39,21 @@ CREATE TABLE IF NOT EXISTS envelopes (
 	nonce       TEXT NOT NULL,
 	ct          TEXT NOT NULL,
 	sent_at     INTEGER NOT NULL,
-	received_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+	received_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+	sig         TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_envelopes_recipient ON envelopes(recipient, id);
 `
+
+// migrate adds columns introduced after the table was first created.
+// Old rows keep empty defaults; v0.2.0+ always writes sig.
+func migrate(db *sql.DB) error {
+	_, err := db.Exec(`ALTER TABLE envelopes ADD COLUMN sig TEXT NOT NULL DEFAULT ''`)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	return nil
+}
 
 // Open opens (creating if needed) the SQLite database at path.
 func Open(path string) (*Store, error) {
@@ -53,6 +66,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -62,9 +79,9 @@ func (s *Store) Close() error { return s.db.Close() }
 // Save stores an envelope and returns its id.
 func (s *Store) Save(e *Envelope) (int64, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO envelopes (recipient, sender, eph, nonce, ct, sent_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		e.To, e.From, e.Eph, e.Nonce, e.Ct, e.SentAt,
+		`INSERT INTO envelopes (recipient, sender, eph, nonce, ct, sent_at, sig)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		e.To, e.From, e.Eph, e.Nonce, e.Ct, e.SentAt, e.Sig,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("insert: %w", err)
@@ -76,7 +93,7 @@ func (s *Store) Save(e *Envelope) (int64, error) {
 // oldest first.
 func (s *Store) List(recipient string, after int64, limit int) ([]Envelope, error) {
 	rows, err := s.db.Query(
-		`SELECT id, recipient, sender, eph, nonce, ct, sent_at, received_at
+		`SELECT id, recipient, sender, eph, nonce, ct, sent_at, received_at, sig
 		 FROM envelopes WHERE recipient = ? AND id > ?
 		 ORDER BY id ASC LIMIT ?`,
 		recipient, after, limit,
@@ -89,7 +106,7 @@ func (s *Store) List(recipient string, after int64, limit int) ([]Envelope, erro
 	var out []Envelope
 	for rows.Next() {
 		var e Envelope
-		if err := rows.Scan(&e.ID, &e.To, &e.From, &e.Eph, &e.Nonce, &e.Ct, &e.SentAt, &e.ReceivedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.To, &e.From, &e.Eph, &e.Nonce, &e.Ct, &e.SentAt, &e.ReceivedAt, &e.Sig); err != nil {
 			return nil, fmt.Errorf("scan: %w", err)
 		}
 		out = append(out, e)

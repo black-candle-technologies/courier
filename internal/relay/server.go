@@ -1,7 +1,7 @@
-// Package relay implements the Courier central relay: a dumb,
-// store-and-forward mailbox. It validates envelope shape, stores
-// ciphertext, and serves it back to the addressed recipient. It can
-// never read message contents.
+// Package relay implements the Courier central relay: a store-and-forward
+// mailbox. It validates envelope shape, verifies sender signatures
+// (v0.2.0+), stores ciphertext, and serves it back to the addressed
+// recipient. It can never read message contents.
 package relay
 
 import (
@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/crypto"
+	"github.com/black-candle-technologies/courier/internal/envelope"
 	"github.com/black-candle-technologies/courier/internal/store"
 )
 
@@ -50,17 +51,18 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 
 // sendRequest is the wire format for POST /v1/send. See PROTOCOL.md.
 type sendRequest struct {
-	To    string `json:"to"`
-	From  string `json:"from"`
-	Eph   string `json:"eph"`
-	Nonce string `json:"nonce"`
-	Ct    string `json:"ct"`
-	SentAt int64 `json:"sent_at"`
+	To     string `json:"to"`
+	From   string `json:"from"`
+	Eph    string `json:"eph"`
+	Nonce  string `json:"nonce"`
+	Ct     string `json:"ct"`
+	SentAt int64  `json:"sent_at"`
+	Sig    string `json:"sig"`
 }
 
-func validKey(s string) bool {
-	raw, err := base64.RawURLEncoding.DecodeString(s)
-	return err == nil && len(raw) == crypto.PubKeyLen
+// parseAddress strictly validates a v0.2.0+ "ed25519:<base64url>" address.
+func parseAddress(s string) ([32]byte, error) {
+	return crypto.ParseAddress(s)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -70,27 +72,31 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"time":     time.Now().UTC().Format(time.RFC3339),
+		"ok":        true,
+		"time":      time.Now().UTC().Format(time.RFC3339),
 		"envelopes": n,
+		"version":   "0.2.0",
 	})
 }
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	var req sendRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxCiphertextBytes+4096)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxCiphertextBytes+8192)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if !validKey(req.To) {
-		writeErr(w, http.StatusBadRequest, `"to" must be a base64url X25519 public key`)
+	to, err := parseAddress(req.To)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"to": %v`, err))
 		return
 	}
-	if !validKey(req.From) {
-		writeErr(w, http.StatusBadRequest, `"from" must be a base64url X25519 public key`)
+	from, err := parseAddress(req.From)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"from": %v`, err))
 		return
 	}
-	if !validKey(req.Eph) {
+	eph, err := base64.RawURLEncoding.DecodeString(req.Eph)
+	if err != nil || len(eph) != crypto.PubKeyLen {
 		writeErr(w, http.StatusBadRequest, `"eph" must be a base64url X25519 public key`)
 		return
 	}
@@ -112,10 +118,22 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, `"sent_at" must be a positive unix timestamp`)
 		return
 	}
+	sig, err := base64.RawURLEncoding.DecodeString(req.Sig)
+	if err != nil || len(sig) != 64 {
+		writeErr(w, http.StatusBadRequest, `"sig" must be a base64url Ed25519 signature`)
+		return
+	}
+
+	// Verify the sender's signature over the canonical envelope bytes.
+	canon := envelope.Canonical(to[:], from[:], eph, nonce, req.SentAt, ct)
+	if !crypto.Verify(from[:], canon, sig) {
+		writeErr(w, http.StatusBadRequest, "signature verification failed")
+		return
+	}
 
 	id, err := s.store.Save(&store.Envelope{
 		To: req.To, From: req.From, Eph: req.Eph,
-		Nonce: req.Nonce, Ct: req.Ct, SentAt: req.SentAt,
+		Nonce: req.Nonce, Ct: req.Ct, SentAt: req.SentAt, Sig: req.Sig,
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "store failed")
@@ -127,8 +145,8 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	to := q.Get("to")
-	if !validKey(to) {
-		writeErr(w, http.StatusBadRequest, `"to" query param must be a base64url X25519 public key`)
+	if _, err := parseAddress(to); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"to" query param: %v`, err))
 		return
 	}
 	var after int64
@@ -165,12 +183,13 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 		Ct         string `json:"ct"`
 		SentAt     int64  `json:"sent_at"`
 		ReceivedAt int64  `json:"received_at"`
+		Sig        string `json:"sig"`
 	}
 	out := make([]msg, 0, len(envs))
 	for _, e := range envs {
 		out = append(out, msg{
 			ID: e.ID, From: e.From, Eph: e.Eph, Nonce: e.Nonce,
-			Ct: e.Ct, SentAt: e.SentAt, ReceivedAt: e.ReceivedAt,
+			Ct: e.Ct, SentAt: e.SentAt, ReceivedAt: e.ReceivedAt, Sig: e.Sig,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"messages": out})

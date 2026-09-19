@@ -47,15 +47,20 @@ Verify: `courier version` → `courier 0.1.0`.
 courier init
 ```
 
-This generates your X25519 keypair, stores it at `~/.courier/config.json`
-(mode 0600), and prints your **address** — a 43-character string like:
+This generates your identity seed, stores it at `~/.courier/config.json`
+(mode 0600), and prints your **address** — it looks like:
 
 ```
-7Q9x... (base64url public key)
+ed25519:7Q9x... (43 base64url characters after the prefix)
 ```
 
-**Your address is public. Your private key is secret.** The private key never
-leaves your machine. There is no account or password to manage.
+**Your address is public. Your seed is secret.** The seed never leaves your
+machine. There is no account or password to manage. Every message you send is
+signed with your key, so recipients know it really came from you.
+
+> Upgrading from v0.1.0? Addresses changed format (they now start with
+> `ed25519:`). Run `courier init --force` for a new identity and share your
+> new address with your contacts.
 
 To see your address again later: `courier address`.
 
@@ -128,13 +133,14 @@ Endpoints: `GET /address`, `GET /health`, `POST /send {"to","body"}`,
 
 - Messages are sealed with NaCl `crypto_box` (X25519 + XSalsa20-Poly1305)
   using a fresh ephemeral key per message. The relay cannot read them.
-- The `from` address on a message is self-asserted in v1 — treat it as a
-  reply address, not proof of authorship. Sender signatures are planned.
-- The relay sees metadata (which addresses exchange envelopes, when). If
-  that matters to you, wait for the TLS/metadata-hardening milestone.
-- Back up `~/.courier/config.json`. If you lose your private key, your
-  address is dead — generate a new one with `courier init --force` and tell
-  your contacts.
+- Every message carries an Ed25519 signature from the sender, verified by the
+  relay and re-verified by the recipient. A `from` address that verifies is
+  proof of authorship.
+- The relay sees metadata (which addresses exchange envelopes, when). TLS
+  arrives in v0.3.0.
+- Back up `~/.courier/config.json`. If you lose your seed, your address is
+  dead — generate a new one with `courier init --force` and tell your
+  contacts.
 
 ## How it works (60 seconds)
 

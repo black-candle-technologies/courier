@@ -26,7 +26,7 @@ import (
 	"github.com/black-candle-technologies/courier/internal/client"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -82,10 +82,16 @@ func cmdInit(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if _, err := client.LoadConfig(); err == nil && !*force {
-		cfg, _ := client.LoadConfig()
+	if client.ConfigExists() && !*force {
+		cfg, err := client.LoadConfig()
+		if err != nil {
+			// v0.1.0 identity (or corrupt config): tell the user how to migrate.
+			fmt.Println(err)
+			fmt.Println("Use --force to replace it.")
+			return nil
+		}
 		fmt.Println("identity already exists. Your address:")
-		fmt.Println(cfg.PubKey)
+		fmt.Println(cfg.Address)
 		fmt.Println("(use --force to replace it; your old address will stop working)")
 		return nil
 	}
@@ -98,7 +104,7 @@ func cmdInit(args []string) error {
 	}
 	fmt.Println("identity created. Your address (share this so agents can reach you):")
 	fmt.Println()
-	fmt.Println("  " + cfg.PubKey)
+	fmt.Println("  " + cfg.Address)
 	fmt.Println()
 	fmt.Println("Relay:", cfg.RelayURL)
 	return nil
@@ -109,7 +115,7 @@ func cmdAddress() error {
 	if err != nil {
 		return err
 	}
-	fmt.Println(cfg.PubKey)
+	fmt.Println(cfg.Address)
 	return nil
 }
 
@@ -184,14 +190,20 @@ func cmdInbox(args []string) error {
 		after = 0
 	}
 	poll := func() (bool, error) {
-		msgs, err := cl.Inbox(after, *limit)
+		msgs, skipped, err := cl.Inbox(after, *limit)
 		if err != nil {
 			return false, err
 		}
 		if len(msgs) == 0 {
+			if skipped > 0 {
+				fmt.Fprintf(os.Stderr, "(%d message(s) failed signature/decryption and were dropped)\n", skipped)
+			}
 			return false, nil
 		}
 		printMessages(msgs)
+		if skipped > 0 {
+			fmt.Fprintf(os.Stderr, "(%d message(s) failed signature/decryption and were dropped)\n", skipped)
+		}
 		after = msgs[len(msgs)-1].ID
 		cfg.Cursor = after
 		_ = cfg.Save()
@@ -268,7 +280,7 @@ func cmdStdio() error {
 		}
 		switch req.Cmd {
 		case "address":
-			reply(stdioResp{ID: req.ID, OK: true, Address: cfg.PubKey})
+			reply(stdioResp{ID: req.ID, OK: true, Address: cfg.Address})
 		case "send":
 			if req.To == "" || req.Body == "" {
 				reply(stdioResp{ID: req.ID, OK: false, Error: `"to" and "body" required`})
@@ -285,7 +297,7 @@ func cmdStdio() error {
 			if limit <= 0 {
 				limit = 50
 			}
-			msgs, err := cl.Inbox(req.After, limit)
+			msgs, _, err := cl.Inbox(req.After, limit)
 			if err != nil {
 				reply(stdioResp{ID: req.ID, OK: false, Error: err.Error()})
 				continue
@@ -331,7 +343,7 @@ func cmdServe(args []string) error {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /address", func(w http.ResponseWriter, r *http.Request) {
-		writeSvcJSON(w, 200, map[string]any{"address": cfg.PubKey, "relay": cfg.RelayURL})
+		writeSvcJSON(w, 200, map[string]any{"address": cfg.Address, "relay": cfg.RelayURL})
 	})
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		err := cl.Ping()

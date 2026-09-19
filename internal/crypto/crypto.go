@@ -1,72 +1,178 @@
-// Package crypto implements Courier's end-to-end encryption.
+// Package crypto implements Courier's identity and end-to-end encryption.
 //
-// Identity is a single X25519 keypair. The public key, base64url-encoded,
-// is the agent's address: it is both the "phone number" (how others reach
-// you) and the encryption key (how others encrypt to you). The private key
-// never leaves the agent's machine.
+// Identity (v0.2.0+): a single 32-byte seed derives everything:
+//   - Ed25519 keypair: the long-term identity. The public key, formatted as
+//     "ed25519:<base64url>", is the agent's address: the phone number (how
+//     others reach you) and the signing key (how others verify it's you).
+//   - X25519 keypair: derived libsodium-style (xpriv = clamp(SHA512(seed)[0:32])).
+//     Anyone can obtain your X25519 public key from your address via the
+//     standard Edwards-to-Montgomery birational map, and use it to seal
+//     messages to you with NaCl crypto_box.
 //
-// Messages are sealed with NaCl crypto_box using a fresh ephemeral sender
-// keypair for every message, so each message gets forward secrecy. The
-// relay only ever sees ciphertext.
+// Messages are sealed with a fresh ephemeral sender key per message
+// (forward secrecy) and signed with the sender's Ed25519 key
+// (sender authentication). The relay only ever sees ciphertext.
 package crypto
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha512"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 
+	"filippo.io/edwards25519"
+	"filippo.io/edwards25519/field"
+	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/nacl/box"
 )
 
-// RawURLEncoding without padding, used for all key material on the wire.
 var b64 = base64.RawURLEncoding
 
+// AddressPrefix marks v0.2.0+ Ed25519 addresses. The prefix is part of the
+// address: it makes the key type explicit and makes v0.1.0 X25519 addresses
+// fail loudly instead of encrypting to a dead key.
+const AddressPrefix = "ed25519:"
+
 const (
-	// PubKeyLen is the length of an X25519 public key in bytes.
+	// SeedLen is the identity master secret length in bytes.
+	SeedLen = 32
+	// PubKeyLen is an Ed25519/X25519 public key length in bytes.
 	PubKeyLen = 32
-	// PrivKeyLen is the length of an X25519 private key in bytes.
-	PrivKeyLen = 32
-	// NonceLen is the length of a NaCl box nonce in bytes.
+	// NonceLen is the NaCl box nonce length in bytes.
 	NonceLen = 24
 )
 
-// GenerateKeypair creates a fresh X25519 identity keypair.
-func GenerateKeypair() (pub, priv *[32]byte, err error) {
-	return box.GenerateKey(rand.Reader)
+// Identity is a Courier agent identity derived from a single seed.
+type Identity struct {
+	Seed   [32]byte // master secret; never leaves the machine
+	EdPub  [32]byte // signing public key; the address material
+	EdPriv ed25519.PrivateKey
+	XPub   [32]byte // encryption public key (derived)
+	XPriv  [32]byte // encryption private key (derived)
 }
 
-// EncodeKey renders a 32-byte public key as an address (base64url, no padding).
-func EncodeKey(key *[32]byte) string {
-	return b64.EncodeToString(key[:])
+func clamp(k []byte) {
+	k[0] &= 248
+	k[31] &= 127
+	k[31] |= 64
 }
 
-// DecodeKey parses an address back into a 32-byte public key.
-func DecodeKey(s string) (*[32]byte, error) {
-	return decodeFixed(s, PubKeyLen, "address")
+// GenerateIdentity creates a fresh identity from a random seed.
+func GenerateIdentity() (*Identity, error) {
+	var seed [32]byte
+	if _, err := rand.Read(seed[:]); err != nil {
+		return nil, fmt.Errorf("seed: %w", err)
+	}
+	return IdentityFromSeed(seed[:])
 }
 
-// DecodePrivKey parses a base64url private key.
-func DecodePrivKey(s string) (*[32]byte, error) {
-	return decodeFixed(s, PrivKeyLen, "private key")
-}
+// IdentityFromSeed derives the full identity from a 32-byte seed.
+func IdentityFromSeed(seed []byte) (*Identity, error) {
+	if len(seed) != SeedLen {
+		return nil, fmt.Errorf("seed must be %d bytes", SeedLen)
+	}
+	var id Identity
+	copy(id.Seed[:], seed)
 
-func decodeFixed(s string, want int, what string) (*[32]byte, error) {
-	raw, err := b64.DecodeString(s)
+	// Ed25519 long-term identity.
+	id.EdPriv = ed25519.NewKeyFromSeed(seed)
+	copy(id.EdPub[:], id.EdPriv.Public().(ed25519.PublicKey))
+
+	// X25519 encryption key, libsodium-style: clamp(SHA512(seed)[0:32]).
+	h := sha512.Sum512(seed)
+	clamp(h[:SeedLen])
+	copy(id.XPriv[:], h[:SeedLen])
+	xpub, err := curve25519.X25519(id.XPriv[:], curve25519.Basepoint)
 	if err != nil {
-		return nil, fmt.Errorf("invalid %s: %w", what, err)
+		return nil, fmt.Errorf("x25519: %w", err)
 	}
-	if len(raw) != want {
-		return nil, fmt.Errorf("invalid %s: want %d bytes, got %d", what, want, len(raw))
-	}
-	var k [32]byte
-	copy(k[:], raw)
-	return &k, nil
+	copy(id.XPub[:], xpub)
+	return &id, nil
 }
 
-// Seal encrypts plaintext for the holder of toPub. A fresh ephemeral
-// keypair is generated per message. It returns the ephemeral public key,
-// the nonce, and the ciphertext (all raw bytes; base64url-encode for the wire).
+// Ed25519PubToX25519 converts an Ed25519 public key to its X25519
+// equivalent via the birational map u = (1+y)/(1-y). It rejects
+// non-canonical encodings.
+func Ed25519PubToX25519(pub []byte) ([32]byte, error) {
+	var out [32]byte
+	if len(pub) != PubKeyLen {
+		return out, errors.New("public key must be 32 bytes")
+	}
+	p, err := new(edwards25519.Point).SetBytes(pub)
+	if err != nil {
+		return out, fmt.Errorf("invalid Ed25519 public key: %w", err)
+	}
+	// Round-trip: the encoding must be canonical.
+	if !equalBytes(p.Bytes(), pub) {
+		return out, errors.New("non-canonical Ed25519 public key encoding")
+	}
+	_, Y, Z, _ := p.ExtendedCoordinates()
+	y := new(field.Element).Multiply(Y, new(field.Element).Invert(Z)) // affine y
+	one := new(field.Element).One()
+	num := new(field.Element).Add(one, y)                             // 1+y
+	negY := new(field.Element).Negate(y)
+	den := new(field.Element).Add(one, negY) // 1-y
+	if den.Equal(new(field.Element)) == 1 {
+		return out, errors.New("invalid Ed25519 public key: y=1")
+	}
+	u := new(field.Element).Multiply(num, new(field.Element).Invert(den))
+	copy(out[:], u.Bytes())
+	return out, nil
+}
+
+func equalBytes(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var v byte
+	for i := range a {
+		v |= a[i] ^ b[i]
+	}
+	return v == 0
+}
+
+// FormatAddress renders an Ed25519 public key as a Courier address.
+func FormatAddress(edPub []byte) string {
+	return AddressPrefix + b64.EncodeToString(edPub)
+}
+
+// ParseAddress parses a Courier address, strictly requiring the
+// "ed25519:" prefix. v0.1.0 bare X25519 addresses are rejected loudly.
+func ParseAddress(s string) ([32]byte, error) {
+	var out [32]byte
+	if !strings.HasPrefix(s, AddressPrefix) {
+		return out, fmt.Errorf("address must start with %q (bare v0.1.0 X25519 addresses are not supported; ask the owner for their new address)", AddressPrefix)
+	}
+	raw, err := b64.DecodeString(strings.TrimPrefix(s, AddressPrefix))
+	if err != nil {
+		return out, fmt.Errorf("invalid address: %w", err)
+	}
+	if len(raw) != PubKeyLen {
+		return out, fmt.Errorf("invalid address: want %d bytes, got %d", PubKeyLen, len(raw))
+	}
+	copy(out[:], raw)
+	return out, nil
+}
+
+// Sign signs msg with the identity's Ed25519 key.
+func (id *Identity) Sign(msg []byte) []byte {
+	return ed25519.Sign(id.EdPriv, msg)
+}
+
+// Verify reports whether sig is a valid Ed25519 signature of msg under pub.
+func Verify(pub []byte, msg, sig []byte) bool {
+	if len(pub) != PubKeyLen || len(sig) != ed25519.SignatureSize {
+		return false
+	}
+	return ed25519.Verify(ed25519.PublicKey(pub), msg, sig)
+}
+
+// Seal encrypts plaintext for the holder of toPub (X25519). A fresh
+// ephemeral keypair is generated per message. Returns ephemeral public key,
+// nonce, ciphertext (raw bytes; base64url-encode for the wire).
 func Seal(toPub *[32]byte, plaintext []byte) (ephPub, nonce, ciphertext []byte, err error) {
 	ephPubKey, ephPriv, err := box.GenerateKey(rand.Reader)
 	if err != nil {
@@ -80,9 +186,10 @@ func Seal(toPub *[32]byte, plaintext []byte) (ephPub, nonce, ciphertext []byte, 
 	return ephPubKey[:], n[:], sealed, nil
 }
 
-// Open decrypts a message sealed with Seal, using the recipient's private key.
+// Open decrypts a message sealed with Seal using the recipient's X25519
+// private key.
 func Open(priv, ephPub, nonce, ciphertext []byte) ([]byte, error) {
-	if len(priv) != PrivKeyLen {
+	if len(priv) != PubKeyLen {
 		return nil, errors.New("bad private key length")
 	}
 	if len(ephPub) != PubKeyLen {
