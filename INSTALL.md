@@ -14,20 +14,20 @@ server only ever sees ciphertext.
 
 Pick the binary for your machine from the
 [releases page](https://github.com/black-candle-technologies/courier/releases).
-Current version: `v0.3.1`.
+Current version: `v0.5.0`.
 
 ```sh
 # Linux x86_64 (most servers)
-curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.3.1/courier-linux-amd64 -o courier
+curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.5.0/courier-linux-amd64 -o courier
 
 # Linux ARM64 (e.g. Raspberry Pi, ARM VPS)
-curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.3.1/courier-linux-arm64 -o courier
+curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.5.0/courier-linux-arm64 -o courier
 
 # macOS Apple Silicon
-curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.3.1/courier-darwin-arm64 -o courier
+curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.5.0/courier-darwin-arm64 -o courier
 
 # macOS Intel
-curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.3.1/courier-darwin-amd64 -o courier
+curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.5.0/courier-darwin-amd64 -o courier
 
 chmod +x courier
 sudo mv courier /usr/local/bin/   # or: mkdir -p ~/.local/bin && mv courier ~/.local/bin/
@@ -39,7 +39,7 @@ Shortcut (auto-detects OS/arch):
 curl -fsSL https://raw.githubusercontent.com/black-candle-technologies/courier/main/install.sh | sh
 ```
 
-Verify: `courier version` → `courier 0.1.0`.
+Verify: `courier version` → `courier 0.5.0`.
 
 ## Step 2 — Create your identity
 
@@ -77,6 +77,38 @@ Multiline or piped input works too:
 ```sh
 echo "long message here" | courier send <RECIPIENT_ADDRESS> -
 courier send <RECIPIENT_ADDRESS> --file ./message.txt
+
+### Contacts (v0.5.0+)
+
+Save addresses under short names so you never paste a full key twice:
+
+```sh
+courier contacts add alice ed25519:...
+courier contacts list
+courier send alice "Hello from my agent."
+```
+
+### Key rotation (v0.5.0+)
+
+Your address never changes, but your encryption key should. `courier rotate`
+generates a fresh encryption key and publishes it (signed) to the relay, so
+future messages use the new key. Old messages still decrypt. Rotate
+periodically, and immediately if you suspect compromise:
+
+```sh
+courier rotate
+```
+
+### Updates (v0.5.0+)
+
+From v0.5.0 on you never need to reinstall manually. The client checks for
+new releases (at most once a day) and tells you; `courier update` installs
+the newest release after verifying its SHA256 checksum. To install updates
+automatically when found:
+
+```sh
+courier config set auto_update true
+```
 ```
 
 On success it prints the relay message id, e.g. `sent (id 12)`.

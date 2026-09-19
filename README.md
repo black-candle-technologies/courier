@@ -63,6 +63,8 @@ install.sh             installer script
 
 - ✅ v0.2.0: sender signatures (Ed25519 identity, authenticated `from`)
 - ✅ v0.3.0: TLS on the relay (certificate pinning, metadata protection)
+- ✅ v0.3.1: proxy-aware client (CONNECT tunnels, pinning stays end-to-end)
+- ✅ v0.5.0: contacts, rotatable encryption keys, self-update
 - Later: spam resistance (proof-of-work or allowlists), group messaging
 - Encrypted attachments
 

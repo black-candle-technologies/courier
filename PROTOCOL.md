@@ -40,8 +40,15 @@ specifies the wire protocol.
 
 - Primitive: NaCl `crypto_box` (X25519 + XSalsa20-Poly1305).
 - For every message the sender generates a **fresh ephemeral X25519 keypair**
-  and seals the plaintext to the recipient's X25519 key (converted from their
-  address). Each message therefore has forward secrecy.
+  and seals the plaintext to the recipient's X25519 key.
+- Forward secrecy, honestly stated: the per-message ephemeral sender key
+  means a compromised *sender* key cannot decrypt past messages. The
+  recipient's encryption key, however, is long-lived: anyone who captures
+  ciphertext and later steals the recipient's encryption private key can
+  read it. v0.5.0 adds `courier rotate`, which retires the recipient
+  encryption key and publishes a new signed one to the relay's key
+  directory — bounding that exposure window. Rotate regularly, and
+  immediately if compromise is suspected.
 - The relay stores and forwards **ciphertext only**. It cannot read messages.
 
 ## Signatures (v0.2.0+)
@@ -115,7 +122,8 @@ should poll regularly; the relay is a mailbox, not an archive.
 | Property | v1 status |
 |---|---|
 | Message confidentiality (relay, network) | ✅ E2E via crypto_box |
-| Forward secrecy per message | ✅ ephemeral sender keys |
+| Forward secrecy, sender side | ✅ per-message ephemeral sender keys |
+| Forward secrecy, recipient side | ⚠️ bounded by key rotation: `courier rotate` retires the encryption key (v0.5.0+) |
 | Sender authentication | ✅ Ed25519 signatures, verified by relay and recipient (v0.2.0+) |
 | Transport metadata privacy (network observers) | ✅ TLS with certificate pinning (v0.3.0+) |
 | Metadata privacy vs the relay itself | ❌ relay sees who exchanges envelopes, when (inherent to store-and-forward) |
@@ -125,3 +133,33 @@ should poll regularly; the relay is a mailbox, not an archive.
 
 Breaking wire changes bump the `/vN/` path. v1 clients ignore unknown JSON
 fields.
+
+## Key rotation (v0.5.0+)
+
+The recipient encryption key is rotatable without changing the address
+(the Ed25519 identity is untouched):
+
+- `courier rotate` generates a fresh X25519 keypair, keeps retired keys
+  (up to 4) for decrypting in-flight messages, and publishes a signed
+  announcement to the relay.
+- `POST /v1/keys` `{address, x25519_pub, epoch, sig}` — signed with the
+  Ed25519 identity key over `courier-key-announce-v1 || address || pub ||
+  epoch`. The relay accepts only strictly increasing epochs (replay-safe).
+- `GET /v1/keys/{address}` returns the current announcement, or 404.
+- Senders seal to the announced key when present, and fall back to the
+  address-derived key for peers that never rotated. Recipients trial-decrypt
+  across retained keys.
+
+## Contacts (v0.5.0+)
+
+Local address book: `courier contacts add <name> <address>` (names are
+1–32 chars, lowercase alnum plus `-`/`_`). `courier send` accepts a contact
+name or a full address.
+
+## Self-update (v0.5.0+)
+
+`courier update` checks the GitHub releases API, downloads the
+`courier-<os>-<arch>` asset for the newest release, verifies its SHA256
+against the release's `SHA256SUMS`, and replaces the running binary. Every
+invocation also does a silent check at most once per 24h (stderr notice
+only); `courier config set auto_update true` installs automatically.
