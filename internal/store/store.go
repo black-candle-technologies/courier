@@ -150,7 +150,10 @@ func backfillEnvelopeHashes(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	type update struct{ id int64; hash string }
+	type update struct {
+		id   int64
+		hash string
+	}
 	var updates []update
 	for rows.Next() {
 		var id, sentAt int64
@@ -281,25 +284,26 @@ type KeyAnnouncement struct {
 	Sig       string // base64url Ed25519 signature over the announcement
 }
 
-// SaveKey stores a key announcement, replacing the previous one only if the
-// epoch is strictly greater. Returns false if the announcement was stale.
+// SaveKey stores a key announcement atomically: the row is inserted or
+// replaced only when the announcement's epoch is strictly greater than
+// the stored one (v0.6.11 F9). A single upsert — no SELECT-then-write
+// race — decides; RowsAffected reports whether this announcement won.
+// Returns false for stale or replayed announcements.
 func (s *Store) SaveKey(k *KeyAnnouncement) (bool, error) {
-	var cur int64
-	err := s.db.QueryRow(`SELECT epoch FROM keys WHERE address = ?`, k.Address).Scan(&cur)
-	if err != nil && err != sql.ErrNoRows {
-		return false, fmt.Errorf("query key: %w", err)
-	}
-	if err == nil && k.Epoch <= cur {
-		return false, nil // stale or replayed announcement
-	}
-	if _, err := s.db.Exec(
+	res, err := s.db.Exec(
 		`INSERT INTO keys (address, x25519_pub, epoch, signature) VALUES (?, ?, ?, ?)
-		 ON CONFLICT(address) DO UPDATE SET x25519_pub = excluded.x25519_pub, epoch = excluded.epoch, signature = excluded.signature`,
+		 ON CONFLICT(address) DO UPDATE SET x25519_pub = excluded.x25519_pub, epoch = excluded.epoch, signature = excluded.signature
+		 WHERE excluded.epoch > keys.epoch`,
 		k.Address, k.X25519Pub, k.Epoch, k.Sig,
-	); err != nil {
+	)
+	if err != nil {
 		return false, fmt.Errorf("save key: %w", err)
 	}
-	return true, nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("save key: %w", err)
+	}
+	return n > 0, nil // 0 rows: stale announcement, nothing changed
 }
 
 // GetKey returns the current key announcement for an address, or
