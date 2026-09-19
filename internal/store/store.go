@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS envelopes (
 CREATE INDEX IF NOT EXISTS idx_envelopes_recipient ON envelopes(recipient, id);
 
 -- v0.5.0: signed encryption-key announcements. One row per address: the
--- current X25519 encryption key the owner published (via `courier rotate`).
+-- current X25519 encryption key the owner published (courier rotate).
 -- Senders look this up before sealing; if absent they fall back to the
 -- address-derived key.
 CREATE TABLE IF NOT EXISTS keys (
