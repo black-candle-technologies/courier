@@ -36,6 +36,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 	mux.HandleFunc("POST /v1/send", s.handleSend)
 	mux.HandleFunc("GET /v1/inbox", s.handleInbox)
+	mux.HandleFunc("POST /v1/keys", s.handleKeyAnnounce)
+	mux.HandleFunc("GET /v1/keys/{address}", s.handleKeyLookup)
 	return mux
 }
 
@@ -75,7 +77,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"ok":        true,
 		"time":      time.Now().UTC().Format(time.RFC3339),
 		"envelopes": n,
-		"version":   "0.3.0",
+		"version":   "0.5.0",
 	})
 }
 
@@ -140,6 +142,83 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
+}
+
+// ---- v0.5.0: signed encryption-key directory ----
+
+// keyAnnounceRequest is the wire format for POST /v1/keys.
+type keyAnnounceRequest struct {
+	Address   string `json:"address"`    // ed25519:<base64url> identity
+	X25519Pub string `json:"x25519_pub"` // base64url 32-byte encryption key
+	Epoch     int64  `json:"epoch"`      // unix seconds of rotation
+	Sig       string `json:"sig"`        // base64url Ed25519 signature
+}
+
+// handleKeyAnnounce accepts a signed key announcement. The signature must
+// verify under the address's Ed25519 key, and the epoch must be strictly
+// greater than the stored one, so only the address owner can rotate and
+// old announcements cannot be replayed.
+func (s *Server) handleKeyAnnounce(w http.ResponseWriter, r *http.Request) {
+	var req keyAnnounceRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	addr, err := parseAddress(req.Address)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"address": %v`, err))
+		return
+	}
+	pubRaw, err := base64.RawURLEncoding.DecodeString(req.X25519Pub)
+	if err != nil || len(pubRaw) != crypto.PubKeyLen {
+		writeErr(w, http.StatusBadRequest, `"x25519_pub" must be a base64url 32-byte X25519 public key`)
+		return
+	}
+	if req.Epoch <= 0 {
+		writeErr(w, http.StatusBadRequest, `"epoch" must be a positive unix timestamp`)
+		return
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(req.Sig)
+	if err != nil || len(sig) != 64 {
+		writeErr(w, http.StatusBadRequest, `"sig" must be a base64url Ed25519 signature`)
+		return
+	}
+	canon := envelope.KeyAnnounce(addr[:], pubRaw, req.Epoch)
+	if !crypto.Verify(addr[:], canon, sig) {
+		writeErr(w, http.StatusBadRequest, "signature verification failed")
+		return
+	}
+	ok, err := s.store.SaveKey(&store.KeyAnnouncement{
+		Address: req.Address, X25519Pub: req.X25519Pub, Epoch: req.Epoch,
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store failed")
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusConflict, "stale epoch: a newer key announcement is already stored")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "epoch": req.Epoch})
+}
+
+// handleKeyLookup returns the current key announcement for an address, or
+// 404 if the owner never published one (senders then fall back to the
+// address-derived key).
+func (s *Server) handleKeyLookup(w http.ResponseWriter, r *http.Request) {
+	address := r.PathValue("address")
+	if _, err := parseAddress(address); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`address: %v`, err))
+		return
+	}
+	k, err := s.store.GetKey(address)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no key announcement for this address"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"address": k.Address, "x25519_pub": k.X25519Pub, "epoch": k.Epoch,
+	})
 }
 
 func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {

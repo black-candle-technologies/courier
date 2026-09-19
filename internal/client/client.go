@@ -24,28 +24,51 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
+	"github.com/black-candle-technologies/courier/internal/update"
 )
 
 // DefaultRelay is the central relay (HTTPS, pinned certificate).
 const DefaultRelay = "https://147.135.112.67:8470"
 
 // ConfigVersion is the current identity format version (v0.2.0+).
+// v0.5.0 keeps version 2: new fields (contacts, encryption keys,
+// auto-update) are lazily migrated on load, so existing identities keep
+// working without re-init.
 const ConfigVersion = 2
 
+// maxRetainedKeys bounds how many retired encryption keys are kept for
+// decrypting in-flight messages after a rotation.
+const maxRetainedKeys = 4
+
+// EncKey is one X25519 encryption keypair owned by this identity.
+// Keys[0] is always the current key used for newly received messages;
+// older entries decrypt messages sealed before a rotation.
+type EncKey struct {
+	Pub       string `json:"pub"`        // base64url 32-byte X25519 public key
+	Priv      string `json:"priv"`       // base64url 32-byte X25519 private key
+	Epoch     int64  `json:"epoch"`      // unix seconds of rotation (monotonic)
+	CreatedAt int64  `json:"created_at"` // unix seconds
+}
+
 // Config is the local agent identity, stored at ~/.courier/config.json.
-// The seed never leaves this file (mode 0600).
+// The seed and encryption private keys never leave this file (mode 0600).
 type Config struct {
-	Version          int    `json:"version"`
-	RelayURL         string `json:"relay"`
-	Seed             string `json:"seed"`    // base64url 32-byte identity seed
-	Address          string `json:"address"` // ed25519:<base64url> (the public address)
-	Cursor           int64  `json:"cursor"`  // last inbox message id seen
-	RelayFingerprint string `json:"relay_fingerprint,omitempty"` // hex SHA256 of relay cert
+	Version          int               `json:"version"`
+	RelayURL         string            `json:"relay"`
+	Seed             string            `json:"seed"`    // base64url 32-byte identity seed
+	Address          string            `json:"address"` // ed25519:<base64url> (the public address)
+	Cursor           int64             `json:"cursor"`  // last inbox message id seen
+	RelayFingerprint string            `json:"relay_fingerprint,omitempty"` // hex SHA256 of relay cert
+	Contacts         map[string]string `json:"contacts,omitempty"`          // name -> ed25519:<base64url> address
+	EncKeys          []EncKey          `json:"enc_keys,omitempty"`          // current first; lazily migrated
+	AutoUpdate       bool              `json:"auto_update,omitempty"`       // self-update when a newer release exists
+	UpdateCheckedAt  int64             `json:"update_checked_at,omitempty"` // unix seconds of last update check
 }
 
 func configPath() (string, error) {
@@ -86,6 +109,23 @@ func LoadConfig() (*Config, error) {
 	if c.RelayURL == "" {
 		c.RelayURL = DefaultRelay
 	}
+	// v0.5.0 lazy migration: identities created before rotatable keys
+	// derive their single encryption key from the seed (epoch 0).
+	if len(c.EncKeys) == 0 {
+		id, err := c.Identity()
+		if err != nil {
+			return nil, err
+		}
+		now := time.Now().Unix()
+		c.EncKeys = []EncKey{{
+			Pub:       base64.RawURLEncoding.EncodeToString(id.XPub[:]),
+			Priv:      base64.RawURLEncoding.EncodeToString(id.XPriv[:]),
+			Epoch:     0,
+			CreatedAt: now,
+		}}
+		// Best effort: persist the migration so it only happens once.
+		_ = c.Save()
+	}
 	return &c, nil
 }
 
@@ -114,11 +154,18 @@ func NewIdentity(relayURL string) (*Config, error) {
 	if relayURL == "" {
 		relayURL = DefaultRelay
 	}
+	now := time.Now().Unix()
 	return &Config{
 		Version:  ConfigVersion,
 		RelayURL: relayURL,
 		Seed:     base64.RawURLEncoding.EncodeToString(id.Seed[:]),
 		Address:  crypto.FormatAddress(id.EdPub[:]),
+		EncKeys: []EncKey{{
+			Pub:       base64.RawURLEncoding.EncodeToString(id.XPub[:]),
+			Priv:      base64.RawURLEncoding.EncodeToString(id.XPriv[:]),
+			Epoch:     0,
+			CreatedAt: now,
+		}},
 	}, nil
 }
 
@@ -129,6 +176,185 @@ func (c *Config) Identity() (*crypto.Identity, error) {
 		return nil, fmt.Errorf("bad seed: %w", err)
 	}
 	return crypto.IdentityFromSeed(raw)
+}
+
+// ---- contacts (v0.5.0) ----
+
+var contactNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+
+// AddContact stores name -> address after validating both.
+func (c *Config) AddContact(name, address string) error {
+	if !contactNameRe.MatchString(name) {
+		return fmt.Errorf("bad contact name %q: use 1-32 chars, lowercase letters, digits, - and _, starting with a letter or digit", name)
+	}
+	if _, err := crypto.ParseAddress(address); err != nil {
+		return fmt.Errorf("bad address: %w", err)
+	}
+	if c.Contacts == nil {
+		c.Contacts = map[string]string{}
+	}
+	c.Contacts[name] = address
+	return c.Save()
+}
+
+// RemoveContact deletes a contact. It is not an error if absent.
+func (c *Config) RemoveContact(name string) error {
+	delete(c.Contacts, name)
+	return c.Save()
+}
+
+// LookupContact returns the address for a contact name.
+func (c *Config) LookupContact(name string) (string, error) {
+	addr, ok := c.Contacts[name]
+	if !ok {
+		return "", fmt.Errorf("unknown contact %q (see `courier contacts list`)", name)
+	}
+	return addr, nil
+}
+
+// ResolveRecipient accepts either a full "ed25519:..." address or a
+// contact name, and returns the address.
+func (c *Config) ResolveRecipient(toOrName string) (string, error) {
+	if strings.HasPrefix(toOrName, crypto.AddressPrefix) {
+		if _, err := crypto.ParseAddress(toOrName); err != nil {
+			return "", err
+		}
+		return toOrName, nil
+	}
+	return c.LookupContact(toOrName)
+}
+
+// ---- rotatable encryption keys (v0.5.0) ----
+
+// currentEncKey returns the active encryption keypair.
+func (c *Config) currentEncKey() (pub, priv [32]byte, epoch int64, err error) {
+	if len(c.EncKeys) == 0 {
+		return pub, priv, 0, errors.New("no encryption keys in config")
+	}
+	k := c.EncKeys[0]
+	pubRaw, err1 := base64.RawURLEncoding.DecodeString(k.Pub)
+	privRaw, err2 := base64.RawURLEncoding.DecodeString(k.Priv)
+	if err1 != nil || err2 != nil || len(pubRaw) != 32 || len(privRaw) != 32 {
+		return pub, priv, 0, errors.New("corrupt encryption key in config")
+	}
+	copy(pub[:], pubRaw)
+	copy(priv[:], privRaw)
+	return pub, priv, k.Epoch, nil
+}
+
+// encryptionPrivKeys returns all retained private keys, current first,
+// for trial decryption of messages sealed before a rotation.
+func (c *Config) encryptionPrivKeys() [][32]byte {
+	var out [][32]byte
+	for _, k := range c.EncKeys {
+		raw, err := base64.RawURLEncoding.DecodeString(k.Priv)
+		if err != nil || len(raw) != 32 {
+			continue
+		}
+		var p [32]byte
+		copy(p[:], raw)
+		out = append(out, p)
+	}
+	return out
+}
+
+// RotateKey generates a fresh encryption keypair, makes it current, and
+// publishes a signed announcement to the relay so future senders use it.
+// Retired keys are kept (up to maxRetainedKeys) to decrypt in-flight
+// messages. The Ed25519 identity — and therefore the address — is unchanged.
+func (c *Client) RotateKey() (published bool, err error) {
+	pub, priv, err := crypto.GenerateX25519Keypair()
+	if err != nil {
+		return false, err
+	}
+	epoch := time.Now().Unix()
+	// Monotonic epoch even within the same second as a previous rotation.
+	if len(c.cfg.EncKeys) > 0 && epoch <= c.cfg.EncKeys[0].Epoch {
+		epoch = c.cfg.EncKeys[0].Epoch + 1
+	}
+	c.cfg.EncKeys = append([]EncKey{{
+		Pub:       base64.RawURLEncoding.EncodeToString(pub[:]),
+		Priv:      base64.RawURLEncoding.EncodeToString(priv[:]),
+		Epoch:     epoch,
+		CreatedAt: time.Now().Unix(),
+	}}, c.cfg.EncKeys...)
+	if len(c.cfg.EncKeys) > maxRetainedKeys {
+		c.cfg.EncKeys = c.cfg.EncKeys[:maxRetainedKeys]
+	}
+	if err := c.cfg.Save(); err != nil {
+		return false, err
+	}
+	if err := c.PublishKey(); err != nil {
+		return false, fmt.Errorf("key rotated locally but NOT published: %w (run `courier publish-key` to announce it)", err)
+	}
+	return true, nil
+}
+
+// PublishKey announces the current encryption key to the relay's key
+// directory, signed by the Ed25519 identity key.
+func (c *Client) PublishKey() error {
+	id, err := c.cfg.Identity()
+	if err != nil {
+		return err
+	}
+	pub, _, epoch, err := c.cfg.currentEncKey()
+	if err != nil {
+		return err
+	}
+	canon := envelope.KeyAnnounce(id.EdPub[:], pub[:], epoch)
+	sig := id.Sign(canon)
+	data, code, err := c.post("/v1/keys", map[string]any{
+		"address":    c.cfg.Address,
+		"x25519_pub": base64.RawURLEncoding.EncodeToString(pub[:]),
+		"epoch":      epoch,
+		"sig":        base64.RawURLEncoding.EncodeToString(sig),
+	})
+	if err != nil {
+		return err
+	}
+	if code != http.StatusCreated {
+		return relayErr(data)
+	}
+	return nil
+}
+
+// recipientKey returns the X25519 public key to seal for: the recipient's
+// published (rotated) key if they announced one, else the key derived from
+// their address (pre-v0.5.0 peers and anyone who never rotated).
+func (c *Client) recipientKey(address string) ([32]byte, error) {
+	var out [32]byte
+	hc, err := c.httpClient()
+	if err != nil {
+		return out, err
+	}
+	resp, err := hc.Get(c.cfg.RelayURL + "/v1/keys/" + url.PathEscape(address))
+	if err != nil {
+		return out, fmt.Errorf("relay unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	if resp.StatusCode == http.StatusNotFound {
+		toEd, err := crypto.ParseAddress(address)
+		if err != nil {
+			return out, err
+		}
+		return crypto.Ed25519PubToX25519(toEd[:])
+	}
+	if resp.StatusCode != http.StatusOK {
+		return out, relayErr(data)
+	}
+	var ann struct {
+		X25519Pub string `json:"x25519_pub"`
+	}
+	if err := json.Unmarshal(data, &ann); err != nil {
+		return out, fmt.Errorf("bad relay response: %w", err)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(ann.X25519Pub)
+	if err != nil || len(raw) != 32 {
+		return out, fmt.Errorf("bad relay response: invalid x25519_pub")
+	}
+	copy(out[:], raw)
+	return out, nil
 }
 
 // Client talks to the relay.
@@ -239,16 +465,22 @@ func relayErr(data []byte) error {
 	return fmt.Errorf("relay: unexpected response")
 }
 
-// Send encrypts and signs body for the agent at address, and submits it.
+// Send encrypts and signs body for the agent at toOrName (a full address
+// or a contact name), and submits it. The recipient's published encryption
+// key is used when they rotated; otherwise the address-derived key.
 // Returns the relay message id.
-func (c *Client) Send(address, body string) (int64, error) {
+func (c *Client) Send(toOrName, body string) (int64, error) {
+	address, err := c.cfg.ResolveRecipient(toOrName)
+	if err != nil {
+		return 0, err
+	}
 	toEd, err := crypto.ParseAddress(address)
 	if err != nil {
 		return 0, err
 	}
-	toX, err := crypto.Ed25519PubToX25519(toEd[:])
+	toX, err := c.recipientKey(address)
 	if err != nil {
-		return 0, fmt.Errorf("recipient address: %w", err)
+		return 0, fmt.Errorf("recipient key: %w", err)
 	}
 	id, err := c.cfg.Identity()
 	if err != nil {
@@ -299,10 +531,6 @@ type Message struct {
 // verifies each sender signature, and decrypts. Envelopes that fail
 // verification or decryption are skipped and counted, never fatal.
 func (c *Client) Inbox(after int64, limit int) ([]Message, int, error) {
-	id, err := c.cfg.Identity()
-	if err != nil {
-		return nil, 0, err
-	}
 	hc, err := c.httpClient()
 	if err != nil {
 		return nil, 0, err
@@ -359,8 +587,16 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int, error) {
 			skipped++ // forged or corrupted: drop
 			continue
 		}
-		plain, err := crypto.Open(id.XPriv[:], eph, nonce, ct)
-		if err != nil {
+		// Trial-decrypt across retained keys: messages sealed before a
+		// rotation still open with the retired key.
+		var plain []byte
+		for _, xp := range c.cfg.encryptionPrivKeys() {
+			if p, err := crypto.Open(xp[:], eph, nonce, ct); err == nil {
+				plain = p
+				break
+			}
+		}
+		if plain == nil {
 			skipped++
 			continue
 		}
@@ -387,4 +623,37 @@ func (c *Client) Ping() error {
 		return fmt.Errorf("relay unhealthy: %s", resp.Status)
 	}
 	return nil
+}
+
+// updateCheckInterval bounds how often the client phones home to the
+// GitHub releases API: at most once per 24 hours.
+const updateCheckInterval = 24 * 3600
+
+// MaybeUpdateCheck looks for a newer Courier release (at most once per
+// day). If one exists it either auto-installs it (AutoUpdate set) or
+// prints a notice to stderr. Network failures are silent: an unreachable
+// update server must never break messaging.
+func (c *Client) MaybeUpdateCheck(current string) {
+	now := time.Now().Unix()
+	if now-c.cfg.UpdateCheckedAt < updateCheckInterval {
+		return
+	}
+	rel, err := update.Latest()
+	c.cfg.UpdateCheckedAt = now
+	_ = c.cfg.Save()
+	if err != nil {
+		return
+	}
+	if !update.NewerThan(current, rel.Tag) {
+		return
+	}
+	if c.cfg.AutoUpdate {
+		if err := rel.Apply(); err != nil {
+			fmt.Fprintf(os.Stderr, "courier auto-update to %s failed: %v\n", rel.Tag, err)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "courier auto-updated to %s (this run used the previous version)\n", rel.Tag)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "a newer courier %s is available: run `courier update`\n", rel.Tag)
 }

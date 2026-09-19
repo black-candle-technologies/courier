@@ -20,18 +20,28 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/client"
+	"github.com/black-candle-technologies/courier/internal/update"
 )
 
-const version = "0.3.1"
+const version = "0.5.0"
 
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
+	}
+	// v0.5.0+: opportunistic update check (at most once per 24h). Notices
+	// go to stderr so stdout stays machine-readable (stdio/serve).
+	if os.Args[1] != "update" && client.ConfigExists() {
+		if cfg, err := client.LoadConfig(); err == nil {
+			client.New(cfg).MaybeUpdateCheck(version)
+		}
 	}
 	var err error
 	switch os.Args[1] {
@@ -47,6 +57,16 @@ func main() {
 		err = cmdStdio()
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "contacts":
+		err = cmdContacts(os.Args[2:])
+	case "rotate":
+		err = cmdRotate(os.Args[2:])
+	case "publish-key":
+		err = cmdPublishKey()
+	case "update":
+		err = cmdUpdate()
+	case "config":
+		err = cmdConfig(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println("courier", version)
 	default:
@@ -66,8 +86,16 @@ func usage() {
   courier init [--relay URL] [--force]   create your identity (keypair)
   courier init --repin                   re-pin the relay certificate
   courier address                        print your address (public key)
-  courier send <address> <message|->     send a message ("-" reads stdin)
+  courier send <address|contact> <msg>    send a message ("-" reads stdin)
   courier inbox [--all] [--limit N] [--follow [--interval 5s]]
+  courier contacts add <name> <address>  save a contact
+  courier contacts list                  list contacts
+  courier contacts show <name>           show a contact's address
+  courier contacts remove <name>         delete a contact
+  courier rotate                         rotate encryption key (durable crypto)
+  courier publish-key                    re-announce your encryption key
+  courier update                         check for and install updates
+  courier config set auto_update true    auto-install updates when found
   courier stdio                          JSON-lines bridge for agents
   courier serve [--listen 127.0.0.1:8471]
   courier version
@@ -162,7 +190,7 @@ func cmdSend(args []string) error {
 	}
 	rest := fs.Args()
 	if len(rest) < 1 {
-		return fmt.Errorf("usage: courier send <address> <message|-> [--file path]")
+		return fmt.Errorf("usage: courier send <address|contact> <message|-> [--file path]")
 	}
 	address := rest[0]
 	var body string
@@ -420,4 +448,170 @@ func writeSvcJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// ---- v0.5.0: contacts ----
+
+func cmdContacts(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: courier contacts <add|list|show|remove> ...")
+	}
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "add":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: courier contacts add <name> <address>")
+		}
+		if err := cfg.AddContact(args[1], args[2]); err != nil {
+			return err
+		}
+		fmt.Printf("contact %q saved.\n", args[1])
+	case "list":
+		if len(cfg.Contacts) == 0 {
+			fmt.Println("no contacts yet. Add one with: courier contacts add <name> <address>")
+			return nil
+		}
+		names := make([]string, 0, len(cfg.Contacts))
+		for n := range cfg.Contacts {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			fmt.Printf("%-24s %s\n", n, cfg.Contacts[n])
+		}
+	case "show":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: courier contacts show <name>")
+		}
+		addr, err := cfg.LookupContact(args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Println(addr)
+	case "remove", "rm", "delete":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: courier contacts remove <name>")
+		}
+		if err := cfg.RemoveContact(args[1]); err != nil {
+			return err
+		}
+		fmt.Printf("contact %q removed.\n", args[1])
+	default:
+		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|remove)", args[0])
+	}
+	return nil
+}
+
+// ---- v0.5.0: key rotation ----
+
+func cmdRotate(args []string) error {
+	fs := flag.NewFlagSet("rotate", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return err
+	}
+	published, err := client.New(cfg).RotateKey()
+	if err != nil {
+		return err
+	}
+	if published {
+		fmt.Println("encryption key rotated and published. Your address is unchanged.")
+		fmt.Println("Senders will use the new key for future messages.")
+	} else {
+		fmt.Println("encryption key rotated locally.")
+	}
+	return nil
+}
+
+func cmdPublishKey() error {
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return err
+	}
+	if err := client.New(cfg).PublishKey(); err != nil {
+		return err
+	}
+	fmt.Println("encryption key published to the relay.")
+	return nil
+}
+
+// ---- v0.5.0: self-update ----
+
+func cmdUpdate() error {
+	fmt.Println("checking for updates...")
+	rel, err := update.Latest()
+	if err != nil {
+		return err
+	}
+	if !update.NewerThan(version, rel.Tag) {
+		fmt.Printf("already up to date (courier %s).\n", version)
+		return nil
+	}
+	fmt.Printf("updating courier %s -> %s...\n", version, rel.Tag)
+	if err := rel.Apply(); err != nil {
+		return err
+	}
+	fmt.Printf("updated to %s.\n", rel.Tag)
+	return nil
+}
+
+// ---- v0.5.0: config ----
+
+func cmdConfig(args []string) error {
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return err
+	}
+	if len(args) == 0 {
+		fmt.Printf("auto_update=%v\n", cfg.AutoUpdate)
+		fmt.Printf("relay=%s\n", cfg.RelayURL)
+		fmt.Printf("address=%s\n", cfg.Address)
+		return nil
+	}
+	switch args[0] {
+	case "get":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: courier config get <key>")
+		}
+		switch args[1] {
+		case "auto_update":
+			fmt.Println(cfg.AutoUpdate)
+		case "relay":
+			fmt.Println(cfg.RelayURL)
+		case "address":
+			fmt.Println(cfg.Address)
+		default:
+			return fmt.Errorf("unknown config key %q", args[1])
+		}
+	case "set":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: courier config set <key> <value>")
+		}
+		switch args[1] {
+		case "auto_update":
+			v, err := strconv.ParseBool(args[2])
+			if err != nil {
+				return fmt.Errorf("auto_update must be true or false")
+			}
+			cfg.AutoUpdate = v
+			if err := cfg.Save(); err != nil {
+				return err
+			}
+			fmt.Printf("auto_update=%v\n", v)
+			if v {
+				fmt.Println("courier will now install new releases automatically when found.")
+			}
+		default:
+			return fmt.Errorf("unknown config key %q (settable: auto_update)", args[1])
+		}
+	default:
+		return fmt.Errorf("usage: courier config [get <key>|set <key> <value>]")
+	}
+	return nil
 }

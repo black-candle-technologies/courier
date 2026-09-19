@@ -156,3 +156,97 @@ func TestRejectsLegacyAddress(t *testing.T) {
 		t.Fatalf("want 400 for legacy address, got %d", rec.Code)
 	}
 }
+
+// ---- v0.5.0: key directory ----
+
+func makeAnnouncement(t *testing.T, id *crypto.Identity, epoch int64) map[string]any {
+	t.Helper()
+	pub, _, err := crypto.GenerateX25519Keypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := id.Sign(envelope.KeyAnnounce(id.EdPub[:], pub[:], epoch))
+	return map[string]any{
+		"address":    crypto.FormatAddress(id.EdPub[:]),
+		"x25519_pub": b64.EncodeToString(pub[:]),
+		"epoch":      epoch,
+		"sig":        b64.EncodeToString(sig),
+	}
+}
+
+func postKeys(t *testing.T, srv *Server, body map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest("POST", "/v1/keys", bytes.NewReader(raw))
+	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, req)
+	return w
+}
+
+func TestKeyAnnounceRoundtrip(t *testing.T) {
+	srv := testServer(t)
+	id, _ := crypto.GenerateIdentity()
+	ann := makeAnnouncement(t, id, 1000)
+	if w := postKeys(t, srv, ann); w.Code != http.StatusCreated {
+		t.Fatalf("announce: got %d, body %s", w.Code, w.Body.String())
+	}
+	addr := crypto.FormatAddress(id.EdPub[:])
+	req := httptest.NewRequest("GET", "/v1/keys/"+addr, nil)
+	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("lookup: got %d", w.Code)
+	}
+	var out struct {
+		Address   string `json:"address"`
+		X25519Pub string `json:"x25519_pub"`
+		Epoch     int64  `json:"epoch"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Address != addr || out.X25519Pub != ann["x25519_pub"] || out.Epoch != 1000 {
+		t.Fatalf("lookup mismatch: %+v", out)
+	}
+}
+
+func TestKeyAnnounceStaleEpochRejected(t *testing.T) {
+	srv := testServer(t)
+	id, _ := crypto.GenerateIdentity()
+	if w := postKeys(t, srv, makeAnnouncement(t, id, 2000)); w.Code != http.StatusCreated {
+		t.Fatalf("first announce: got %d", w.Code)
+	}
+	// Older epoch must be rejected (replay protection).
+	if w := postKeys(t, srv, makeAnnouncement(t, id, 1500)); w.Code != http.StatusConflict {
+		t.Fatalf("stale announce: got %d, want 409", w.Code)
+	}
+	// Newer epoch replaces.
+	if w := postKeys(t, srv, makeAnnouncement(t, id, 2001)); w.Code != http.StatusCreated {
+		t.Fatalf("newer announce: got %d", w.Code)
+	}
+}
+
+func TestKeyAnnounceBadSigRejected(t *testing.T) {
+	srv := testServer(t)
+	id, _ := crypto.GenerateIdentity()
+	other, _ := crypto.GenerateIdentity()
+	ann := makeAnnouncement(t, id, 3000)
+	// Re-sign with a different key: must fail verification.
+	pub, _, _ := crypto.GenerateX25519Keypair()
+	ann["sig"] = b64.EncodeToString(other.Sign(envelope.KeyAnnounce(id.EdPub[:], pub[:], 3000)))
+	if w := postKeys(t, srv, ann); w.Code != http.StatusBadRequest {
+		t.Fatalf("forged announce: got %d, want 400", w.Code)
+	}
+}
+
+func TestKeyLookupMissing(t *testing.T) {
+	srv := testServer(t)
+	id, _ := crypto.GenerateIdentity()
+	addr := crypto.FormatAddress(id.EdPub[:])
+	req := httptest.NewRequest("GET", "/v1/keys/"+addr, nil)
+	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("missing key: got %d, want 404", w.Code)
+	}
+}

@@ -9,9 +9,17 @@
 //     standard Edwards-to-Montgomery birational map, and use it to seal
 //     messages to you with NaCl crypto_box.
 //
-// Messages are sealed with a fresh ephemeral sender key per message
-// (forward secrecy) and signed with the sender's Ed25519 key
-// (sender authentication). The relay only ever sees ciphertext.
+// Messages are sealed with a fresh ephemeral sender key per message and
+// signed with the sender's Ed25519 key (sender authentication). The relay
+// only ever sees ciphertext.
+//
+// Forward secrecy, honestly stated: the per-message ephemeral sender key
+// means a compromised *sender* key cannot decrypt past messages. The
+// recipient's encryption key, however, is long-lived: anyone who captures
+// ciphertext and later steals the recipient's encryption private key can
+// read it. `courier rotate` (v0.5.0+) retires the recipient encryption key
+// and publishes a new one, which bounds that exposure window. Rotate
+// regularly, and immediately if compromise is suspected.
 package crypto
 
 import (
@@ -168,6 +176,21 @@ func Verify(pub []byte, msg, sig []byte) bool {
 		return false
 	}
 	return ed25519.Verify(ed25519.PublicKey(pub), msg, sig)
+}
+
+// GenerateX25519Keypair creates a fresh random X25519 keypair. Used for
+// encryption-key rotation (v0.5.0+): unlike the seed-derived keypair, a
+// rotated key can be retired, which bounds the damage of a compromised
+// encryption key to messages sent while it was current.
+func GenerateX25519Keypair() (pub, priv [32]byte, err error) {
+	pubKey, privKey, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		return pub, priv, fmt.Errorf("x25519 keygen: %w", err)
+	}
+	var p, s [32]byte
+	copy(p[:], pubKey[:])
+	copy(s[:], privKey[:])
+	return p, s, nil
 }
 
 // Seal encrypts plaintext for the holder of toPub (X25519). A fresh

@@ -43,6 +43,16 @@ CREATE TABLE IF NOT EXISTS envelopes (
 	sig         TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_envelopes_recipient ON envelopes(recipient, id);
+
+-- v0.5.0: signed encryption-key announcements. One row per address: the
+-- current X25519 encryption key the owner published (via `courier rotate`).
+-- Senders look this up before sealing; if absent they fall back to the
+-- address-derived key.
+CREATE TABLE IF NOT EXISTS keys (
+	address    TEXT PRIMARY KEY,
+	x25519_pub TEXT NOT NULL,
+	epoch      INTEGER NOT NULL
+);
 `
 
 // migrate adds columns introduced after the table was first created.
@@ -132,4 +142,46 @@ func (s *Store) Count() (int64, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+// KeyAnnouncement is one published encryption key for an address.
+type KeyAnnouncement struct {
+	Address   string
+	X25519Pub string // base64url 32-byte X25519 public key
+	Epoch     int64  // unix seconds of rotation; strictly increasing
+}
+
+// SaveKey stores a key announcement, replacing the previous one only if the
+// epoch is strictly greater. Returns false if the announcement was stale.
+func (s *Store) SaveKey(k *KeyAnnouncement) (bool, error) {
+	var cur int64
+	err := s.db.QueryRow(`SELECT epoch FROM keys WHERE address = ?`, k.Address).Scan(&cur)
+	if err != nil && err != sql.ErrNoRows {
+		return false, fmt.Errorf("query key: %w", err)
+	}
+	if err == nil && k.Epoch <= cur {
+		return false, nil // stale or replayed announcement
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO keys (address, x25519_pub, epoch) VALUES (?, ?, ?)
+		 ON CONFLICT(address) DO UPDATE SET x25519_pub = excluded.x25519_pub, epoch = excluded.epoch`,
+		k.Address, k.X25519Pub, k.Epoch,
+	); err != nil {
+		return false, fmt.Errorf("save key: %w", err)
+	}
+	return true, nil
+}
+
+// GetKey returns the current key announcement for an address, or
+// sql.ErrNoRows if the owner never published one.
+func (s *Store) GetKey(address string) (*KeyAnnouncement, error) {
+	var k KeyAnnouncement
+	err := s.db.QueryRow(
+		`SELECT address, x25519_pub, epoch FROM keys WHERE address = ?`,
+		address,
+	).Scan(&k.Address, &k.X25519Pub, &k.Epoch)
+	if err != nil {
+		return nil, err
+	}
+	return &k, nil
 }

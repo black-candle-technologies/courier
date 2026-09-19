@@ -2,11 +2,14 @@ package client
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/black-candle-technologies/courier/internal/crypto"
 )
 
 func testTLSServer(t *testing.T) (*httptest.Server, string) {
@@ -71,5 +74,177 @@ func TestHTTPTransportSkipsPinning(t *testing.T) {
 	}
 	if fp, err := FetchRelayFingerprint(ts.URL); err != nil || fp != "" {
 		t.Fatalf("FetchRelayFingerprint(http) = %q, %v; want empty", fp, err)
+	}
+}
+
+// ---- v0.5.0: contacts ----
+
+func testConfig(t *testing.T) *Config {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	cfg, err := NewIdentity("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func TestContactsAddResolve(t *testing.T) {
+	cfg := testConfig(t)
+	alice, err := NewIdentity("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.AddContact("alice", alice.Address); err != nil {
+		t.Fatal(err)
+	}
+	got, err := cfg.LookupContact("alice")
+	if err != nil || got != alice.Address {
+		t.Fatalf("lookup: got %q, %v", got, err)
+	}
+	// ResolveRecipient: name and raw address both work.
+	if r, err := cfg.ResolveRecipient("alice"); err != nil || r != alice.Address {
+		t.Fatalf("resolve name: got %q, %v", r, err)
+	}
+	if r, err := cfg.ResolveRecipient(alice.Address); err != nil || r != alice.Address {
+		t.Fatalf("resolve address: got %q, %v", r, err)
+	}
+	if _, err := cfg.ResolveRecipient("nobody"); err == nil {
+		t.Fatal("expected error for unknown contact")
+	}
+	if err := cfg.RemoveContact("alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.LookupContact("alice"); err == nil {
+		t.Fatal("expected error after remove")
+	}
+}
+
+func TestContactsValidation(t *testing.T) {
+	cfg := testConfig(t)
+	alice, _ := NewIdentity("")
+	for _, bad := range []string{"", "Alice", "a b", "a/b", strings.Repeat("x", 33)} {
+		if err := cfg.AddContact(bad, alice.Address); err == nil {
+			t.Fatalf("bad name %q accepted", bad)
+		}
+	}
+	if err := cfg.AddContact("bob", "not-an-address"); err == nil {
+		t.Fatal("bad address accepted")
+	}
+	if err := cfg.AddContact("bob", "ed25519:!!!"); err == nil {
+		t.Fatal("malformed address accepted")
+	}
+}
+
+// ---- v0.5.0: rotation ----
+
+// keyDirServer is a fake relay implementing only the key directory.
+func keyDirServer(t *testing.T, store map[string]string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/keys", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"ok":true}`))
+	})
+	mux.HandleFunc("GET /v1/keys/", func(w http.ResponseWriter, r *http.Request) {
+		addr := strings.TrimPrefix(r.URL.Path, "/v1/keys/")
+		pub, ok := store[addr]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(`{"address":"` + addr + `","x25519_pub":"` + pub + `","epoch":1}`))
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func TestRotatePublishesAndTrialDecrypt(t *testing.T) {
+	cfg := testConfig(t)
+	oldPub := cfg.EncKeys[0].Pub
+	ts := keyDirServer(t, map[string]string{})
+	cfg.RelayURL = ts.URL
+	cl := New(cfg)
+
+	published, err := cl.RotateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !published {
+		t.Fatal("expected published=true")
+	}
+	if cfg.EncKeys[0].Pub == oldPub {
+		t.Fatal("current key did not change after rotation")
+	}
+	if len(cfg.EncKeys) != 2 {
+		t.Fatalf("expected 2 retained keys, got %d", len(cfg.EncKeys))
+	}
+
+	// A message sealed to the RETIRED key must still decrypt (trial).
+	var oldPubArr [32]byte
+	raw, _ := base64.RawURLEncoding.DecodeString(oldPub)
+	copy(oldPubArr[:], raw)
+	eph, nonce, ct, err := crypto.Seal(&oldPubArr, []byte("hello retired key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plain []byte
+	for _, xp := range cfg.encryptionPrivKeys() {
+		if p, err := crypto.Open(xp[:], eph, nonce, ct); err == nil {
+			plain = p
+			break
+		}
+	}
+	if string(plain) != "hello retired key" {
+		t.Fatalf("trial decryption failed: %q", plain)
+	}
+}
+
+func TestRecipientKeyFallbackToDerived(t *testing.T) {
+	cfg := testConfig(t)
+	ts := keyDirServer(t, map[string]string{}) // empty: 404s
+	cfg.RelayURL = ts.URL
+	cl := New(cfg)
+
+	peer, _ := NewIdentity("")
+	got, err := cl.recipientKey(peer.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No announcement: must equal the address-derived key.
+	toEd, err := crypto.ParseAddress(peer.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := crypto.Ed25519PubToX25519(toEd[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatal("fallback did not return the address-derived key")
+	}
+}
+
+func TestRecipientKeyUsesAnnouncement(t *testing.T) {
+	cfg := testConfig(t)
+	peer, _ := NewIdentity("")
+	announcedPub := peer.EncKeys[0].Pub
+	ts := keyDirServer(t, map[string]string{peer.Address: announcedPub})
+	cfg.RelayURL = ts.URL
+	cl := New(cfg)
+
+	got, err := cl.recipientKey(peer.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := base64.RawURLEncoding.DecodeString(announcedPub)
+	var want [32]byte
+	copy(want[:], raw)
+	if got != want {
+		t.Fatal("did not use the announced key")
 	}
 }

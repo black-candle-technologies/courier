@@ -1,6 +1,6 @@
-// Package envelope defines the canonical signed payload for Courier
-// envelopes (v0.2.0+). Both the client and the relay use it, so a signature
-// made by one is verifiable by the other.
+// Package envelope defines the canonical signed payloads for Courier
+// (v0.2.0+). Both the client and the relay use these, so a signature made
+// by one is verifiable by the other.
 package envelope
 
 import "encoding/binary"
@@ -8,6 +8,10 @@ import "encoding/binary"
 // Domain separates Courier envelope signatures from every other use of the
 // sender's Ed25519 key.
 var domain = []byte("courier-envelope-sig-v1\x00")
+
+// announceDomain separates key-announcement signatures (v0.5.0+) from
+// envelope signatures: a signature for one can never validate as the other.
+var announceDomain = []byte("courier-key-announce-v1\x00")
 
 // Canonical returns the exact bytes covered by the sender's signature.
 // All fields except ct are fixed length, and ct is last, so the encoding
@@ -23,5 +27,21 @@ func Canonical(to, from, eph, nonce []byte, sentAt int64, ct []byte) []byte {
 	binary.BigEndian.PutUint64(ts[:], uint64(sentAt))
 	out = append(out, ts[:]...)
 	out = append(out, ct...)
+	return out
+}
+
+// KeyAnnounce returns the exact bytes covered by a key-announcement
+// signature (v0.5.0+). An announcement binds an Ed25519 identity (address)
+// to a current X25519 encryption public key at a given epoch. The relay
+// only accepts announcements with a strictly increasing epoch, so a
+// captured old announcement cannot be replayed to downgrade the key.
+func KeyAnnounce(addressEd25519, x25519Pub []byte, epoch int64) []byte {
+	out := make([]byte, 0, len(announceDomain)+32+32+8)
+	out = append(out, announceDomain...)
+	out = append(out, addressEd25519...) // 32 bytes Ed25519 (address key)
+	out = append(out, x25519Pub...)      // 32 bytes X25519 encryption key
+	var ep [8]byte
+	binary.BigEndian.PutUint64(ep[:], uint64(epoch))
+	out = append(out, ep[:]...)
 	return out
 }
