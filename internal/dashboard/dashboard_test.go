@@ -65,6 +65,7 @@ func register(t *testing.T, srv *Server, username, password string, id *crypto.I
 func TestRegisterAndPush(t *testing.T) {
 	srv := testServer(t)
 	id := testIdentity(t)
+	addr := crypto.FormatAddress(id.EdPub[:])
 	token := register(t, srv, "lane", "temporary-password-123", id)
 
 	// Push two messages with the token.
