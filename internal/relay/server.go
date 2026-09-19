@@ -133,7 +133,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, err := s.store.Save(&store.Envelope{
+	id, stored, err := s.store.Save(&store.Envelope{
 		To: req.To, From: req.From, Eph: req.Eph,
 		Nonce: req.Nonce, Ct: req.Ct, SentAt: req.SentAt, Sig: req.Sig,
 	})
@@ -141,7 +141,9 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "store failed")
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
+	// A replayed envelope is acknowledged with its original id rather
+	// than stored twice (v0.6.11 F3).
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "duplicate": !stored})
 }
 
 // ---- v0.5.0: signed encryption-key directory ----

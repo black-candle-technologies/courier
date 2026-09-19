@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/black-candle-technologies/courier/internal/envelope"
 	_ "modernc.org/sqlite"
 )
 
@@ -40,9 +41,12 @@ CREATE TABLE IF NOT EXISTS envelopes (
 	ct          TEXT NOT NULL,
 	sent_at     INTEGER NOT NULL,
 	received_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-	sig         TEXT NOT NULL DEFAULT ''
+	sig         TEXT NOT NULL DEFAULT '',
+	env_hash    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_envelopes_recipient ON envelopes(recipient, id);
+-- The UNIQUE index on env_hash is created by the v0.6.11 (F3) migration,
+-- after the column exists on upgraded databases.
 
 -- v0.5.0: signed encryption-key announcements. One row per address: the
 -- current X25519 encryption key the owner published (courier rotate).
@@ -115,6 +119,18 @@ func migrate(db *sql.DB) error {
 	if err := addColumn(`ALTER TABLE keys ADD COLUMN signature TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
+	// v0.6.11 (F3): replay dedup. env_hash covers every sender-controlled
+	// envelope field; the UNIQUE index makes re-POSTed envelopes
+	// idempotent instead of duplicating delivery.
+	if err := addColumn(`ALTER TABLE envelopes ADD COLUMN env_hash TEXT`); err != nil {
+		return err
+	}
+	if err := backfillEnvelopeHashes(db); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_envelopes_env_hash ON envelopes(env_hash)`); err != nil {
+		return err
+	}
 	// v0.6.9: per-thread read state for unread badges.
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS dashboard_seen(
 		user_id      INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
@@ -122,6 +138,38 @@ func migrate(db *sql.DB) error {
 		last_seen_id INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY (user_id, peer))`); err != nil {
 		return err
+	}
+	return nil
+}
+
+// backfillEnvelopeHashes computes env_hash for envelopes stored before
+// the v0.6.11 (F3) replay-dedup migration, so old messages are covered too.
+func backfillEnvelopeHashes(db *sql.DB) error {
+	rows, err := db.Query(`SELECT id, recipient, sender, eph, nonce, ct, sent_at, sig
+		FROM envelopes WHERE env_hash IS NULL`)
+	if err != nil {
+		return err
+	}
+	type update struct{ id int64; hash string }
+	var updates []update
+	for rows.Next() {
+		var id, sentAt int64
+		var to, from, eph, nonce, ct, sig string
+		if err := rows.Scan(&id, &to, &from, &eph, &nonce, &ct, &sentAt, &sig); err != nil {
+			rows.Close()
+			return err
+		}
+		updates = append(updates, update{id, envelope.DedupHash(to, from, eph, nonce, sentAt, ct, sig)})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, u := range updates {
+		if _, err := db.Exec(`UPDATE envelopes SET env_hash = ? WHERE id = ?`, u.hash, u.id); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -147,17 +195,37 @@ func Open(path string) (*Store, error) {
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 
-// Save stores an envelope and returns its id.
-func (s *Store) Save(e *Envelope) (int64, error) {
+// Save stores an envelope and returns its id. If an identical envelope
+// (same canonical hash, v0.6.11 F3) was already stored — a replayed POST —
+// it returns the existing id with stored=false instead of duplicating
+// the message. Replays are acknowledged, not redelivered.
+func (s *Store) Save(e *Envelope) (id int64, stored bool, err error) {
+	h := envelope.DedupHash(e.To, e.From, e.Eph, e.Nonce, e.SentAt, e.Ct, e.Sig)
 	res, err := s.db.Exec(
-		`INSERT INTO envelopes (recipient, sender, eph, nonce, ct, sent_at, sig)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		e.To, e.From, e.Eph, e.Nonce, e.Ct, e.SentAt, e.Sig,
+		`INSERT INTO envelopes (recipient, sender, eph, nonce, ct, sent_at, sig, env_hash)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(env_hash) DO NOTHING`,
+		e.To, e.From, e.Eph, e.Nonce, e.Ct, e.SentAt, e.Sig, h,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("insert: %w", err)
+		return 0, false, fmt.Errorf("insert: %w", err)
 	}
-	return res.LastInsertId()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, false, fmt.Errorf("insert: %w", err)
+	}
+	if n == 0 {
+		var existing int64
+		if err := s.db.QueryRow(`SELECT id FROM envelopes WHERE env_hash = ?`, h).Scan(&existing); err != nil {
+			return 0, false, fmt.Errorf("lookup duplicate: %w", err)
+		}
+		return existing, false, nil
+	}
+	id, err = res.LastInsertId()
+	if err != nil {
+		return 0, false, fmt.Errorf("insert: %w", err)
+	}
+	return id, true, nil
 }
 
 // List returns up to limit envelopes for recipient with id > after,

@@ -419,3 +419,82 @@ func TestDashboardSetupRejectsPinMismatch(t *testing.T) {
 		t.Fatalf("got %v, want a certificate mismatch error", err)
 	}
 }
+
+// cannedInboxServer serves one fixed /v1/inbox response.
+func cannedInboxServer(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(body))
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func cannedMessage(from, eph, nonce, ct, sig string, sentAt int64) string {
+	return fmt.Sprintf(`{"messages":[{"id":42,"from":%q,"eph":%q,"nonce":%q,"ct":%q,"sent_at":%d,"received_at":%d,"sig":%q}]}`,
+		from, eph, nonce, ct, sentAt, sentAt, sig)
+}
+
+func TestInboxSuppressesReplayedEnvelopes(t *testing.T) {
+	cfg := testConfig(t)
+	const sentAt = 1700000000
+	ts := cannedInboxServer(t, cannedMessage("ed25519:from", "eph", "nonce", "ct", "sig", sentAt))
+	cfg.RelayURL = ts.URL
+	cl := New(cfg)
+
+	// Pretend this envelope was already delivered: it must be
+	// suppressed even though the relay served it again.
+	h := envelope.DedupHash(cfg.Address, "ed25519:from", "eph", "nonce", sentAt, "ct", "sig")
+	cfg.SeenEnvelopeHashes = []string{h}
+
+	msgs, skipped, err := cl.Inbox(0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 0 || skipped != 1 {
+		t.Fatalf("replay not suppressed: msgs=%d skipped=%d", len(msgs), skipped)
+	}
+}
+
+func TestInboxDoesNotMarkUndeliveredSeen(t *testing.T) {
+	cfg := testConfig(t)
+	const sentAt = 1700000000
+	ts := cannedInboxServer(t, cannedMessage("ed25519:from", "eph", "nonce", "ct", "sig", sentAt))
+	cfg.RelayURL = ts.URL
+	cl := New(cfg)
+
+	// The canned message fails address parsing, so it is dropped — and
+	// must NOT be recorded as seen (it may become readable later).
+	msgs, skipped, err := cl.Inbox(0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 0 || skipped != 1 {
+		t.Fatalf("msgs=%d skipped=%d, want 0/1", len(msgs), skipped)
+	}
+	if len(cfg.SeenEnvelopeHashes) != 0 {
+		t.Fatalf("undelivered message was marked seen: %v", cfg.SeenEnvelopeHashes)
+	}
+}
+
+func TestRecordSeenEnvelopesBounded(t *testing.T) {
+	cfg := testConfig(t)
+	cl := New(cfg)
+	var hashes []string
+	for i := 0; i < maxSeenEnvelopeHashes+10; i++ {
+		hashes = append(hashes, fmt.Sprintf("hash-%d", i))
+	}
+	cl.recordSeenEnvelopes(hashes)
+	if len(cfg.SeenEnvelopeHashes) != maxSeenEnvelopeHashes {
+		t.Fatalf("want %d hashes, got %d", maxSeenEnvelopeHashes, len(cfg.SeenEnvelopeHashes))
+	}
+	// Oldest dropped, newest retained.
+	if cfg.SeenEnvelopeHashes[0] != "hash-10" {
+		t.Fatalf("oldest not dropped: %s", cfg.SeenEnvelopeHashes[0])
+	}
+	// Re-recording is idempotent.
+	cl.recordSeenEnvelopes([]string{"hash-10"})
+	if len(cfg.SeenEnvelopeHashes) != maxSeenEnvelopeHashes {
+		t.Fatalf("duplicate grew the set: %d", len(cfg.SeenEnvelopeHashes))
+	}
+}
