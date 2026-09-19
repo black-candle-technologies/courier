@@ -589,12 +589,16 @@ func (s *Store) SearchThreadPeers(userID int64, q string) ([]string, error) {
 }
 
 // DashboardThreadMessages returns one thread's messages, oldest first.
+// DashboardThreadMessages returns the NEWEST limit messages of a thread in
+// chronological (oldest-first) display order. F12: the query fetches the
+// newest rows first and the results are reversed in Go, so a long thread
+// shows recent history instead of the oldest 500 messages.
 func (s *Store) DashboardThreadMessages(userID int64, peer string, limit int) ([]DashboardMessage, error) {
 	rows, err := s.db.Query(
 		`SELECT id, courier_id, sender, recipient, body, sent_at, received_at
 		 FROM dashboard_messages
 		 WHERE user_id = ? AND `+peerExpr+` = ?
-		 ORDER BY COALESCE(sent_at, received_at) ASC, id ASC LIMIT ?`,
+		 ORDER BY COALESCE(sent_at, received_at) DESC, id DESC LIMIT ?`,
 		userID, peer, limit)
 	if err != nil {
 		return nil, err
@@ -608,5 +612,12 @@ func (s *Store) DashboardThreadMessages(userID int64, peer string, limit int) ([
 		}
 		out = append(out, m)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Reverse to chronological display order.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
 }

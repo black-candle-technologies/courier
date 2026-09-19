@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/black-candle-technologies/courier/internal/envelope"
@@ -269,6 +270,45 @@ func TestDashboardThreadsUnreadCounts(t *testing.T) {
 			if th.Unread != 1 || th.LastBody != "a5-new" {
 				t.Fatalf("thread A after new msg: unread=%d body=%q, want 1 / a5-new", th.Unread, th.LastBody)
 			}
+		}
+	}
+}
+
+// TestDashboardThreadMessagesNewest500 verifies F12: the thread view
+// returns the NEWEST 500 messages in chronological display order — the
+// oldest messages fall off instead of the newest being unreachable.
+func TestDashboardThreadMessagesNewest500(t *testing.T) {
+	s := testStore(t)
+	uid := int64(1)
+	self := "ed25519:self"
+	peer := "ed25519:peer"
+	for i := int64(1); i <= 600; i++ {
+		body := "msg-" + strconv.FormatInt(i, 10)
+		if _, err := s.SaveDashboardMessage(uid, i, peer, self, peer, body, i, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	msgs, err := s.DashboardThreadMessages(uid, peer, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 500 {
+		t.Fatalf("messages = %d, want 500", len(msgs))
+	}
+	if msgs[0].Body != "msg-101" {
+		t.Fatalf("oldest shown = %q, want msg-101 (oldest 100 dropped)", msgs[0].Body)
+	}
+	if msgs[499].Body != "msg-600" {
+		t.Fatalf("newest shown = %q, want msg-600", msgs[499].Body)
+	}
+	for i := 1; i < len(msgs); i++ {
+		if msgs[i].ID <= msgs[i-1].ID {
+			t.Fatalf("messages not in chronological order at index %d", i)
+		}
+	}
+	for _, m := range msgs {
+		if m.Body == "msg-1" || m.Body == "msg-100" {
+			t.Fatalf("stale message %q still shown", m.Body)
 		}
 	}
 }
