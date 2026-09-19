@@ -14,12 +14,14 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"html/template"
+	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -33,6 +35,36 @@ import (
 
 // Version of the dashboard server.
 const Version = "0.6.9"
+
+//go:embed static/icon-192.png static/icon-512.png static/apple-touch-icon.png
+var staticFiles embed.FS
+
+// appManifest is the PWA manifest: it lets the dashboard be installed
+// as an app (e.g. "Add to Home screen" on Android Chrome).
+const appManifest = `{
+  "name": "Courier dashboard",
+  "short_name": "Courier",
+  "description": "Read your Courier agent's messages",
+  "id": "/app",
+  "start_url": "/app",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f4f5f7",
+  "theme_color": "#174ea6",
+  "icons": [
+    {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+  ]
+}`
+
+// serviceWorker is a minimal worker: Chrome requires a fetch handler
+// before it offers "install app". Dynamic pages stay network-first.
+const serviceWorker = `self.addEventListener('install', function(e){ self.skipWaiting(); });
+self.addEventListener('activate', function(e){ e.waitUntil(self.clients.claim()); });
+self.addEventListener('fetch', function(e){
+  e.respondWith(fetch(e.request).catch(function(){ return caches.match(e.request); }));
+});`
 
 // sessionTTL is how long a login session lasts.
 const sessionTTL = 30 * 24 * time.Hour
@@ -65,7 +97,42 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /change-password", s.handleChangePasswordForm)
 	mux.HandleFunc("POST /change-password", s.handleChangePassword)
 	mux.HandleFunc("POST /logout", s.handleLogout)
+	// PWA install assets (no login required).
+	mux.HandleFunc("GET /manifest.webmanifest", handleManifest)
+	mux.HandleFunc("GET /sw.js", handleServiceWorker)
+	mux.HandleFunc("GET /icon-192.png", handleStaticIcon("icon-192.png"))
+	mux.HandleFunc("GET /icon-512.png", handleStaticIcon("icon-512.png"))
+	mux.HandleFunc("GET /apple-touch-icon.png", handleStaticIcon("apple-touch-icon.png"))
 	return mux
+}
+
+// handleManifest serves the PWA manifest for "install app" on Android.
+func handleManifest(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/manifest+json")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = io.WriteString(w, appManifest)
+}
+
+// handleServiceWorker serves the minimal worker Chrome requires before
+// offering app installation.
+func handleServiceWorker(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = io.WriteString(w, serviceWorker)
+}
+
+// handleStaticIcon serves an embedded PNG app icon.
+func handleStaticIcon(name string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		b, err := staticFiles.ReadFile("static/" + name)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "public, max-age=604800")
+		_, _ = w.Write(b)
+	}
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -541,6 +608,9 @@ func senderHue(addr string) int {
 // the OS preference.
 const pageHead = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#174ea6">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <title>Courier dashboard</title>
 <style>
 :root{
@@ -640,6 +710,10 @@ input:focus{border-color:var(--accent);outline:none}
 .search .clear{flex:none;display:inline-flex;align-items:center;justify-content:center;
   width:44px;min-height:44px;border-radius:12px;background:var(--card);color:var(--muted);
   text-decoration:none;font-size:1.4rem;line-height:1;border:1px solid var(--line)}
+.installbtn{flex:none;border:1px solid var(--line);background:var(--card);color:var(--accent);
+  border-radius:999px;padding:.4rem .85rem;font-size:.85rem;font-weight:600;
+  min-height:36px;cursor:pointer}
+.installbtn[hidden]{display:none}
 /* conversation */
 .back{flex:none;display:inline-flex;align-items:center;justify-content:center;
   width:44px;height:44px;font-size:1.6rem;color:var(--ink);text-decoration:none;
@@ -712,6 +786,7 @@ const changeTmpl = pageHead + `
 const appTmpl = pageHead + `
 <header class="appbar"><div class="appbar-inner">
 <h1>Messages</h1>
+<button class="installbtn" id="installBtn" hidden>Install app</button>
 <span class="user" title="{{.User}}">{{.User}}</span>
 <form method="post" action="/logout"><button class="btn-ghost btn" type="submit">Log out</button></form>
 </div></header>
@@ -768,6 +843,27 @@ function fmt(ms){
   return d.toLocaleDateString([], {month:'short',day:'numeric'})+' '+t;
 }
 for(var i=0;i<els.length;i++){var e=els[i];e.textContent=fmt(1e3*+e.getAttribute('data-ts'));}
+}catch(e){}})();
+</script>
+<script>
+/* PWA install: register the worker, then show the Install button when
+   Android Chrome fires beforeinstallprompt. */
+(function(){try{
+if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){});}
+var btn=document.getElementById('installBtn');
+if(!btn)return;
+function inApp(){return window.matchMedia('(display-mode: standalone)').matches||window.navigator.standalone===true;}
+if(inApp())return;
+var deferred=null;
+window.addEventListener('beforeinstallprompt',function(e){
+  e.preventDefault();deferred=e;btn.hidden=false;
+});
+btn.addEventListener('click',function(){
+  if(!deferred)return;
+  deferred.prompt();
+  deferred.userChoice.then(function(c){if(c&&c.outcome==='accepted'){btn.hidden=true;}deferred=null;});
+});
+window.addEventListener('appinstalled',function(){btn.hidden=true;deferred=null;});
 }catch(e){}})();
 </script>
 </body></html>`

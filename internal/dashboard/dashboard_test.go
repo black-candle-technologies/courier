@@ -447,3 +447,79 @@ func TestSearch(t *testing.T) {
 		t.Fatalf("search with %%: got %d", r.Code)
 	}
 }
+
+func TestPWAAssets(t *testing.T) {
+	srv := testServer(t)
+	h := srv.Routes()
+
+	// Manifest: installable, correct content type, valid JSON.
+	req := httptest.NewRequest("GET", "/manifest.webmanifest", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("manifest: got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/manifest+json" {
+		t.Fatalf("manifest content type = %q", ct)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatalf("manifest is not valid JSON: %v", err)
+	}
+	for _, k := range []string{"name", "start_url", "display", "icons"} {
+		if _, ok := m[k]; !ok {
+			t.Fatalf("manifest missing %q", k)
+		}
+	}
+
+	// Service worker: must contain a fetch handler for installability.
+	req = httptest.NewRequest("GET", "/sw.js", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sw: got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "addEventListener('fetch'") {
+		t.Fatalf("service worker has no fetch handler")
+	}
+
+	// Icons: PNG magic bytes, non-trivial size.
+	for _, p := range []string{"/icon-192.png", "/icon-512.png", "/apple-touch-icon.png"} {
+		req = httptest.NewRequest("GET", p, nil)
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: got %d", p, rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "image/png" {
+			t.Fatalf("%s content type = %q", p, ct)
+		}
+		b := rec.Body.Bytes()
+		if len(b) < 1000 || string(b[:8]) != "\x89PNG\r\n\x1a\n" {
+			t.Fatalf("%s: not a plausible PNG (%d bytes)", p, len(b))
+		}
+	}
+
+	// The app shell links the manifest and carries the install button.
+	id := testIdentity(t)
+	register(t, srv, "lane", "temporary-password-123", id)
+	cookie := login(t, srv, "lane", "temporary-password-123")
+	form := url.Values{"password": {"a-brand-new-password"}, "confirm": {"a-brand-new-password"}}
+	req = httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	r := get(t, srv, "/app", cookie)
+	if r.Code != http.StatusOK {
+		t.Fatalf("/app: got %d", r.Code)
+	}
+	html := r.Body.String()
+	if !strings.Contains(html, `rel="manifest"`) {
+		t.Fatalf("/app missing manifest link")
+	}
+	if !strings.Contains(html, `id="installBtn"`) {
+		t.Fatalf("/app missing install button")
+	}
+}
