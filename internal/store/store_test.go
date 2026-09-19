@@ -171,3 +171,104 @@ func TestSaveKeyScrambledOrderKeepsNewest(t *testing.T) {
 		t.Fatalf("want epoch 500, got %d", got.Epoch)
 	}
 }
+
+// TestDashboardThreadsUnreadCounts seeds several threads and verifies the
+// F7 rewrite reports correct per-thread unread counts, latest messages,
+// and message counts.
+func TestDashboardThreadsUnreadCounts(t *testing.T) {
+	s := testStore(t)
+	self := "ed25519:self"
+	peerA := "ed25519:peerA"
+	peerB := "ed25519:peerB"
+	uid := int64(1)
+
+	// Create the dashboard user row the seen bookkeeping keys off.
+	if _, err := s.db.Exec(
+		`INSERT INTO dashboard_users(username, password_hash, courier_address, api_token_hash) VALUES(?,?,?,?)`,
+		"lane", "x", self, "tokhash"); err != nil {
+		t.Fatal(err)
+	}
+
+	push := func(courierID int64, sender, peer, body string, ts int64) {
+		t.Helper()
+		if _, err := s.SaveDashboardMessage(uid, courierID, sender, self, peer, body, ts, ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Thread A: 3 inbound from peerA, 1 outbound from self.
+	push(1, peerA, peerA, "a1", 100)
+	push(2, peerA, peerA, "a2", 200)
+	push(3, self, peerA, "a3-out", 300)
+	push(4, peerA, peerA, "a4-latest", 400)
+	// Thread B: 2 inbound from peerB.
+	push(5, peerB, peerB, "b1", 150)
+	push(6, peerB, peerB, "b2-latest", 250)
+
+	threads, err := s.DashboardThreads(uid, self, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(threads) != 2 {
+		t.Fatalf("threads = %d, want 2", len(threads))
+	}
+	byPeer := map[string]DashboardThread{}
+	for _, th := range threads {
+		byPeer[th.Peer] = th
+	}
+	a, b := byPeer[peerA], byPeer[peerB]
+	// Most recent activity first: A (ts 400) before B (ts 250).
+	if threads[0].Peer != peerA || threads[1].Peer != peerB {
+		t.Fatalf("order = %q, %q, want A then B", threads[0].Peer, threads[1].Peer)
+	}
+	if a.Unread != 3 || b.Unread != 2 {
+		t.Fatalf("unread = A:%d B:%d, want 3 and 2 (outbound excluded)", a.Unread, b.Unread)
+	}
+	if a.Count != 4 || b.Count != 2 {
+		t.Fatalf("count = A:%d B:%d, want 4 and 2", a.Count, b.Count)
+	}
+	if a.LastBody != "a4-latest" || b.LastBody != "b2-latest" {
+		t.Fatalf("latest bodies = %q, %q", a.LastBody, b.LastBody)
+	}
+	if a.LastOut {
+		t.Fatal("thread A latest is inbound, LastOut must be false")
+	}
+
+	// Mark thread A seen: unread clears, B untouched.
+	var maxA int64
+	if err := s.db.QueryRow(`SELECT MAX(id) FROM dashboard_messages WHERE user_id=? AND peer=?`, uid, peerA).Scan(&maxA); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkThreadSeen(uid, peerA, maxA); err != nil {
+		t.Fatal(err)
+	}
+	threads, err = s.DashboardThreads(uid, self, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, th := range threads {
+		switch th.Peer {
+		case peerA:
+			if th.Unread != 0 {
+				t.Fatalf("thread A unread after seen = %d, want 0", th.Unread)
+			}
+		case peerB:
+			if th.Unread != 2 {
+				t.Fatalf("thread B unread after A seen = %d, want 2", th.Unread)
+			}
+		}
+	}
+
+	// A new inbound message on A becomes unread again.
+	push(7, peerA, peerA, "a5-new", 500)
+	threads, err = s.DashboardThreads(uid, self, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, th := range threads {
+		if th.Peer == peerA {
+			if th.Unread != 1 || th.LastBody != "a5-new" {
+				t.Fatalf("thread A after new msg: unread=%d body=%q, want 1 / a5-new", th.Unread, th.LastBody)
+			}
+		}
+	}
+}

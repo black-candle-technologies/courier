@@ -476,40 +476,73 @@ type DashboardThread struct {
 }
 
 // DashboardThreads returns the user's threads, most recently active first.
+//
+// v0.6.11 (F7): the unread count used to be a correlated subquery
+// evaluated once per message row — quadratic work on SQLite's single
+// connection. It is now aggregated once per peer with a single GROUP BY
+// and joined to the latest-message rows in Go.
 func (s *Store) DashboardThreads(userID int64, userAddr string, limit int) ([]DashboardThread, error) {
-	// tpeer is the thread key qualified for the inner table alias.
+	// Unread inbound messages per peer, computed in one pass. The peer
+	// expression matches the thread key: stored peer, else the sender
+	// for rows predating threading. Qualified with m. because
+	// dashboard_seen also has a peer column.
+	const peer = `COALESCE(NULLIF(m.peer,''), m.sender)`
+	unreadByPeer := map[string]int64{}
+	urows, err := s.db.Query(
+		`SELECT `+peer+` AS p, COUNT(*)
+		 FROM dashboard_messages m
+		 LEFT JOIN dashboard_seen s
+		   ON s.user_id = m.user_id AND s.peer = `+peer+`
+		 WHERE m.user_id = ? AND m.sender != ?
+		   AND m.id > COALESCE(s.last_seen_id, 0)
+		 GROUP BY p`,
+		userID, userAddr)
+	if err != nil {
+		return nil, err
+	}
+	for urows.Next() {
+		var p string
+		var n int64
+		if err := urows.Scan(&p, &n); err != nil {
+			urows.Close()
+			return nil, err
+		}
+		unreadByPeer[p] = n
+	}
+	if err := urows.Err(); err != nil {
+		urows.Close()
+		return nil, err
+	}
+	urows.Close()
+
+	// Latest message per peer.
 	const tpeer = `COALESCE(NULLIF(t.peer,''), t.sender)`
-	rows, err := s.db.Query(
-		`SELECT p, body, sender, cnt, ts, unread FROM (
+	lrows, err := s.db.Query(
+		`SELECT p, body, sender, cnt, ts FROM (
 		   SELECT `+tpeer+` AS p, t.body AS body, t.sender AS sender,
 		          COUNT(*) OVER (PARTITION BY `+tpeer+`) AS cnt,
 		          COALESCE(t.sent_at, t.received_at) AS ts,
-		          COALESCE((SELECT COUNT(*) FROM dashboard_messages m
-		                    WHERE m.user_id = ?
-		                      AND COALESCE(NULLIF(m.peer,''), m.sender) = `+tpeer+`
-		                      AND m.sender != ?
-		                      AND m.id > COALESCE((SELECT s.last_seen_id FROM dashboard_seen s
-		                                          WHERE s.user_id = ? AND s.peer = `+tpeer+`), 0)), 0) AS unread,
 		          ROW_NUMBER() OVER (PARTITION BY `+tpeer+`
 		                             ORDER BY COALESCE(t.sent_at, t.received_at) DESC, t.id DESC) AS rn
 		   FROM dashboard_messages t WHERE t.user_id = ?
 		 ) WHERE rn = 1 ORDER BY ts DESC, p ASC LIMIT ?`,
-		userID, userAddr, userID, userID, limit)
+		userID, limit)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer lrows.Close()
 	var out []DashboardThread
-	for rows.Next() {
+	for lrows.Next() {
 		var th DashboardThread
 		var sender string
-		if err := rows.Scan(&th.Peer, &th.LastBody, &sender, &th.Count, &th.LastTS, &th.Unread); err != nil {
+		if err := lrows.Scan(&th.Peer, &th.LastBody, &sender, &th.Count, &th.LastTS); err != nil {
 			return nil, err
 		}
 		th.LastOut = sender == userAddr
+		th.Unread = unreadByPeer[th.Peer]
 		out = append(out, th)
 	}
-	return out, rows.Err()
+	return out, lrows.Err()
 }
 
 // MarkThreadSeen records that the user has viewed a thread up to lastID.
