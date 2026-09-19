@@ -18,9 +18,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"html/template"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/crypto"
@@ -30,7 +32,7 @@ import (
 )
 
 // Version of the dashboard server.
-const Version = "0.6.0"
+const Version = "0.6.2"
 
 // sessionTTL is how long a login session lasts.
 const sessionTTL = 30 * 24 * time.Hour
@@ -365,63 +367,233 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 func render(w http.ResponseWriter, tmpl string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	t := template.Must(template.New("p").Funcs(template.FuncMap{
-		"time": func(unix int64) string {
-			return time.Unix(unix, 0).Format("2006-01-02 15:04:05 MST")
-		},
+		"ago":            ago,
+		"senderShort":    senderShort,
+		"senderInitials": senderInitials,
+		"senderHue":      senderHue,
 	}).Parse(tmpl))
 	_ = t.Execute(w, data)
 }
 
-const pageHead = `<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+// ago renders a unix timestamp as a human relative time ("3h ago").
+func ago(unix int64) string {
+	d := time.Since(time.Unix(unix, 0))
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	case d < 7*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	default:
+		return time.Unix(unix, 0).Format("Jan 2, 2006")
+	}
+}
+
+// senderShort truncates a Courier address for display while keeping it
+// identifiable: ed25519:hsJUdq…AVXHqSQ.
+func senderShort(addr string) string {
+	const prefix = "ed25519:"
+	key := strings.TrimPrefix(addr, prefix)
+	if len(key) <= 14 {
+		return addr
+	}
+	return prefix + key[:6] + "…" + key[len(key)-6:]
+}
+
+// senderInitials returns up to two uppercase alphanumeric characters from
+// the address, used for the sender avatar.
+func senderInitials(addr string) string {
+	key := strings.TrimPrefix(addr, "ed25519:")
+	out := make([]byte, 0, 2)
+	for i := 0; i < len(key) && len(out) < 2; i++ {
+		c := key[i]
+		switch {
+		case 'a' <= c && c <= 'z':
+			out = append(out, c-('a'-'A'))
+		case 'A' <= c && c <= 'Z', '0' <= c && c <= '9':
+			out = append(out, c)
+		}
+	}
+	if len(out) == 0 {
+		return "?"
+	}
+	return string(out)
+}
+
+// senderHue derives a stable avatar hue (0-359) from the sender address.
+func senderHue(addr string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(addr))
+	return int(h.Sum32() % 360)
+}
+
+// pageHead holds the shared document head and the responsive stylesheet.
+// Mobile-first: the base layout targets phones, with breakpoints widening
+// the content column for tablets/laptops and desktops. Dark mode follows
+// the OS preference.
+const pageHead = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Courier dashboard</title>
 <style>
-body{font-family:system-ui,-apple-system,sans-serif;max-width:720px;margin:2em auto;padding:0 1em;color:#1a1a1a;background:#fafafa}
-.card{background:#fff;border:1px solid #ddd;border-radius:8px;padding:1.5em;margin:1em 0}
-input,button{font-size:1em;padding:.5em;margin:.25em 0}
-input[type=text],input[type=password]{width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px}
-button{background:#111;color:#fff;border:0;border-radius:4px;padding:.6em 1.2em;cursor:pointer}
-.error{color:#a00;margin:.5em 0}
-.msg{border-bottom:1px solid #eee;padding:.75em 0}
-.meta{color:#666;font-size:.85em}
-pre{white-space:pre-wrap;word-wrap:break-word;margin:.4em 0}
-.top{display:flex;justify-content:space-between;align-items:center}
+:root{
+  --bg:#f4f5f7; --card:#ffffff; --ink:#14171c; --muted:#606875;
+  --line:#e2e6ec; --accent:#174ea6; --accent-ink:#ffffff;
+  --error:#b3261e; --error-bg:#fbeae8;
+  --radius:14px; --maxw:44rem;
+  color-scheme:light dark;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0d1015; --card:#151a22; --ink:#e9ecf1; --muted:#9aa3b2;
+    --line:#242c38; --accent:#8ab4f8; --accent-ink:#0d1015;
+    --error:#ff8a80; --error-bg:#3a1e1b;
+  }
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  font-size:16px;line-height:1.55}
+h1{font-size:1.35rem;margin:0}
+h2{font-size:1.1rem;margin:0 0 .4rem}
+p{margin:.4em 0}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.88em}
+.wrap{max-width:var(--maxw);margin:0 auto;padding:1rem .875rem 3rem}
+@media(min-width:700px){
+  :root{--maxw:48rem}
+  .wrap{padding:2rem 1.25rem 4rem}
+  h1{font-size:1.6rem}
+}
+@media(min-width:1100px){:root{--maxw:56rem}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  padding:1.1rem;box-shadow:0 1px 2px rgba(0,0,0,.05)}
+@media(min-width:700px){.card{padding:1.5rem}}
+/* auth pages */
+.auth{max-width:26rem;margin:6vh auto 0}
+@media(min-width:700px){.auth{margin-top:10vh}}
+.brand{display:flex;align-items:center;gap:.8rem;margin-bottom:1.25rem}
+.mark{flex:none;width:2.75rem;height:2.75rem;border-radius:12px;background:var(--ink);color:var(--bg);
+  display:flex;align-items:center;justify-content:center;font-size:1.4rem}
+.brand p{margin:.1em 0 0;color:var(--muted);font-size:.92rem}
+.hint{color:var(--muted);font-size:.85rem;margin-top:1rem;text-align:center}
+/* forms */
+.field{margin:0 0 1rem}
+label{display:block;font-weight:600;font-size:.9rem;margin-bottom:.35rem}
+input[type=text],input[type=password]{width:100%;font-size:16px;padding:.7rem .8rem;
+  border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink)}
+input:focus{border-color:var(--accent);outline:none}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.btn{display:inline-flex;align-items:center;justify-content:center;min-height:44px;
+  font-size:1rem;font-weight:600;border:0;border-radius:10px;padding:.7rem 1.25rem;
+  background:var(--accent);color:var(--accent-ink);cursor:pointer;text-decoration:none}
+.btn-block{width:100%}
+.btn-ghost{background:transparent;color:var(--ink);border:1px solid var(--line);
+  min-height:40px;padding:.45rem .9rem;font-size:.9rem}
+.error{background:var(--error-bg);color:var(--error);border:1px solid var(--error);
+  border-radius:10px;padding:.6rem .8rem;margin:.75rem 0;font-size:.9rem}
+/* app header */
+.appbar{position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px solid var(--line)}
+@supports ((-webkit-backdrop-filter:blur(8px)) or (backdrop-filter:blur(8px))){
+  .appbar{background:color-mix(in srgb, var(--bg) 82%, transparent);
+    -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+}
+.appbar-inner{max-width:var(--maxw);margin:0 auto;padding:.55rem .875rem;
+  display:flex;align-items:center;gap:.6rem .75rem;flex-wrap:wrap}
+.appbar h1{flex:1;min-width:6rem}
+.user{font-size:.85rem;color:var(--muted);max-width:11rem;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+/* messages */
+.msg{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  padding:.95rem 1rem;margin:0 0 .75rem}
+@media(min-width:700px){.msg{padding:1.1rem 1.25rem}}
+.msg-head{display:flex;align-items:center;gap:.65rem;margin-bottom:.45rem;min-width:0}
+.avatar{flex:none;width:2.3rem;height:2.3rem;border-radius:50%;color:#fff;
+  display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.78rem}
+.msg-meta{flex:1;min-width:0}
+.sender{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.84rem;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.when{font-size:.78rem;color:var(--muted)}
+.msg-body{margin:.3rem 0 0;white-space:pre-wrap;word-break:break-word;font-size:.95rem}
+/* empty state */
+.empty{text-align:center;padding:3rem 1.5rem;color:var(--muted)}
+.empty-mark{font-size:2.5rem;margin-bottom:.5rem}
+.empty h2{color:var(--ink)}
+.foot{margin-top:2.5rem;color:var(--muted);font-size:.78rem;text-align:center}
 </style></head><body>`
 
 const loginTmpl = pageHead + `
-<h1>Courier dashboard</h1>
+<div class="wrap"><div class="auth">
+<header class="brand">
+  <div class="mark" aria-hidden="true">◈</div>
+  <div><h1>Courier</h1><p>Messages from your agent, decrypted for your eyes only.</p></div>
+</header>
 <div class="card">
 <form method="post" action="/login">
-<label>Username<br><input type="text" name="username" autocomplete="username" required></label><br>
-<label>Password<br><input type="password" name="password" autocomplete="current-password" required></label><br>
-{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
-<button type="submit">Log in</button>
+<div class="field">
+<label for="u">Username</label>
+<input id="u" type="text" name="username" autocomplete="username" autocapitalize="none" autocorrect="off" required>
+</div>
+<div class="field">
+<label for="p">Password</label>
+<input id="p" type="password" name="password" autocomplete="current-password" required>
+</div>
+{{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
+<button class="btn btn-block" type="submit">Log in</button>
 </form>
-<p class="meta">Your agent created this account with a temporary password. You'll be asked to change it on first login.</p>
-</div></body></html>`
+</div>
+<p class="hint">Your agent created this account with a temporary password — you'll set your own on first login.</p>
+</div></div></body></html>`
 
 const changeTmpl = pageHead + `
-<h1>{{if .Forced}}Choose a new password{{else}}Change password{{end}}</h1>
+<div class="wrap"><div class="auth">
+<header class="brand">
+  <div class="mark" aria-hidden="true">◈</div>
+  <div><h1>{{if .Forced}}Set your password{{else}}Change password{{end}}</h1>
+  {{if .Forced}}<p>Your temporary password has expired. Pick a new one to continue.</p>{{end}}</div>
+</header>
 <div class="card">
-{{if .Forced}}<p>Your temporary password has expired. Pick a new one to continue.</p>{{end}}
 <form method="post" action="/change-password">
-<label>New password (12+ characters)<br><input type="password" name="password" autocomplete="new-password" required></label><br>
-<label>Confirm<br><input type="password" name="confirm" autocomplete="new-password" required></label><br>
-{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
-<button type="submit">Set password</button>
+<div class="field">
+<label for="pw">New password (12+ characters)</label>
+<input id="pw" type="password" name="password" autocomplete="new-password" required>
+</div>
+<div class="field">
+<label for="cf">Confirm new password</label>
+<input id="cf" type="password" name="confirm" autocomplete="new-password" required>
+</div>
+{{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
+<button class="btn btn-block" type="submit">Set password</button>
 </form>
-</div></body></html>`
+</div>
+</div></div></body></html>`
 
 const appTmpl = pageHead + `
-<div class="top"><h1>Messages</h1>
-<form method="post" action="/logout"><button type="submit">Log out ({{.User}})</button></form>
-</div>
+<header class="appbar"><div class="appbar-inner">
+<h1>Messages</h1>
+<span class="user" title="{{.User}}">{{.User}}</span>
+<form method="post" action="/logout"><button class="btn-ghost btn" type="submit">Log out</button></form>
+</div></header>
+<div class="wrap">
 {{if .Messages}}
-{{range .Messages}}<div class="card msg">
-<div class="meta">From <code>{{.Sender}}</code> · courier #{{.CourierID}} · {{.ReceivedAt | time}}</div>
-<pre>{{.Body}}</pre>
-</div>{{end}}
+{{range .Messages}}<article class="msg">
+<div class="msg-head">
+<span class="avatar" style="background:hsl({{senderHue .Sender}} 55% 38%)" aria-hidden="true">{{senderInitials .Sender}}</span>
+<div class="msg-meta">
+<span class="sender" title="{{.Sender}}">{{senderShort .Sender}}</span>
+<span class="when">{{ago .ReceivedAt}} · courier #{{.CourierID}}</span>
+</div>
+</div>
+<p class="msg-body">{{.Body}}</p>
+</article>{{end}}
 {{else}}
-<div class="card"><p>No messages yet. Your agent pushes new Courier messages here with <code>courier dashboard push</code>.</p></div>
+<div class="card empty">
+<div class="empty-mark" aria-hidden="true">✉</div>
+<h2>No messages yet</h2>
+<p>Your agent pushes new Courier messages here with <code>courier dashboard push</code>.</p>
+</div>
 {{end}}
-</body></html>`
+<footer class="foot">Courier dashboard · messages are decrypted by your agent, never on this server</footer>
+</div></body></html>`
