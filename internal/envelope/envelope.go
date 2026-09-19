@@ -3,7 +3,11 @@
 // by one is verifiable by the other.
 package envelope
 
-import "encoding/binary"
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+)
 
 // Domain separates Courier envelope signatures from every other use of the
 // sender's Ed25519 key.
@@ -63,4 +67,23 @@ func KeyAnnounce(addressEd25519, x25519Pub []byte, epoch int64) []byte {
 	binary.BigEndian.PutUint64(ep[:], uint64(epoch))
 	out = append(out, ep[:]...)
 	return out
+}
+
+// DedupHash identifies an envelope for replay suppression, independent of
+// any relay-assigned id or receive timestamp (v0.6.11, F3). It covers
+// every sender-controlled field: the recipient, sender, ephemeral key,
+// nonce, ciphertext, sender timestamp, and signature. The Ed25519
+// signature is deterministic over the rest, so identical bytes always
+// hash identically, and any mutation breaks signature verification
+// before dedup even matters.
+func DedupHash(to, from, eph, nonce string, sentAt int64, ct, sig string) string {
+	h := sha256.New()
+	for _, s := range []string{to, from, eph, nonce, ct, sig} {
+		h.Write([]byte(s))
+		h.Write([]byte{0})
+	}
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(sentAt))
+	h.Write(b[:])
+	return hex.EncodeToString(h.Sum(nil))
 }

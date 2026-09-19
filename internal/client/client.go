@@ -89,6 +89,10 @@ type Config struct {
 	// announcement with a lower epoch than recorded is rejected as a
 	// rollback — so a malicious relay cannot substitute keys.
 	VerifiedKeyEpochs map[string]int64 `json:"verified_key_epochs,omitempty"`
+	// v0.6.11 (F3): hashes of envelopes already delivered to this
+	// client, for replay suppression independent of relay message ids.
+	// Bounded (oldest dropped); the relay also dedups permanently.
+	SeenEnvelopeHashes []string `json:"seen_envelope_hashes,omitempty"`
 }
 
 func configPath() (string, error) {
@@ -731,7 +735,16 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int, error) {
 	}
 	var out []Message
 	skipped := 0
+	var newHashes []string
+	seen := c.seenEnvelopeSet()
 	for _, m := range in.Messages {
+		// v0.6.11 (F3): suppress replays independently of relay message
+		// ids — identical envelope bytes are never delivered twice.
+		h := envelope.DedupHash(c.cfg.Address, m.From, m.Eph, m.Nonce, m.SentAt, m.Ct, m.Sig)
+		if seen[h] {
+			skipped++
+			continue
+		}
 		fromEd, err := crypto.ParseAddress(m.From)
 		if err != nil {
 			skipped++
@@ -772,8 +785,50 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int, error) {
 			ID: m.ID, From: m.From, Body: string(plain),
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
 		})
+		// Only successfully delivered messages are marked seen: a
+		// message that fails verification or decryption now may become
+		// readable later (e.g. after the sender's key announcement
+		// arrives), and must not be suppressed.
+		seen[h] = true
+		newHashes = append(newHashes, h)
 	}
+	c.recordSeenEnvelopes(newHashes)
 	return out, skipped, nil
+}
+
+// maxSeenEnvelopeHashes bounds the client-side replay-suppression set.
+// The relay dedups permanently; this is defense-in-depth against a rogue
+// relay, so a bounded window is sufficient.
+const maxSeenEnvelopeHashes = 1000
+
+// seenEnvelopeSet returns the client's delivered-envelope hashes as a set.
+func (c *Client) seenEnvelopeSet() map[string]bool {
+	seen := make(map[string]bool, len(c.cfg.SeenEnvelopeHashes))
+	for _, h := range c.cfg.SeenEnvelopeHashes {
+		seen[h] = true
+	}
+	return seen
+}
+
+// recordSeenEnvelopes persists newly delivered envelope hashes,
+// dropping the oldest beyond the bound.
+func (c *Client) recordSeenEnvelopes(hashes []string) {
+	if len(hashes) == 0 {
+		return
+	}
+	known := c.seenEnvelopeSet()
+	for _, h := range hashes {
+		if !known[h] {
+			known[h] = true
+			c.cfg.SeenEnvelopeHashes = append(c.cfg.SeenEnvelopeHashes, h)
+		}
+	}
+	if len(c.cfg.SeenEnvelopeHashes) > maxSeenEnvelopeHashes {
+		c.cfg.SeenEnvelopeHashes = c.cfg.SeenEnvelopeHashes[len(c.cfg.SeenEnvelopeHashes)-maxSeenEnvelopeHashes:]
+	}
+	// Best effort: losing the set only weakens replay suppression,
+	// never message delivery.
+	_ = c.cfg.Save()
 }
 
 // Ping checks the relay is reachable.

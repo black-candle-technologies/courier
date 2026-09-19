@@ -255,3 +255,57 @@ func TestKeyLookupMissing(t *testing.T) {
 		t.Fatalf("missing key: got %d, want 404", w.Code)
 	}
 }
+
+func TestSendReplayIsIdempotent(t *testing.T) {
+	srv := testServer(t)
+	alice, _ := crypto.GenerateIdentity()
+	bob, _ := crypto.GenerateIdentity()
+	body := makeEnvelope(t, alice, bob, "hello bob")
+
+	first := postSend(t, srv, body)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first send: got %d", first.Code)
+	}
+	var f struct {
+		ID        int64 `json:"id"`
+		Duplicate bool  `json:"duplicate"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &f); err != nil {
+		t.Fatal(err)
+	}
+	if f.Duplicate {
+		t.Fatal("first send reported duplicate")
+	}
+
+	// Replaying the identical envelope must be acknowledged with the
+	// original id, not stored twice.
+	second := postSend(t, srv, body)
+	if second.Code != http.StatusCreated {
+		t.Fatalf("replay send: got %d", second.Code)
+	}
+	var s struct {
+		ID        int64 `json:"id"`
+		Duplicate bool  `json:"duplicate"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &s); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Duplicate || s.ID != f.ID {
+		t.Fatalf("replay not idempotent: %+v vs %+v", s, f)
+	}
+
+	req := httptest.NewRequest("GET", "/v1/inbox?to="+crypto.FormatAddress(bob.EdPub[:]), nil)
+	inrec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(inrec, req)
+	var out struct {
+		Messages []struct {
+			ID int64 `json:"id"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(inrec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Messages) != 1 || out.Messages[0].ID != f.ID {
+		t.Fatalf("want exactly the original message, got %+v", out.Messages)
+	}
+}
