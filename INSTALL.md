@@ -107,7 +107,7 @@ subprocess and exchange newline-delimited JSON:
 ← {"id":3,"ok":true,"messages":[{"id":12,"from":"<sender>","body":"hello","sent_at":...,"received_at":...}]}
 
 → {"id":4,"cmd":"health"}
-← {"id":4,"ok":true,"relay":"http://147.135.112.67:8470"}
+← {"id":4,"ok":true,"relay":"https://147.135.112.67:8470"}
 ```
 
 Errors come back as `{"id":N,"ok":false,"error":"..."}`.
@@ -123,11 +123,37 @@ courier serve   # http://127.0.0.1:8471
 Endpoints: `GET /address`, `GET /health`, `POST /send {"to","body"}`,
 `GET /inbox?after=<id>`.
 
+## The relay
+
+The default relay runs at:
+
+```
+https://147.135.112.67:8470
+```
+
+The connection is TLS-encrypted and the relay's certificate is **pinned**:
+when you run `courier init`, the client records the certificate's SHA256
+fingerprint and rejects any other certificate from then on. This stops
+network-level impersonation of the relay. `init` prints the fingerprint —
+compare it to the published value below before trusting it.
+
+**Published relay certificate fingerprint (SHA256):**
+
+```
+RELAY_FINGERPRINT_PLACEHOLDER
+```
+
+If `init` shows a different fingerprint, **do not proceed** — something is
+intercepting your connection. If the operator ever rotates the certificate,
+re-pin with `courier init --repin` after confirming the new published value.
+
 ## Configuration
 
-- Relay URL defaults to `http://147.135.112.67:8470`. Override at init:
-  `courier init --relay http://host:port`, or edit `~/.courier/config.json`.
-- Config also stores your inbox cursor (last message id seen).
+- Relay URL defaults to `https://147.135.112.67:8470`. Override at init:
+  `courier init --relay https://host:port`, or edit `~/.courier/config.json`.
+  Plain `http://` relays skip certificate pinning (useful for local testing).
+- Config also stores your inbox cursor (last message id seen) and the pinned
+  relay certificate fingerprint.
 
 ## Security notes (read once)
 
@@ -136,8 +162,9 @@ Endpoints: `GET /address`, `GET /health`, `POST /send {"to","body"}`,
 - Every message carries an Ed25519 signature from the sender, verified by the
   relay and re-verified by the recipient. A `from` address that verifies is
   proof of authorship.
-- The relay sees metadata (which addresses exchange envelopes, when). TLS
-  arrives in v0.3.0.
+- The relay sees metadata (which addresses exchange envelopes, when), but
+  the connection is TLS-encrypted with a pinned certificate, so network
+  observers cannot see it either.
 - Back up `~/.courier/config.json`. If you lose your seed, your address is
   dead — generate a new one with `courier init --force` and tell your
   contacts.

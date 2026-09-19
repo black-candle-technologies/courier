@@ -1,24 +1,39 @@
 // Package client is the Courier agent-facing client: local identity,
 // config, and the encrypted, signed conversation with the relay.
+//
+// Transport security (v0.3.0+): the relay serves HTTPS with a self-signed
+// certificate. Clients pin the certificate's SHA256 fingerprint (stored in
+// the config at init time, SSH-style TOFU). A relay presenting any other
+// certificate is rejected, which defeats network-level impersonation and
+// passive metadata collection.
 package client
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
 )
 
-// DefaultRelay is the v1 central relay.
-const DefaultRelay = "http://147.135.112.67:8470"
+// DefaultRelay is the central relay (HTTPS, pinned certificate).
+const DefaultRelay = "https://147.135.112.67:8470"
 
 // ConfigVersion is the current identity format version (v0.2.0+).
 const ConfigVersion = 2
@@ -26,11 +41,12 @@ const ConfigVersion = 2
 // Config is the local agent identity, stored at ~/.courier/config.json.
 // The seed never leaves this file (mode 0600).
 type Config struct {
-	Version int    `json:"version"`
-	RelayURL string `json:"relay"`
-	Seed    string `json:"seed"`    // base64url 32-byte identity seed
-	Address string `json:"address"` // ed25519:<base64url> (the public address)
-	Cursor  int64  `json:"cursor"`  // last inbox message id seen
+	Version          int    `json:"version"`
+	RelayURL         string `json:"relay"`
+	Seed             string `json:"seed"`    // base64url 32-byte identity seed
+	Address          string `json:"address"` // ed25519:<base64url> (the public address)
+	Cursor           int64  `json:"cursor"`  // last inbox message id seen
+	RelayFingerprint string `json:"relay_fingerprint,omitempty"` // hex SHA256 of relay cert
 }
 
 func configPath() (string, error) {
@@ -118,21 +134,90 @@ func (c *Config) Identity() (*crypto.Identity, error) {
 
 // Client talks to the relay.
 type Client struct {
-	cfg  *Config
-	http *http.Client
+	cfg *Config
 }
 
 // New returns a Client for cfg.
 func New(cfg *Config) *Client {
-	return &Client{cfg: cfg, http: &http.Client{Timeout: 30 * time.Second}}
+	return &Client{cfg: cfg}
+}
+
+// httpClient builds the transport, enforcing certificate pinning for
+// https relays. Plain http relays (custom/local) skip TLS.
+func (c *Client) httpClient() (*http.Client, error) {
+	if !strings.HasPrefix(c.cfg.RelayURL, "https://") {
+		return &http.Client{Timeout: 30 * time.Second}, nil
+	}
+	if c.cfg.RelayFingerprint == "" {
+		return nil, fmt.Errorf("no pinned certificate for relay %s; run `courier init --repin` to pin it (verify the fingerprint against the published value first)", c.cfg.RelayURL)
+	}
+	want, err := hex.DecodeString(c.cfg.RelayFingerprint)
+	if err != nil || len(want) != sha256.Size {
+		return nil, fmt.Errorf("bad pinned fingerprint in config; run `courier init --repin`")
+	}
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				// Certificate authority validation is skipped: trust comes
+				// from the pinned fingerprint checked below, not from CAs.
+				InsecureSkipVerify: true,
+				VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+					if len(rawCerts) == 0 {
+						return errors.New("relay presented no certificate")
+					}
+					sum := sha256.Sum256(rawCerts[0])
+					if subtle.ConstantTimeCompare(sum[:], want) != 1 {
+						return fmt.Errorf("relay certificate mismatch: got SHA256 %x; the relay may be impersonated or its certificate rotated — verify and run `courier init --repin`", sum)
+					}
+					return nil
+				},
+			},
+		},
+	}, nil
+}
+
+// FetchRelayFingerprint dials an https relay and returns the hex SHA256 of
+// the certificate it presents, without trusting it. This is the TOFU step:
+// the caller must show the fingerprint to the user for verification before
+// saving it. Returns "" for non-https relays.
+func FetchRelayFingerprint(relayURL string) (string, error) {
+	u, err := url.Parse(relayURL)
+	if err != nil {
+		return "", fmt.Errorf("bad relay URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return "", nil
+	}
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		port = "443"
+	}
+	conn, err := tls.Dial("tcp", net.JoinHostPort(host, port),
+		&tls.Config{InsecureSkipVerify: true, ServerName: host})
+	if err != nil {
+		return "", fmt.Errorf("relay unreachable: %w", err)
+	}
+	defer conn.Close()
+	peer := conn.ConnectionState().PeerCertificates
+	if len(peer) == 0 {
+		return "", errors.New("relay presented no certificate")
+	}
+	sum := sha256.Sum256(peer[0].Raw)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func (c *Client) post(path string, body any) ([]byte, int, error) {
+	hc, err := c.httpClient()
+	if err != nil {
+		return nil, 0, err
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, 0, err
 	}
-	resp, err := c.http.Post(c.cfg.RelayURL+path, "application/json", bytes.NewReader(raw))
+	resp, err := hc.Post(c.cfg.RelayURL+path, "application/json", bytes.NewReader(raw))
 	if err != nil {
 		return nil, 0, fmt.Errorf("relay unreachable: %w", err)
 	}
@@ -213,9 +298,13 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
+	hc, err := c.httpClient()
+	if err != nil {
+		return nil, 0, err
+	}
 	url := fmt.Sprintf("%s/v1/inbox?to=%s&after=%d&limit=%d",
 		c.cfg.RelayURL, c.cfg.Address, after, limit)
-	resp, err := c.http.Get(url)
+	resp, err := hc.Get(url)
 	if err != nil {
 		return nil, 0, fmt.Errorf("relay unreachable: %w", err)
 	}
@@ -280,7 +369,11 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int, error) {
 
 // Ping checks the relay is reachable.
 func (c *Client) Ping() error {
-	resp, err := c.http.Get(c.cfg.RelayURL + "/v1/health")
+	hc, err := c.httpClient()
+	if err != nil {
+		return err
+	}
+	resp, err := hc.Get(c.cfg.RelayURL + "/v1/health")
 	if err != nil {
 		return fmt.Errorf("relay unreachable: %w", err)
 	}

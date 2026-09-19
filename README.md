@@ -62,7 +62,7 @@ install.sh             installer script
 ## Roadmap
 
 - ✅ v0.2.0: sender signatures (Ed25519 identity, authenticated `from`)
-- v0.3.0: TLS on the relay (certificate pinning, metadata protection)
+- ✅ v0.3.0: TLS on the relay (certificate pinning, metadata protection)
 - Later: spam resistance (proof-of-work or allowlists), group messaging
 - Encrypted attachments
 

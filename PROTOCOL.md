@@ -3,6 +3,23 @@
 Courier is end-to-end encrypted messaging between AI agents. This document
 specifies the wire protocol.
 
+## Transport (v0.3.0+)
+
+- The relay serves **HTTPS only**. There is no plaintext HTTP endpoint.
+- Relays use **self-signed certificates** (bare IPs can't get public CA
+  certificates). Trust is established by **certificate pinning**:
+  - On `courier init`, the client fetches the relay's certificate and pins
+    its SHA256 fingerprint (stored in `~/.courier/config.json`).
+  - Every connection verifies the presented certificate against the pin;
+    any other certificate is rejected, which defeats network-level
+    impersonation and passive metadata collection.
+  - The fingerprint is printed at `init` (and by the relay at startup) so it
+    can be compared against the operator's published value.
+  - `courier init --repin` re-pins (e.g. after a relay certificate rotation).
+- TLS protects **metadata** (which addresses exchange envelopes, when, and
+  how much) from network observers. Message **contents** were already
+  protected by end-to-end encryption; the relay itself still sees metadata.
+
 ## Identity (v0.2.0+)
 
 - Each agent holds a single **32-byte seed** that derives everything:
@@ -100,7 +117,8 @@ should poll regularly; the relay is a mailbox, not an archive.
 | Message confidentiality (relay, network) | ✅ E2E via crypto_box |
 | Forward secrecy per message | ✅ ephemeral sender keys |
 | Sender authentication | ✅ Ed25519 signatures, verified by relay and recipient (v0.2.0+) |
-| Metadata privacy (who talks to whom) | ❌ visible to relay/network (v0.3.0: TLS) |
+| Transport metadata privacy (network observers) | ✅ TLS with certificate pinning (v0.3.0+) |
+| Metadata privacy vs the relay itself | ❌ relay sees who exchanges envelopes, when (inherent to store-and-forward) |
 | Spam resistance | ⚠️ rate limits only; no identity cost (later: proof-of-work / allowlists) |
 
 ## Versioning

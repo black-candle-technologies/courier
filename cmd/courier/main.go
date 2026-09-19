@@ -26,7 +26,7 @@ import (
 	"github.com/black-candle-technologies/courier/internal/client"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -64,6 +64,7 @@ func usage() {
 	fmt.Println(`courier — encrypted agent-to-agent messaging
 
   courier init [--relay URL] [--force]   create your identity (keypair)
+  courier init --repin                   re-pin the relay certificate
   courier address                        print your address (public key)
   courier send <address> <message|->     send a message ("-" reads stdin)
   courier inbox [--all] [--limit N] [--follow [--interval 5s]]
@@ -79,9 +80,30 @@ func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	relay := fs.String("relay", "", "relay URL (default "+client.DefaultRelay+")")
 	force := fs.Bool("force", false, "overwrite existing identity")
+	repin := fs.Bool("repin", false, "re-pin the relay certificate fingerprint (keeps identity)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+
+	if *repin {
+		cfg, err := client.LoadConfig()
+		if err != nil {
+			return err
+		}
+		fp, err := client.FetchRelayFingerprint(cfg.RelayURL)
+		if err != nil {
+			return err
+		}
+		cfg.RelayFingerprint = fp
+		if err := cfg.Save(); err != nil {
+			return err
+		}
+		fmt.Println("pinned relay certificate:")
+		fmt.Println("  SHA256: " + fp)
+		fmt.Println("Verify this matches the published fingerprint before trusting it.")
+		return nil
+	}
+
 	if client.ConfigExists() && !*force {
 		cfg, err := client.LoadConfig()
 		if err != nil {
@@ -93,12 +115,20 @@ func cmdInit(args []string) error {
 		fmt.Println("identity already exists. Your address:")
 		fmt.Println(cfg.Address)
 		fmt.Println("(use --force to replace it; your old address will stop working)")
+		fmt.Println("(use --repin to re-pin the relay certificate)")
 		return nil
 	}
 	cfg, err := client.NewIdentity(*relay)
 	if err != nil {
 		return err
 	}
+	// Pin the relay's TLS certificate (TOFU). For the default relay the
+	// fingerprint is published in INSTALL.md — compare before trusting.
+	fp, err := client.FetchRelayFingerprint(cfg.RelayURL)
+	if err != nil {
+		return err
+	}
+	cfg.RelayFingerprint = fp
 	if err := cfg.Save(); err != nil {
 		return err
 	}
@@ -107,6 +137,11 @@ func cmdInit(args []string) error {
 	fmt.Println("  " + cfg.Address)
 	fmt.Println()
 	fmt.Println("Relay:", cfg.RelayURL)
+	if fp != "" {
+		fmt.Println("Pinned relay certificate SHA256:")
+		fmt.Println("  " + fp)
+		fmt.Println("Verify this matches the published fingerprint in INSTALL.md.")
+	}
 	return nil
 }
 

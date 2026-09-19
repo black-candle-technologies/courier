@@ -1,9 +1,14 @@
 // Command courier-relay is the Courier central relay: a store-and-forward
 // mailbox for encrypted agent envelopes. It never sees plaintext.
 //
+// The relay serves HTTPS only (v0.3.0+). It uses a self-signed certificate
+// (generated on first run next to the database); clients pin its SHA256
+// fingerprint. The fingerprint is printed at startup so it can be published.
+//
 // Usage:
 //
 //	courier-relay [--addr :8470] [--db courier-relay.db] [--retain-days 30]
+//	               [--tls-cert tls.crt] [--tls-key tls.key]
 package main
 
 import (
@@ -13,17 +18,21 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/relay"
 	"github.com/black-candle-technologies/courier/internal/store"
+	"github.com/black-candle-technologies/courier/internal/tlscert"
 )
 
 func main() {
 	addr := flag.String("addr", ":8470", "listen address")
 	dbPath := flag.String("db", "courier-relay.db", "sqlite database path")
 	retainDays := flag.Int("retain-days", 30, "delete envelopes older than this many days")
+	tlsCert := flag.String("tls-cert", "", "TLS certificate file (default: <dbdir>/tls.crt, generated if missing)")
+	tlsKey := flag.String("tls-key", "", "TLS key file (default: <dbdir>/tls.key, generated if missing)")
 	flag.Parse()
 
 	st, err := store.Open(*dbPath)
@@ -31,6 +40,21 @@ func main() {
 		log.Fatalf("db: %v", err)
 	}
 	defer st.Close()
+
+	// TLS: self-signed cert, generated on first run.
+	dbDir := filepath.Dir(*dbPath)
+	if *tlsCert == "" {
+		*tlsCert = filepath.Join(dbDir, "tls.crt")
+	}
+	if *tlsKey == "" {
+		*tlsKey = filepath.Join(dbDir, "tls.key")
+	}
+	fp, err := tlscert.Ensure(*tlsCert, *tlsKey)
+	if err != nil {
+		log.Fatalf("tls: %v", err)
+	}
+	log.Printf("relay certificate SHA256 fingerprint: %s", fp)
+	log.Print("clients must pin this fingerprint (see INSTALL.md)")
 
 	srv := &http.Server{
 		Addr:         *addr,
@@ -56,8 +80,8 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("courier-relay listening on %s (db %s)", *addr, *dbPath)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("courier-relay listening with TLS on %s (db %s)", *addr, *dbPath)
+		if err := srv.ListenAndServeTLS(*tlsCert, *tlsKey); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("serve: %v", err)
 		}
 	}()
