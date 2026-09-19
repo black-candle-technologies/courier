@@ -375,12 +375,26 @@ func (s *Store) DashboardUserByTokenHash(tokenHash string) (*DashboardUser, erro
 		 FROM dashboard_users WHERE api_token_hash = ?`, tokenHash))
 }
 
-// SetDashboardPassword replaces the password hash and clears must_change.
-func (s *Store) SetDashboardPassword(userID int64, passwordHash string) error {
-	_, err := s.db.Exec(
+// ChangeDashboardPassword replaces the password hash, clears must_change,
+// and revokes ALL sessions for the user, atomically (F6). A password
+// change — forced or not — must not leave old sessions alive. The caller
+// issues a fresh session for the requester afterwards so they stay
+// logged in.
+func (s *Store) ChangeDashboardPassword(userID int64, passwordHash string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
 		`UPDATE dashboard_users SET password_hash = ?, must_change = 0 WHERE id = ?`,
-		passwordHash, userID)
-	return err
+		passwordHash, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM dashboard_sessions WHERE user_id = ?`, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // CreateSession stores a login session token (by its SHA256 hash).

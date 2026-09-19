@@ -300,16 +300,13 @@ func TestLoginForcesPasswordChange(t *testing.T) {
 		t.Fatalf("/app: got %d -> %q, want redirect to /change-password", r.Code, r.Header().Get("Location"))
 	}
 
-	// Change the password.
-	form := url.Values{"password": {"a-brand-new-password"}, "confirm": {"a-brand-new-password"}}
-	req = httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(cookie)
-	rec = httptest.NewRecorder()
-	srv.Routes().ServeHTTP(rec, req)
+	// Change the password. F6: the change revokes all sessions and issues
+	// a fresh one, so pick up the new cookie.
+	rec = postChangePassword(t, srv, cookie, url.Values{"password": {"a-brand-new-password"}, "confirm": {"a-brand-new-password"}})
 	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/app" {
 		t.Fatalf("change-password: got %d -> %q: %s", rec.Code, rec.Header().Get("Location"), rec.Body.String())
 	}
+	cookie = sessionCookieFromRec(t, rec)
 
 	// Now /app renders the pushed message.
 	r := get(t, srv, "/app", cookie)
@@ -321,7 +318,7 @@ func TestLoginForcesPasswordChange(t *testing.T) {
 	}
 
 	// Old temp password no longer works.
-	form = url.Values{"username": {"lane"}, "password": {"temporary-password-123"}}
+	form := url.Values{"username": {"lane"}, "password": {"temporary-password-123"}}
 	req = httptest.NewRequest("POST", "/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec = httptest.NewRecorder()
@@ -384,14 +381,11 @@ func TestUnreadBadges(t *testing.T) {
 		t.Fatalf("unread before open = %+v, want 2 inbound unread", threads)
 	}
 
-	// Open the thread (login first: forced password change).
-	cookie := login(t, srv, "lane", "temporary-password-123")
-	form := url.Values{"password": {"a-brand-new-password"}, "confirm": {"a-brand-new-password"}}
-	req := httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(cookie)
-	rec := httptest.NewRecorder()
-	srv.Routes().ServeHTTP(rec, req)
+	// Open the thread (login first: forced password change). F6: the
+	// password change revokes the login session, so use the fresh cookie.
+	cookie := sessionCookieFromRec(t, postChangePassword(t, srv,
+		login(t, srv, "lane", "temporary-password-123"),
+		url.Values{"password": {"a-brand-new-password"}, "confirm": {"a-brand-new-password"}}))
 
 	if r := get(t, srv, "/app/thread?with="+url.QueryEscape(peer), cookie); r.Code != http.StatusOK {
 		t.Fatalf("open thread: got %d", r.Code)
@@ -424,12 +418,9 @@ func TestSearch(t *testing.T) {
 	}
 
 	cookie := login(t, srv, "lane", "temporary-password-123")
-	form := url.Values{"password": {"a-brand-new-password"}, "confirm": {"a-brand-new-password"}}
-	req = httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(cookie)
-	rec = httptest.NewRecorder()
-	srv.Routes().ServeHTTP(rec, req)
+	// F6: the password change revokes the login session; use the fresh cookie.
+	cookie = sessionCookieFromRec(t, postChangePassword(t, srv, cookie,
+		url.Values{"password": {"a-brand-new-password"}, "confirm": {"a-brand-new-password"}}))
 
 	r := get(t, srv, "/app?q=hello", cookie)
 	if r.Code != http.StatusOK {
@@ -503,13 +494,10 @@ func TestPWAAssets(t *testing.T) {
 	// The app shell links the manifest and carries the install button.
 	id := testIdentity(t)
 	register(t, srv, "lane", "temporary-password-123", id)
-	cookie := login(t, srv, "lane", "temporary-password-123")
-	form := url.Values{"password": {"a-brand-new-password"}, "confirm": {"a-brand-new-password"}}
-	req = httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(cookie)
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	// F6: the password change revokes the login session; use the fresh cookie.
+	cookie := sessionCookieFromRec(t, postChangePassword(t, srv,
+		login(t, srv, "lane", "temporary-password-123"),
+		url.Values{"password": {"a-brand-new-password"}, "confirm": {"a-brand-new-password"}}))
 
 	r := get(t, srv, "/app", cookie)
 	if r.Code != http.StatusOK {
@@ -584,4 +572,121 @@ func TestChangePasswordByteLimit(t *testing.T) {
 	}
 	// The password must be unchanged: the old temp password still logs in.
 	login(t, srv, "lane", "temporary-password-123")
+}
+
+// postChangePassword submits the change-password form with an optional
+// session cookie, returning the recorder.
+func postChangePassword(t *testing.T, srv *Server, cookie *http.Cookie, form url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	return rec
+}
+
+// sessionCookieFromRec extracts the session cookie a response set.
+func sessionCookieFromRec(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie {
+	t.Helper()
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie {
+			return c
+		}
+	}
+	t.Fatal("no session cookie in response")
+	return nil
+}
+
+// TestChangePasswordRevokesSessions verifies F6: any successful password
+// change revokes ALL existing sessions atomically and issues a fresh one
+// for the requester.
+func TestChangePasswordRevokesSessions(t *testing.T) {
+	srv := testServer(t)
+	register(t, srv, "lane", "temporary-password-123", testIdentity(t))
+	cookieA := login(t, srv, "lane", "temporary-password-123")
+	cookieB := login(t, srv, "lane", "temporary-password-123") // second session
+
+	// Forced change (the temp password is the credential here): no
+	// current-password check, but sessions must still be revoked.
+	rec := postChangePassword(t, srv, cookieA, url.Values{
+		"password": {"a-brand-new-password"}, "confirm": {"a-brand-new-password"},
+	})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("change-password: got %d: %s", rec.Code, rec.Body.String())
+	}
+	fresh := sessionCookieFromRec(t, rec)
+
+	// Both pre-existing sessions are dead.
+	for i, c := range []*http.Cookie{cookieA, cookieB} {
+		r := get(t, srv, "/app", c)
+		if r.Code != http.StatusSeeOther || r.Header().Get("Location") != "/" {
+			t.Fatalf("old session %d still valid: got %d -> %q", i, r.Code, r.Header().Get("Location"))
+		}
+	}
+	// The fresh session keeps the requester logged in.
+	if r := get(t, srv, "/app", fresh); r.Code != http.StatusOK {
+		t.Fatalf("fresh session: got %d, want 200", r.Code)
+	}
+	// The old temp password no longer logs in.
+	form := url.Values{"username": {"lane"}, "password": {"temporary-password-123"}}
+	req := httptest.NewRequest("POST", "/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	lrec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(lrec, req)
+	if lrec.Code != http.StatusOK {
+		t.Fatalf("old password login: got %d, want 200 (rejected)", lrec.Code)
+	}
+}
+
+// TestChangePasswordRequiresCurrent verifies F6: non-forced changes
+// (must_change=0) require the current password.
+func TestChangePasswordRequiresCurrent(t *testing.T) {
+	srv := testServer(t)
+	register(t, srv, "lane", "temporary-password-123", testIdentity(t))
+	cookie := login(t, srv, "lane", "temporary-password-123")
+	// Forced change first, so must_change=0 afterwards.
+	rec := postChangePassword(t, srv, cookie, url.Values{
+		"password": {"second-password-1"}, "confirm": {"second-password-1"},
+	})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("forced change: got %d", rec.Code)
+	}
+	cookie = sessionCookieFromRec(t, rec)
+
+	// Missing current password: rejected.
+	rec = postChangePassword(t, srv, cookie, url.Values{
+		"password": {"third-password-1"}, "confirm": {"third-password-1"},
+	})
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Current password is incorrect") {
+		t.Fatalf("missing current: got %d, want 200 with error", rec.Code)
+	}
+	// Wrong current password: rejected.
+	rec = postChangePassword(t, srv, cookie, url.Values{
+		"current": {"not-the-password"}, "password": {"third-password-1"}, "confirm": {"third-password-1"},
+	})
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Current password is incorrect") {
+		t.Fatalf("wrong current: got %d, want 200 with error", rec.Code)
+	}
+	// Password unchanged: the second password still logs in.
+	login(t, srv, "lane", "second-password-1")
+
+	// Correct current password: accepted, old sessions revoked, fresh
+	// session issued.
+	rec = postChangePassword(t, srv, cookie, url.Values{
+		"current": {"second-password-1"}, "password": {"third-password-1"}, "confirm": {"third-password-1"},
+	})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("valid change: got %d: %s", rec.Code, rec.Body.String())
+	}
+	fresh := sessionCookieFromRec(t, rec)
+	if r := get(t, srv, "/app", cookie); r.Code != http.StatusSeeOther {
+		t.Fatalf("old session still valid after change: got %d", r.Code)
+	}
+	if r := get(t, srv, "/app", fresh); r.Code != http.StatusOK {
+		t.Fatalf("fresh session: got %d, want 200", r.Code)
+	}
+	login(t, srv, "lane", "third-password-1")
 }
