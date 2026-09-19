@@ -30,7 +30,7 @@ import (
 	"github.com/mattn/go-isatty"
 )
 
-const version = "0.6.0"
+const version = "0.6.1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -639,8 +639,19 @@ func cmdConfig(args []string) error {
 			if v {
 				fmt.Println("courier will now install new releases automatically when found.")
 			}
+		case "relay":
+			u := strings.TrimSpace(args[2])
+			if !strings.HasPrefix(u, "https://") {
+				return fmt.Errorf("relay must be an https:// URL")
+			}
+			cfg.RelayURL = u
+			if err := cfg.Save(); err != nil {
+				return err
+			}
+			fmt.Printf("relay=%s\n", u)
+			fmt.Println("certificate pin unchanged; re-run with --repin only if the relay certificate itself changed.")
 		default:
-			return fmt.Errorf("unknown config key %q (settable: auto_update)", args[1])
+			return fmt.Errorf("unknown config key %q (settable: auto_update, relay)", args[1])
 		}
 	default:
 		return fmt.Errorf("usage: courier config [get <key>|set <key> <value>]")
