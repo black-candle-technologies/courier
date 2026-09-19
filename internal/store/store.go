@@ -53,6 +53,36 @@ CREATE TABLE IF NOT EXISTS keys (
 	x25519_pub TEXT NOT NULL,
 	epoch      INTEGER NOT NULL
 );
+
+-- v0.6.0: web dashboard accounts. One dashboard user per Courier address.
+-- password_hash is bcrypt; api_token_hash is SHA256 of the push token
+-- (the raw token is shown once at registration and never stored).
+CREATE TABLE IF NOT EXISTS dashboard_users (
+	id                INTEGER PRIMARY KEY AUTOINCREMENT,
+	username          TEXT NOT NULL UNIQUE,
+	password_hash     TEXT NOT NULL,
+	must_change       INTEGER NOT NULL DEFAULT 1,
+	courier_address   TEXT NOT NULL UNIQUE,
+	api_token_hash    TEXT NOT NULL UNIQUE,
+	created_at        INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE TABLE IF NOT EXISTS dashboard_sessions (
+	token_hash TEXT PRIMARY KEY,
+	user_id    INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
+	created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+	expires_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dashboard_messages (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id     INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
+	courier_id  INTEGER NOT NULL,
+	sender      TEXT NOT NULL,
+	body        TEXT NOT NULL,
+	sent_at     INTEGER NOT NULL,
+	received_at INTEGER NOT NULL,
+	UNIQUE(user_id, courier_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dashboard_messages_user ON dashboard_messages(user_id, courier_id);
 `
 
 // migrate adds columns introduced after the table was first created.
@@ -184,4 +214,141 @@ func (s *Store) GetKey(address string) (*KeyAnnouncement, error) {
 		return nil, err
 	}
 	return &k, nil
+}
+
+// ---- v0.6.0: dashboard ----
+
+// DashboardUser is one web-dashboard account.
+type DashboardUser struct {
+	ID             int64
+	Username       string
+	PasswordHash   string
+	MustChange     bool
+	CourierAddress string
+	APITokenHash   string
+	CreatedAt      int64
+}
+
+// CreateDashboardUser inserts a dashboard user. The caller hashes the
+// password (bcrypt) and the API token (SHA256) first.
+func (s *Store) CreateDashboardUser(username, passwordHash, courierAddress, apiTokenHash string) (*DashboardUser, error) {
+	res, err := s.db.Exec(
+		`INSERT INTO dashboard_users (username, password_hash, must_change, courier_address, api_token_hash)
+		 VALUES (?, ?, 1, ?, ?)`,
+		username, passwordHash, courierAddress, apiTokenHash,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create user: %w", err)
+	}
+	id, _ := res.LastInsertId()
+	return &DashboardUser{ID: id, Username: username, PasswordHash: passwordHash,
+		MustChange: true, CourierAddress: courierAddress, APITokenHash: apiTokenHash}, nil
+}
+
+func scanDashboardUser(row *sql.Row) (*DashboardUser, error) {
+	var u DashboardUser
+	var mustChange int
+	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &mustChange,
+		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	u.MustChange = mustChange != 0
+	return &u, nil
+}
+
+// DashboardUserByName looks up a user by username.
+func (s *Store) DashboardUserByName(username string) (*DashboardUser, error) {
+	return scanDashboardUser(s.db.QueryRow(
+		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at
+		 FROM dashboard_users WHERE username = ?`, username))
+}
+
+// DashboardUserByTokenHash looks up a user by the SHA256 of their API token.
+func (s *Store) DashboardUserByTokenHash(tokenHash string) (*DashboardUser, error) {
+	return scanDashboardUser(s.db.QueryRow(
+		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at
+		 FROM dashboard_users WHERE api_token_hash = ?`, tokenHash))
+}
+
+// SetDashboardPassword replaces the password hash and clears must_change.
+func (s *Store) SetDashboardPassword(userID int64, passwordHash string) error {
+	_, err := s.db.Exec(
+		`UPDATE dashboard_users SET password_hash = ?, must_change = 0 WHERE id = ?`,
+		passwordHash, userID)
+	return err
+}
+
+// CreateSession stores a login session token (by its SHA256 hash).
+func (s *Store) CreateSession(tokenHash string, userID int64, ttl time.Duration) error {
+	_, err := s.db.Exec(
+		`INSERT INTO dashboard_sessions (token_hash, user_id, expires_at)
+		 VALUES (?, ?, strftime('%s','now') + ?)`,
+		tokenHash, userID, int64(ttl.Seconds()))
+	return err
+}
+
+// SessionUser returns the user for a session token hash, or sql.ErrNoRows.
+func (s *Store) SessionUser(tokenHash string) (*DashboardUser, error) {
+	var u DashboardUser
+	var mustChange int
+	err := s.db.QueryRow(
+		`SELECT u.id, u.username, u.password_hash, u.must_change, u.courier_address, u.api_token_hash, u.created_at
+		 FROM dashboard_sessions s JOIN dashboard_users u ON u.id = s.user_id
+		 WHERE s.token_hash = ? AND s.expires_at > strftime('%s','now')`,
+		tokenHash).Scan(&u.ID, &u.Username, &u.PasswordHash, &mustChange,
+		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	u.MustChange = mustChange != 0
+	return &u, nil
+}
+
+// DeleteSession removes one session token.
+func (s *Store) DeleteSession(tokenHash string) error {
+	_, err := s.db.Exec(`DELETE FROM dashboard_sessions WHERE token_hash = ?`, tokenHash)
+	return err
+}
+
+// DashboardMessage is one decrypted agent message forwarded for the user.
+type DashboardMessage struct {
+	ID         int64
+	CourierID  int64
+	Sender     string
+	Body       string
+	SentAt     int64
+	ReceivedAt int64
+}
+
+// SaveDashboardMessage stores a pushed message; duplicates (same user +
+// courier id) are ignored.
+func (s *Store) SaveDashboardMessage(userID, courierID int64, sender, body string, sentAt, receivedAt int64) error {
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO dashboard_messages
+		 (user_id, courier_id, sender, body, sent_at, received_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		userID, courierID, sender, body, sentAt, receivedAt)
+	return err
+}
+
+// DashboardMessages returns the user's messages, newest first.
+func (s *Store) DashboardMessages(userID int64, limit int) ([]DashboardMessage, error) {
+	rows, err := s.db.Query(
+		`SELECT id, courier_id, sender, body, sent_at, received_at
+		 FROM dashboard_messages WHERE user_id = ? ORDER BY courier_id DESC LIMIT ?`,
+		userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DashboardMessage
+	for rows.Next() {
+		var m DashboardMessage
+		if err := rows.Scan(&m.ID, &m.CourierID, &m.Sender, &m.Body, &m.SentAt, &m.ReceivedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }

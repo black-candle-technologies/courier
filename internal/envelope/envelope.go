@@ -13,6 +13,11 @@ var domain = []byte("courier-envelope-sig-v1\x00")
 // envelope signatures: a signature for one can never validate as the other.
 var announceDomain = []byte("courier-key-announce-v1\x00")
 
+// dashboardRegisterDomain separates dashboard registration signatures
+// (v0.6.0+) from every other use of the identity key. Registering binds a
+// dashboard username to the Courier address that signed.
+var dashboardRegisterDomain = []byte("courier-dashboard-register-v1\x00")
+
 // Canonical returns the exact bytes covered by the sender's signature.
 // All fields except ct are fixed length, and ct is last, so the encoding
 // is unambiguous.
@@ -27,6 +32,20 @@ func Canonical(to, from, eph, nonce []byte, sentAt int64, ct []byte) []byte {
 	binary.BigEndian.PutUint64(ts[:], uint64(sentAt))
 	out = append(out, ts[:]...)
 	out = append(out, ct...)
+	return out
+}
+
+// DashboardRegister returns the exact bytes covered by a dashboard
+// registration signature (v0.6.0+): it binds a dashboard username to the
+// Courier address (Ed25519 identity) that will own the account. The
+// dashboard verifies this before creating the user, so only the holder of
+// the identity's private key can register that address.
+func DashboardRegister(username string, addressEd25519 []byte) []byte {
+	out := make([]byte, 0, len(dashboardRegisterDomain)+len(username)+1+32)
+	out = append(out, dashboardRegisterDomain...)
+	out = append(out, username...)
+	out = append(out, 0x00)
+	out = append(out, addressEd25519...) // 32 bytes Ed25519 (address key)
 	return out
 }
 

@@ -27,9 +27,10 @@ import (
 
 	"github.com/black-candle-technologies/courier/internal/client"
 	"github.com/black-candle-technologies/courier/internal/update"
+	"github.com/mattn/go-isatty"
 )
 
-const version = "0.5.0"
+const version = "0.6.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -65,6 +66,8 @@ func main() {
 		err = cmdPublishKey()
 	case "update":
 		err = cmdUpdate()
+	case "dashboard":
+		err = cmdDashboard(os.Args[2:])
 	case "config":
 		err = cmdConfig(os.Args[2:])
 	case "version", "--version", "-v":
@@ -96,6 +99,10 @@ func usage() {
   courier publish-key                    re-announce your encryption key
   courier update                         check for and install updates
   courier config set auto_update true    auto-install updates when found
+  courier dashboard setup [--username NAME]
+                                         create your web dashboard login
+  courier dashboard push [--follow]      forward new messages to the dashboard
+  courier dashboard status               show dashboard account status
   courier stdio                          JSON-lines bridge for agents
   courier serve [--listen 127.0.0.1:8471]
   courier version
@@ -170,7 +177,20 @@ func cmdInit(args []string) error {
 		fmt.Println("  " + fp)
 		fmt.Println("Verify this matches the published fingerprint in INSTALL.md.")
 	}
+	fmt.Println()
+	fmt.Println(dashboardSetupDirective())
 	return nil
+}
+
+// dashboardSetupDirective tells a fresh or freshly-updated agent how to
+// create its user's web dashboard login (v0.6.0+).
+func dashboardSetupDirective() string {
+	return `Next: set up your web dashboard login.
+  1. Ask your user to pick a login username.
+  2. Run:  courier dashboard setup --username <name>
+  3. Give the printed temporary password to your user — it is shown once
+     and must be changed on first login.
+  4. Keep messages flowing with:  courier dashboard push --follow`
 }
 
 func cmdAddress() error {
@@ -558,6 +578,12 @@ func cmdUpdate() error {
 		return err
 	}
 	fmt.Printf("updated to %s.\n", rel.Tag)
+	// v0.6.0+: agents arriving via the updater never ran the new `init`
+	// flow, so point them at dashboard setup too.
+	if cfg, err := client.LoadConfig(); err == nil && cfg.DashboardToken == "" {
+		fmt.Println()
+		fmt.Println(dashboardSetupDirective())
+	}
 	return nil
 }
 
@@ -613,5 +639,123 @@ func cmdConfig(args []string) error {
 	default:
 		return fmt.Errorf("usage: courier config [get <key>|set <key> <value>]")
 	}
+	return nil
+}
+
+// ---- v0.6.0: dashboard ----
+
+func cmdDashboard(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: courier dashboard <setup|push|status> ...")
+	}
+	switch args[0] {
+	case "setup":
+		return cmdDashboardSetup(args[1:])
+	case "push":
+		return cmdDashboardPush(args[1:])
+	case "status":
+		return cmdDashboardStatus()
+	default:
+		return fmt.Errorf("unknown dashboard subcommand %q (setup|push|status)", args[0])
+	}
+}
+
+// cmdDashboardSetup registers the dashboard user. The agent obtains a
+// username from its user, then runs this; it prints a temporary password
+// exactly once for the agent to hand to the user.
+func cmdDashboardSetup(args []string) error {
+	fs := flag.NewFlagSet("dashboard setup", flag.ContinueOnError)
+	username := fs.String("username", "", "dashboard login username (3-32 chars: a-z, 0-9, -, _)")
+	dashURL := fs.String("dashboard-url", "", "dashboard URL (default "+client.DefaultDashboardURL+")")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	name := *username
+	if name == "" {
+		if !isatty.IsTerminal(os.Stdin.Fd()) {
+			return fmt.Errorf("no --username given and stdin is not a terminal; re-run with --username <name>")
+		}
+		fmt.Print("Dashboard username for your user: ")
+		var line string
+		if _, err := fmt.Scanln(&line); err != nil {
+			return fmt.Errorf("could not read username: %w", err)
+		}
+		name = line
+	}
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return err
+	}
+	if *dashURL != "" {
+		cfg.DashboardURL = *dashURL
+	}
+	temp, err := client.New(cfg).DashboardSetup(name)
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+	fmt.Printf("Dashboard account created: %s\n", cfg.DashboardUser)
+	fmt.Printf("Login at: %s\n", cfg.DashboardURL)
+	fmt.Println()
+	fmt.Println("Temporary password — give this to your user now. It is never shown again")
+	fmt.Println("and must be changed on first login:")
+	fmt.Println()
+	fmt.Printf("  %s\n", temp)
+	fmt.Println()
+	fmt.Println("Then keep their messages flowing with:  courier dashboard push --follow")
+	return nil
+}
+
+// cmdDashboardPush forwards newly decrypted inbox messages to the
+// dashboard. With --follow it runs as a poller.
+func cmdDashboardPush(args []string) error {
+	fs := flag.NewFlagSet("dashboard push", flag.ContinueOnError)
+	follow := fs.Bool("follow", false, "keep polling for new messages")
+	interval := fs.Duration("interval", 30*time.Second, "poll interval with --follow")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return err
+	}
+	c := client.New(cfg)
+	pushOnce := func() error {
+		n, err := c.DashboardPush()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("pushed %d message(s) to the dashboard\n", n)
+		return nil
+	}
+	if err := pushOnce(); err != nil {
+		return err
+	}
+	if !*follow {
+		return nil
+	}
+	t := time.NewTicker(*interval)
+	defer t.Stop()
+	for range t.C {
+		if err := pushOnce(); err != nil {
+			fmt.Fprintf(os.Stderr, "dashboard push: %v\n", err)
+		}
+	}
+	return nil
+}
+
+func cmdDashboardStatus() error {
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.DashboardToken == "" {
+		fmt.Println("no dashboard account configured.")
+		fmt.Println("Run: courier dashboard setup --username <name>")
+		return nil
+	}
+	fmt.Printf("user:     %s\n", cfg.DashboardUser)
+	fmt.Printf("url:      %s\n", cfg.DashboardURL)
+	fmt.Printf("cursor:   %d (last pushed courier message id)\n", cfg.DashboardCursor)
 	return nil
 }

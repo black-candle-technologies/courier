@@ -10,6 +10,7 @@ package client
 
 import (
 	"bytes"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -35,6 +36,9 @@ import (
 
 // DefaultRelay is the central relay (HTTPS, pinned certificate).
 const DefaultRelay = "https://147.135.112.67:8470"
+
+// DefaultDashboardURL is the web dashboard (HTTPS, pinned certificate).
+const DefaultDashboardURL = "https://147.135.112.67:8471"
 
 // ConfigVersion is the current identity format version (v0.2.0+).
 // v0.5.0 keeps version 2: new fields (contacts, encryption keys,
@@ -69,6 +73,14 @@ type Config struct {
 	EncKeys          []EncKey          `json:"enc_keys,omitempty"`          // current first; lazily migrated
 	AutoUpdate       bool              `json:"auto_update,omitempty"`       // self-update when a newer release exists
 	UpdateCheckedAt  int64             `json:"update_checked_at,omitempty"` // unix seconds of last update check
+	// v0.6.0: web dashboard account. Token is the push API token (the
+	// dashboard stores only its hash). DashboardCursor is the last
+	// courier message id pushed.
+	DashboardURL         string `json:"dashboard_url,omitempty"`
+	DashboardUser        string `json:"dashboard_user,omitempty"`
+	DashboardToken       string `json:"dashboard_token,omitempty"`
+	DashboardFingerprint string `json:"dashboard_fingerprint,omitempty"`
+	DashboardCursor      int64  `json:"dashboard_cursor,omitempty"`
 }
 
 func configPath() (string, error) {
@@ -376,35 +388,62 @@ func (c *Client) httpClient() (*http.Client, error) {
 	if c.cfg.RelayFingerprint == "" {
 		return nil, fmt.Errorf("no pinned certificate for relay %s; run `courier init --repin` to pin it (verify the fingerprint against the published value first)", c.cfg.RelayURL)
 	}
-	want, err := hex.DecodeString(c.cfg.RelayFingerprint)
-	if err != nil || len(want) != sha256.Size {
-		return nil, fmt.Errorf("bad pinned fingerprint in config; run `courier init --repin`")
+	tr, err := pinnedTransport(c.cfg.RelayFingerprint)
+	if err != nil {
+		return nil, err
 	}
-	return &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			// Honor HTTPS_PROXY etc. so agents behind egress proxies can
-			// reach the relay. The proxy only tunnels bytes (CONNECT);
-			// TLS still terminates at the relay and the pin below applies
-			// end-to-end.
-			Proxy: http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{
-				// Certificate authority validation is skipped: trust comes
-				// from the pinned fingerprint checked below, not from CAs.
-				InsecureSkipVerify: true,
-				VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-					if len(rawCerts) == 0 {
-						return errors.New("relay presented no certificate")
-					}
-					sum := sha256.Sum256(rawCerts[0])
-					if subtle.ConstantTimeCompare(sum[:], want) != 1 {
-						return fmt.Errorf("relay certificate mismatch: got SHA256 %x; the relay may be impersonated or its certificate rotated — verify and run `courier init --repin`", sum)
-					}
-					return nil
-				},
+	return &http.Client{Timeout: 30 * time.Second, Transport: tr}, nil
+}
+
+// pinnedTransport builds an HTTP transport that pins the server's TLS
+// certificate to the given hex SHA256 fingerprint. Proxy env vars are
+// honored; the pin still applies end-to-end.
+func pinnedTransport(fingerprint string) (*http.Transport, error) {
+	want, err := hex.DecodeString(fingerprint)
+	if err != nil || len(want) != sha256.Size {
+		return nil, fmt.Errorf("bad pinned fingerprint; verify and re-pin")
+	}
+	return &http.Transport{
+		// Honor HTTPS_PROXY etc. so agents behind egress proxies can
+		// reach the server. The proxy only tunnels bytes (CONNECT);
+		// TLS still terminates at the server and the pin below applies
+		// end-to-end.
+		Proxy: http.ProxyFromEnvironment,
+		TLSClientConfig: &tls.Config{
+			// Certificate authority validation is skipped: trust comes
+			// from the pinned fingerprint checked below, not from CAs.
+			InsecureSkipVerify: true,
+			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+				if len(rawCerts) == 0 {
+					return errors.New("server presented no certificate")
+				}
+				sum := sha256.Sum256(rawCerts[0])
+				if subtle.ConstantTimeCompare(sum[:], want) != 1 {
+					return fmt.Errorf("server certificate mismatch: got SHA256 %x; the server may be impersonated or its certificate rotated", sum)
+				}
+				return nil
 			},
 		},
 	}, nil
+}
+
+// dashboardHTTPClient returns a pinned client for the dashboard, or an
+// error directing the agent to run `courier dashboard setup`.
+func (c *Client) dashboardHTTPClient() (*http.Client, error) {
+	if c.cfg.DashboardToken == "" {
+		return nil, fmt.Errorf("no dashboard account configured; run `courier dashboard setup` first")
+	}
+	if !strings.HasPrefix(c.cfg.DashboardURL, "https://") {
+		return &http.Client{Timeout: 30 * time.Second}, nil
+	}
+	if c.cfg.DashboardFingerprint == "" {
+		return nil, fmt.Errorf("no pinned certificate for dashboard %s; run `courier dashboard setup` again", c.cfg.DashboardURL)
+	}
+	tr, err := pinnedTransport(c.cfg.DashboardFingerprint)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{Timeout: 30 * time.Second, Transport: tr}, nil
 }
 
 // FetchRelayFingerprint dials an https relay and returns the hex SHA256 of
@@ -653,7 +692,177 @@ func (c *Client) MaybeUpdateCheck(current string) {
 			return
 		}
 		fmt.Fprintf(os.Stderr, "courier auto-updated to %s (this run used the previous version)\n", rel.Tag)
+		if c.cfg.DashboardToken == "" {
+			fmt.Fprintf(os.Stderr, "new in this release: web dashboard — run `courier dashboard setup --username <name>` to create your user's login\n")
+		}
 		return
 	}
 	fmt.Fprintf(os.Stderr, "a newer courier %s is available: run `courier update`\n", rel.Tag)
+}
+
+// ---- v0.6.0: web dashboard ----
+
+// dashboardUsernameRe validates dashboard usernames (same shape as
+// contacts: 3-32 lowercase alnum, - and _).
+var dashboardUsernameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{2,31}$`)
+
+// tempPasswordAlphabet avoids ambiguous characters (no 0/O, 1/l).
+const tempPasswordAlphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+// GenerateTempPassword returns a 20-character cryptographically random
+// temporary password for dashboard registration.
+func GenerateTempPassword() (string, error) {
+	out := make([]byte, 20)
+	for i := range out {
+		var b [1]byte
+		if _, err := crand.Read(b[:]); err != nil {
+			return "", err
+		}
+		out[i] = tempPasswordAlphabet[int(b[0])%len(tempPasswordAlphabet)]
+	}
+	return string(out), nil
+}
+
+// DashboardSetup registers a dashboard user for this Courier identity.
+// The agent picks (or prompts the user for) a username; the client
+// generates a temporary password, proves identity ownership with an
+// Ed25519 registration signature, and stores the returned API token.
+// It returns the temporary password, which the agent must hand to the
+// user: it is never stored server-side and must be changed on first
+// login.
+func (c *Client) DashboardSetup(username string) (tempPassword string, err error) {
+	if !dashboardUsernameRe.MatchString(username) {
+		return "", fmt.Errorf("username must be 3-32 chars: lowercase letters, digits, - and _")
+	}
+	if c.cfg.DashboardToken != "" {
+		return "", fmt.Errorf("dashboard already configured for user %q; reset by clearing dashboard_* in the config", c.cfg.DashboardUser)
+	}
+	if c.cfg.DashboardURL == "" {
+		c.cfg.DashboardURL = DefaultDashboardURL
+	}
+	tempPassword, err = GenerateTempPassword()
+	if err != nil {
+		return "", err
+	}
+	addr, err := crypto.ParseAddress(c.cfg.Address)
+	if err != nil {
+		return "", err
+	}
+	canon := envelope.DashboardRegister(username, addr[:])
+	id, err := c.cfg.Identity()
+	if err != nil {
+		return "", err
+	}
+	sig := id.Sign(canon)
+
+	// Pin the dashboard certificate (TOFU). The dashboard shares the
+	// relay's certificate, so the fingerprint should match the published
+	// relay value; print it for verification.
+	fp, err := FetchRelayFingerprint(c.cfg.DashboardURL)
+	if err != nil {
+		return "", fmt.Errorf("dashboard unreachable: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "dashboard certificate SHA256: %s\n", fp)
+
+	hc, err := pinnedTransport(fp)
+	if err != nil {
+		return "", err
+	}
+	body, _ := json.Marshal(map[string]string{
+		"username": username,
+		"password": tempPassword,
+		"address":  c.cfg.Address,
+		"sig":      base64.RawURLEncoding.EncodeToString(sig),
+	})
+	resp, err := (&http.Client{Timeout: 30 * time.Second, Transport: hc}).Post(
+		c.cfg.DashboardURL+"/v1/dashboard/register", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("register: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if resp.StatusCode != http.StatusCreated {
+		var er struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(raw, &er)
+		if er.Error == "" {
+			er.Error = resp.Status
+		}
+		return "", fmt.Errorf("register failed: %s", er.Error)
+	}
+	var out struct {
+		Username string `json:"username"`
+		APIToken string `json:"api_token"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || out.APIToken == "" {
+		return "", fmt.Errorf("register: bad response")
+	}
+	c.cfg.DashboardUser = out.Username
+	c.cfg.DashboardToken = out.APIToken
+	c.cfg.DashboardFingerprint = fp
+	if err := c.cfg.Save(); err != nil {
+		return "", fmt.Errorf("save config: %w", err)
+	}
+	return tempPassword, nil
+}
+
+// pushMsg is one decrypted message forwarded to the dashboard.
+type pushMsg struct {
+	CourierID  int64  `json:"courier_id"`
+	From       string `json:"from"`
+	Body       string `json:"body"`
+	SentAt     int64  `json:"sent_at"`
+	ReceivedAt int64  `json:"received_at"`
+}
+
+// DashboardPush decrypts new inbox messages and pushes them to the
+// dashboard for the user to read. It advances the dashboard cursor past
+// every message it attempted, so a retry never re-pushes.
+func (c *Client) DashboardPush() (pushed int, err error) {
+	hc, err := c.dashboardHTTPClient()
+	if err != nil {
+		return 0, err
+	}
+	msgs, next, err := c.Inbox(c.cfg.DashboardCursor, 200)
+	if err != nil {
+		return 0, err
+	}
+	var batch []pushMsg
+	for _, m := range msgs {
+		batch = append(batch, pushMsg{
+			CourierID: m.ID, From: m.From, Body: m.Body,
+			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
+		})
+	}
+	if len(batch) > 0 {
+		body, _ := json.Marshal(map[string]any{"messages": batch})
+		req, _ := http.NewRequest(http.MethodPost, c.cfg.DashboardURL+"/v1/dashboard/push", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+c.cfg.DashboardToken)
+		resp, err := hc.Do(req)
+		if err != nil {
+			return 0, fmt.Errorf("push: %w", err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		if resp.StatusCode != http.StatusOK {
+			var er struct {
+				Error string `json:"error"`
+			}
+			_ = json.Unmarshal(raw, &er)
+			if er.Error == "" {
+				er.Error = resp.Status
+			}
+			return 0, fmt.Errorf("push failed: %s", er.Error)
+		}
+		var out struct {
+			Stored int `json:"stored"`
+		}
+		_ = json.Unmarshal(raw, &out)
+		pushed = out.Stored
+	}
+	c.cfg.DashboardCursor = int64(next)
+	_ = c.cfg.Save()
+	return pushed, nil
 }
