@@ -22,6 +22,11 @@ const MaxCiphertextBytes = 256 * 1024
 // MaxInboxLimit caps one inbox page.
 const MaxInboxLimit = 200
 
+// MaxInboxPageBytes caps one inbox page by encoded size (v0.6.11 F8).
+// Pages were bounded by message count only, so large ciphertexts could
+// exceed the client's 8 MiB read limit. 1 MiB leaves ample headroom.
+const MaxInboxPageBytes = 1 << 20
+
 // Server is the relay HTTP server.
 type Server struct {
 	store *store.Store
@@ -269,7 +274,15 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 		Sig        string `json:"sig"`
 	}
 	out := make([]msg, 0, len(envs))
+	var size int
 	for _, e := range envs {
+		// Bound the page by encoded bytes (v0.6.11 F8): the base64url
+		// fields plus JSON overhead per message. Always return at
+		// least one message; pagination continues via after=lastID.
+		size += len(e.From) + len(e.Eph) + len(e.Nonce) + len(e.Ct) + len(e.Sig) + 128
+		if size > MaxInboxPageBytes && len(out) > 0 {
+			break
+		}
 		out = append(out, msg{
 			ID: e.ID, From: e.From, Eph: e.Eph, Nonce: e.Nonce,
 			Ct: e.Ct, SentAt: e.SentAt, ReceivedAt: e.ReceivedAt, Sig: e.Sig,
