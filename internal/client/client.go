@@ -714,8 +714,22 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, error) {
 	if err != nil {
 		return nil, after, 0, err
 	}
-	url := fmt.Sprintf("%s/v1/inbox?to=%s&after=%d&limit=%d",
-		c.cfg.RelayURL, c.cfg.Address, after, limit)
+	id, err := c.cfg.Identity()
+	if err != nil {
+		return nil, after, 0, err
+	}
+	toEd, err := crypto.ParseAddress(c.cfg.Address)
+	if err != nil {
+		return nil, after, 0, fmt.Errorf("bad address: %w", err)
+	}
+	// v0.6.11 (F10): the inbox request is signed by the recipient, so
+	// the relay serves ciphertext only to the address owner. after and
+	// limit are covered by the signature to prevent cursor tampering.
+	ts := time.Now().Unix()
+	sig := id.Sign(envelope.InboxRequest(toEd[:], after, int64(limit), ts))
+	url := fmt.Sprintf("%s/v1/inbox?to=%s&after=%d&limit=%d&ts=%d&sig=%s",
+		c.cfg.RelayURL, c.cfg.Address, after, limit, ts,
+		base64.RawURLEncoding.EncodeToString(sig))
 	resp, err := hc.Get(url)
 	if err != nil {
 		return nil, after, 0, fmt.Errorf("relay unreachable: %w", err)

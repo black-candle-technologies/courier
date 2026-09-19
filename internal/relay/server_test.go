@@ -72,7 +72,7 @@ func TestSendAndInboxRoundtrip(t *testing.T) {
 		t.Fatalf("send: got %d, body %s", rec.Code, rec.Body.String())
 	}
 
-	req := httptest.NewRequest("GET", "/v1/inbox?to="+crypto.FormatAddress(bob.EdPub[:]), nil)
+	req := httptest.NewRequest("GET", signedInboxURL(t, bob, 0, 50), nil)
 	inrec := httptest.NewRecorder()
 	srv.Routes().ServeHTTP(inrec, req)
 	if inrec.Code != http.StatusOK {
@@ -296,7 +296,7 @@ func TestSendReplayIsIdempotent(t *testing.T) {
 		t.Fatalf("replay not idempotent: %+v vs %+v", s, f)
 	}
 
-	req := httptest.NewRequest("GET", "/v1/inbox?to="+crypto.FormatAddress(bob.EdPub[:]), nil)
+	req := httptest.NewRequest("GET", signedInboxURL(t, bob, 0, 50), nil)
 	inrec := httptest.NewRecorder()
 	srv.Routes().ServeHTTP(inrec, req)
 	var out struct {
@@ -316,7 +316,6 @@ func TestInboxPageBoundedByBytes(t *testing.T) {
 	srv := testServer(t)
 	alice, _ := crypto.GenerateIdentity()
 	bob, _ := crypto.GenerateIdentity()
-	bobAddr := crypto.FormatAddress(bob.EdPub[:])
 
 	// Ten large envelopes (~190 KiB plaintext each, ~260 KiB encoded —
 	// near the 256 KiB per-message cap, within the send body limit). A
@@ -334,8 +333,7 @@ func TestInboxPageBoundedByBytes(t *testing.T) {
 	var total, pages int
 	var after int64
 	for {
-		req := httptest.NewRequest("GET",
-			fmt.Sprintf("/v1/inbox?to=%s&after=%d&limit=200", bobAddr, after), nil)
+		req := httptest.NewRequest("GET", signedInboxURL(t, bob, after, 200), nil)
 		rec := httptest.NewRecorder()
 		srv.Routes().ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
@@ -368,5 +366,83 @@ func TestInboxPageBoundedByBytes(t *testing.T) {
 	}
 	if pages < 2 {
 		t.Fatalf("expected multiple pages for large envelopes, got %d", pages)
+	}
+}
+
+// signedInboxURL builds a /v1/inbox URL carrying a valid recipient
+// signature (v0.6.11 F10).
+func signedInboxURL(t *testing.T, id *crypto.Identity, after int64, limit int) string {
+	t.Helper()
+	ts := time.Now().Unix()
+	sig := id.Sign(envelope.InboxRequest(id.EdPub[:], after, int64(limit), ts))
+	return fmt.Sprintf("/v1/inbox?to=%s&after=%d&limit=%d&ts=%d&sig=%s",
+		crypto.FormatAddress(id.EdPub[:]), after, limit, ts, b64.EncodeToString(sig))
+}
+
+func inboxStatus(t *testing.T, srv *Server, rawURL string) int {
+	t.Helper()
+	req := httptest.NewRequest("GET", rawURL, nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	return rec.Code
+}
+
+func TestInboxRejectsUnsigned(t *testing.T) {
+	srv := testServer(t)
+	id, _ := crypto.GenerateIdentity()
+	u := "/v1/inbox?to=" + crypto.FormatAddress(id.EdPub[:]) + "&after=0&limit=50"
+	if code := inboxStatus(t, srv, u); code != http.StatusBadRequest {
+		t.Fatalf("unsigned inbox request: got %d, want 400", code)
+	}
+}
+
+func TestInboxRejectsForgedSignature(t *testing.T) {
+	srv := testServer(t)
+	alice, _ := crypto.GenerateIdentity()
+	bob, _ := crypto.GenerateIdentity()
+	// Request for bob's inbox, signed by alice's key.
+	ts := time.Now().Unix()
+	sig := alice.Sign(envelope.InboxRequest(bob.EdPub[:], 0, 50, ts))
+	u := fmt.Sprintf("/v1/inbox?to=%s&after=0&limit=50&ts=%d&sig=%s",
+		crypto.FormatAddress(bob.EdPub[:]), ts, b64.EncodeToString(sig))
+	if code := inboxStatus(t, srv, u); code != http.StatusUnauthorized {
+		t.Fatalf("forged inbox signature: got %d, want 401", code)
+	}
+}
+
+func TestInboxRejectsStaleTimestamp(t *testing.T) {
+	srv := testServer(t)
+	id, _ := crypto.GenerateIdentity()
+	ts := time.Now().Unix() - 600
+	sig := id.Sign(envelope.InboxRequest(id.EdPub[:], 0, 50, ts))
+	u := fmt.Sprintf("/v1/inbox?to=%s&after=0&limit=50&ts=%d&sig=%s",
+		crypto.FormatAddress(id.EdPub[:]), ts, b64.EncodeToString(sig))
+	if code := inboxStatus(t, srv, u); code != http.StatusBadRequest {
+		t.Fatalf("stale inbox timestamp: got %d, want 400", code)
+	}
+}
+
+func TestInboxRejectsFutureTimestamp(t *testing.T) {
+	srv := testServer(t)
+	id, _ := crypto.GenerateIdentity()
+	ts := time.Now().Unix() + 600
+	sig := id.Sign(envelope.InboxRequest(id.EdPub[:], 0, 50, ts))
+	u := fmt.Sprintf("/v1/inbox?to=%s&after=0&limit=50&ts=%d&sig=%s",
+		crypto.FormatAddress(id.EdPub[:]), ts, b64.EncodeToString(sig))
+	if code := inboxStatus(t, srv, u); code != http.StatusBadRequest {
+		t.Fatalf("future inbox timestamp: got %d, want 400", code)
+	}
+}
+
+func TestInboxRejectsTamperedCursor(t *testing.T) {
+	srv := testServer(t)
+	id, _ := crypto.GenerateIdentity()
+	ts := time.Now().Unix()
+	// Signed for after=0, requested with after=5.
+	sig := id.Sign(envelope.InboxRequest(id.EdPub[:], 0, 50, ts))
+	u := fmt.Sprintf("/v1/inbox?to=%s&after=5&limit=50&ts=%d&sig=%s",
+		crypto.FormatAddress(id.EdPub[:]), ts, b64.EncodeToString(sig))
+	if code := inboxStatus(t, srv, u); code != http.StatusUnauthorized {
+		t.Fatalf("tampered inbox cursor: got %d, want 401", code)
 	}
 }

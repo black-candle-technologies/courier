@@ -22,6 +22,30 @@ var announceDomain = []byte("courier-key-announce-v1\x00")
 // dashboard username to the Courier address that signed.
 var dashboardRegisterDomain = []byte("courier-dashboard-register-v1\x00")
 
+// inboxRequestDomain separates inbox-request signatures (v0.6.11+) from
+// every other use of the identity key: a signature for one can never
+// validate as another.
+var inboxRequestDomain = []byte("courier-inbox-req-v1\x00")
+
+// InboxRequest builds the canonical bytes a recipient signs to authorize
+// reading their own inbox (v0.6.11, F10). The relay verifies the
+// signature against the requested address, so only the address owner can
+// read their ciphertext and metadata. ts is unix seconds; the relay
+// enforces a freshness window.
+func InboxRequest(address []byte, after, limit, ts int64) []byte {
+	out := make([]byte, 0, len(inboxRequestDomain)+32+8+8+8)
+	out = append(out, inboxRequestDomain...)
+	out = append(out, address...) // 32 bytes Ed25519 (recipient address)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(after))
+	out = append(out, b[:]...)
+	binary.BigEndian.PutUint64(b[:], uint64(limit))
+	out = append(out, b[:]...)
+	binary.BigEndian.PutUint64(b[:], uint64(ts))
+	out = append(out, b[:]...)
+	return out
+}
+
 // Canonical returns the exact bytes covered by the sender's signature.
 // All fields except ct are fixed length, and ct is last, so the encoding
 // is unambiguous.

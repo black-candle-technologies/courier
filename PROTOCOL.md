@@ -89,7 +89,7 @@ forged envelopes with `400`.
 
 ## Inbox
 
-`GET /v1/inbox?to=<address>&after=<id>&limit=<n>` →
+`GET /v1/inbox?to=<address>&after=<id>&limit=<n>&ts=<unix>&sig=<base64url>` →
 
 ```json
 {
@@ -107,8 +107,19 @@ forged envelopes with `400`.
 }
 ```
 
+v0.6.11+: inbox reads require a recipient-signed request (F10). `sig` is
+the requester's Ed25519 signature over
+`envelope.InboxRequest(address, after, limit, ts)` (domain
+`courier-inbox-req-v1`), and the relay verifies it against the `to`
+address key — so only the address owner can read their ciphertext and
+metadata. `ts` must be within 300 seconds of relay time; unsigned,
+forged, or stale requests are rejected (`400`/`401`). The signature
+covers the cursor and limit to prevent tampering.
+
 Messages are ordered oldest-first, `id` is monotonic per relay. Clients
 decrypt locally with their private key and the envelope's ephemeral key.
+Pages are additionally bounded to 1 MiB of encoded output (v0.6.11 F8);
+use `after=<last id seen>` to page through.
 
 `GET /v1/health` → `{"ok": true, "time": "...", "envelopes": N}`.
 
