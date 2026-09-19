@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
@@ -523,5 +524,45 @@ func TestInboxAdvancesPastUndecryptable(t *testing.T) {
 	}
 	if lastID != 9 {
 		t.Fatalf("lastID = %d, want 9 (highest inspected envelope)", lastID)
+	}
+}
+
+func TestInboxSendsSignedRequest(t *testing.T) {
+	cfg := testConfig(t)
+	var gotQ url.Values
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQ = r.URL.Query()
+		w.Write([]byte(`{"messages":[]}`))
+	}))
+	t.Cleanup(ts.Close)
+	cfg.RelayURL = ts.URL
+	cl := New(cfg)
+
+	if _, _, _, err := cl.Inbox(7, 25); err != nil {
+		t.Fatal(err)
+	}
+	if gotQ.Get("to") != cfg.Address || gotQ.Get("after") != "7" || gotQ.Get("limit") != "25" {
+		t.Fatalf("bad query params: %v", gotQ)
+	}
+	toEd, err := crypto.ParseAddress(cfg.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ts64 int64
+	if _, err := fmt.Sscanf(gotQ.Get("ts"), "%d", &ts64); err != nil {
+		t.Fatalf("bad ts param: %v", gotQ.Get("ts"))
+	}
+	if now := time.Now().Unix(); ts64 < now-10 || ts64 > now+10 {
+		t.Fatalf("ts not fresh: %d", ts64)
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(gotQ.Get("sig"))
+	if err != nil || len(sig) != 64 {
+		t.Fatalf("bad sig param: %q", gotQ.Get("sig"))
+	}
+	// The signature must verify against the client's own address key
+	// over the exact requested parameters.
+	canon := envelope.InboxRequest(toEd[:], 7, 25, ts64)
+	if !crypto.Verify(toEd[:], canon, sig) {
+		t.Fatal("client inbox signature does not verify")
 	}
 }

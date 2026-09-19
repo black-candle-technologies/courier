@@ -27,6 +27,11 @@ const MaxInboxLimit = 200
 // exceed the client's 8 MiB read limit. 1 MiB leaves ample headroom.
 const MaxInboxPageBytes = 1 << 20
 
+// maxInboxRequestAge bounds the inbox-request timestamp: the relay
+// rejects requests older or newer than 300 seconds (v0.6.11 F10), so a
+// captured signed request cannot be replayed indefinitely.
+const maxInboxRequestAge = 300
+
 // Server is the relay HTTP server.
 type Server struct {
 	store *store.Store
@@ -233,7 +238,8 @@ func (s *Server) handleKeyLookup(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	to := q.Get("to")
-	if _, err := parseAddress(to); err != nil {
+	toEd, err := parseAddress(to)
+	if err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"to" query param: %v`, err))
 		return
 	}
@@ -256,6 +262,34 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	}
 	if limit > MaxInboxLimit {
 		limit = MaxInboxLimit
+	}
+
+	// v0.6.11 (F10): inbox reads require a recipient-signed request, so
+	// only the address owner can read their ciphertext and metadata.
+	// The signature covers the requested address, cursor, limit, and a
+	// timestamp, and is verified against the "to" address key — which
+	// also binds the requester to the address they are reading.
+	var ts int64
+	if t := q.Get("ts"); t == "" {
+		writeErr(w, http.StatusBadRequest, `"ts" query param is required`)
+		return
+	} else if _, err := fmt.Sscanf(t, "%d", &ts); err != nil {
+		writeErr(w, http.StatusBadRequest, `"ts" must be a unix timestamp`)
+		return
+	}
+	if now := time.Now().Unix(); ts < now-maxInboxRequestAge || ts > now+maxInboxRequestAge {
+		writeErr(w, http.StatusBadRequest, `"ts" is outside the freshness window`)
+		return
+	}
+	sigRaw, err := base64.RawURLEncoding.DecodeString(q.Get("sig"))
+	if err != nil || len(sigRaw) != 64 {
+		writeErr(w, http.StatusUnauthorized, `"sig" must be a base64url Ed25519 signature`)
+		return
+	}
+	canon := envelope.InboxRequest(toEd[:], after, int64(limit), ts)
+	if !crypto.Verify(toEd[:], canon, sigRaw) {
+		writeErr(w, http.StatusUnauthorized, "inbox request signature verification failed")
+		return
 	}
 
 	envs, err := s.store.List(to, after, limit)
