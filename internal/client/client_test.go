@@ -447,7 +447,7 @@ func TestInboxSuppressesReplayedEnvelopes(t *testing.T) {
 	h := envelope.DedupHash(cfg.Address, "ed25519:from", "eph", "nonce", sentAt, "ct", "sig")
 	cfg.SeenEnvelopeHashes = []string{h}
 
-	msgs, skipped, err := cl.Inbox(0, 100)
+	msgs, _, skipped, err := cl.Inbox(0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,7 +465,7 @@ func TestInboxDoesNotMarkUndeliveredSeen(t *testing.T) {
 
 	// The canned message fails address parsing, so it is dropped — and
 	// must NOT be recorded as seen (it may become readable later).
-	msgs, skipped, err := cl.Inbox(0, 100)
+	msgs, _, skipped, err := cl.Inbox(0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -496,5 +496,32 @@ func TestRecordSeenEnvelopesBounded(t *testing.T) {
 	cl.recordSeenEnvelopes([]string{"hash-10"})
 	if len(cfg.SeenEnvelopeHashes) != maxSeenEnvelopeHashes {
 		t.Fatalf("duplicate grew the set: %d", len(cfg.SeenEnvelopeHashes))
+	}
+}
+
+func TestInboxAdvancesPastUndecryptable(t *testing.T) {
+	cfg := testConfig(t)
+	// Two undecryptable messages (bad from address): nothing decrypts,
+	// but the cursor must still advance past both (F4).
+	two := `{"messages":[` +
+		`{"id":7,"from":"ed25519:bad1","eph":"e","nonce":"n","ct":"c","sent_at":1700000000,"received_at":1700000000,"sig":"s"},` +
+		`{"id":9,"from":"ed25519:bad2","eph":"e","nonce":"n","ct":"c","sent_at":1700000000,"received_at":1700000000,"sig":"s"}]}`
+
+	ts := cannedInboxServer(t, two)
+	cfg.RelayURL = ts.URL
+	cl := New(cfg)
+
+	msgs, lastID, skipped, err := cl.Inbox(0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("want 0 messages, got %d", len(msgs))
+	}
+	if skipped != 2 {
+		t.Fatalf("want 2 skipped, got %d", skipped)
+	}
+	if lastID != 9 {
+		t.Fatalf("lastID = %d, want 9 (highest inspected envelope)", lastID)
 	}
 }

@@ -702,21 +702,28 @@ type Message struct {
 // Inbox fetches envelopes addressed to this agent after message id `after`,
 // verifies each sender signature, and decrypts. Envelopes that fail
 // verification or decryption are skipped and counted, never fatal.
-func (c *Client) Inbox(after int64, limit int) ([]Message, int, error) {
+//
+// It returns the decrypted messages, the highest envelope id inspected
+// in this page (lastID), and the skip count. lastID advances past every
+// inspected envelope — including undecryptable or replayed ones — so
+// callers must persist it as their cursor: a page of only undecryptable
+// messages must not wedge pagination (v0.6.11 F4). lastID is at least
+// `after`.
+func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, error) {
 	hc, err := c.httpClient()
 	if err != nil {
-		return nil, 0, err
+		return nil, after, 0, err
 	}
 	url := fmt.Sprintf("%s/v1/inbox?to=%s&after=%d&limit=%d",
 		c.cfg.RelayURL, c.cfg.Address, after, limit)
 	resp, err := hc.Get(url)
 	if err != nil {
-		return nil, 0, fmt.Errorf("relay unreachable: %w", err)
+		return nil, after, 0, fmt.Errorf("relay unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, 0, relayErr(data)
+		return nil, after, 0, relayErr(data)
 	}
 	var in struct {
 		Messages []struct {
@@ -731,13 +738,20 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int, error) {
 		} `json:"messages"`
 	}
 	if err := json.Unmarshal(data, &in); err != nil {
-		return nil, 0, fmt.Errorf("bad relay response: %w", err)
+		return nil, after, 0, fmt.Errorf("bad relay response: %w", err)
 	}
 	var out []Message
 	skipped := 0
+	lastID := after
 	var newHashes []string
 	seen := c.seenEnvelopeSet()
 	for _, m := range in.Messages {
+		// Track the highest inspected envelope id regardless of
+		// outcome: the cursor must advance past undecryptable and
+		// replayed messages too (v0.6.11 F4).
+		if m.ID > lastID {
+			lastID = m.ID
+		}
 		// v0.6.11 (F3): suppress replays independently of relay message
 		// ids — identical envelope bytes are never delivered twice.
 		h := envelope.DedupHash(c.cfg.Address, m.From, m.Eph, m.Nonce, m.SentAt, m.Ct, m.Sig)
@@ -793,7 +807,7 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int, error) {
 		newHashes = append(newHashes, h)
 	}
 	c.recordSeenEnvelopes(newHashes)
-	return out, skipped, nil
+	return out, lastID, skipped, nil
 }
 
 // maxSeenEnvelopeHashes bounds the client-side replay-suppression set.
@@ -1055,7 +1069,7 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 	if err != nil {
 		return 0, err
 	}
-	msgs, _, err := c.Inbox(c.cfg.DashboardCursor, 200)
+	msgs, lastID, _, err := c.Inbox(c.cfg.DashboardCursor, 200)
 	if err != nil {
 		return 0, err
 	}
@@ -1109,9 +1123,11 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 		_ = json.Unmarshal(raw, &out)
 		pushed = out.Stored
 	}
-	// Advance past every message attempted: inbox order is ascending by id.
-	if len(msgs) > 0 {
-		c.cfg.DashboardCursor = msgs[len(msgs)-1].ID
+	// Advance past every message attempted — including undecryptable
+	// ones, so a poisoned page never wedges the push cursor (v0.6.11
+	// F4). Inbox order is ascending by id, so lastID is monotonic.
+	if lastID > c.cfg.DashboardCursor {
+		c.cfg.DashboardCursor = lastID
 	}
 	if sentMax > c.cfg.DashboardSentCursor {
 		c.cfg.DashboardSentCursor = sentMax
