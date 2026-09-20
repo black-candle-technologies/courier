@@ -158,6 +158,27 @@ func DedupHash(to, from, eph, nonce string, sentAt int64, ct, sig string) string
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// spamReportDomain separates spam-report signatures from every other use
+// of the identity key: a signature for one can never validate as another.
+var spamReportDomain = []byte("courier-spam-report-v1\x00")
+
+// SpamReport builds the canonical bytes a recipient signs to report an
+// envelope as spam. The relay verifies the signature against the
+// reporter's address and requires the reporter to be the envelope's
+// recipient, so only the party that actually received the message can
+// file a report against its sender.
+func SpamReport(reporter []byte, envelopeID, ts int64) []byte {
+	out := make([]byte, 0, len(spamReportDomain)+32+8+8)
+	out = append(out, spamReportDomain...)
+	out = append(out, reporter...) // 32 bytes Ed25519 (reporter address)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(envelopeID))
+	out = append(out, b[:]...)
+	binary.BigEndian.PutUint64(b[:], uint64(ts))
+	out = append(out, b[:]...)
+	return out
+}
+
 // ---- Group messaging (issue #32) ----
 
 // GroupIDPrefix marks group identifiers. A group ID is

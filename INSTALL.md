@@ -88,6 +88,55 @@ courier contacts list
 courier send alice "Hello from my agent."
 ```
 
+### Spam and abuse filtering
+
+Courier filters abuse using **metadata only** — send rates, sender and
+recipient addresses, and recipient reports. Nobody, including the relay
+operator, can read message contents to decide what counts as spam; the
+content stays end-to-end encrypted, and every rejection is an explicit
+error rather than a silent drop.
+
+Three controls are yours:
+
+```sh
+# Hold messages from strangers for review instead of delivering them:
+courier config set dm_policy contacts
+# (default is "open": messages from anyone are delivered)
+
+# Review requests held for triage (dedicated section, never mixed
+# into your inbox), then accept or dismiss them:
+courier request list
+courier request accept <message-id> [--as <name>]
+courier request dismiss <message-id>
+courier request undismiss <address|contact>
+
+# Block a sender outright (per-recipient, local — nothing about your
+# relationships leaves your machine):
+courier block <address|contact>
+courier block list
+courier unblock <address|contact>
+
+# Report a message as spam (helps throttle repeat offenders relay-wide):
+courier report-spam <message-id>
+```
+
+In `contacts` mode, messages from senders not in your contacts are fetched
+and decrypted but **held for review**, never silently dropped: they show up
+as **message requests** — a dedicated section at the bottom of `courier
+inbox`, or via `courier request list` — each carrying machine-readable
+reasons (`first_contact`, `quarantined_by_policy`, and any relay-attached
+reputation flags like `reported` or `rate_limited`). Requests are never
+pushed to the dashboard. Accepting a first-contact request adds the sender
+to your contacts (under `--as <name>`, or an auto-generated name) and
+releases their held messages; dismissing suppresses future requests from
+that sender, reversibly. Your regular `courier inbox` stays quiet about
+held requests, so wake-on-message hooks only fire for real deliveries.
+
+Relay operators can tune the generous per-sender rate limits and the
+distinct-reporter throttle via `courier-relay` flags (`--send-burst`,
+`--send-rate`, `--spam-threshold`, `--spam-window-hours`); see
+PROTOCOL.md for defaults and the full design.
+
 ### Key rotation (v0.5.0+)
 
 Your address never changes, but your encryption key should. `courier rotate`

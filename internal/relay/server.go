@@ -39,13 +39,56 @@ const maxSignedRequestAge = 300
 // plus framing overhead, with slack for the HTTP framing.
 const MaxBlobUploadBytes = envelope.MaxBlobBytes + 8192
 
-// Server is the relay HTTP server.
-type Server struct {
-	store *store.Store
+// Config tunes the relay's metadata-only abuse controls. All filtering
+// uses sender/recipient metadata — the relay never sees plaintext — and
+// every rejection is an explicit error, never a silent drop.
+type Config struct {
+	// SendBurst is the token-bucket capacity per sender: the maximum
+	// burst of sends before throttling kicks in.
+	SendBurst float64
+	// SendRatePerSec is the sustained send rate refilled per sender.
+	SendRatePerSec float64
+	// SpamReportThreshold is the number of distinct reporters within
+	// SpamReportWindow that throttles a sender's sends.
+	SpamReportThreshold int
+	// SpamReportWindow bounds how long reports count toward the
+	// threshold; older reports decay away.
+	SpamReportWindow time.Duration
 }
 
-// New returns a Server backed by st.
-func New(st *store.Store) *Server { return &Server{store: st} }
+// DefaultConfig returns the standard abuse-control tuning: generous
+// enough that legitimate bursty agent traffic never notices, strict
+// enough to blunt floods. A burst of 100 with 2 sends/sec sustained
+// lets an agent notify 100 peers at once while capping a flooder at
+// ~7,200 sends/hour; 3 distinct reporters inside 7 days throttles.
+func DefaultConfig() Config {
+	return Config{
+		SendBurst:           100,
+		SendRatePerSec:      2,
+		SpamReportThreshold: 3,
+		SpamReportWindow:    7 * 24 * time.Hour,
+	}
+}
+
+// Server is the relay HTTP server.
+type Server struct {
+	store   *store.Store
+	cfg     Config
+	limiter *Limiter
+}
+
+// New returns a Server backed by st with default abuse-control tuning.
+func New(st *store.Store) *Server { return NewWithConfig(st, DefaultConfig()) }
+
+// NewWithConfig returns a Server backed by st with custom abuse-control
+// tuning (used by tests and operators via relay flags).
+func NewWithConfig(st *store.Store, cfg Config) *Server {
+	return &Server{
+		store:   st,
+		cfg:     cfg,
+		limiter: NewLimiter(cfg.SendBurst, cfg.SendRatePerSec),
+	}
+}
 
 // Routes returns the HTTP handler with all endpoints registered.
 func (s *Server) Routes() http.Handler {
@@ -57,6 +100,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/blobs/{blob_id}", s.handleBlobDownload)
 	mux.HandleFunc("POST /v1/keys", s.handleKeyAnnounce)
 	mux.HandleFunc("GET /v1/keys/{address}", s.handleKeyLookup)
+	mux.HandleFunc("POST /v1/report", s.handleReport)
 	// issue #32: group messaging.
 	mux.HandleFunc("POST /v1/groups/control", s.handleGroupControl)
 	return mux
@@ -168,6 +212,25 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Metadata-only abuse controls. The relay cannot inspect content,
+	// so it meters behavior: per-sender token bucket first (cheap,
+	// in-memory), then the reporter-based throttle (distinct recipients
+	// flagged this sender inside the window). Both reject with an
+	// explicit 429 — the sender's client surfaces the error, so the
+	// failure is visible and never a silent loss.
+	if !s.limiter.Allow("send:" + req.From) {
+		writeErr(w, http.StatusTooManyRequests, "rate limit exceeded: slow down")
+		return
+	}
+	if n, err := s.store.DistinctReporterCount(req.From, int64(s.cfg.SpamReportWindow.Seconds())); err != nil {
+		writeErr(w, http.StatusInternalServerError, "store failed")
+		return
+	} else if n >= s.cfg.SpamReportThreshold {
+		writeErr(w, http.StatusTooManyRequests,
+			fmt.Sprintf("sender throttled: %d distinct recipients reported spam (decays over %s)", n, s.cfg.SpamReportWindow))
+		return
+	}
+
 	id, stored, err := s.store.Save(&store.Envelope{
 		To: req.To, From: req.From, Eph: req.Eph,
 		Nonce: req.Nonce, Ct: req.Ct, SentAt: req.SentAt, Sig: req.Sig,
@@ -260,6 +323,73 @@ func (s *Server) handleKeyLookup(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ---- spam / abuse reports (metadata-only filtering) ----
+
+// reportRequest is the wire format for POST /v1/report.
+type reportRequest struct {
+	Reporter   string `json:"reporter"`    // ed25519:<base64url> reporter address
+	EnvelopeID int64  `json:"envelope_id"` // relay envelope id being reported
+	Ts         int64  `json:"ts"`          // unix seconds; freshness-checked
+	Sig        string `json:"sig"`         // base64url Ed25519 signature
+}
+
+// handleReport records a spam report against an envelope's sender. The
+// report is signed by the reporter and only the envelope's recipient may
+// file it, so reports are attributable and cannot be forged by third
+// parties. Reports are idempotent per (sender, reporter): only distinct
+// reporters count toward the throttle threshold, and reports decay out
+// of the window over time.
+func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
+	var req reportRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	reporter, err := parseAddress(req.Reporter)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"reporter": %v`, err))
+		return
+	}
+	if req.EnvelopeID <= 0 {
+		writeErr(w, http.StatusBadRequest, `"envelope_id" must be a positive message id`)
+		return
+	}
+	if now := time.Now().Unix(); req.Ts < now-maxSignedRequestAge || req.Ts > now+maxSignedRequestAge {
+		writeErr(w, http.StatusBadRequest, `"ts" is outside the freshness window`)
+		return
+	}
+	sigRaw, err := base64.RawURLEncoding.DecodeString(req.Sig)
+	if err != nil || len(sigRaw) != 64 {
+		writeErr(w, http.StatusUnauthorized, `"sig" must be a base64url Ed25519 signature`)
+		return
+	}
+	canon := envelope.SpamReport(reporter[:], req.EnvelopeID, req.Ts)
+	if !crypto.Verify(reporter[:], canon, sigRaw) {
+		writeErr(w, http.StatusUnauthorized, "report signature verification failed")
+		return
+	}
+	// The report itself is rate-limited, so reporting cannot be used as
+	// a cheap flood vector.
+	if !s.limiter.Allow("report:" + req.Reporter) {
+		writeErr(w, http.StatusTooManyRequests, "rate limit exceeded: slow down")
+		return
+	}
+	env, err := s.store.EnvelopeByID(req.EnvelopeID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such envelope")
+		return
+	}
+	if env.To != req.Reporter {
+		writeErr(w, http.StatusForbidden, "only the message recipient may report it")
+		return
+	}
+	if err := s.store.RecordSpamReport(env.From, req.Reporter, req.EnvelopeID); err != nil {
+		writeErr(w, http.StatusInternalServerError, "store failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	// issue #32: reads addressed to a group ID take the group path, with
@@ -329,14 +459,36 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type msg struct {
-		ID         int64  `json:"id"`
-		From       string `json:"from"`
-		Eph        string `json:"eph"`
-		Nonce      string `json:"nonce"`
-		Ct         string `json:"ct"`
-		SentAt     int64  `json:"sent_at"`
-		ReceivedAt int64  `json:"received_at"`
-		Sig        string `json:"sig"`
+		ID          int64    `json:"id"`
+		From        string   `json:"from"`
+		Eph         string   `json:"eph"`
+		Nonce       string   `json:"nonce"`
+		Ct          string   `json:"ct"`
+		SentAt      int64    `json:"sent_at"`
+		ReceivedAt  int64    `json:"received_at"`
+		Sig         string   `json:"sig"`
+		SenderFlags []string `json:"sender_flags"`
+	}
+	// Sender reputation flags (metadata-only, advisory): computed once
+	// per distinct sender across the page. "rate_limited" means the
+	// sender's send bucket is currently exhausted (actively bursting);
+	// "reported" means the sender is currently over the distinct-reporter
+	// throttle threshold. Recipients use these as machine-readable
+	// reasons when triaging message requests. They are relay-asserted,
+	// not signed — advisory signal, not authentication.
+	senderFlags := make(map[string][]string)
+	for _, e := range envs {
+		if _, ok := senderFlags[e.From]; ok {
+			continue
+		}
+		var flags []string
+		if s.limiter.Exhausted("send:" + e.From) {
+			flags = append(flags, "rate_limited")
+		}
+		if n, err := s.store.DistinctReporterCount(e.From, int64(s.cfg.SpamReportWindow.Seconds())); err == nil && n >= s.cfg.SpamReportThreshold {
+			flags = append(flags, "reported")
+		}
+		senderFlags[e.From] = flags
 	}
 	out := make([]msg, 0, len(envs))
 	var size int
@@ -351,6 +503,7 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 		out = append(out, msg{
 			ID: e.ID, From: e.From, Eph: e.Eph, Nonce: e.Nonce,
 			Ct: e.Ct, SentAt: e.SentAt, ReceivedAt: e.ReceivedAt, Sig: e.Sig,
+			SenderFlags: senderFlags[e.From],
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"messages": out})

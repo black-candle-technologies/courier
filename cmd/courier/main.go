@@ -61,6 +61,14 @@ func main() {
 		err = cmdServe(os.Args[2:])
 	case "contacts":
 		err = cmdContacts(os.Args[2:])
+	case "block":
+		err = cmdBlock(os.Args[2:])
+	case "unblock":
+		err = cmdUnblock(os.Args[2:])
+	case "report-spam":
+		err = cmdReportSpam(os.Args[2:])
+	case "request":
+		err = cmdRequest(os.Args[2:])
 	case "group":
 		err = cmdGroup(os.Args[2:])
 	case "rotate":
@@ -94,8 +102,19 @@ func usage() {
   courier address                        print your address (public key)
   courier send <address|contact> <msg>    send a message ("-" reads stdin)
       [--attach <file>]...               attach files (E2E encrypted, 25 MiB max each)
-  courier inbox [--all] [--limit N] [--follow [--interval 5s]]
+  courier inbox [--all] [--limit N] [--follow [--interval 5s]] [--requests]
       [--attachments-dir <dir>]          download verified attachments into dir
+                                         --requests lists held message requests instead
+  courier request list                   list message requests held for review
+  courier request accept <id> [--as <name>]
+                                         accept a request (first contact joins contacts)
+  courier request dismiss <id>           dismiss a request (sender suppressed)
+  courier request undismiss <addr|contact>
+                                         reverse a dismissal
+  courier block <address|contact>        block a sender (messages dropped at inbox time)
+  courier block list                     list blocked senders
+  courier unblock <address|contact>      unblock a sender
+  courier report-spam <message-id>       report a message as spam (throttles repeat offenders)
   courier contacts add <name> <address>  save a contact
   courier contacts list                  list contacts
   courier contacts show <name>           show a contact's address
@@ -108,6 +127,8 @@ func usage() {
   courier publish-key                    re-announce your encryption key
   courier update                         check for and install updates
   courier config set auto_update false   opt out of automatic update installs
+  courier config set dm_policy contacts hold messages from unknown senders for review
+  courier config set dm_policy open     deliver messages from anyone (default)
   courier dashboard setup [--username NAME]
                                          create your web dashboard login
   courier dashboard push [--follow]      forward new messages to the dashboard
@@ -300,7 +321,11 @@ func (s *stringSliceFlag) Set(v string) error {
 func printMessages(msgs []client.Message) {
 	for _, m := range msgs {
 		ts := time.Unix(m.ReceivedAt, 0).UTC().Format("2006-01-02 15:04:05Z")
-		fmt.Printf("[#%d] from %s at %s\n%s\n", m.ID, m.From, ts, m.Body)
+		flagStr := ""
+		if len(m.Flags) > 0 {
+			flagStr = " [" + strings.Join(m.Flags, ",") + "]"
+		}
+		fmt.Printf("[#%d] from %s at %s%s\n%s\n", m.ID, m.From, ts, flagStr, m.Body)
 		for _, a := range m.Attachments {
 			mf := a.Manifest
 			if a.KeyError != nil {
@@ -311,6 +336,17 @@ func printMessages(msgs []client.Message) {
 		}
 		fmt.Println()
 	}
+}
+
+// printRequests prints held message requests as a dedicated section,
+// separate from the normal inbox. Each request carries its
+// machine-readable flag reasons and the commands to accept or dismiss
+// it. Requests are held, never silently dropped.
+func printRequests(reqs []client.Message) {
+	fmt.Printf("Message requests (%d) — held for review, not in your inbox.\n", len(reqs))
+	fmt.Printf("Accept with `courier request accept <id>` (--as <name> to name the contact);\n")
+	fmt.Printf("dismiss with `courier request dismiss <id>`.\n\n")
+	printMessages(reqs)
 }
 
 // saveAttachment writes verified attachment data into dir, never
@@ -346,6 +382,8 @@ func cmdInbox(args []string) error {
 	limit := fs.Int("limit", 50, "max messages per fetch")
 	follow := fs.Bool("follow", false, "keep polling for new messages")
 	interval := fs.Duration("interval", 5*time.Second, "poll interval with --follow")
+	requests := fs.Bool("requests", false, "list message requests held for review, instead of the inbox")
+	quarantine := fs.Bool("quarantine", false, "deprecated alias for --requests")
 	attachDir := fs.String("attachments-dir", "", "download and verify attachments into this directory")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -355,12 +393,28 @@ func cmdInbox(args []string) error {
 		return err
 	}
 	cl := client.New(cfg)
+	if *requests || *quarantine {
+		// Review mode: list messages held for review. Read-only — the
+		// normal inbox cursor is untouched, nothing is marked seen,
+		// and messages shown here are never delivered to the inbox or
+		// the dashboard until accepted.
+		held, err := cl.InboxReview(*limit)
+		if err != nil {
+			return err
+		}
+		if len(held) == 0 {
+			fmt.Println("no message requests.")
+			return nil
+		}
+		printRequests(held)
+		return nil
+	}
 	after := cfg.Cursor
 	if *all {
 		after = 0
 	}
 	poll := func() (bool, error) {
-		msgs, lastID, skipped, err := cl.Inbox(after, *limit)
+		msgs, lastID, skipped, _, err := cl.Inbox(after, *limit)
 		if err != nil {
 			return false, err
 		}
@@ -373,15 +427,30 @@ func cmdInbox(args []string) error {
 			fresh.Cursor = after
 			return nil
 		})
-		if len(msgs) == 0 {
+		// Held message requests are never mixed into the normal
+		// inbox: they get their own dedicated section below.
+		var delivered, reqs []client.Message
+		for _, m := range msgs {
+			if m.Request {
+				reqs = append(reqs, m)
+			} else {
+				delivered = append(delivered, m)
+			}
+		}
+		if len(delivered) == 0 && len(reqs) == 0 {
 			if skipped > 0 {
 				fmt.Fprintf(os.Stderr, "(%d message(s) failed signature/decryption and were dropped)\n", skipped)
 			}
 			return false, nil
 		}
-		printMessages(msgs)
+		if len(delivered) > 0 {
+			printMessages(delivered)
+		}
+		if len(reqs) > 0 {
+			printRequests(reqs)
+		}
 		if *attachDir != "" {
-			for _, m := range msgs {
+			for _, m := range delivered {
 				for _, a := range m.Attachments {
 					data, err := cl.DownloadAttachment(a)
 					if err != nil {
@@ -421,30 +490,32 @@ func cmdInbox(args []string) error {
 // ---- stdio bridge: JSON lines on stdin/stdout for agent integration ----
 
 type stdioReq struct {
-	ID       int64  `json:"id"`
-	Cmd      string `json:"cmd"`
-	To       string `json:"to,omitempty"`
-	Body     string `json:"body,omitempty"`
-	After    int64  `json:"after,omitempty"`
-	Limit    int    `json:"limit,omitempty"`
+	ID    int64  `json:"id"`
+	Cmd   string `json:"cmd"`
+	To    string `json:"to,omitempty"`
+	Body  string `json:"body,omitempty"`
+	After int64  `json:"after,omitempty"`
+	Limit int    `json:"limit,omitempty"`
 }
 
 type stdioResp struct {
-	ID       int64            `json:"id"`
-	OK       bool             `json:"ok"`
-	Error    string           `json:"error,omitempty"`
-	Address  string           `json:"address,omitempty"`
-	MsgID    int64            `json:"message_id,omitempty"`
-	Messages []stdioMessage   `json:"messages,omitempty"`
-	Relay    string           `json:"relay,omitempty"`
+	ID       int64          `json:"id"`
+	OK       bool           `json:"ok"`
+	Error    string         `json:"error,omitempty"`
+	Address  string         `json:"address,omitempty"`
+	MsgID    int64          `json:"message_id,omitempty"`
+	Messages []stdioMessage `json:"messages,omitempty"`
+	Relay    string         `json:"relay,omitempty"`
 }
 
 type stdioMessage struct {
-	ID         int64  `json:"id"`
-	From       string `json:"from"`
-	Body       string `json:"body"`
-	SentAt     int64  `json:"sent_at"`
-	ReceivedAt int64  `json:"received_at"`
+	ID         int64    `json:"id"`
+	From       string   `json:"from"`
+	Body       string   `json:"body"`
+	SentAt     int64    `json:"sent_at"`
+	ReceivedAt int64    `json:"received_at"`
+	Flags      []string `json:"flags,omitempty"`
+	Request    bool     `json:"request,omitempty"`
 }
 
 func cmdStdio() error {
@@ -490,7 +561,7 @@ func cmdStdio() error {
 			if limit <= 0 {
 				limit = 50
 			}
-			msgs, _, _, err := cl.Inbox(req.After, limit)
+			msgs, _, _, _, err := cl.Inbox(req.After, limit)
 			if err != nil {
 				reply(stdioResp{ID: req.ID, OK: false, Error: err.Error()})
 				continue
@@ -500,6 +571,7 @@ func cmdStdio() error {
 				sm = append(sm, stdioMessage{
 					ID: m.ID, From: m.From, Body: m.Body,
 					SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
+					Flags: m.Flags, Request: m.Request,
 				})
 			}
 			reply(stdioResp{ID: req.ID, OK: true, Messages: sm})
@@ -562,7 +634,7 @@ func cmdServe(args []string) error {
 		q := r.URL.Query()
 		var after int64
 		fmt.Sscanf(q.Get("after"), "%d", &after)
-		msgs, _, _, err := cl.Inbox(after, 50)
+		msgs, _, _, _, err := cl.Inbox(after, 50)
 		if err != nil {
 			writeSvcJSON(w, 502, map[string]string{"error": err.Error()})
 			return
@@ -633,6 +705,179 @@ func cmdContacts(args []string) error {
 		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|remove)", args[0])
 	}
 	return nil
+}
+
+// ---- spam / abuse filtering CLI ----
+
+// cmdBlock blocks a sender, or lists the blocklist with `block list`.
+// Blocking is per-recipient and local: blocked messages are dropped at
+// inbox time, and nothing about the recipient's relationships leaves
+// the machine.
+func cmdBlock(args []string) error {
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return err
+	}
+	if len(args) == 1 && args[0] == "list" {
+		if len(cfg.Blocked) == 0 {
+			fmt.Println("no blocked senders.")
+			return nil
+		}
+		for _, b := range cfg.Blocked {
+			fmt.Println(b)
+		}
+		return nil
+	}
+	if len(args) != 1 {
+		return fmt.Errorf("usage: courier block <address|contact> | courier block list")
+	}
+	addr, err := cfg.ResolveRecipient(args[0])
+	if err != nil {
+		return err
+	}
+	if err := cfg.Update(func(fresh *client.Config) error {
+		return fresh.Block(addr)
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("blocked %s. Future messages from this sender are dropped at inbox time.\n", addr)
+	return nil
+}
+
+// cmdUnblock removes a sender from the blocklist.
+func cmdUnblock(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: courier unblock <address|contact>")
+	}
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return err
+	}
+	addr, err := cfg.ResolveRecipient(args[0])
+	if err != nil {
+		return err
+	}
+	if err := cfg.Update(func(fresh *client.Config) error {
+		fresh.Unblock(addr)
+		return nil
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("unblocked %s.\n", addr)
+	return nil
+}
+
+// cmdReportSpam files a signed spam report with the relay. Reports are
+// idempotent per (sender, reporter): only distinct reporters count
+// toward the relay's throttle threshold.
+func cmdReportSpam(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: courier report-spam <message-id>")
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil || id <= 0 {
+		return fmt.Errorf("bad message id %q", args[0])
+	}
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return err
+	}
+	if err := client.New(cfg).ReportSpam(id); err != nil {
+		return err
+	}
+	fmt.Printf("spam report filed for message #%d.\n", id)
+	return nil
+}
+
+// ---- message requests ----
+
+// cmdRequest manages held message requests: list (review), accept
+// (release + optionally add the sender to contacts), dismiss (suppress
+// future requests from the sender), undismiss (reverse a dismissal).
+func cmdRequest(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: courier request <list|accept|dismiss|undismiss> ...")
+	}
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return err
+	}
+	cl := client.New(cfg)
+	switch args[0] {
+	case "list":
+		held, err := cl.InboxReview(50)
+		if err != nil {
+			return err
+		}
+		if len(held) == 0 {
+			fmt.Println("no message requests.")
+			return nil
+		}
+		printRequests(held)
+		return nil
+	case "accept":
+		if len(args) < 2 || len(args) > 4 {
+			return fmt.Errorf("usage: courier request accept <message-id> [--as <name>]")
+		}
+		id, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil || id <= 0 {
+			return fmt.Errorf("bad message id %q", args[1])
+		}
+		asName := ""
+		if len(args) == 4 {
+			if args[2] != "--as" {
+				return fmt.Errorf("usage: courier request accept <message-id> [--as <name>]")
+			}
+			asName = args[3]
+		} else if len(args) == 3 {
+			return fmt.Errorf("usage: courier request accept <message-id> [--as <name>]")
+		}
+		released, err := cl.AcceptRequest(id, asName)
+		if err != nil {
+			return err
+		}
+		if len(released) == 0 {
+			fmt.Printf("request #%d accepted.\n", id)
+			return nil
+		}
+		fmt.Printf("request #%d accepted from %s; released %d message(s):\n\n",
+			id, released[0].From, len(released))
+		printMessages(released)
+		return nil
+	case "dismiss":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: courier request dismiss <message-id>")
+		}
+		id, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil || id <= 0 {
+			return fmt.Errorf("bad message id %q", args[1])
+		}
+		sender, err := cl.DismissRequest(id)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("request #%d dismissed; future messages from %s will not surface as requests.\n", id, sender)
+		fmt.Printf("(reverse with `courier request undismiss %s`)\n", sender)
+		return nil
+	case "undismiss":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: courier request undismiss <address|contact>")
+		}
+		addr, err := cfg.ResolveRecipient(args[1])
+		if err != nil {
+			return err
+		}
+		if err := cfg.Update(func(fresh *client.Config) error {
+			fresh.Undismiss(addr)
+			return nil
+		}); err != nil {
+			return err
+		}
+		fmt.Printf("undismissed %s; their messages will surface as requests again.\n", addr)
+		return nil
+	default:
+		return fmt.Errorf("unknown request subcommand %q (list|accept|dismiss|undismiss)", args[0])
+	}
 }
 
 // ---- v0.5.0: key rotation ----
@@ -718,6 +963,7 @@ func cmdConfig(args []string) error {
 		fmt.Printf("auto_update=%v\n", cfg.AutoUpdateEnabled())
 		fmt.Printf("relay=%s\n", cfg.RelayURL)
 		fmt.Printf("address=%s\n", cfg.Address)
+		fmt.Printf("dm_policy=%s\n", cfg.DMPolicyEffective())
 		return nil
 	}
 	switch args[0] {
@@ -732,6 +978,8 @@ func cmdConfig(args []string) error {
 			fmt.Println(cfg.RelayURL)
 		case "address":
 			fmt.Println(cfg.Address)
+		case "dm_policy":
+			fmt.Println(cfg.DMPolicyEffective())
 		default:
 			return fmt.Errorf("unknown config key %q", args[1])
 		}
@@ -766,8 +1014,25 @@ func cmdConfig(args []string) error {
 			}
 			fmt.Printf("relay=%s\n", u)
 			fmt.Println("certificate pin unchanged; re-run with --repin only if the relay certificate itself changed.")
+		case "dm_policy":
+			v := strings.ToLower(strings.TrimSpace(args[2]))
+			if v != client.DMPolicyOpen && v != client.DMPolicyContacts {
+				return fmt.Errorf("dm_policy must be %q or %q", client.DMPolicyOpen, client.DMPolicyContacts)
+			}
+			if err := cfg.Update(func(fresh *client.Config) error {
+				fresh.DMPolicy = v
+				return nil
+			}); err != nil {
+				return err
+			}
+			fmt.Printf("dm_policy=%s\n", v)
+			if v == client.DMPolicyContacts {
+				fmt.Println("messages from senders not in your contacts will be held as message requests for review (courier request list).")
+			} else {
+				fmt.Println("messages from anyone will be delivered normally.")
+			}
 		default:
-			return fmt.Errorf("unknown config key %q (settable: auto_update, relay)", args[1])
+			return fmt.Errorf("unknown config key %q (settable: auto_update, relay, dm_policy)", args[1])
 		}
 	default:
 		return fmt.Errorf("usage: courier config [get <key>|set <key> <value>]")

@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -66,9 +67,9 @@ type EncKey struct {
 type Config struct {
 	Version          int               `json:"version"`
 	RelayURL         string            `json:"relay"`
-	Seed             string            `json:"seed"`    // base64url 32-byte identity seed
-	Address          string            `json:"address"` // ed25519:<base64url> (the public address)
-	Cursor           int64             `json:"cursor"`  // last inbox message id seen
+	Seed             string            `json:"seed"`                        // base64url 32-byte identity seed
+	Address          string            `json:"address"`                     // ed25519:<base64url> (the public address)
+	Cursor           int64             `json:"cursor"`                      // last inbox message id seen
 	RelayFingerprint string            `json:"relay_fingerprint,omitempty"` // hex SHA256 of relay cert
 	Contacts         map[string]string `json:"contacts,omitempty"`          // name -> ed25519:<base64url> address
 	EncKeys          []EncKey          `json:"enc_keys,omitempty"`          // current first; lazily migrated
@@ -94,6 +95,21 @@ type Config struct {
 	// client, for replay suppression independent of relay message ids.
 	// Bounded (oldest dropped); the relay also dedups permanently.
 	SeenEnvelopeHashes []string `json:"seen_envelope_hashes,omitempty"`
+	// Spam/abuse filtering (metadata-only; the relay never sees
+	// plaintext). DMPolicy is "open" (default, unset) or "contacts":
+	// in contacts mode, messages from senders not in contacts are
+	// quarantined — held for review, never silently dropped.
+	DMPolicy string `json:"dm_policy,omitempty"`
+	// Blocked lists sender addresses whose messages are dropped at
+	// inbox time. The cursor still advances past them, so unblocking
+	// later plus `inbox --all` recovers them.
+	Blocked []string `json:"blocked,omitempty"`
+	// Dismissed lists sender addresses whose message requests were
+	// dismissed via `courier request dismiss`. Their messages no longer
+	// surface as requests; they are dropped at read time like blocked
+	// senders, visibly counted but never mixed into the inbox.
+	// Reversible with `courier request undismiss`.
+	Dismissed []string `json:"dismissed,omitempty"`
 }
 
 func configPath() (string, error) {
@@ -349,6 +365,130 @@ func (c *Config) ResolveRecipient(toOrName string) (string, error) {
 		return toOrName, nil
 	}
 	return c.LookupContact(toOrName)
+}
+
+// ---- spam / abuse filtering (metadata-only) ----
+
+// DMPolicyOpen and DMPolicyContacts are the valid dm_policy values.
+const (
+	DMPolicyOpen     = "open"
+	DMPolicyContacts = "contacts"
+)
+
+// DMPolicyEffective returns the recipient-consent policy: "open" unless
+// the operator set "contacts". Unset (pre-existing configs) means open,
+// so the default never changes behavior for existing users.
+func (c *Config) DMPolicyEffective() string {
+	if c.DMPolicy == DMPolicyContacts {
+		return DMPolicyContacts
+	}
+	return DMPolicyOpen
+}
+
+// ContactsOnly reports whether inbound messages from unknown senders
+// should be quarantined instead of delivered.
+func (c *Config) ContactsOnly() bool { return c.DMPolicyEffective() == DMPolicyContacts }
+
+// contactAddressSet returns every trusted sender address: all contacts
+// plus the agent's own address (self-messages are never quarantined).
+func (c *Config) contactAddressSet() map[string]bool {
+	set := make(map[string]bool, len(c.Contacts)+1)
+	for _, addr := range c.Contacts {
+		set[addr] = true
+	}
+	set[c.Address] = true
+	return set
+}
+
+// HoldForReview reports whether a message from `from` should be
+// quarantined: in contacts mode, any authenticated sender who is not a
+// contact (and not self) is held for review instead of delivered.
+func (c *Config) HoldForReview(from string) bool {
+	if !c.ContactsOnly() {
+		return false
+	}
+	return !c.contactAddressSet()[from]
+}
+
+// IsBlocked reports whether from is on this recipient's blocklist.
+func (c *Config) IsBlocked(from string) bool {
+	for _, b := range c.Blocked {
+		if b == from {
+			return true
+		}
+	}
+	return false
+}
+
+// IsDismissed reports whether from's message requests were dismissed.
+func (c *Config) IsDismissed(from string) bool {
+	for _, d := range c.Dismissed {
+		if d == from {
+			return true
+		}
+	}
+	return false
+}
+
+// IsFirstContact reports whether from is an unknown sender: not the
+// agent itself and not in contacts. First-contact messages carry the
+// machine-readable "first_contact" flag and, under contacts-only
+// dm_policy, are held as message requests instead of delivered.
+func (c *Config) IsFirstContact(from string) bool {
+	if from == c.Address {
+		return false
+	}
+	return !c.contactAddressSet()[from]
+}
+
+// Block adds address to the blocklist in memory; callers persist the
+// change with Config.Update. It is not an error if already present.
+func (c *Config) Block(address string) error {
+	if _, err := crypto.ParseAddress(address); err != nil {
+		return fmt.Errorf("bad address: %w", err)
+	}
+	if !c.IsBlocked(address) {
+		c.Blocked = append(c.Blocked, address)
+	}
+	return nil
+}
+
+// Unblock removes address from the blocklist in memory; callers persist
+// the change with Config.Update. It is not an error if absent.
+func (c *Config) Unblock(address string) {
+	kept := c.Blocked[:0]
+	for _, b := range c.Blocked {
+		if b != address {
+			kept = append(kept, b)
+		}
+	}
+	c.Blocked = kept
+}
+
+// Dismiss adds address to the dismissed-requests set in memory; callers
+// persist the change with Config.Update. It is not an error if already
+// present.
+func (c *Config) Dismiss(address string) error {
+	if _, err := crypto.ParseAddress(address); err != nil {
+		return fmt.Errorf("bad address: %w", err)
+	}
+	if !c.IsDismissed(address) {
+		c.Dismissed = append(c.Dismissed, address)
+	}
+	return nil
+}
+
+// Undismiss removes address from the dismissed-requests set in memory;
+// callers persist the change with Config.Update. It is not an error if
+// absent.
+func (c *Config) Undismiss(address string) {
+	kept := c.Dismissed[:0]
+	for _, d := range c.Dismissed {
+		if d != address {
+			kept = append(kept, d)
+		}
+	}
+	c.Dismissed = kept
 }
 
 // ---- rotatable encryption keys (v0.5.0) ----
@@ -933,12 +1073,25 @@ func appendSentLog(e SentEntry) error {
 
 // Message is one decrypted, signature-verified inbox message.
 type Message struct {
-	ID          int64
-	From        string // authenticated sender address
-	Body        string
-	SentAt      int64
-	ReceivedAt  int64
+	ID         int64
+	From       string // authenticated sender address
+	Body       string
+	SentAt     int64
+	ReceivedAt int64
 	Attachments []IncomingAttachment // verified manifests (data keys unwrapped when possible)
+	// Flags carries the machine-readable reasons a message was
+	// flagged for review. Client-derived: "first_contact" (sender not
+	// in contacts and not self), "quarantined_by_policy" (held by the
+	// recipient's contacts-only dm_policy). Relay-attached (advisory,
+	// metadata-only): "rate_limited" (sender's send bucket currently
+	// exhausted), "reported" (sender currently over the
+	// distinct-reporter throttle threshold).
+	Flags []string `json:"flags,omitempty"`
+	// Request marks a message held for review instead of delivered:
+	// it appears in the dedicated message-requests section (`courier
+	// inbox`, `courier request list`), never in the normal inbox and
+	// never pushed to the dashboard. Held, never silently dropped.
+	Request bool `json:"request,omitempty"`
 }
 
 // Inbox fetches envelopes addressed to this agent after message id `after`,
@@ -954,9 +1107,9 @@ type Message struct {
 // Inbox fetches and decrypts messages after the given id. See inbox for
 // the lastID contract. Delivered envelopes are marked seen so they are
 // never delivered twice (v0.6.11 F3).
-func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, error) {
-	msgs, lastID, skipped, _, err := c.inbox(after, limit, true)
-	return msgs, lastID, skipped, err
+func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, int, error) {
+	msgs, lastID, skipped, filtered, _, err := c.inbox(after, limit, true)
+	return msgs, lastID, skipped, filtered, err
 }
 
 // inbox is Inbox with control over replay bookkeeping. Push consumers
@@ -965,18 +1118,23 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, error) {
 // messages stay re-fetchable on retry instead of being suppressed as
 // replays while the cursor advances past them (v0.6.11 F11). It returns
 // the dedup hashes of the delivered messages for that bookkeeping.
-func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64, int, []string, error) {
+//
+// skipped counts envelopes that failed authentication or decryption
+// (corrupt/forged); filtered counts messages intentionally filtered by
+// the recipient's own rules (blocked or dismissed senders). The two are
+// reported separately so routine filtering never looks like an attack.
+func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64, int, int, []string, error) {
 	hc, err := c.httpClient()
 	if err != nil {
-		return nil, after, 0, nil, err
+		return nil, after, 0, 0, nil, err
 	}
 	id, err := c.cfg.Identity()
 	if err != nil {
-		return nil, after, 0, nil, err
+		return nil, after, 0, 0, nil, err
 	}
 	toEd, err := crypto.ParseAddress(c.cfg.Address)
 	if err != nil {
-		return nil, after, 0, nil, fmt.Errorf("bad address: %w", err)
+		return nil, after, 0, 0, nil, fmt.Errorf("bad address: %w", err)
 	}
 	// v0.6.11 (F10): the inbox request is signed by the recipient, so
 	// the relay serves ciphertext only to the address owner. after and
@@ -988,31 +1146,33 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 		base64.RawURLEncoding.EncodeToString(sig))
 	resp, err := hc.Get(url)
 	if err != nil {
-		return nil, after, 0, nil, fmt.Errorf("relay unreachable: %w", err)
+		return nil, after, 0, 0, nil, fmt.Errorf("relay unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, after, 0, nil, relayErr(data)
+		return nil, after, 0, 0, nil, relayErr(data)
 	}
 	var in struct {
 		Messages []struct {
-			ID         int64  `json:"id"`
-			From       string `json:"from"`
-			Eph        string `json:"eph"`
-			Nonce      string `json:"nonce"`
-			Ct         string `json:"ct"`
-			SentAt     int64  `json:"sent_at"`
-			ReceivedAt int64  `json:"received_at"`
-			Sig        string `json:"sig"`
-			Kind       string `json:"kind"`
+			ID          int64    `json:"id"`
+			From        string   `json:"from"`
+			Eph         string   `json:"eph"`
+			Nonce       string   `json:"nonce"`
+			Ct          string   `json:"ct"`
+			SentAt      int64    `json:"sent_at"`
+			ReceivedAt  int64    `json:"received_at"`
+			Sig         string   `json:"sig"`
+			SenderFlags []string `json:"sender_flags"`
+			Kind        string   `json:"kind"`
 		} `json:"messages"`
 	}
 	if err := json.Unmarshal(data, &in); err != nil {
-		return nil, after, 0, nil, fmt.Errorf("bad relay response: %w", err)
+		return nil, after, 0, 0, nil, fmt.Errorf("bad relay response: %w", err)
 	}
 	var out []Message
 	skipped := 0
+	filtered := 0
 	lastID := after
 	var newHashes []string
 	seen := c.seenEnvelopeSet()
@@ -1040,6 +1200,16 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 		fromEd, err := crypto.ParseAddress(m.From)
 		if err != nil {
 			skipped++
+			continue
+		}
+		// Blocklist and dismissed requests: messages from these senders
+		// are dropped at read time, before any decryption work. The
+		// cursor still advances past them (F4) and they are never marked
+		// seen, so unblocking/undismissing later plus `inbox --all`
+		// recovers them. Counted as filtered (the recipient's own
+		// choice), not as skipped (corrupt/forged).
+		if c.cfg.IsBlocked(m.From) || c.cfg.IsDismissed(m.From) {
+			filtered++
 			continue
 		}
 		eph, err1 := base64.RawURLEncoding.DecodeString(m.Eph)
@@ -1124,11 +1294,41 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 			atts = append(atts, ia)
 
 		}
-		out = append(out, Message{
+		msg := Message{
 			ID: m.ID, From: m.From, Body: body,
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
 			Attachments: atts,
-		})
+		}
+		// Machine-readable flag reasons. "first_contact" is derived
+		// locally (sender not in contacts and not self); the rest are
+		// relay-attached sender-reputation metadata (advisory). Flags
+		// ride along on delivered messages too, so agents can see at a
+		// glance why a message was singled out.
+		if c.cfg.IsFirstContact(m.From) {
+			msg.Flags = append(msg.Flags, "first_contact")
+		}
+		msg.Flags = append(msg.Flags, m.SenderFlags...)
+		// Hold rule: a message becomes a request (held for review,
+		// never delivered to the inbox or dashboard) when the
+		// recipient's contacts-only policy quarantines a first contact,
+		// or when the relay reports the sender is currently throttled
+		// for spam — even under the open policy. Held messages are not
+		// marked seen, so review re-derives them; the empty hash keeps
+		// newHashes parallel to out for DashboardPush.
+		hold := c.cfg.HoldForReview(m.From) || slices.Contains(msg.Flags, "reported")
+		if hold {
+			msg.Request = true
+			// Machine-readable reason when the hold comes from the
+			// recipient's contacts-only policy (as opposed to the
+			// relay's spam throttle, which arrives as a flag).
+			if c.cfg.HoldForReview(m.From) {
+				msg.Flags = append(msg.Flags, "quarantined_by_policy")
+			}
+			out = append(out, msg)
+			newHashes = append(newHashes, "")
+			continue
+		}
+		out = append(out, msg)
 		// Only successfully delivered messages are marked seen: a
 		// message that fails verification or decryption now may become
 		// readable later (e.g. after the sender's key announcement
@@ -1139,7 +1339,160 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 	if markSeen {
 		c.recordSeenEnvelopes(newHashes)
 	}
-	return out, lastID, skipped, newHashes, nil
+	return out, lastID, skipped, filtered, newHashes, nil
+}
+
+// InboxReview re-derives the messages currently held as requests,
+// without advancing the inbox cursor or marking anything seen. Review
+// is read-only: it never changes delivery state.
+func (c *Client) InboxReview(limit int) ([]Message, error) {
+	msgs, _, _, _, _, err := c.inbox(0, limit, false)
+	if err != nil {
+		return nil, err
+	}
+	var held []Message
+	for _, m := range msgs {
+		if m.Request {
+			held = append(held, m)
+		}
+	}
+	return held, nil
+}
+
+// requestContactName derives a default contact name for an accepted
+// first-contact sender: "new-" plus 8 hex chars of the address hash.
+// It fits the contact name rules and is made unique against existing
+// contacts.
+func (c *Client) requestContactName(address string) string {
+	sum := sha256.Sum256([]byte(address))
+	base := "new-" + hex.EncodeToString(sum[:])[:8]
+	name := base
+	for i := 2; ; i++ {
+		if _, ok := c.cfg.Contacts[name]; !ok {
+			return name
+		}
+		if c.cfg.Contacts[name] == address {
+			return name
+		}
+		name = fmt.Sprintf("%s-%d", base, i)
+	}
+}
+
+// AcceptRequest accepts the held message request id: the request's
+// messages from that sender are returned for immediate delivery, and
+// when the request is a first contact the sender is added to contacts
+// (under --as name, or an auto-generated one), so future messages
+// arrive normally. Accepting never drops anything: the held messages
+// are handed back, not discarded.
+func (c *Client) AcceptRequest(id int64, asName string) ([]Message, error) {
+	held, err := c.InboxReview(200)
+	if err != nil {
+		return nil, err
+	}
+	var req *Message
+	for i, m := range held {
+		if m.ID == id {
+			req = &held[i]
+			break
+		}
+	}
+	if req == nil {
+		return nil, fmt.Errorf("no message request with id %d (see `courier request list`)", id)
+	}
+	sender := req.From
+	if slices.Contains(req.Flags, "first_contact") && senderAddr(c.cfg, sender) == "" {
+		name := asName
+		if name == "" {
+			name = c.requestContactName(sender)
+		} else if !contactNameRe.MatchString(name) {
+			return nil, fmt.Errorf("bad contact name %q: use 1-32 chars, lowercase letters, digits, - and _, starting with a letter or digit", asName)
+		}
+		// Never clobber an existing contact name that points at a
+		// different address; fall back to a generated name instead.
+		if addr, ok := c.cfg.Contacts[name]; ok && addr != sender {
+			name = c.requestContactName(sender)
+		}
+		if err := c.cfg.AddContact(name, sender); err != nil {
+			return nil, err
+		}
+	}
+	var released []Message
+	for _, m := range held {
+		if m.From == sender {
+			m.Request = false // released: no longer held
+			released = append(released, m)
+		}
+	}
+	return released, nil
+}
+
+// DismissRequest dismisses the held message request id: the sender is
+// added to the dismissed set, so their messages no longer surface as
+// requests. Dismissed messages are dropped at read time like blocked
+// ones — visibly counted, never mixed into the inbox — and the
+// dismissal is reversible with `courier request undismiss`.
+func (c *Client) DismissRequest(id int64) (string, error) {
+	held, err := c.InboxReview(200)
+	if err != nil {
+		return "", err
+	}
+	for _, m := range held {
+		if m.ID == id {
+			if err := c.cfg.Update(func(fresh *Config) error {
+				return fresh.Dismiss(m.From)
+			}); err != nil {
+				return "", err
+			}
+			return m.From, nil
+		}
+	}
+	return "", fmt.Errorf("no message request with id %d (see `courier request list`)", id)
+}
+
+// senderAddr is a tiny helper to check contact membership by address.
+func senderAddr(cfg *Config, addr string) string {
+	for name, a := range cfg.Contacts {
+		if a == addr {
+			return name
+		}
+	}
+	return ""
+}
+
+// ReportSpam files a spam report against envelopeID with the relay.
+// The reporter proves it is the message's recipient by signing a
+// canonical spam-report payload (envelope.SpamReport); the relay
+// verifies the signature, requires the reporter to be the envelope's
+// recipient, and derives the reported sender from the stored envelope.
+// Reports are idempotent per (sender, reporter): only distinct
+// reporters count toward the relay's throttle threshold.
+func (c *Client) ReportSpam(envelopeID int64) error {
+	if envelopeID <= 0 {
+		return fmt.Errorf("bad message id %d", envelopeID)
+	}
+	id, err := c.cfg.Identity()
+	if err != nil {
+		return err
+	}
+	reporterEd, err := crypto.ParseAddress(c.cfg.Address)
+	if err != nil {
+		return err
+	}
+	ts := time.Now().Unix()
+	sig := id.Sign(envelope.SpamReport(reporterEd[:], envelopeID, ts))
+	data, code, err := c.post("/v1/report", map[string]any{
+		"reporter":    c.cfg.Address,
+		"envelope_id": envelopeID,
+		"ts":          ts,
+		"sig":         base64.RawURLEncoding.EncodeToString(sig),
+	})
+	if err != nil {
+		return err
+	}
+	if code != http.StatusOK {
+		return relayErr(data)
+	}
+	return nil
 }
 
 // maxSeenEnvelopeHashes bounds the client-side replay-suppression set.
@@ -1172,6 +1525,9 @@ func (c *Client) recordSeenEnvelopes(hashes []string) {
 			known[h] = true
 		}
 		for _, h := range hashes {
+			if h == "" {
+				continue // quarantine sentinel: held, not delivered
+			}
 			if !known[h] {
 				known[h] = true
 				fresh.SeenEnvelopeHashes = append(fresh.SeenEnvelopeHashes, h)
@@ -1475,12 +1831,15 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 	// as seen only inside acknowledged push batches below, so a failed
 	// batch's messages are re-fetched on retry instead of being
 	// suppressed as replays while the cursor advances past them.
-	msgs, lastID, _, hashes, err := c.inbox(c.cfg.DashboardCursor, 200, false)
+	msgs, lastID, _, _, hashes, err := c.inbox(c.cfg.DashboardCursor, 200, false)
 	if err != nil {
 		return 0, err
 	}
 	var items []pushItem
 	for i, m := range msgs {
+		if m.Request {
+			continue // held for review; never pushed to the dashboard
+		}
 		items = append(items, pushItem{hash: hashes[i], msg: pushMsg{
 			CourierID: m.ID, From: m.From, Body: m.Body,
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,

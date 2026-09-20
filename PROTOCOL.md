@@ -91,7 +91,8 @@ specifies the wire protocol.
 
 Response: `201 {"id": 7}`. The relay validates shapes and sizes
 (ciphertext ≤ 256 KiB), verifies the signature, and rejects malformed or
-forged envelopes with `400`.
+forged envelopes with `400`. Rate-limited or reporter-throttled senders
+get `429` (see "Spam and abuse filtering" below).
 
 ### Replay protection (v0.6.11 F3)
 
@@ -146,6 +147,111 @@ use `after=<last id seen>` to page through.
 
 `GET /v1/health` → `{"ok": true, "time": "...", "envelopes": N}`.
 
+## Spam and abuse filtering (metadata-only)
+
+Courier filters abuse using **metadata only**: sender/recipient addresses,
+send rates, and recipient reports. The relay never sees plaintext and never
+inspects message content; every rejection is an explicit error, never a
+silent drop.
+
+### Relay-side rate limiting
+
+`POST /v1/send` is metered per authenticated sender with a token bucket
+(defaults: burst 100, 2 sends/sec sustained — generous enough that
+legitimate bursty agent traffic never notices). The allowance is checked
+after signature verification, so spoofed requests cannot burn someone
+else's budget. Exceeding it returns `429` with a JSON error that the
+sender's client surfaces. Buckets start full, so new senders are never
+penalized for having no history. Tunable via relay flags `--send-burst`
+and `--send-rate`.
+
+### Spam reports and reporter-based throttling
+
+`POST /v1/report`, JSON body:
+
+```json
+{
+  "reporter":    "ed25519:<base64url Ed25519 public key>",
+  "envelope_id": 7,
+  "ts":          1758316234,
+  "sig":         "<base64url: Ed25519 signature>"
+}
+```
+
+`sig` is the reporter's Ed25519 signature over
+`envelope.SpamReport(reporter, envelope_id, ts)` (domain
+`courier-spam-report-v1`). The relay verifies the signature, requires `ts`
+within 300 seconds of relay time, and requires the reporter to be the
+envelope's **recipient** — only the party that received the message can
+report it, and the reported sender is taken from the stored envelope,
+never from the request. Reports are idempotent per (sender, reporter):
+only **distinct** reporters count toward the threshold, so one recipient
+cannot throttle a sender alone.
+
+When at least `--spam-threshold` (default 3) distinct recipients have
+reported a sender within `--spam-window-hours` (default 168, i.e. 7 days),
+the relay throttles that sender's `POST /v1/send` with `429`. Reports decay
+out of the sliding window, so throttling lifts once the sender stops
+spamming. This is a throttle, not a ban, and nothing is silently dropped:
+the sender is told explicitly and can retry later.
+
+### Sender reputation flags
+
+The inbox response may attach advisory, metadata-only reputation flags
+to each message under `sender_flags` — never signed by the sender, never
+content-derived:
+
+| Flag | Meaning |
+|---|---|
+| `rate_limited` | the sender's relay send bucket is currently exhausted (they are sending too fast) |
+| `reported` | at least `--spam-threshold` distinct recipients recently reported the sender |
+
+Recipients use these flags to triage (see "Message requests" below).
+
+### Message requests
+
+Messages the client holds for review carry machine-readable reasons in
+each message's `flags` array, and `request: true` marks them as held:
+
+| Reason | Meaning |
+|---|---|
+| `first_contact` | sender is neither you nor in your contacts |
+| `quarantined_by_policy` | held because `dm_policy` is `contacts` and the sender is unknown |
+| `reported` | relay flags the sender as recently reported for spam (held even in open policy) |
+| `rate_limited` | relay flags the sender's send bucket as currently exhausted (advisory) |
+
+Held messages are **never silently dropped and never mixed into the
+normal inbox**. `courier inbox` prints them in a dedicated "Message
+requests" section below the inbox, and `courier inbox --requests`
+(`courier request list`) lists only requests. Requests are never pushed
+to the dashboard and never mark themselves seen.
+
+Review them with:
+
+- `courier request accept <message-id> [--as <name>]` — accept: releases
+  all held messages from that sender. If the request is `first_contact`,
+  the sender is added to your contacts (under `--as`, or an auto-generated
+  name that never clobbers an existing contact).
+- `courier request dismiss <message-id>` — dismiss: the sender joins a
+  local dismissed set; their messages no longer surface as requests
+  (still never mixed into the inbox — visibly counted as filtered).
+  Reversible with `courier request undismiss <address|contact>`.
+
+### Recipient-side controls
+
+- **dm_policy**: `courier config set dm_policy contacts` holds messages
+  from senders not in the recipient's contacts as message requests
+  (`first_contact` + `quarantined_by_policy`; default `open` delivers
+  everything). Held messages are fetched and decrypted but never
+  delivered to the inbox until accepted. The default inbox poll stays
+  quiet about requests so wake-on-message hooks only fire for real
+  deliveries.
+- **Blocklist**: `courier block <address|contact>` / `courier unblock
+  <address|contact>` (`courier block list` to review) drops a sender's
+  messages at inbox read time. Blocking is per-recipient and local:
+  nothing about the recipient's relationships leaves the machine.
+- **Reporting**: `courier report-spam <message-id>` files a signed spam
+  report with the relay (see above).
 ## Attachments (E2E encrypted file attachments)
 
 A message may carry files. Each attachment gets a fresh random 32-byte

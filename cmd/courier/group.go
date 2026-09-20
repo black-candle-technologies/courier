@@ -162,7 +162,7 @@ func cmdGroupInbox(cl *client.Client, cfg *client.Config, groupID string) error 
 	// Direct messages carry group protocol traffic (invites, key
 	// distributions), so sync them first. Any chat messages that arrive
 	// are shown, like `courier inbox` does.
-	msgs, lastID, skipped, err := cl.Inbox(cfg.Cursor, 50)
+	msgs, lastID, skipped, _, err := cl.Inbox(cfg.Cursor, 50)
 	if err != nil {
 		return fmt.Errorf("direct inbox sync: %w", err)
 	}

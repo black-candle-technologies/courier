@@ -61,7 +61,7 @@ func TestAttachmentEndToEnd(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 
-	msgs, _, skipped, err := recipient.Inbox(0, 50)
+	msgs, _, skipped, _, err := recipient.Inbox(0, 50)
 	if err != nil {
 		t.Fatalf("inbox: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestAttachmentEndToEndPlaintextUnaffected(t *testing.T) {
 	if _, err := sender.Send(recipCfg.Address, "just words"); err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	msgs, _, _, err := recipient.Inbox(0, 50)
+	msgs, _, _, _, err := recipient.Inbox(0, 50)
 	if err != nil {
 		t.Fatalf("inbox: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestAttachmentEndToEndNonRecipientBlocked(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 
-	msgs, _, _, err := recipient.Inbox(0, 50)
+	msgs, _, _, _, err := recipient.Inbox(0, 50)
 	if err != nil || len(msgs) != 1 || len(msgs[0].Attachments) != 1 {
 		t.Fatalf("inbox: %v %+v", err, msgs)
 	}

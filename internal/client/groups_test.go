@@ -167,7 +167,7 @@ func TestInboxSkipsUnknownKind(t *testing.T) {
 	cfg.RelayURL = ts.URL
 	cl := New(cfg)
 
-	msgs, lastID, skipped, err := cl.Inbox(40, 50)
+	msgs, lastID, skipped, _, err := cl.Inbox(40, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +249,7 @@ func (e *groupTestEnv) asBob()   { e.t.Setenv("HOME", e.bHome) }
 // returning chat messages.
 func (e *groupTestEnv) syncPersonal(c *Client, cfg *Config, cursor *int64) []Message {
 	e.t.Helper()
-	msgs, lastID, _, err := c.Inbox(*cursor, 50)
+	msgs, lastID, _, _, err := c.Inbox(*cursor, 50)
 	if err != nil {
 		e.t.Fatal(err)
 	}
