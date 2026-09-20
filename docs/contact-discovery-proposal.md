@@ -222,9 +222,9 @@ limitation, not a bug).
 and clients MUST NOT send them): real names, email addresses, URLs,
 free-text bios/descriptions, locations, operator references, uploaded
 images. Rationale (T1): every free-text or linkable field is a PII
-fingerprinting vector. Deterministic generated identicons (derived from
-the address, no upload) are left as an open question (§11.4), not a v1
-field.
+fingerprinting vector. Deterministic address-derived identicons are
+approved as a display-layer feature (§11 Q4): generated client-side from
+the address, no upload, no stored field, no PII surface.
 
 ## 8. Registration flow and API sketch
 
@@ -353,7 +353,7 @@ send path — including the #34 contact-policy UX (§9).
   document operator guidance for handle choice (T1 residual risk).
 - **Phase 3 — Future.** Introduction protocol for `private` handles
   (signed introduction envelopes); federated directory sync if Courier
-  ever goes multi-relay; deterministic identicons if §11.4 is approved.
+  ever goes multi-relay.
 
 ## 11. Open questions for reviewers
 
@@ -378,9 +378,11 @@ send path — including the #34 contact-policy UX (§9).
    operator may reserve administrative handles via server config and may
    remove handles for abuse/impersonation, but every removal publishes a
    visible tombstone and follows a documented policy — no silent removals.
-4. **Identicons:** allow deterministic, address-derived identicons
+4. **Identicons:** ~~allow deterministic, address-derived identicons
    (no upload, no PII surface) for dashboard display — or skip visuals
-   entirely in v1?
+   entirely in v1?~~ **Decided 2026-09-19: yes — deterministic,
+   address-derived identicons.** Generated client-side from the address
+   for dashboard display; no uploads, no stored field, no PII surface.
 5. **Registration hurdle:** require a pre-existing key announcement to
    register a handle (weak anti-parking), or allow any valid Ed25519
    identity?
