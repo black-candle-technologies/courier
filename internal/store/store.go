@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS dashboard_messages (
 	body        TEXT NOT NULL,
 	sent_at     INTEGER NOT NULL,
 	received_at INTEGER NOT NULL,
+	expires_at  INTEGER NOT NULL DEFAULT 0,
 	UNIQUE(user_id, courier_id)
 );
 CREATE INDEX IF NOT EXISTS idx_dashboard_messages_user ON dashboard_messages(user_id, courier_id);
@@ -142,6 +143,12 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN peer TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	// issue #53: disappearing messages. expires_at is 0 for messages
+	// that never expire; the dashboard filters expired rows from reads
+	// and deletes them on push.
+	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
 	// v0.6.11: key announcements now carry their Ed25519 signature so
@@ -889,18 +896,23 @@ type DashboardMessage struct {
 	Body       string
 	SentAt     int64
 	ReceivedAt int64
+	// ExpiresAt is the issue #53 disappearing-message expiry (0 =
+	// never). Read paths filter expired rows; the push sweep deletes
+	// them.
+	ExpiresAt int64
 }
 
 // SaveDashboardMessage stores a pushed message; duplicates (same user +
 // courier id) are ignored. It reports whether the row was actually
 // inserted. peer is the counterparty address: the sender for inbound
-// messages, the recipient for outbound ones.
-func (s *Store) SaveDashboardMessage(userID, courierID int64, sender, recipient, peer, body string, sentAt, receivedAt int64) (bool, error) {
+// messages, the recipient for outbound ones. expiresAt is the issue #53
+// disappearing-message expiry, 0 for messages that never expire.
+func (s *Store) SaveDashboardMessage(userID, courierID int64, sender, recipient, peer, body string, sentAt, receivedAt, expiresAt int64) (bool, error) {
 	res, err := s.db.Exec(
 		`INSERT OR IGNORE INTO dashboard_messages
-		 (user_id, courier_id, sender, recipient, peer, body, sent_at, received_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		userID, courierID, sender, recipient, peer, body, sentAt, receivedAt)
+		 (user_id, courier_id, sender, recipient, peer, body, sent_at, received_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		userID, courierID, sender, recipient, peer, body, sentAt, receivedAt, expiresAt)
 	if err != nil {
 		return false, err
 	}
@@ -911,9 +923,35 @@ func (s *Store) SaveDashboardMessage(userID, courierID int64, sender, recipient,
 	return n > 0, nil
 }
 
+// PruneExpiredDashboardMessages deletes disappeared messages (issue
+// #53): rows whose expires_at has passed. It returns the number of rows
+// deleted. Called on every dashboard push; read paths also filter
+// expired rows so a message never surfaces after its expiry even
+// between pushes.
+func (s *Store) PruneExpiredDashboardMessages() (int64, error) {
+	res, err := s.db.Exec(
+		`DELETE FROM dashboard_messages
+		 WHERE expires_at != 0 AND expires_at <= strftime('%s','now')`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // peerExpr resolves the counterparty of a message row. Rows written before
 // v0.6.5 have no peer value; those are all inbound, so sender is the peer.
 const peerExpr = `COALESCE(NULLIF(peer,''), sender)`
+
+// liveMessageExpr is the issue #53 disappearing-message read predicate:
+// rows that never expire, or whose expiry is still in the future. alias
+// is the table alias ("" when the query has no alias).
+func liveMessageExpr(alias string) string {
+	col := "expires_at"
+	if alias != "" {
+		col = alias + ".expires_at"
+	}
+	return `(` + col + ` = 0 OR ` + col + ` > strftime('%s','now'))`
+}
 
 // DashboardThread is one conversation: all messages exchanged with a
 // single counterparty address. Handle is the peer's listed directory
@@ -949,6 +987,7 @@ func (s *Store) DashboardThreads(userID int64, userAddr string, limit int) ([]Da
 		   ON s.user_id = m.user_id AND s.peer = `+peer+`
 		 WHERE m.user_id = ? AND m.sender != ?
 		   AND m.id > COALESCE(s.last_seen_id, 0)
+		   AND `+liveMessageExpr("m")+`
 		 GROUP BY p`,
 		userID, userAddr)
 	if err != nil {
@@ -987,6 +1026,7 @@ func (s *Store) DashboardThreads(userID int64, userAddr string, limit int) ([]Da
 		          ROW_NUMBER() OVER (PARTITION BY `+tpeer+`
 		                             ORDER BY COALESCE(t.sent_at, t.received_at) DESC, t.id DESC) AS rn
 		   FROM dashboard_messages t WHERE t.user_id = ?
+		     AND `+liveMessageExpr("t")+`
 		 ) WHERE rn = 1 ORDER BY ts DESC, p ASC LIMIT ?`,
 		userID, limit)
 	if err != nil {
@@ -1140,6 +1180,7 @@ func (s *Store) SearchThreadPeers(userID int64, q string) ([]string, error) {
 	rows, err := s.db.Query(
 		`SELECT DISTINCT `+peerExpr+` FROM dashboard_messages
 		 WHERE user_id = ?
+		   AND `+liveMessageExpr("")+`
 		   AND (body LIKE ? ESCAPE '\'
 		        OR sender LIKE ? ESCAPE '\'
 		        OR COALESCE(NULLIF(peer,''), '') LIKE ? ESCAPE '\')`,
@@ -1166,9 +1207,10 @@ func (s *Store) SearchThreadPeers(userID int64, q string) ([]string, error) {
 // shows recent history instead of the oldest 500 messages.
 func (s *Store) DashboardThreadMessages(userID int64, peer string, limit int) ([]DashboardMessage, error) {
 	rows, err := s.db.Query(
-		`SELECT id, courier_id, sender, recipient, body, sent_at, received_at
+		`SELECT id, courier_id, sender, recipient, body, sent_at, received_at, expires_at
 		 FROM dashboard_messages
 		 WHERE user_id = ? AND `+peerExpr+` = ?
+		   AND `+liveMessageExpr("")+`
 		 ORDER BY COALESCE(sent_at, received_at) DESC, id DESC LIMIT ?`,
 		userID, peer, limit)
 	if err != nil {
@@ -1178,7 +1220,7 @@ func (s *Store) DashboardThreadMessages(userID int64, peer string, limit int) ([
 	var out []DashboardMessage
 	for rows.Next() {
 		var m DashboardMessage
-		if err := rows.Scan(&m.ID, &m.CourierID, &m.Sender, &m.Recipient, &m.Body, &m.SentAt, &m.ReceivedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.CourierID, &m.Sender, &m.Recipient, &m.Body, &m.SentAt, &m.ReceivedAt, &m.ExpiresAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

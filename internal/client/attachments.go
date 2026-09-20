@@ -32,24 +32,32 @@ var b64 = base64.RawURLEncoding
 // relay never sees filenames, MIME types, plaintext hashes, or data
 // keys. Messages without attachments keep the legacy raw-text plaintext
 // so old clients render them unchanged.
+//
+// issue #53: ExpiresAt is an optional unix timestamp marking a
+// disappearing message. Messages sent with --ttl are wrapped in this
+// JSON envelope even without attachments; old clients render the
+// wrapper as raw text (message preserved, TTL ignored) while new
+// clients enforce expiry.
 type messagePayload struct {
 	Version     int                           `json:"v"`
 	Body        string                        `json:"body"`
-	Attachments []envelope.AttachmentManifest `json:"attachments"`
+	Attachments []envelope.AttachmentManifest `json:"attachments,omitempty"`
+	ExpiresAt   int64                         `json:"expires_at,omitempty"`
 }
 
-// parseMessagePayload splits a decrypted plaintext into its body text and
-// attachment manifests. Anything that is not a v1 payload carrying
-// attachments is treated as legacy raw text.
-func parseMessagePayload(plain []byte) (string, []envelope.AttachmentManifest) {
+// parseMessagePayload splits a decrypted plaintext into its body text,
+// attachment manifests, and expiry timestamp. Anything that is not a
+// v1 payload carrying attachments or an expiry is treated as legacy raw
+// text (expires 0).
+func parseMessagePayload(plain []byte) (string, []envelope.AttachmentManifest, int64) {
 	var p messagePayload
 	if err := json.Unmarshal(plain, &p); err != nil {
-		return string(plain), nil
+		return string(plain), nil, 0
 	}
-	if p.Version != 1 || len(p.Attachments) == 0 {
-		return string(plain), nil
+	if p.Version != 1 || (len(p.Attachments) == 0 && p.ExpiresAt == 0) {
+		return string(plain), nil, 0
 	}
-	return p.Body, p.Attachments
+	return p.Body, p.Attachments, p.ExpiresAt
 }
 
 // IncomingAttachment is one attachment manifest from a received message,

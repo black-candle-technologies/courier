@@ -955,17 +955,28 @@ func (c *Client) Send(toOrName, body string) (int64, error) {
 // never sees filenames, MIME types, plaintext hashes, or data keys.
 // Returns the relay message id.
 func (c *Client) SendWithAttachments(toOrName, body string, attachPaths []string) (int64, error) {
-	return c.send(toOrName, body, attachPaths, true)
+	return c.send(toOrName, body, attachPaths, true, 0)
+}
+
+// SendWithTTL encrypts body for the agent at toOrName as a disappearing
+// message (issue #53): the recipient's client deletes its copies once
+// ttl elapses. ttl must be positive; the expiry is stamped from the
+// sender's clock. Returns the relay message id.
+func (c *Client) SendWithTTL(toOrName, body string, ttl time.Duration) (int64, error) {
+	if ttl <= 0 {
+		return 0, fmt.Errorf("ttl must be positive")
+	}
+	return c.send(toOrName, body, nil, true, ttl)
 }
 
 // sendProtocolDM sends a machine-protocol DM (channel handshake traffic)
 // without recording it in the sent log: protocol DMs are not chat and
 // must not be pushed to the dashboard as sent messages.
 func (c *Client) sendProtocolDM(toOrName, body string) (int64, error) {
-	return c.send(toOrName, body, nil, false)
+	return c.send(toOrName, body, nil, false, 0)
 }
 
-func (c *Client) send(toOrName, body string, attachPaths []string, logSent bool) (int64, error) {
+func (c *Client) send(toOrName, body string, attachPaths []string, logSent bool, ttl time.Duration) (int64, error) {
 	address, err := c.cfg.ResolveRecipient(toOrName)
 	if err != nil {
 		return 0, err
@@ -997,23 +1008,39 @@ func (c *Client) send(toOrName, body string, attachPaths []string, logSent bool)
 		manifests = append(manifests, m)
 	}
 	var plain []byte
-	if len(manifests) > 0 {
-		plain, err = json.Marshal(messagePayload{Version: 1, Body: body, Attachments: manifests})
+	// issue #53: a TTL wraps the body in the versioned JSON envelope so
+	// the expiry rides inside the ciphertext (the relay never sees it).
+	var expiresAt int64
+	if ttl > 0 {
+		var err error
+		expiresAt, err = ttlExpiry(ttl)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if len(manifests) > 0 || expiresAt != 0 {
+		plain, err = json.Marshal(messagePayload{Version: 1, Body: body, Attachments: manifests, ExpiresAt: expiresAt})
 		if err != nil {
 			return 0, fmt.Errorf("encode payload: %w", err)
 		}
 	} else {
 		plain = []byte(body)
 	}
-	return c.sendSealed(address, plain, body, logSent)
+	id, err := c.sendSealed(address, plain, body, logSent, expiresAt)
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 // sendSealed encrypts plain for address and posts it as a DM. sentLogBody
 // is the human-readable summary recorded in the local sent log (and shown
 // on the dashboard); it may differ from the plaintext, e.g. for protocol
 // payloads like shared-state events (issue #49). logSent=false skips the
-// sent log for machine protocol DMs (channel handshakes).
-func (c *Client) sendSealed(address string, plain []byte, sentLogBody string, logSent bool) (int64, error) {
+// sent log for machine protocol DMs (channel handshakes). expiresAt is
+// the issue #53 disappearing-message expiry (0 = never); the sent-log
+// entry is pruned once it passes.
+func (c *Client) sendSealed(address string, plain []byte, sentLogBody string, logSent bool, expiresAt int64) (int64, error) {
 	toEd, err := crypto.ParseAddress(address)
 	if err != nil {
 		return 0, err
@@ -1059,7 +1086,7 @@ func (c *Client) sendSealed(address string, plain []byte, sentLogBody string, lo
 	// conversation. A logging failure must never fail the send itself.
 	// Protocol DMs skip the log: they are machine traffic, not chat.
 	if logSent {
-		_ = appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: sentLogBody, SentAt: sentAt})
+		_ = appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: sentLogBody, SentAt: sentAt, ExpiresAt: expiresAt})
 	}
 	return out.ID, nil
 }
@@ -1158,11 +1185,14 @@ func (c *Client) DownloadAttachment(a IncomingAttachment) ([]byte, error) {
 // SentEntry is one locally recorded outbound message: the plaintext the
 // agent sent, kept so `courier dashboard push` can thread conversations.
 // It lives next to config.json (mode 0600 material already lives there).
+// ExpiresAt is the issue #53 disappearing-message expiry (0 = never);
+// expired entries are pruned from the log on read.
 type SentEntry struct {
 	CourierID int64  `json:"courier_id"` // relay envelope id
 	To        string `json:"to"`
 	Body      string `json:"body"`
 	SentAt    int64  `json:"sent_at"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
 }
 
 // maxSentLog is the cap on the local sent log; older entries are dropped.
@@ -1176,7 +1206,10 @@ func sentLogPath() (string, error) {
 	return filepath.Join(home, ".courier", "sent.jsonl"), nil
 }
 
-// readSentLog returns all logged sent entries, oldest first.
+// readSentLog returns all logged sent entries, oldest first. Expired
+// disappearing-message entries (issue #53) are pruned: they are
+// filtered from the result and the log file is rewritten without them
+// (best-effort; a rewrite failure still returns the filtered entries).
 func readSentLog() ([]SentEntry, error) {
 	p, err := sentLogPath()
 	if err != nil {
@@ -1189,7 +1222,9 @@ func readSentLog() ([]SentEntry, error) {
 		}
 		return nil, err
 	}
+	now := time.Now().Unix()
 	var out []SentEntry
+	pruned := false
 	for _, line := range bytes.Split(raw, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
@@ -1199,9 +1234,56 @@ func readSentLog() ([]SentEntry, error) {
 		if err := json.Unmarshal(line, &e); err != nil {
 			continue
 		}
+		if stateExpired(now, e.ExpiresAt) {
+			pruned = true
+			continue
+		}
 		out = append(out, e)
 	}
+	if pruned {
+		_ = rewriteSentLog(out)
+	}
 	return out, nil
+}
+
+// rewriteSentLog replaces the sent log with entries, preserving the
+// maxSentLog cap. Used to drop expired disappearing-message entries.
+func rewriteSentLog(entries []SentEntry) error {
+	p, err := sentLogPath()
+	if err != nil {
+		return err
+	}
+	if len(entries) > maxSentLog {
+		entries = entries[len(entries)-maxSentLog:]
+	}
+	var buf bytes.Buffer
+	for _, e := range entries {
+		line, err := json.Marshal(e)
+		if err != nil {
+			return err
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(p), "sent-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(buf.Bytes()); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, p)
 }
 
 // appendSentLog records a sent message, pruning the log to maxSentLog.
@@ -1251,6 +1333,10 @@ type Message struct {
 	// inbox`, `courier request list`), never in the normal inbox and
 	// never pushed to the dashboard. Held, never silently dropped.
 	Request bool `json:"request,omitempty"`
+	// ExpiresAt is the issue #53 disappearing-message expiry as a unix
+	// timestamp, 0 when the message never expires. Set from the
+	// ciphertext payload; the dashboard uses it to delete its copy.
+	ExpiresAt int64 `json:"expires_at,omitempty"`
 }
 
 // Inbox fetches envelopes addressed to this agent after message id `after`,
@@ -1483,12 +1569,23 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 				continue
 			}
 		}
-		// Split a decrypted payload into its body text and attachment
-		// manifests. Manifests are validated and their data keys are
-		// unwrapped with this recipient's keys; a manifest whose key
-		// cannot be opened is kept with KeyError set, so the message is
-		// still delivered and the failure is visible, never silent.
-		body, manifests := parseMessagePayload(plain)
+		// Split a decrypted payload into its body text, attachment
+		// manifests, and disappearing-message expiry. Manifests are
+		// validated and their data keys are unwrapped with this
+		// recipient's keys; a manifest whose key cannot be opened is
+		// kept with KeyError set, so the message is still delivered
+		// and the failure is visible, never silent.
+		body, manifests, expiresAt := parseMessagePayload(plain)
+		// issue #53: a message already expired at fetch time is
+		// consumed silently — dropped, never delivered to the inbox,
+		// the dashboard, or the request queue. The cursor still
+		// advances past it and it is marked seen, so it is not
+		// re-derived on every fetch.
+		if stateExpired(time.Now().Unix(), expiresAt) {
+			seen[h] = true
+			newHashes = append(newHashes, h)
+			continue
+		}
 		var atts []IncomingAttachment
 		for _, mf := range manifests {
 			ia := IncomingAttachment{Manifest: mf}
@@ -1527,7 +1624,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		msg := Message{
 			ID: m.ID, From: m.From, Body: body,
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
-			Attachments: atts,
+			Attachments: atts, ExpiresAt: expiresAt,
 		}
 		// Machine-readable flag reasons. "first_contact" is derived
 		// locally (sender not in contacts and not self); the rest are
@@ -1997,6 +2094,9 @@ type pushMsg struct {
 	Body       string `json:"body"`
 	SentAt     int64  `json:"sent_at"`
 	ReceivedAt int64  `json:"received_at"`
+	// ExpiresAt is the issue #53 disappearing-message expiry (0 =
+	// never). The dashboard deletes its copy once it passes.
+	ExpiresAt int64 `json:"expires_at,omitempty"`
 }
 
 // Bounds for a single dashboard push request (v0.6.11 F11). The
@@ -2079,6 +2179,7 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 		items = append(items, pushItem{hash: hashes[i], msg: pushMsg{
 			CourierID: m.ID, From: m.From, Body: m.Body,
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
+			ExpiresAt: m.ExpiresAt,
 		}})
 	}
 	// issue #49: newly applied shared-state events are announced to
@@ -2094,14 +2195,22 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 		}})
 	}
 	// Outbound messages, oldest first, from the local sent log.
+	// readSentLog already pruned expired disappearing-message entries;
+	// skip any that expired since (best-effort prune above) rather than
+	// pushing a message that is already gone.
 	if sent, err := readSentLog(); err == nil {
+		now := time.Now().Unix()
 		for _, e := range sent {
 			if e.CourierID <= c.cfg.DashboardSentCursor {
+				continue
+			}
+			if stateExpired(now, e.ExpiresAt) {
 				continue
 			}
 			items = append(items, pushItem{sent: true, msg: pushMsg{
 				CourierID: e.CourierID, From: c.cfg.Address, To: e.To,
 				Body: e.Body, SentAt: e.SentAt, ReceivedAt: e.SentAt,
+				ExpiresAt: e.ExpiresAt,
 			}})
 		}
 	}

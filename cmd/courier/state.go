@@ -12,10 +12,11 @@ import (
 
 func stateUsage() string {
 	return `usage:
-  courier state note add <peer> --title <t> [--body <b>]   share a note
+  courier state note add <peer> --title <t> [--body <b>] [--ttl <duration>]
+                                                          share a note (--ttl e.g. 10m, 2h: disappearing note)
   courier state note done <peer> <note-id>                 mark note done
   courier state note reopen <peer> <note-id>               reopen a note
-  courier state task add <peer> --title <t> [--body <b>] [--assignee <addr|contact>] [--escalate]
+  courier state task add <peer> --title <t> [--body <b>] [--assignee <addr|contact>] [--escalate] [--ttl <duration>]
                                                           share a task
   courier state task assign <peer> <task-id> --assignee <addr|contact>
   courier state task done <peer> <task-id>                 (assignee only)
@@ -27,6 +28,29 @@ func stateUsage() string {
   courier state compact <peer> [--days N]                 compact note events older than N days (default 90)
 
 <peer> is an address or contact name. <id> accepts an unambiguous prefix.`
+}
+
+// parseTTLFlag parses an optional --ttl duration flag (issue #53).
+// Empty means "never expires".
+func parseTTLFlag(flags map[string]string) (time.Duration, error) {
+	v, ok := flags["ttl"]
+	if !ok || v == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("--ttl must be a positive duration (e.g. 30s, 10m, 2h)")
+	}
+	return d, nil
+}
+
+// expiryMark renders a short disappearing-item marker for list output
+// (issue #53), "" when the item never expires.
+func expiryMark(expiresAt int64) string {
+	if expiresAt == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" ⏳ expires %s", time.Unix(expiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"))
 }
 
 // splitStateFlags separates positional args from --flags, since Go's
@@ -147,14 +171,18 @@ func cmdStateNote(cl *client.Client, args []string) error {
 	}
 	switch args[0] {
 	case "add":
-		pos, flags, err := splitStateFlags(args[1:], map[string]bool{"title": true, "body": true})
+		pos, flags, err := splitStateFlags(args[1:], map[string]bool{"title": true, "body": true, "ttl": true})
 		if err != nil {
 			return err
 		}
 		if len(pos) != 1 || flags["title"] == "" {
-			return fmt.Errorf("usage: courier state note add <peer> --title <t> [--body <b>]")
+			return fmt.Errorf("usage: courier state note add <peer> --title <t> [--body <b>] [--ttl <duration>]")
 		}
-		id, envID, err := cl.StateAddNote(pos[0], flags["title"], flags["body"])
+		ttl, err := parseTTLFlag(flags)
+		if err != nil {
+			return err
+		}
+		id, envID, err := cl.StateAddNote(pos[0], flags["title"], flags["body"], ttl)
 		if err != nil {
 			return err
 		}
@@ -181,14 +209,18 @@ func cmdStateTask(cl *client.Client, args []string) error {
 	}
 	switch args[0] {
 	case "add":
-		pos, flags, err := splitStateFlags(args[1:], map[string]bool{"title": true, "body": true, "assignee": true, "escalate": false})
+		pos, flags, err := splitStateFlags(args[1:], map[string]bool{"title": true, "body": true, "assignee": true, "escalate": false, "ttl": true})
 		if err != nil {
 			return err
 		}
 		if len(pos) != 1 || flags["title"] == "" {
-			return fmt.Errorf("usage: courier state task add <peer> --title <t> [--body <b>] [--assignee <a>] [--escalate]")
+			return fmt.Errorf("usage: courier state task add <peer> --title <t> [--body <b>] [--assignee <a>] [--escalate] [--ttl <duration>]")
 		}
-		id, envID, err := cl.StateAddTask(pos[0], flags["title"], flags["body"], flags["assignee"], flags["escalate"] == "true")
+		ttl, err := parseTTLFlag(flags)
+		if err != nil {
+			return err
+		}
+		id, envID, err := cl.StateAddTask(pos[0], flags["title"], flags["body"], flags["assignee"], flags["escalate"] == "true", ttl)
 		if err != nil {
 			return err
 		}
@@ -246,7 +278,7 @@ func cmdStateList(cl *client.Client, peer string, all bool) error {
 			continue
 		}
 		shown++
-		fmt.Printf("  [%s] %s %s\n", n.ID[:8], doneMark(n.Done), n.Title)
+		fmt.Printf("  [%s] %s %s%s\n", n.ID[:8], doneMark(n.Done), n.Title, expiryMark(n.ExpiresAt))
 	}
 	if shown == 0 {
 		fmt.Println("  (none)")
@@ -262,7 +294,7 @@ func cmdStateList(cl *client.Client, peer string, all bool) error {
 		if t.Escalate {
 			esc = " [needs human]"
 		}
-		fmt.Printf("  [%s] %s %s (assignee %s)%s\n", t.ID[:8], taskMark(t.State), t.Title, shortAddr(t.Assignee), esc)
+		fmt.Printf("  [%s] %s %s (assignee %s)%s%s\n", t.ID[:8], taskMark(t.State), t.Title, shortAddr(t.Assignee), esc, expiryMark(t.ExpiresAt))
 	}
 	if shown == 0 {
 		fmt.Println("  (none)")
@@ -303,6 +335,9 @@ func cmdStateShow(cl *client.Client, peer, prefix string) error {
 			n.ID, n.Title, n.Done, shortAddr(n.Author),
 			time.Unix(n.CreatedAt, 0).Format(time.RFC3339),
 			time.Unix(n.UpdatedAt, 0).Format(time.RFC3339))
+		if n.ExpiresAt != 0 {
+			fmt.Printf("  expires: %s\n", time.Unix(n.ExpiresAt, 0).Format(time.RFC3339))
+		}
 		if n.Body != "" {
 			fmt.Printf("  body: %s\n", n.Body)
 		}
@@ -314,6 +349,9 @@ func cmdStateShow(cl *client.Client, peer, prefix string) error {
 			t.Escalate, shortAddr(t.Author),
 			time.Unix(t.CreatedAt, 0).Format(time.RFC3339),
 			time.Unix(t.UpdatedAt, 0).Format(time.RFC3339))
+		if t.ExpiresAt != 0 {
+			fmt.Printf("  expires: %s\n", time.Unix(t.ExpiresAt, 0).Format(time.RFC3339))
+		}
 		if t.Body != "" {
 			fmt.Printf("  body: %s\n", t.Body)
 		}

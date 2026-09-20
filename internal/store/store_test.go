@@ -192,7 +192,7 @@ func TestDashboardThreadsUnreadCounts(t *testing.T) {
 
 	push := func(courierID int64, sender, peer, body string, ts int64) {
 		t.Helper()
-		if _, err := s.SaveDashboardMessage(uid, courierID, sender, self, peer, body, ts, ts); err != nil {
+		if _, err := s.SaveDashboardMessage(uid, courierID, sender, self, peer, body, ts, ts, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -284,7 +284,7 @@ func TestDashboardThreadMessagesNewest500(t *testing.T) {
 	peer := "ed25519:peer"
 	for i := int64(1); i <= 600; i++ {
 		body := "msg-" + strconv.FormatInt(i, 10)
-		if _, err := s.SaveDashboardMessage(uid, i, peer, self, peer, body, i, i); err != nil {
+		if _, err := s.SaveDashboardMessage(uid, i, peer, self, peer, body, i, i, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
