@@ -226,7 +226,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"ok":        true,
 		"time":      time.Now().UTC().Format(time.RFC3339),
 		"envelopes": n,
-		"version":   "0.8.1",
+		"version":   "0.9.0",
 	})
 }
 

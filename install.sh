@@ -4,7 +4,7 @@
 set -e
 
 REPO="black-candle-technologies/courier"
-VERSION="${COURIER_VERSION:-v0.8.0}"
+VERSION="${COURIER_VERSION:-v0.9.0}"
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
