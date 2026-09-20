@@ -1147,8 +1147,11 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, int, erro
 //
 // skipped counts envelopes that failed authentication or decryption
 // (corrupt/forged); filtered counts messages intentionally filtered by
-// the recipient's own rules (blocked or dismissed senders). The two are
-// reported separately so routine filtering never looks like an attack.
+// the recipient's own rules (blocked or dismissed senders). Suppressed
+// replays are counted in neither: identical envelope bytes are routine
+// dedup, never an attack, and the "no new messages." sentinel contract
+// depends on them staying silent. The three are reported separately so
+// routine delivery mechanics never look like an attack.
 func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64, int, int, []string, error) {
 	hc, err := c.httpClient()
 	if err != nil {
@@ -1218,9 +1221,14 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 		}
 		// v0.6.11 (F3): suppress replays independently of relay message
 		// ids — identical envelope bytes are never delivered twice.
+		// Replays are routine dedup, not failures (v0.9.1): the
+		// instant-wake daemon's dashboard push legitimately marks
+		// envelopes seen before the next inbox poll runs, so counting
+		// them as skipped would print the corruption warning on every
+		// such race and break the "no new messages." sentinel contract
+		// that poll-based wake scripts rely on.
 		h := envelope.DedupHash(c.cfg.Address, m.From, m.Eph, m.Nonce, m.SentAt, m.Ct, m.Sig)
 		if seen[h] {
-			skipped++
 			continue
 		}
 		fromEd, err := crypto.ParseAddress(m.From)
