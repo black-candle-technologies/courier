@@ -31,6 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/black-candle-technologies/courier/m
 ```sh
 courier init            # creates your keypair, prints your address
 courier send <ADDRESS> "hello from agent A"
+courier send <ADDRESS> "this self-destructs" --ttl 10m
 courier inbox           # read your messages
 courier send <ADDRESS> "sounds good" --reply-to 42   # reply to message #42
 ```

@@ -5,7 +5,7 @@
 //
 //	courier init [--relay URL] [--force]   create your identity
 //	courier address                      print your address (public key)
-//	courier send <address> <message|-> [--attach file]... [--reply-to id]
+//	courier send <address> <message|-> [--attach file]... [--reply-to id] [--ttl 10m]
 //	courier inbox [--all] [--limit N] [--follow] [--attachments-dir dir]
 //	courier backup create|restore|export-sync|import-sync
 //	courier stdio                        JSON-lines bridge for agents
@@ -120,6 +120,7 @@ func usage() {
                                          first-contact or contacts-policy handle sends
       [--attach <file>]...               attach files (E2E encrypted, 25 MiB max each)
       [--reply-to <id>]                  reply to message #id (quotes it, threads the view)
+      [--ttl <duration>]                 disappearing message: delete after duration (e.g. 10m, 2h)
   courier inbox [--all] [--limit N] [--follow [--interval 5s]] [--requests]
       [--attachments-dir <dir>]          download verified attachments into dir
                                          --requests lists held message requests instead
@@ -354,7 +355,7 @@ func cmdSend(args []string) error {
 	// Accept flags before or after the positional address/message, as the
 	// usage string documents: Go's flag package stops parsing at the first
 	// positional argument, so extract them manually first.
-	positional, fileVal, replyToVal, attachVals := splitSendArgs(noForce)
+	positional, fileVal, replyToVal, attachVals, ttlVal := splitSendArgs(noForce)
 	if fileVal != "" {
 		*file = fileVal
 	}
@@ -426,7 +427,18 @@ func cmdSend(args []string) error {
 		}
 		address = addr
 	}
-	id, err := cl.SendReplyWithAttachments(address, body, attach, replyTo)
+	// issue #53: disappearing messages. --ttl takes a Go duration
+	// (30s, 10m, 2h). Attachments, reply threading, and TTL compose:
+	// the expiry rides inside the encrypted payload (v1 or v2).
+	var ttl time.Duration
+	if ttlVal != "" {
+		var terr error
+		ttl, terr = time.ParseDuration(ttlVal)
+		if terr != nil || ttl <= 0 {
+			return fmt.Errorf("--ttl must be a positive duration (e.g. 30s, 10m, 2h)")
+		}
+	}
+	id, err := cl.SendFull(address, body, attach, replyTo, ttl)
 	if err != nil {
 		return err
 	}
@@ -436,6 +448,9 @@ func cmdSend(args []string) error {
 	}
 	if len(attach) > 0 {
 		fmt.Printf(" with %d attachment(s)", len(attach))
+	}
+	if ttlVal != "" {
+		fmt.Printf(" (disappearing in %s)", ttlVal)
 	}
 	fmt.Println()
 	// issue #52: receipts for my messages depend on the *recipient's*
@@ -447,11 +462,12 @@ func cmdSend(args []string) error {
 	return nil
 }
 
-// splitSendArgs extracts --file/--attach flags from any position in the
-// send command's arguments, returning the remaining positional arguments.
-// Go's flag package stops parsing at the first positional, but the usage
-// string documents flags after the message, so this keeps both working.
-func splitSendArgs(args []string) (positional []string, file, replyTo string, attach []string) {
+// splitSendArgs extracts --file/--attach/--reply-to/--ttl flags from any
+// position in the send command's arguments, returning the remaining
+// positional arguments. Go's flag package stops parsing at the first
+// positional, but the usage string documents flags after the message,
+// so this keeps both working.
+func splitSendArgs(args []string) (positional []string, file, replyTo string, attach []string, ttl string) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -470,11 +486,16 @@ func splitSendArgs(args []string) (positional []string, file, replyTo string, at
 			i++
 		case strings.HasPrefix(a, "--reply-to="):
 			replyTo = strings.TrimPrefix(a, "--reply-to=")
+		case a == "--ttl" && i+1 < len(args):
+			ttl = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--ttl="):
+			ttl = strings.TrimPrefix(a, "--ttl=")
 		default:
 			positional = append(positional, a)
 		}
 	}
-	return positional, file, replyTo, attach
+	return positional, file, replyTo, attach, ttl
 }
 
 // stringSliceFlag is a repeatable string flag (e.g. --attach a --attach b).
@@ -492,6 +513,10 @@ func printMessages(msgs []client.Message) {
 		flagStr := ""
 		if len(m.Flags) > 0 {
 			flagStr = " [" + strings.Join(m.Flags, ",") + "]"
+		}
+		// issue #53: disappearing messages show their expiry.
+		if m.ExpiresAt != 0 {
+			flagStr += fmt.Sprintf(" [expires %s]", time.Unix(m.ExpiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"))
 		}
 		fmt.Printf("[#%d] from %s at %s%s\n", m.ID, m.From, ts, flagStr)
 		// issue #51: reply threading. The parent snippet is

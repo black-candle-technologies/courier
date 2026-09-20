@@ -694,7 +694,7 @@ func (c *Client) sendFSInit(address string) error {
 	if err != nil {
 		return err
 	}
-	_, err = c.sendSealed(address, raw, "", false)
+	_, err = c.sendSealed(address, raw, "", 0, "", false, 0)
 	return err
 }
 
@@ -814,7 +814,7 @@ func (c *Client) handleFSInit(from string, p fsPayload) {
 	}
 	// Best-effort accept: if it fails to send, the initiator refreshes
 	// its init within fsInitRefreshSeconds and we adopt again.
-	_, _ = c.sendSealed(from, accept, "", false)
+	_, _ = c.sendSealed(from, accept, "", 0, "", false, 0)
 }
 
 // handleFSAccept processes an fs-accept for our pending init and

@@ -192,7 +192,7 @@ func TestDashboardThreadsUnreadCounts(t *testing.T) {
 
 	push := func(courierID int64, sender, peer, body string, ts int64) {
 		t.Helper()
-		if _, err := s.SaveDashboardMessage(uid, courierID, sender, self, peer, body, ts, ts, 0, ""); err != nil {
+		if _, err := s.SaveDashboardMessage(uid, courierID, sender, self, peer, body, ts, ts, 0, "", 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -284,7 +284,7 @@ func TestDashboardThreadMessagesNewest500(t *testing.T) {
 	peer := "ed25519:peer"
 	for i := int64(1); i <= 600; i++ {
 		body := "msg-" + strconv.FormatInt(i, 10)
-		if _, err := s.SaveDashboardMessage(uid, i, peer, self, peer, body, i, i, 0, ""); err != nil {
+		if _, err := s.SaveDashboardMessage(uid, i, peer, self, peer, body, i, i, 0, "", 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -416,10 +416,10 @@ func TestDashboardMessageReplyThreading(t *testing.T) {
 	uid := int64(1)
 	self := "ed25519:self"
 	peer := "ed25519:peer"
-	if _, err := s.SaveDashboardMessage(uid, 1, peer, "", peer, "parent", 100, 100, 0, ""); err != nil {
+	if _, err := s.SaveDashboardMessage(uid, 1, peer, "", peer, "parent", 100, 100, 0, "", 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SaveDashboardMessage(uid, 2, self, peer, peer, "reply", 101, 101, 1, "parent"); err != nil {
+	if _, err := s.SaveDashboardMessage(uid, 2, self, peer, peer, "reply", 101, 101, 1, "parent", 0); err != nil {
 		t.Fatal(err)
 	}
 	msgs, err := s.DashboardThreadMessages(uid, peer, 500)

@@ -313,11 +313,16 @@ plaintext payload:
 ```
 
 Messages without attachments keep the legacy raw-text plaintext, so old
-clients render them unchanged. The `keys` array holds one wrapped data
-key per recipient, leaving room for future group messaging without a
-format change. Filenames are bare names (no path separators, ≤ 256
-bytes); the sender's envelope signature covers the ciphertext, binding
-the manifest to the envelope without revealing it.
+clients render them unchanged — **except** disappearing messages (issue
+#53): a message sent with `--ttl` is wrapped as
+`{"v": 1, "body": "<message text>", "expires_at": <unix>}` even without
+attachments. Pre-#53 clients render that JSON as raw text (message
+preserved, TTL ignored); new clients enforce the expiry. The `keys`
+array holds one wrapped data key per recipient, leaving room for future
+group messaging without a format change. Filenames are bare names (no
+path separators, ≤ 256 bytes); the sender's envelope signature covers
+the ciphertext, binding the manifest to the envelope without revealing
+it.
 
 Limits: 25 MiB plaintext per attachment, 256 KiB chunks.
 
@@ -916,12 +921,20 @@ message so a stranger cannot write into the shared log.
 
 | Kind | Fields | Effect |
 |---|---|---|
-| `note-add` | `note_id`, `title`, `body?` | Creates the note (content immutable afterwards) |
+| `note-add` | `note_id`, `title`, `body?`, `expires_at?` | Creates the note (content immutable afterwards) |
 | `note-done` | `note_id`, `done` | Last-writer-wins done flag |
-| `task-add` | `task_id`, `title`, `body?`, `assignee`, `escalate?` | Creates the task; assignee must be one of the two collaborators |
+| `task-add` | `task_id`, `title`, `body?`, `assignee`, `escalate?`, `expires_at?` | Creates the task; assignee must be one of the two collaborators |
 | `task-assign` | `task_id`, `assignee` | Reassigns; **only the assigner** may issue |
 | `task-done` | `task_id` | **Only the assignee** may issue |
 | `task-reopen` | `task_id` | **Only the assigner** may issue |
+
+`expires_at` (issue #53) is a unix timestamp stamped from the sender's
+clock; it is only valid on `note-add`/`task-add` and rejected on every
+other kind. Expired notes/tasks disappear from the derived view and
+their events are pruned from each endpoint's local log (real local
+deletion — the one exception to "task events are archived, never
+pruned", because expiry is an explicit deletion request). Pre-#53
+clients ignore the field and never expire the item.
 
 Every event carries `author` (Ed25519 address, stamped by the
 applier), `seq`, and `sent_at`. Events fold in `(sent_at, author,
@@ -1018,3 +1031,45 @@ chat, and never reach the dashboard.
 Receipt DMs are ordinary envelopes. Older clients display the payload
 JSON as chat text (harmless) while new clients consume it silently. No
 relay changes were required.
+## Disappearing messages (issue #53)
+
+Any message may carry a time-to-live. The expiry travels **inside the
+encrypted payload** — never as relay-visible envelope metadata (so the
+relay learns nothing about which messages are disappearing):
+
+- **Chat:** `courier send <peer> <msg> --ttl <duration>` (e.g. `10m`,
+  `2h`). The plaintext becomes `{"v": 1, "body": "...",
+  "expires_at": <unix>}`. A recipient whose clock says the message has
+  expired drops it silently (and marks it seen, so it never surfaces
+  later). Expired sender copies in `~/.courier/sent.jsonl` are filtered
+  from inbox/outbound views and the file is rewritten without them.
+- **Shared state:** `courier state note add <peer> ... --ttl <duration>`
+  and `courier state task add <peer> ... --ttl <duration>`. `expires_at`
+  rides on the `note-add`/`task-add` events and is folded into the
+  derived notes/tasks; expired items vanish from views and their events
+  are pruned from the local `state.json` log.
+- **Dashboard:** the push body carries `expires_at`; the
+  `dashboard_messages` table stores it and every read filters rows with
+  `expires_at != 0 AND expires_at <= now`. Each push also sweeps
+  already-expired rows. Existing rows migrate with `expires_at = 0`
+  (never expire).
+
+No relay changes: expired envelopes remain on the relay until the
+existing 30-day retention pruning deletes them (the relay deletes whole
+envelopes, not per-message, and cannot see the expiry). The sender
+stamps an absolute unix expiry from its own clock; the recipient
+enforces it against its own clock, with no grace period and no cross-
+device synchronization guarantees. **Honest caveat:** expiry is local
+deletion on each endpoint the agent controls (client, dashboard), not
+guaranteed remote erasure — a message delivered before expiry is still
+deleted locally, but any copy the recipient made outside Courier is out
+of scope. State DMs and TTL chat DMs remain ordinary envelopes and never
+touch `sent.jsonl`.
+
+### Backward compatibility
+
+Pre-#53 clients ignore unknown JSON fields: state `note-add`/`task-add`
+payloads still parse (the note/task simply never expires for them), and
+old chat clients display a TTL message's versioned JSON as raw text
+rather than losing the message. Old dashboard rows default to
+`expires_at = 0`.
