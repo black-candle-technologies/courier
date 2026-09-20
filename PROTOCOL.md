@@ -147,6 +147,31 @@ use `after=<last id seen>` to page through.
 
 `GET /v1/health` → `{"ok": true, "time": "...", "envelopes": N}`.
 
+## Instant wake (long-poll subscription)
+
+`GET /v1/inbox/subscribe?to=<address>&cursor=<id>&ts=<unix>&sig=<base64url>`
+→ same envelope shape as `/v1/inbox`, plus `"timeout": true` on an empty
+long-poll expiry:
+
+```json
+{ "messages": [ { "id": 7, "from": "...", ... } ] }
+{ "messages": [], "timeout": true }
+```
+
+Authorization mirrors inbox reads: `sig` is the recipient's Ed25519
+signature over `envelope.SubscribeRequest(address, cursor, ts)` (domain
+`courier-subscribe-req-v1`), verified against the `to` key; `ts` must be
+within 300 seconds of relay time. If envelopes with `id > cursor` already
+exist, the relay answers immediately; otherwise it holds the request up to
+55 seconds (configurable server-side) and replies the moment a new
+envelope for `to` is durably stored — duplicates never re-wake. At most 4
+concurrent subscriptions per identity; extras are rejected with `429`.
+Timed-out responses carry `timeout: true` so clients can distinguish "no
+mail yet" from "mail arrived"; clients re-subscribe from the last seen id.
+Use this for push-style wake instead of polling `/v1/inbox`; it does not
+replace inbox reads (the wake daemon keeps a separate cursor and never
+marks messages seen).
+
 ## Spam and abuse filtering (metadata-only)
 
 Courier filters abuse using **metadata only**: sender/recipient addresses,

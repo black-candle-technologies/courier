@@ -124,6 +124,11 @@ type Config struct {
 	// handles-only update; refreshed at most once per 24h so inactive
 	// threads get their labels without a message batch.
 	HandleRefreshAt int64 `json:"handle_refresh_at,omitempty"`
+	// Instant wake (issue #42). WakeCursor is the last envelope id the
+	// wake daemon observed. It is tracked separately from Cursor so
+	// observing a message never consumes it: a woken agent still sees
+	// it as new in `courier inbox`.
+	WakeCursor int64 `json:"wake_cursor,omitempty"`
 }
 
 // HandleCacheEntry is a cached address→handle mapping with a local

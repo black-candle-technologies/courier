@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/crypto"
@@ -106,6 +107,10 @@ type Server struct {
 	dirSearchLimiter *Limiter
 	// reserved holds operator-reserved handles (lowercase).
 	reserved map[string]bool
+	// subs tracks held /v1/inbox/subscribe long-poll requests
+	// (issue #42), keyed by recipient address. Guarded by subMu.
+	subMu sync.Mutex
+	subs  map[string]map[*subscriber]struct{}
 }
 
 // New returns a Server backed by st with default abuse-control tuning.
@@ -152,6 +157,7 @@ func NewWithConfig(st *store.Store, cfg Config) *Server {
 		dirLookupLimiter: NewLimiter(cfg.DirLookupBurst, cfg.DirLookupRatePerSec),
 		dirSearchLimiter: NewLimiter(cfg.DirSearchBurst, cfg.DirSearchRatePerSec),
 		reserved:         reserved,
+		subs:             make(map[string]map[*subscriber]struct{}),
 	}
 }
 
@@ -161,6 +167,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 	mux.HandleFunc("POST /v1/send", s.handleSend)
 	mux.HandleFunc("GET /v1/inbox", s.handleInbox)
+	// issue #42: long-poll inbox subscription for instant wake.
+	mux.HandleFunc("GET /v1/inbox/subscribe", s.handleSubscribe)
 	mux.HandleFunc("POST /v1/blobs", s.handleBlobUpload)
 	mux.HandleFunc("GET /v1/blobs/{blob_id}", s.handleBlobDownload)
 	mux.HandleFunc("POST /v1/keys", s.handleKeyAnnounce)
@@ -312,6 +320,12 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	// A replayed envelope is acknowledged with its original id rather
 	// than stored twice (v0.6.11 F3).
+	// Issue #42: wake any held /v1/inbox/subscribe requests for the
+	// recipient, but only for newly stored envelopes — a duplicate
+	// carries no new message.
+	if stored {
+		s.notifySubscribers(req.To)
+	}
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "duplicate": !stored})
 }
 
@@ -529,55 +543,7 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "store failed")
 		return
 	}
-	type msg struct {
-		ID          int64    `json:"id"`
-		From        string   `json:"from"`
-		Eph         string   `json:"eph"`
-		Nonce       string   `json:"nonce"`
-		Ct          string   `json:"ct"`
-		SentAt      int64    `json:"sent_at"`
-		ReceivedAt  int64    `json:"received_at"`
-		Sig         string   `json:"sig"`
-		SenderFlags []string `json:"sender_flags"`
-	}
-	// Sender reputation flags (metadata-only, advisory): computed once
-	// per distinct sender across the page. "rate_limited" means the
-	// sender's send bucket is currently exhausted (actively bursting);
-	// "reported" means the sender is currently over the distinct-reporter
-	// throttle threshold. Recipients use these as machine-readable
-	// reasons when triaging message requests. They are relay-asserted,
-	// not signed — advisory signal, not authentication.
-	senderFlags := make(map[string][]string)
-	for _, e := range envs {
-		if _, ok := senderFlags[e.From]; ok {
-			continue
-		}
-		var flags []string
-		if s.limiter.Exhausted("send:" + e.From) {
-			flags = append(flags, "rate_limited")
-		}
-		if n, err := s.store.DistinctReporterCount(e.From, int64(s.cfg.SpamReportWindow.Seconds())); err == nil && n >= s.cfg.SpamReportThreshold {
-			flags = append(flags, "reported")
-		}
-		senderFlags[e.From] = flags
-	}
-	out := make([]msg, 0, len(envs))
-	var size int
-	for _, e := range envs {
-		// Bound the page by encoded bytes (v0.6.11 F8): the base64url
-		// fields plus JSON overhead per message. Always return at
-		// least one message; pagination continues via after=lastID.
-		size += len(e.From) + len(e.Eph) + len(e.Nonce) + len(e.Ct) + len(e.Sig) + 128
-		if size > MaxInboxPageBytes && len(out) > 0 {
-			break
-		}
-		out = append(out, msg{
-			ID: e.ID, From: e.From, Eph: e.Eph, Nonce: e.Nonce,
-			Ct: e.Ct, SentAt: e.SentAt, ReceivedAt: e.ReceivedAt, Sig: e.Sig,
-			SenderFlags: senderFlags[e.From],
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"messages": out})
+	writeJSON(w, http.StatusOK, map[string]any{"messages": s.buildInboxPage(envs)})
 }
 
 // ---- Attachments: encrypted blob store ----

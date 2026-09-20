@@ -31,6 +31,11 @@ var dashboardRegisterDomain = []byte("courier-dashboard-register-v1\x00")
 // validate as another.
 var inboxRequestDomain = []byte("courier-inbox-req-v1\x00")
 
+// subscribeRequestDomain separates inbox-subscription signatures (issue
+// #42) from every other use of the identity key: a subscription
+// signature can never validate as an inbox read, and vice versa.
+var subscribeRequestDomain = []byte("courier-subscribe-req-v1\x00")
+
 // blobUploadDomain separates blob-upload authorization signatures: the
 // uploader signs the blob id, recipient, byte size, and timestamp, so the
 // relay can attribute stored blobs to an identity.
@@ -87,6 +92,23 @@ func InboxRequest(address []byte, after, limit, ts int64) []byte {
 	binary.BigEndian.PutUint64(b[:], uint64(after))
 	out = append(out, b[:]...)
 	binary.BigEndian.PutUint64(b[:], uint64(limit))
+	out = append(out, b[:]...)
+	binary.BigEndian.PutUint64(b[:], uint64(ts))
+	out = append(out, b[:]...)
+	return out
+}
+
+// SubscribeRequest builds the canonical bytes a recipient signs to
+// authorize a long-poll inbox subscription (issue #42). It binds the
+// recipient address, the resume cursor, and a timestamp; the relay
+// enforces the same freshness window as inbox reads. Domain-separated
+// from InboxRequest so the two authorizations are not interchangeable.
+func SubscribeRequest(address []byte, cursor, ts int64) []byte {
+	out := make([]byte, 0, len(subscribeRequestDomain)+32+8+8)
+	out = append(out, subscribeRequestDomain...)
+	out = append(out, address...) // 32 bytes Ed25519 (recipient address)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(cursor))
 	out = append(out, b[:]...)
 	binary.BigEndian.PutUint64(b[:], uint64(ts))
 	out = append(out, b[:]...)
