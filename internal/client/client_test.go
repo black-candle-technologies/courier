@@ -454,8 +454,11 @@ func TestInboxSuppressesReplayedEnvelopes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(msgs) != 0 || skipped != 1 {
-		t.Fatalf("replay not suppressed: msgs=%d skipped=%d", len(msgs), skipped)
+	// v0.9.1: replays are routine dedup, not failures — suppressed
+	// silently so poll-based wake scripts keep their "no new messages."
+	// sentinel instead of tripping the corruption warning.
+	if len(msgs) != 0 || skipped != 0 {
+		t.Fatalf("replay not suppressed silently: msgs=%d skipped=%d", len(msgs), skipped)
 	}
 }
 
