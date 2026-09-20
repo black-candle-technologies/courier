@@ -870,3 +870,75 @@ a snapshot; task events are retained for the archive.
 State DMs are ordinary envelopes. Pre-v0.10.0 clients display the
 payload JSON as chat text (harmless) while new clients consume it
 silently. No relay changes were required.
+
+## Delivery and read receipts (issue #52)
+
+Strictly opt-in delivery/read receipts for DMs. Off by default
+everywhere; enabling is an explicit per-contact user action
+(`courier contacts receipts-on <name>`). A receipt leaks the reader's
+activity, so nothing is ever sent without the reader's opt-in for that
+sender. The two sides are independent: I send receipts to S iff *I*
+opted in for S; I record receipts from anyone, but only against sent
+envelopes I can find locally. Absence of a receipt is not a signal —
+the recipient may simply not have opted in, and the sender cannot tell.
+
+### Wire format
+
+Receipts are ordinary encrypted DM envelopes (kind `dm`) carrying a
+protocol payload, like channel/group/state protocol DMs. The relay
+sees only standard envelope metadata and cannot distinguish a receipt
+from chat, nor learn which message was read (the referenced envelope
+id is inside the ciphertext):
+
+```json
+{"cr":3,"t":"delivery","m":1234,"at":1758316234}
+```
+
+- `cr: 3` — magic marking the payload as a receipt (group is `cg:1`,
+  channel is `cc:2`, shared state is `cs:1`).
+- `t` — `delivery` or `read`.
+- `m` — the relay envelope id of the acknowledged message.
+- `at` — unix seconds when the receipt was generated.
+
+Unknown `cr` values or malformed payloads fall through as ordinary
+chat, never silently swallowed. Pre-receipt clients display the
+payload JSON as chat text (same forward-compatibility tradeoff as
+group/channel DMs).
+
+### Triggers
+
+- `delivery`: the recipient's inbox consumer first delivers the
+  envelope. Automatic, once per envelope. Dashboard pushes and state
+  syncs never fire receipts; held message requests never generate
+  receipts.
+- `read`: the message is surfaced to the consumer — printed by
+  `courier inbox` or returned by the stdio bridge's `inbox` command.
+  Dashboard thread opens are future work (the dashboard server holds
+  no keys to sign with). Group messages are out of scope.
+
+### Authentication and replay safety
+
+The envelope's Ed25519 signature authenticates `from`. Identical
+envelope bytes are suppressed by the per-consumer seen sets; a replay
+with fresh envelope bytes is idempotent — received receipts are keyed
+by (sender, envelope id, type) with first-wins timestamps, and
+sent-receipt dedup makes each (peer, envelope, type) fire at most
+once. A receipt is recorded only if it references a known sent
+envelope (matching id and recipient in the sender's local sent log)
+with a sane timestamp, so fabricated receipts are dropped. Receipts
+bypass the sent log (`logSent=false`): they are machine traffic, not
+chat, and never reach the dashboard.
+
+### Local storage
+
+- Opt-in: `config.json` → `receipt_contacts` (address → true).
+  Cleared on contact removal.
+- Traffic state: `~/.courier/receipts.json` (0600) — received
+  receipts per (peer, envelope id), plus the sent-receipt dedup set.
+  Both tables are bounded (500 / 2000, oldest pruned).
+
+### Backward compatibility
+
+Receipt DMs are ordinary envelopes. Older clients display the payload
+JSON as chat text (harmless) while new clients consume it silently. No
+relay changes were required.

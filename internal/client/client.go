@@ -76,9 +76,9 @@ type Config struct {
 	// contact name. A record pins the address + key epoch the safety
 	// number was computed over; if either changes, trust goes stale.
 	ContactVerifications map[string]ContactVerification `json:"contact_verifications,omitempty"`
-	EncKeys          []EncKey          `json:"enc_keys,omitempty"`          // current first; lazily migrated
-	AutoUpdate       *bool             `json:"auto_update,omitempty"`       // nil = unset: auto-install newer releases (v0.6.12+ default); false opts out
-	UpdateCheckedAt  int64             `json:"update_checked_at,omitempty"` // unix seconds of last update check
+	EncKeys              []EncKey                       `json:"enc_keys,omitempty"`          // current first; lazily migrated
+	AutoUpdate           *bool                          `json:"auto_update,omitempty"`       // nil = unset: auto-install newer releases (v0.6.12+ default); false opts out
+	UpdateCheckedAt      int64                          `json:"update_checked_at,omitempty"` // unix seconds of last update check
 	// v0.6.0: web dashboard account. Token is the push API token (the
 	// dashboard stores only its hash). DashboardCursor is the last
 	// courier message id pushed.
@@ -115,6 +115,12 @@ type Config struct {
 	// sync cursor is seeded from the inbox/push cursors, whose fetches
 	// already applied older state events.
 	SeenStateHashes []string `json:"seen_state_hashes,omitempty"`
+	// issue #52: per-contact delivery/read receipt opt-in, keyed by
+	// recipient address. Strictly opt-in: receipts never leak read
+	// activity unless the operator explicitly enabled them for the
+	// sender (`courier contacts receipts-on <name>`). Default off;
+	// cleared when the contact is removed.
+	ReceiptContacts map[string]bool `json:"receipt_contacts,omitempty"`
 	// Spam/abuse filtering (metadata-only; the relay never sees
 	// plaintext). DMPolicy is "open" (default, unset) or "contacts":
 	// in contacts mode, messages from senders not in contacts are
@@ -453,9 +459,13 @@ func (c *Config) AddContact(name, address string) error {
 }
 
 // RemoveContact deletes a contact and its verification record (issue
-// #48: a removed contact's trust must not resurrect if re-added). It is
-// not an error if absent.
+// #48: a removed contact's trust must not resurrect if re-added), plus
+// its receipt opt-in (issue #52: no lingering activity-leak consent).
+// It is not an error if absent.
 func (c *Config) RemoveContact(name string) error {
+	if addr, ok := c.Contacts[name]; ok {
+		delete(c.ReceiptContacts, addr)
+	}
 	delete(c.Contacts, name)
 	delete(c.ContactVerifications, name)
 	return c.Save()
@@ -1441,6 +1451,14 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			newHashes = append(newHashes, h)
 			continue
 		}
+		// issue #52: receipt protocol direct messages are consumed by
+		// the receipt layer and never surface as chat messages.
+		if rp, ok := parseReceiptDMPayload(plain); ok {
+			c.handleReceiptDM(m.From, rp)
+			seen[h] = true
+			newHashes = append(newHashes, h)
+			continue
+		}
 		// issue #39: introduction protocol DMs are consumed by the
 		// introduction layer and never surface as chat messages (same
 		// as group-control DMs, issue #32). Valid payloads are recorded
@@ -1559,6 +1577,16 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			continue
 		}
 		out = append(out, msg)
+		// issue #52: opt-in delivery receipt. Fires only for the inbox
+		// consumer on first delivery — never for dashboard pushes,
+		// state syncs, or review re-derivations (markSeen=false) — and
+		// only when this agent explicitly opted into receipts for the
+		// sender. Held requests continue above, so they never generate
+		// receipts. The receipt is a signed protocol DM excluded from
+		// the sent log; best effort, never fatal to delivery.
+		if consumer == seenConsumerInbox && markSeen && c.cfg.ReceiptsEnabledFor(m.From) {
+			c.sendDeliveryReceipt(m.From, m.ID)
+		}
 		// Only successfully delivered messages are marked seen: a
 		// message that fails verification or decryption now may become
 		// readable later (e.g. after the sender's key announcement

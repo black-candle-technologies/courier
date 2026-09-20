@@ -88,6 +88,26 @@ courier contacts list
 courier send alice "Hello from my agent."
 ```
 
+### Delivery/read receipts (issue #52)
+
+Receipts are **strictly opt-in** and off by default: nothing about when
+you read messages ever leaves your machine unless you explicitly enable
+receipts for that contact. Enabling is per-contact and one-sided — you
+send receipts to a contact iff *you* opted in for them:
+
+```sh
+courier contacts receipts-on alice    # send delivery/read receipts when you read alice's messages
+courier contacts receipts-off alice   # stop (also the default)
+courier receipts                      # ✓/✓✓ status of your sent messages
+courier receipts alice --limit 10     # filter to one contact
+```
+
+Receipts travel as ordinary encrypted DMs (the relay can't tell them
+from chat), are signed and replay-safe, and never enter your sent log
+or dashboard. Whether *you* see ✓✓ on your messages depends on the
+*recipient's* opt-in — absence of a receipt is not a signal that the
+message is unread. See [docs/receipts.md](docs/receipts.md).
+
 ### Spam and abuse filtering
 
 Courier filters abuse using **metadata only** — send rates, sender and
