@@ -29,11 +29,11 @@ func legacyParseMessagePayload(plain []byte) (string, []envelope.AttachmentManif
 }
 
 func TestReplyPayloadRoundTrip(t *testing.T) {
-	raw, err := encodeReplyPayload("yes, 3 works", 42, "want to sync at 3?", nil)
+	raw, err := encodeReplyPayload("yes, 3 works", 42, "want to sync at 3?", nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, manifests, r := parseMessagePayload(raw)
+	body, manifests, r, _ := parseMessagePayload(raw)
 	if body != "yes, 3 works" {
 		t.Fatalf("body = %q", body)
 	}
@@ -51,11 +51,11 @@ func TestReplyPayloadWithAttachments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := encodeReplyPayload("see attached", 7, "send the report", []envelope.AttachmentManifest{m})
+	raw, err := encodeReplyPayload("see attached", 7, "send the report", []envelope.AttachmentManifest{m}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, manifests, r := parseMessagePayload(raw)
+	body, manifests, r, _ := parseMessagePayload(raw)
 	if body != "see attached" || len(manifests) != 1 || manifests[0].Filename != "f.txt" {
 		t.Fatalf("body/manifests not parsed: %q %+v", body, manifests)
 	}
@@ -66,19 +66,19 @@ func TestReplyPayloadWithAttachments(t *testing.T) {
 
 func TestReplyPayloadValidation(t *testing.T) {
 	// Negative reply_to normalizes to "not a reply", never an error.
-	raw, _ := encodeReplyPayload("hi", -3, "x", nil)
-	if _, _, r := parseMessagePayload(raw); r.To != 0 {
+	raw, _ := encodeReplyPayload("hi", -3, "x", nil, 0)
+	if _, _, r, _ := parseMessagePayload(raw); r.To != 0 {
 		t.Fatalf("negative reply_to not normalized: %+v", r)
 	}
 	// Unknown versions fall back to raw text.
 	for _, v := range []string{`{"v":99,"body":"hi","reply_to":1}`, `{"v":0}`, `not json`} {
-		b, ms, r := parseMessagePayload([]byte(v))
+		b, ms, r, _ := parseMessagePayload([]byte(v))
 		if b != v || len(ms) != 0 || r.To != 0 {
 			t.Fatalf("payload %q misparsed: %q %+v %+v", v, b, ms, r)
 		}
 	}
 	// v1 with a foreign reply_to field: v1 semantics frozen, ignored.
-	b, ms, r := parseMessagePayload([]byte(`{"v":1,"body":"hi","reply_to":9,"attachments":[]}`))
+	b, ms, r, _ := parseMessagePayload([]byte(`{"v":1,"body":"hi","reply_to":9,"attachments":[]}`))
 	if b != `{"v":1,"body":"hi","reply_to":9,"attachments":[]}` || len(ms) != 0 || r.To != 0 {
 		t.Fatalf("v1+reply_to not treated as raw text: %q %+v %+v", b, ms, r)
 	}
@@ -87,7 +87,7 @@ func TestReplyPayloadValidation(t *testing.T) {
 func TestOldClientToleratesV2Reply(t *testing.T) {
 	// The old (pre-#51) parser must never choke on a v2 reply: it
 	// renders the JSON as chat text, preserving the message content.
-	raw, err := encodeReplyPayload("yes, 3 works", 42, "want to sync at 3?", nil)
+	raw, err := encodeReplyPayload("yes, 3 works", 42, "want to sync at 3?", nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestOldClientToleratesV2Reply(t *testing.T) {
 
 func TestEncodeMessageBodyWireChoice(t *testing.T) {
 	// Plain message: legacy raw text, byte-identical.
-	raw, err := encodeMessageBody("hello", nil, 0, "")
+	raw, err := encodeMessageBody("hello", nil, 0, "", 0)
 	if err != nil || string(raw) != "hello" {
 		t.Fatalf("plain = %q, %v", raw, err)
 	}
@@ -115,7 +115,7 @@ func TestEncodeMessageBodyWireChoice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err = encodeMessageBody("hi", []envelope.AttachmentManifest{m}, 0, "")
+	raw, err = encodeMessageBody("hi", []envelope.AttachmentManifest{m}, 0, "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestEncodeMessageBodyWireChoice(t *testing.T) {
 		t.Fatalf("old client misparsed v1 attachments: %q %+v", body, ms)
 	}
 	// Reply: v2.
-	raw, err = encodeMessageBody("re: hi", nil, 42, "hi")
+	raw, err = encodeMessageBody("re: hi", nil, 42, "hi", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,14 +138,14 @@ func TestEncodeMessageBodyWireChoice(t *testing.T) {
 		t.Fatalf("reply must be v2: %s", raw)
 	}
 	// Reply with attachments: v2 carrying both.
-	raw, err = encodeMessageBody("re: docs", []envelope.AttachmentManifest{m}, 42, "send docs")
+	raw, err = encodeMessageBody("re: docs", []envelope.AttachmentManifest{m}, 42, "send docs", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := json.Unmarshal(raw, &v); err != nil || v.Version != 2 {
 		t.Fatalf("reply+attachments must be v2: %s", raw)
 	}
-	body, ms, r := parseMessagePayload(raw)
+	body, ms, r, _ := parseMessagePayload(raw)
 	if body != "re: docs" || len(ms) != 1 || r.To != 42 || r.Quote != "send docs" {
 		t.Fatalf("v2 reply+attachments misparsed: %q %+v %+v", body, ms, r)
 	}

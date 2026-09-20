@@ -31,13 +31,15 @@ import (
 const replyPayloadVersion = 2
 
 // replyPayload is the v2 wire form of a chat message: body text plus
-// optional reply threading metadata and optional attachments.
+// optional reply threading metadata, optional attachments, and an
+// optional disappearing-message expiry (issue #53).
 type replyPayload struct {
 	Version     int                           `json:"v"`
 	Body        string                        `json:"body"`
 	ReplyTo     int64                         `json:"reply_to,omitempty"`
 	Quote       string                        `json:"quote,omitempty"`
 	Attachments []envelope.AttachmentManifest `json:"attachments,omitempty"`
+	ExpiresAt   int64                         `json:"expires_at,omitempty"`
 }
 
 // replyInfo is the threading metadata parsed out of a received message:
@@ -72,32 +74,35 @@ func truncateQuote(s string) string {
 }
 
 // encodeMessageBody builds the DM plaintext: legacy raw text for plain
-// messages, the v1 attachment payload when attachments ride along, or
-// the v2 reply payload (issue #51) when threading metadata is present.
-// Attachment-only sends keep the exact legacy v1 wire so old clients
-// render them unchanged.
-func encodeMessageBody(body string, manifests []envelope.AttachmentManifest, replyTo int64, quote string) ([]byte, error) {
+// messages, the v1 attachment/expiry payload when attachments or a TTL
+// ride along, or the v2 reply payload (issue #51) when threading
+// metadata is present. Attachment-only sends keep the exact legacy v1
+// wire so old clients render them unchanged; TTL-only sends use the
+// v1+expires_at form from #53.
+func encodeMessageBody(body string, manifests []envelope.AttachmentManifest, replyTo int64, quote string, expiresAt int64) ([]byte, error) {
 	switch {
-	case len(manifests) > 0 && replyTo <= 0:
-		return json.Marshal(messagePayload{Version: 1, Body: body, Attachments: manifests})
-	case len(manifests) > 0 || replyTo > 0:
-		return encodeReplyPayload(body, replyTo, quote, manifests)
+	case replyTo > 0:
+		return encodeReplyPayload(body, replyTo, quote, manifests, expiresAt)
+	case len(manifests) > 0 || expiresAt != 0:
+		return json.Marshal(messagePayload{Version: 1, Body: body, Attachments: manifests, ExpiresAt: expiresAt})
 	default:
 		return []byte(body), nil
 	}
 }
 
 // encodeReplyPayload builds the v2 plaintext for a reply: body plus the
-// parent envelope id and the best-effort parent snippet. Attachments may
-// ride along; callers that have attachments but no reply keep emitting
-// the legacy v1 payload (see encodeMessageBody).
-func encodeReplyPayload(body string, replyTo int64, quote string, manifests []envelope.AttachmentManifest) ([]byte, error) {
+// parent envelope id and the best-effort parent snippet. Attachments and
+// a TTL expiry may ride along; callers that have attachments or an
+// expiry but no reply keep emitting the legacy v1 payload (see
+// encodeMessageBody).
+func encodeReplyPayload(body string, replyTo int64, quote string, manifests []envelope.AttachmentManifest, expiresAt int64) ([]byte, error) {
 	return json.Marshal(replyPayload{
 		Version:     replyPayloadVersion,
 		Body:        body,
 		ReplyTo:     replyTo,
 		Quote:       truncateQuote(quote),
 		Attachments: manifests,
+		ExpiresAt:   expiresAt,
 	})
 }
 

@@ -32,45 +32,54 @@ var b64 = base64.RawURLEncoding
 // relay never sees filenames, MIME types, plaintext hashes, or data
 // keys. Messages without attachments keep the legacy raw-text plaintext
 // so old clients render them unchanged.
+//
+// issue #53: ExpiresAt is an optional unix timestamp marking a
+// disappearing message. Messages sent with --ttl are wrapped in this
+// JSON envelope even without attachments; old clients render the
+// wrapper as raw text (message preserved, TTL ignored) while new
+// clients enforce expiry.
 type messagePayload struct {
 	Version     int                           `json:"v"`
 	Body        string                        `json:"body"`
-	Attachments []envelope.AttachmentManifest `json:"attachments"`
+	Attachments []envelope.AttachmentManifest `json:"attachments,omitempty"`
+	ExpiresAt   int64                         `json:"expires_at,omitempty"`
 }
 
 // parseMessagePayload splits a decrypted plaintext into its body text,
-// attachment manifests, and reply threading metadata (issue #51).
-// Anything that is not a recognized versioned payload is treated as
-// legacy raw text, so old and foreign payloads never fail delivery.
+// attachment manifests, reply threading metadata (issue #51), and
+// disappearing-message expiry (issue #53). Anything that is not a
+// recognized versioned payload is treated as legacy raw text (expiry
+// 0), so old and foreign payloads never fail delivery.
 //
-// v1 keeps its exact legacy semantics: only payloads carrying
-// attachments are structured; a v1 without attachments (or any
-// unrecognized version) renders as raw text. v2 adds optional
-// reply_to/quote alongside optional attachments; reply metadata on a
-// v1 payload is ignored (v1 semantics are frozen).
-func parseMessagePayload(plain []byte) (string, []envelope.AttachmentManifest, replyInfo) {
-	var p replyPayload
+// v1 keeps its exact legacy semantics, extended by #53: only payloads
+// carrying attachments or an expiry are structured; a v1 without
+// attachments or expiry (or any unrecognized version) renders as raw
+// text. v2 adds optional reply_to/quote alongside optional
+// attachments and an optional expiry; reply metadata on a v1 payload
+// is ignored (v1 semantics are frozen).
+func parseMessagePayload(plain []byte) (string, []envelope.AttachmentManifest, replyInfo, int64) {
+	var p messagePayload
 	if err := json.Unmarshal(plain, &p); err != nil {
-		return string(plain), nil, replyInfo{}
+		return string(plain), nil, replyInfo{}, 0
 	}
 	switch p.Version {
 	case 1:
-		if len(p.Attachments) == 0 {
-			return string(plain), nil, replyInfo{}
+		if len(p.Attachments) == 0 && p.ExpiresAt == 0 {
+			return string(plain), nil, replyInfo{}, 0
 		}
-		return p.Body, p.Attachments, replyInfo{}
+		return p.Body, p.Attachments, replyInfo{}, p.ExpiresAt
 	case replyPayloadVersion:
 		rp, ok := parseReplyPayload(plain)
 		if !ok {
-			return string(plain), nil, replyInfo{}
+			return string(plain), nil, replyInfo{}, 0
 		}
 		var r replyInfo
 		if rp.ReplyTo > 0 {
 			r = replyInfo{To: rp.ReplyTo, Quote: rp.Quote}
 		}
-		return rp.Body, rp.Attachments, r
+		return rp.Body, rp.Attachments, r, rp.ExpiresAt
 	default:
-		return string(plain), nil, replyInfo{}
+		return string(plain), nil, replyInfo{}, 0
 	}
 }
 

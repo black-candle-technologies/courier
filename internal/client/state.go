@@ -69,17 +69,27 @@ const (
 // StateEvent is one shared-state mutation. Author is implicit: the
 // address that sent the enclosing DM (authenticated by the envelope
 // signature). Seq is the author's per-author sequence number.
+// ExpiresAt is an optional unix timestamp (issue #53): on note-add and
+// task-add it marks when the item disappears (see stateExpired). It is
+// rejected on every other event kind.
 type StateEvent struct {
-	Kind     string `json:"k"`
-	Seq      int64  `json:"seq"`
-	SentAt   int64  `json:"ts"`
-	NoteID   string `json:"note_id,omitempty"`
-	TaskID   string `json:"task_id,omitempty"`
-	Title    string `json:"title,omitempty"`
-	Body     string `json:"body,omitempty"`
-	Assignee string `json:"assignee,omitempty"`
-	Escalate bool   `json:"escalate,omitempty"`
-	Done     bool   `json:"done,omitempty"`
+	Kind      string `json:"k"`
+	Seq       int64  `json:"seq"`
+	SentAt    int64  `json:"ts"`
+	NoteID    string `json:"note_id,omitempty"`
+	TaskID    string `json:"task_id,omitempty"`
+	Title     string `json:"title,omitempty"`
+	Body      string `json:"body,omitempty"`
+	Assignee  string `json:"assignee,omitempty"`
+	Escalate  bool   `json:"escalate,omitempty"`
+	Done      bool   `json:"done,omitempty"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
+}
+
+// stateExpired reports whether an item with the given expiry timestamp
+// is gone at now. Zero means "never expires".
+func stateExpired(now, expiresAt int64) bool {
+	return expiresAt != 0 && now >= expiresAt
 }
 
 // statePayload is the wire format: a batch of events inside one DM's
@@ -127,6 +137,17 @@ func parseStatePayload(plain []byte) (statePayload, bool) {
 func validateStateEvent(ev *StateEvent) error {
 	if ev.Seq <= 0 {
 		return errors.New("event seq must be positive")
+	}
+	// issue #53: expiry is only meaningful when an item is created.
+	if ev.ExpiresAt != 0 {
+		switch ev.Kind {
+		case StateEventNoteAdd, StateEventTaskAdd:
+			if ev.ExpiresAt <= 0 {
+				return errors.New("expires_at must be positive")
+			}
+		default:
+			return fmt.Errorf("%s: expires_at only valid on note-add/task-add", ev.Kind)
+		}
 	}
 	switch ev.Kind {
 	case StateEventNoteAdd:
@@ -185,7 +206,8 @@ func newStateID() (string, error) {
 // ---- derived state ----
 
 // StateNote is one shared note. Notes are immutable once added; only
-// the done flag changes, by last-writer-wins.
+// the done flag changes, by last-writer-wins. ExpiresAt is zero for
+// notes that never expire (issue #53).
 type StateNote struct {
 	ID        string `json:"id"`
 	Title     string `json:"title"`
@@ -194,6 +216,7 @@ type StateNote struct {
 	Author    string `json:"author"`
 	CreatedAt int64  `json:"created_at"`
 	UpdatedAt int64  `json:"updated_at"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
 }
 
 // Task states.
@@ -215,6 +238,11 @@ type StateTask struct {
 	CreatedAt int64  `json:"created_at"`
 	UpdatedAt int64  `json:"updated_at"`
 	DoneBy    string `json:"done_by,omitempty"`
+	// ExpiresAt is zero for tasks that never expire (issue #53). An
+	// expired task disappears from the view and its events are pruned —
+	// the one exception to "task events are archived, never pruned",
+	// because expiry is an explicit deletion request.
+	ExpiresAt int64 `json:"expires_at,omitempty"`
 }
 
 // LoggedStateEvent is one event in a conversation's log, with its
@@ -236,16 +264,39 @@ type StateView struct {
 // the same state. Task transitions are authorized here: task-assign
 // and task-reopen only from the assigner, task-done only from the
 // assignee. Unauthorized transitions are ignored by the fold (they stay
-// in the log as the audit trail).
+// in the log as the audit trail). Items whose expires_at has passed
+// (issue #53) are excluded from the view.
 func foldStateEvents(log []LoggedStateEvent) *StateView {
+	return foldStateEventsAt(log, time.Now().Unix())
+}
+
+// foldStateEventsAt is foldStateEvents evaluated at a fixed now (used
+// by viewOf and by tests).
+func foldStateEventsAt(log []LoggedStateEvent, now int64) *StateView {
 	v := &StateView{Notes: map[string]*StateNote{}, Tasks: map[string]*StateTask{}}
-	foldStateEventsInto(v, log)
+	foldStateEventsIntoAt(v, log, now)
 	return v
 }
 
 // foldStateEventsInto folds log on top of an existing view (used to
 // apply post-snapshot events over compacted notes).
 func foldStateEventsInto(v *StateView, log []LoggedStateEvent) {
+	foldStateEventsIntoAt(v, log, time.Now().Unix())
+}
+
+// foldStateEventsIntoAt is foldStateEventsInto evaluated at a fixed now.
+func foldStateEventsIntoAt(v *StateView, log []LoggedStateEvent, now int64) {
+	foldStateEventsOrdered(v, log)
+	// issue #53: expired items disappear from the derived view. Their
+	// events are pruned from the local log separately (pruneExpiredState);
+	// the fold only decides what is visible.
+	filterExpiredStateView(v, now)
+}
+
+// foldStateEventsOrdered applies log to v in (sentAt, author, seq)
+// order, without any expiry filtering. pruneExpiredState uses it to see
+// every item's ExpiresAt, including expired ones.
+func foldStateEventsOrdered(v *StateView, log []LoggedStateEvent) {
 	ordered := make([]LoggedStateEvent, len(log))
 	copy(ordered, log)
 	sort.Slice(ordered, func(i, j int) bool {
@@ -266,6 +317,7 @@ func foldStateEventsInto(v *StateView, log []LoggedStateEvent) {
 				v.Notes[ev.NoteID] = &StateNote{
 					ID: ev.NoteID, Title: ev.Title, Body: ev.Body,
 					Author: le.Author, CreatedAt: ev.SentAt, UpdatedAt: ev.SentAt,
+					ExpiresAt: ev.ExpiresAt,
 				}
 			}
 		case StateEventNoteDone:
@@ -282,6 +334,7 @@ func foldStateEventsInto(v *StateView, log []LoggedStateEvent) {
 					Assignee: ev.Assignee, Assigner: le.Author,
 					Escalate: ev.Escalate, State: StateTaskOpen,
 					Author: le.Author, CreatedAt: ev.SentAt, UpdatedAt: ev.SentAt,
+					ExpiresAt: ev.ExpiresAt,
 				}
 			}
 		case StateEventTaskAssign:
@@ -311,6 +364,21 @@ func foldStateEventsInto(v *StateView, log []LoggedStateEvent) {
 			t.State = StateTaskOpen
 			t.DoneBy = ""
 			t.UpdatedAt = ev.SentAt
+		}
+	}
+}
+
+// filterExpiredStateView drops expired notes and tasks from a folded
+// view (issue #53).
+func filterExpiredStateView(v *StateView, now int64) {
+	for id, n := range v.Notes {
+		if stateExpired(now, n.ExpiresAt) {
+			delete(v.Notes, id)
+		}
+	}
+	for id, t := range v.Tasks {
+		if stateExpired(now, t.ExpiresAt) {
+			delete(v.Tasks, id)
 		}
 	}
 }
@@ -450,15 +518,81 @@ func loadState() (*stateFile, error) {
 
 // viewOf folds one conversation: snapshot notes plus post-snapshot
 // events. Post-snapshot events fold on top of the snapshot, so a
-// note-done for a compacted note still applies.
+// note-done for a compacted note still applies. Expired snapshot notes
+// (issue #53) are dropped before folding.
 func (c *stateConversation) viewOf() *StateView {
+	return c.viewOfAt(time.Now().Unix())
+}
+
+// viewOfAt is viewOf evaluated at a fixed now (used by tests).
+func (c *stateConversation) viewOfAt(now int64) *StateView {
 	v := &StateView{Notes: map[string]*StateNote{}, Tasks: map[string]*StateTask{}}
 	for id, n := range c.SnapshotNotes {
+		if stateExpired(now, n.ExpiresAt) {
+			continue
+		}
 		cp := *n
 		v.Notes[id] = &cp
 	}
-	foldStateEventsInto(v, c.Events)
+	foldStateEventsIntoAt(v, c.Events, now)
 	return v
+}
+
+// pruneExpiredState deletes the local log events of expired notes and
+// tasks, and drops expired snapshot notes. This is real local deletion
+// (issue #53): each endpoint prunes its own copies independently on
+// read/sync — the relay keeps the envelopes until its retention policy
+// ages them out. It returns the number of events dropped.
+func pruneExpiredState(conv *stateConversation, now int64) int {
+	// Fold without the expiry filter so expired items are visible with
+	// their ExpiresAt; snapshot notes seed the view first.
+	v := &StateView{Notes: map[string]*StateNote{}, Tasks: map[string]*StateTask{}}
+	for id, n := range conv.SnapshotNotes {
+		cp := *n
+		v.Notes[id] = &cp
+	}
+	foldStateEventsOrdered(v, conv.Events)
+	expiredNotes := map[string]bool{}
+	expiredTasks := map[string]bool{}
+	for id, n := range v.Notes {
+		if stateExpired(now, n.ExpiresAt) {
+			expiredNotes[id] = true
+		}
+	}
+	for id, t := range v.Tasks {
+		if stateExpired(now, t.ExpiresAt) {
+			expiredTasks[id] = true
+		}
+	}
+	if len(expiredNotes) == 0 && len(expiredTasks) == 0 {
+		return 0
+	}
+	for id := range expiredNotes {
+		delete(conv.SnapshotNotes, id)
+	}
+	dropped := 0
+	keep := conv.Events[:0]
+	for _, le := range conv.Events {
+		switch le.Kind {
+		case StateEventNoteAdd, StateEventNoteDone:
+			if expiredNotes[le.NoteID] {
+				dropped++
+				continue
+			}
+		case StateEventTaskAdd, StateEventTaskAssign, StateEventTaskDone, StateEventTaskReopen:
+			if expiredTasks[le.TaskID] {
+				dropped++
+				continue
+			}
+		}
+		keep = append(keep, le)
+	}
+	// Zero the tail so pruned events don't linger in the backing array.
+	for i := len(keep); i < len(conv.Events); i++ {
+		conv.Events[i] = LoggedStateEvent{}
+	}
+	conv.Events = keep
+	return dropped
 }
 
 // applyStateEvents validates a batch of events from author for peer's
@@ -488,6 +622,11 @@ func (c *Client) applyStateEvents(peer, author string, events []StateEvent) ([]S
 			}
 			applied = append(applied, ev)
 		}
+		// issue #53: prune expired items' events from the local log.
+		// This runs on every consumer's pass (inbox, dashboard push,
+		// state sync) and on the sender's local apply, so each
+		// endpoint deletes its own expired copies independently.
+		pruneExpiredState(conv, time.Now().Unix())
 		return nil
 	})
 	return applied, err
@@ -509,9 +648,14 @@ func stateSummary(peer string, ev StateEvent) string {
 	if title == "" {
 		title = shortID
 	}
+	// issue #53: flag disappearing items in the announcement.
+	expiry := ""
+	if ev.ExpiresAt != 0 {
+		expiry = fmt.Sprintf(" (expires %s)", time.Unix(ev.ExpiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"))
+	}
 	switch ev.Kind {
 	case StateEventNoteAdd:
-		return fmt.Sprintf("📝 shared note with %s: %s", shortPeer(peer), title)
+		return fmt.Sprintf("📝 shared note with %s: %s%s", shortPeer(peer), title, expiry)
 	case StateEventNoteDone:
 		if ev.Done {
 			return fmt.Sprintf("☑ shared note done: %s", title)
@@ -522,7 +666,7 @@ func stateSummary(peer string, ev StateEvent) string {
 		if ev.Escalate {
 			s += " (needs human)"
 		}
-		return s
+		return s + expiry
 	case StateEventTaskAssign:
 		return fmt.Sprintf("📌 task reassigned to %s: %s", shortPeer(ev.Assignee), title)
 	case StateEventTaskDone:
@@ -580,7 +724,7 @@ func (c *Client) sendStateEvents(peer string, events []StateEvent) (int64, error
 	for _, ev := range prepared {
 		summaries = append(summaries, stateSummary(address, ev))
 	}
-	id, err := c.sendSealed(address, plain, strings.Join(summaries, "; "), 0, "", true)
+	id, err := c.sendSealed(address, plain, strings.Join(summaries, "; "), 0, "", true, 0)
 	if err != nil {
 		return 0, err
 	}
@@ -594,21 +738,30 @@ func (c *Client) sendStateEvents(peer string, events []StateEvent) (int64, error
 	return id, nil
 }
 
-// StateConversation loads and folds one peer conversation.
+// StateConversation loads and folds one peer conversation. Expired
+// notes/tasks (issue #53) are pruned from the local log on the way,
+// so pure reads (list/show/search with no new events) still delete
+// expired items.
 func (c *Client) StateConversation(peer string) (*StateView, error) {
 	address, err := c.cfg.ResolveRecipient(peer)
 	if err != nil {
 		return nil, err
 	}
-	sf, err := loadState()
+	var view *StateView
+	err = updateState(func(sf *stateFile) error {
+		conv := sf.Conversations[address]
+		if conv == nil {
+			view = &StateView{Notes: map[string]*StateNote{}, Tasks: map[string]*StateTask{}}
+			return nil
+		}
+		pruneExpiredState(conv, time.Now().Unix())
+		view = conv.viewOf()
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	conv := sf.Conversations[address]
-	if conv == nil {
-		return &StateView{Notes: map[string]*StateNote{}, Tasks: map[string]*StateTask{}}, nil
-	}
-	return conv.viewOf(), nil
+	return view, nil
 }
 
 // StateListNotes returns the conversation's notes sorted by most
@@ -705,15 +858,21 @@ func (c *Client) defaultAssignee(peer, assignee string) (string, error) {
 	return a, nil
 }
 
-// StateAddNote shares a note with peer. Returns the note id and the
-// relay envelope id.
-func (c *Client) StateAddNote(peer, title, body string) (string, int64, error) {
+// StateAddNote shares a note with peer. ttl is the disappearing-message
+// lifetime (issue #53); zero means the note never expires. Returns the
+// note id and the relay envelope id.
+func (c *Client) StateAddNote(peer, title, body string, ttl time.Duration) (string, int64, error) {
+	expiresAt, err := ttlExpiry(ttl)
+	if err != nil {
+		return "", 0, err
+	}
 	noteID, err := newStateID()
 	if err != nil {
 		return "", 0, err
 	}
 	id, err := c.sendStateEvents(peer, []StateEvent{{
 		Kind: StateEventNoteAdd, NoteID: noteID, Title: title, Body: body,
+		ExpiresAt: expiresAt,
 	}})
 	if err != nil {
 		return "", 0, err
@@ -742,9 +901,14 @@ func (c *Client) StateSetNoteDone(peer, notePrefix string, done bool) (int64, er
 }
 
 // StateAddTask shares a task with peer. Empty assignee means self.
-// Returns the task id and the relay envelope id.
-func (c *Client) StateAddTask(peer, title, body, assignee string, escalate bool) (string, int64, error) {
+// ttl is the disappearing-message lifetime (issue #53); zero means the
+// task never expires. Returns the task id and the relay envelope id.
+func (c *Client) StateAddTask(peer, title, body, assignee string, escalate bool, ttl time.Duration) (string, int64, error) {
 	a, err := c.defaultAssignee(peer, assignee)
+	if err != nil {
+		return "", 0, err
+	}
+	expiresAt, err := ttlExpiry(ttl)
 	if err != nil {
 		return "", 0, err
 	}
@@ -754,12 +918,26 @@ func (c *Client) StateAddTask(peer, title, body, assignee string, escalate bool)
 	}
 	id, err := c.sendStateEvents(peer, []StateEvent{{
 		Kind: StateEventTaskAdd, TaskID: taskID, Title: title, Body: body,
-		Assignee: a, Escalate: escalate,
+		Assignee: a, Escalate: escalate, ExpiresAt: expiresAt,
 	}})
 	if err != nil {
 		return "", 0, err
 	}
 	return taskID, id, nil
+}
+
+// ttlExpiry converts a disappearing-message TTL into an absolute unix
+// expiry timestamp stamped from the sender's clock (issue #53). Zero
+// ttl means "never expires" (returned as 0). Negative ttls are
+// rejected.
+func ttlExpiry(ttl time.Duration) (int64, error) {
+	if ttl < 0 {
+		return 0, fmt.Errorf("ttl must not be negative")
+	}
+	if ttl == 0 {
+		return 0, nil
+	}
+	return time.Now().Unix() + int64(ttl.Seconds()), nil
 }
 
 // StateAssignTask reassigns a task. Only the current assigner may
@@ -935,7 +1113,20 @@ func (c *Client) StateSync(peer string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return after - before, nil
+	// issue #53: prune even when nothing new arrived (the fetch above
+	// only prunes inside applyStateEvents when events are applied).
+	// Pruning can drop old events, so the net count may go negative;
+	// clamp it — the return is "newly applied events", never negative.
+	if err := updateState(func(sf *stateFile) error {
+		pruneExpiredState(sf.conversation(address), time.Now().Unix())
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	if n := after - before; n > 0 {
+		return n, nil
+	}
+	return 0, nil
 }
 
 func (c *Client) stateEventCount(peer string) (int, error) {

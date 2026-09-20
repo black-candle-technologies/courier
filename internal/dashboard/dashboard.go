@@ -244,6 +244,10 @@ type pushMessage struct {
 	// decrypted the envelope); the dashboard never decrypts.
 	ReplyTo int64  `json:"reply_to,omitempty"`
 	Quote   string `json:"quote,omitempty"`
+	// ExpiresAt is the issue #53 disappearing-message expiry (0 =
+	// never). Expired rows are filtered from reads and deleted by the
+	// push-time sweep.
+	ExpiresAt int64 `json:"expires_at,omitempty"`
 }
 
 func bearerToken(r *http.Request) string {
@@ -321,6 +325,7 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	stored := 0
+	now := time.Now().Unix()
 	for _, m := range req.Messages {
 		if len(m.Body) == 0 || len(m.Body) > 256*1024 || m.CourierID <= 0 {
 			continue
@@ -339,6 +344,14 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		if len(quote) > 4096 {
 			quote = quote[:4096]
 		}
+		// issue #53: a negative expiry is a malformed push; an already
+		// expired message is gone before it arrives — don't store it.
+		if m.ExpiresAt < 0 {
+			continue
+		}
+		if m.ExpiresAt != 0 && m.ExpiresAt <= now {
+			continue
+		}
 		// peer is the counterparty: the sender for inbound messages, the
 		// recipient for outbound ones the agent sent itself.
 		peer := m.From
@@ -353,7 +366,7 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 			recipient = m.To
 			peer = m.To
 		}
-		inserted, err := s.store.SaveDashboardMessage(user.ID, m.CourierID, m.From, recipient, peer, m.Body, m.SentAt, m.ReceivedAt, replyTo, quote)
+		inserted, err := s.store.SaveDashboardMessage(user.ID, m.CourierID, m.From, recipient, peer, m.Body, m.SentAt, m.ReceivedAt, replyTo, quote, m.ExpiresAt)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "store failed")
 			return
@@ -362,6 +375,10 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 			stored++
 		}
 	}
+	// issue #53: disappearing-message sweep. Read paths already filter
+	// expired rows; the sweep reclaims the space. Best-effort: a sweep
+	// failure must not fail the push.
+	_, _ = s.store.PruneExpiredDashboardMessages()
 	writeJSON(w, http.StatusOK, map[string]any{"stored": stored})
 }
 
@@ -638,6 +655,7 @@ func render(w http.ResponseWriter, tmpl string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	t := template.Must(template.New("p").Funcs(template.FuncMap{
 		"ago":            ago,
+		"until":          until,
 		"senderShort":    senderShort,
 		"senderInitials": senderInitials,
 		"senderHue":      senderHue,
@@ -660,6 +678,28 @@ func ago(unix int64) string {
 		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
 	default:
 		return time.Unix(unix, 0).Format("Jan 2, 2006")
+	}
+}
+
+// until renders a future unix timestamp as a relative countdown
+// ("in 5m", "in 2h") for issue #53 disappearing messages. Past
+// timestamps render as "expired" (the row should already be gone;
+// the sweep is best-effort).
+func until(unix int64) string {
+	d := time.Until(time.Unix(unix, 0))
+	switch {
+	case d <= 0:
+		return "expired"
+	case d < time.Hour:
+		m := int(d.Minutes())
+		if m < 1 {
+			return "in under a minute"
+		}
+		return fmt.Sprintf("in %dm", m)
+	case d < 24*time.Hour:
+		return fmt.Sprintf("in %dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("in %dd", int(d.Hours()/24))
 	}
 }
 
@@ -1023,7 +1063,7 @@ const threadTmpl = pageHead + `
 <div class="bubble">
 {{if .ReplyTo}}<blockquote class="reply">↩ in reply to #{{.ReplyTo}}{{if .Quote}}<span class="reply-quote">{{.Quote}}</span>{{end}}</blockquote>{{end}}
 <p class="msg-body">{{.Body}}</p>
-<span class="when" data-ts="{{.TS}}">{{ago .TS}}</span>
+<span class="when" data-ts="{{.TS}}">{{ago .TS}}</span>{{if .ExpiresAt}}<span class="when disappearing" title="Disappearing message — deleted after expiry">⏳ {{until .ExpiresAt}}</span>{{end}}
 </div>
 </div>{{end}}
 <footer class="foot">Courier dashboard · messages are decrypted by your agent, never on this server</footer>

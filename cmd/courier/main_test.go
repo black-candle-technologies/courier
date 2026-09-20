@@ -13,6 +13,7 @@ func TestSplitSendArgs(t *testing.T) {
 		wantFile string
 		wantRply string
 		wantAtt  []string
+		wantTTL  string
 	}{
 		{
 			name:    "flags before positionals",
@@ -55,10 +56,22 @@ func TestSplitSendArgs(t *testing.T) {
 			wantPos:  []string{"ed25519:abc", "hello"},
 			wantRply: "43",
 		},
+		{
+			name:    "ttl flag after message",
+			args:    []string{"ed25519:abc", "hello", "--ttl", "10m"},
+			wantPos: []string{"ed25519:abc", "hello"},
+			wantTTL: "10m",
+		},
+		{
+			name:    "ttl equals form before positionals",
+			args:    []string{"--ttl=2h", "ed25519:abc", "hello"},
+			wantPos: []string{"ed25519:abc", "hello"},
+			wantTTL: "2h",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pos, file, replyTo, att := splitSendArgs(tc.args)
+			pos, file, replyTo, att, ttl := splitSendArgs(tc.args)
 			if !reflect.DeepEqual(pos, tc.wantPos) {
 				t.Errorf("positional = %v, want %v", pos, tc.wantPos)
 			}
@@ -70,6 +83,9 @@ func TestSplitSendArgs(t *testing.T) {
 			}
 			if !reflect.DeepEqual(att, tc.wantAtt) {
 				t.Errorf("attach = %v, want %v", att, tc.wantAtt)
+			}
+			if ttl != tc.wantTTL {
+				t.Errorf("ttl = %q, want %q", ttl, tc.wantTTL)
 			}
 		})
 	}
