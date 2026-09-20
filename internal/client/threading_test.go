@@ -2,10 +2,14 @@ package client
 
 import (
 	"encoding/json"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/black-candle-technologies/courier/internal/envelope"
+	"github.com/black-candle-technologies/courier/internal/relay"
+	"github.com/black-candle-technologies/courier/internal/store"
 )
 
 // legacyParseMessagePayload is a frozen copy of the pre-#51
@@ -222,5 +226,65 @@ func TestLookupReplyParent(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	if _, ok := LookupReplyParent(100); ok {
 		t.Fatal("lookup succeeded with no state")
+	}
+}
+
+// TestSentLogReplyVsProtocolDM runs a human reply and a machine
+// protocol DM through a live test relay. The human reply must be
+// recorded in the sent log with its threading fields; the protocol
+// DM must never enter the sent log.
+func TestSentLogReplyVsProtocolDM(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.Open(filepath.Join(t.TempDir(), "relay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	srv := httptest.NewServer(relay.New(st).Routes())
+	defer srv.Close()
+
+	senderCfg, err := NewIdentity(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipCfg, err := NewIdentity(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := New(senderCfg)
+	recipient := New(recipCfg)
+	if err := recipient.PublishKey(); err != nil {
+		t.Fatalf("publish key: %v", err)
+	}
+
+	// A plain human send, then a reply to it.
+	parentID, err := sender.Send(recipCfg.Address, "parent body here")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replyID, err := sender.SendReply(recipCfg.Address, "reply body here", parentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Machine protocol traffic: must not be logged.
+	if _, err := sender.sendProtocolDM(recipCfg.Address, `{"type":"handshake"}`); err != nil {
+		t.Fatal(err)
+	}
+
+	sent, err := readSentLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sent) != 2 {
+		t.Fatalf("sent log has %d entries, want 2 (protocol DM leaked in)", len(sent))
+	}
+	if sent[0].CourierID != parentID || sent[0].ReplyTo != 0 {
+		t.Fatalf("parent entry wrong: %+v", sent[0])
+	}
+	if sent[1].CourierID != replyID || sent[1].ReplyTo != parentID {
+		t.Fatalf("reply entry wrong: %+v", sent[1])
+	}
+	if sent[1].Quote != "parent body here" {
+		t.Fatalf("reply quote not resolved from sent log: %q", sent[1].Quote)
 	}
 }
