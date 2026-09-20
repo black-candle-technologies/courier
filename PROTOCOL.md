@@ -101,7 +101,12 @@ ephemeral key, nonce, ciphertext, sent timestamp, signature). The relay
 stores it under a unique index, so a replayed `POST` returns the original
 relay id with `"duplicate": true` instead of creating a second row.
 Recipients additionally suppress envelopes whose hash is in their local
-seen set (last 1,000 delivered).
+seen set (last 1,000 delivered). The seen set is tracked **per consumer**
+since v0.9.2 (issue #45): inbox delivery and dashboard pushing are
+independent consumers, and sharing one set let the minutely dashboard
+push and the inbox poller consume each other's messages — whichever ran
+first marked an envelope seen and the other silently suppressed it as a
+replay. Upgrades migrate the legacy shared set into both consumer sets.
 
 There is deliberately **no signed-timestamp acceptance window**: rejecting
 old `sent_at` values would silently drop legitimate messages for

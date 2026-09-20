@@ -94,7 +94,18 @@ type Config struct {
 	// v0.6.11 (F3): hashes of envelopes already delivered to this
 	// client, for replay suppression independent of relay message ids.
 	// Bounded (oldest dropped); the relay also dedups permanently.
-	SeenEnvelopeHashes []string `json:"seen_envelope_hashes,omitempty"`
+	//
+	// v0.9.2 (issue #45): the set is tracked per consumer. The legacy
+	// shared seen_envelope_hashes let `dashboard push` and the inbox
+	// poller consume each other's messages — whichever ran first
+	// marked an envelope seen and the other silently suppressed it as
+	// a replay. SeenInboxHashes covers `courier inbox` (plus the group
+	// inbox and request-review paths); SeenPushHashes covers
+	// `dashboard push`. The legacy field is migrated into both sets on
+	// load (migrateSeenSets) and then dropped.
+	SeenEnvelopeHashes []string `json:"seen_envelope_hashes,omitempty"` // deprecated: use the per-consumer sets
+	SeenInboxHashes    []string `json:"seen_inbox_hashes,omitempty"`
+	SeenPushHashes     []string `json:"seen_push_hashes,omitempty"`
 	// Spam/abuse filtering (metadata-only; the relay never sees
 	// plaintext). DMPolicy is "open" (default, unset) or "contacts":
 	// in contacts mode, messages from senders not in contacts are
@@ -186,6 +197,56 @@ func loadConfigRaw() (*Config, error) {
 	return &c, nil
 }
 
+// seenConsumer identifies one of the independent consumers that read
+// the inbox. Each tracks its own replay-suppression set (issue #45):
+// the inbox poller and the dashboard pusher must never consume each
+// other's messages.
+type seenConsumer int
+
+const (
+	// seenConsumerInbox covers `courier inbox`, the group inbox fetch,
+	// and request review — everything that delivers to the local agent.
+	seenConsumerInbox seenConsumer = iota
+	// seenConsumerPush covers `courier dashboard push` — everything
+	// whose delivery target is the web dashboard.
+	seenConsumerPush
+)
+
+// migrateSeenSets applies the v0.9.2 lazy migration (issue #45): the
+// legacy shared seen_envelope_hashes is split into per-consumer sets.
+// Both consumers are seeded with the legacy union so nothing replays
+// on upgrade, whichever consumer originally recorded a hash; the
+// legacy field is then dropped.
+func migrateSeenSets(c *Config) {
+	if len(c.SeenEnvelopeHashes) == 0 {
+		return
+	}
+	c.SeenInboxHashes = unionSeen(c.SeenInboxHashes, c.SeenEnvelopeHashes)
+	c.SeenPushHashes = unionSeen(c.SeenPushHashes, c.SeenEnvelopeHashes)
+	c.SeenEnvelopeHashes = nil
+}
+
+// unionSeen merges hashes into dst without duplicates, keeping the
+// newest maxSeenEnvelopeHashes entries. The "" quarantine sentinel is
+// never stored: held messages are not delivered.
+func unionSeen(dst, hashes []string) []string {
+	known := make(map[string]bool, len(dst))
+	for _, h := range dst {
+		known[h] = true
+	}
+	for _, h := range hashes {
+		if h == "" || known[h] {
+			continue
+		}
+		known[h] = true
+		dst = append(dst, h)
+	}
+	if len(dst) > maxSeenEnvelopeHashes {
+		dst = dst[len(dst)-maxSeenEnvelopeHashes:]
+	}
+	return dst
+}
+
 // migrateEncKeys applies the v0.5.0 lazy migration: identities created
 // before rotatable keys derive their single encryption key from the seed
 // (epoch 0).
@@ -213,10 +274,18 @@ func LoadConfig() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	migrated := false
 	if len(c.EncKeys) == 0 {
 		if err := migrateEncKeys(c); err != nil {
 			return nil, err
 		}
+		migrated = true
+	}
+	if len(c.SeenEnvelopeHashes) > 0 {
+		migrateSeenSets(c)
+		migrated = true
+	}
+	if migrated {
 		// Best effort: persist the migration so it only happens once.
 		_ = c.Save()
 	}
@@ -291,6 +360,9 @@ func (c *Config) Update(fn func(*Config) error) error {
 				return err
 			}
 		}
+		// v0.9.2 (issue #45): migrate the legacy shared seen set into
+		// the per-consumer sets. Persisted by the saveAtomic below.
+		migrateSeenSets(fresh)
 		if err := fn(fresh); err != nil {
 			return err
 		}
@@ -1134,16 +1206,22 @@ type Message struct {
 // the lastID contract. Delivered envelopes are marked seen so they are
 // never delivered twice (v0.6.11 F3).
 func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, int, error) {
-	msgs, lastID, skipped, filtered, _, err := c.inbox(after, limit, true)
+	msgs, lastID, skipped, filtered, _, err := c.inbox(after, limit, true, seenConsumerInbox)
 	return msgs, lastID, skipped, filtered, err
 }
 
-// inbox is Inbox with control over replay bookkeeping. Push consumers
-// (dashboard push) pass markSeen=false and record hashes themselves,
-// but only for batches the server acknowledges — so a failed batch's
-// messages stay re-fetchable on retry instead of being suppressed as
-// replays while the cursor advances past them (v0.6.11 F11). It returns
-// the dedup hashes of the delivered messages for that bookkeeping.
+// inbox is Inbox with control over replay bookkeeping and consumer
+// selection. Push consumers (dashboard push) pass markSeen=false and
+// record hashes themselves, but only for batches the server
+// acknowledges — so a failed batch's messages stay re-fetchable on
+// retry instead of being suppressed as replays while the cursor
+// advances past them (v0.6.11 F11). It returns the dedup hashes of the
+// delivered messages for that bookkeeping.
+//
+// The consumer selects which replay-suppression set is used (issue
+// #45): inbox delivery and dashboard pushing are independent
+// consumers, and each suppresses only envelopes it has itself
+// delivered. A shared set let the two consume each other's messages.
 //
 // skipped counts envelopes that failed authentication or decryption
 // (corrupt/forged); filtered counts messages intentionally filtered by
@@ -1152,7 +1230,7 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, int, erro
 // dedup, never an attack, and the "no new messages." sentinel contract
 // depends on them staying silent. The three are reported separately so
 // routine delivery mechanics never look like an attack.
-func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64, int, int, []string, error) {
+func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsumer) ([]Message, int64, int, int, []string, error) {
 	hc, err := c.httpClient()
 	if err != nil {
 		return nil, after, 0, 0, nil, err
@@ -1204,7 +1282,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 	filtered := 0
 	lastID := after
 	var newHashes []string
-	seen := c.seenEnvelopeSet()
+	seen := c.seenSet(consumer)
 	for _, m := range in.Messages {
 		// Track the highest inspected envelope id regardless of
 		// outcome: the cursor must advance past undecryptable and
@@ -1220,13 +1298,13 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 			continue
 		}
 		// v0.6.11 (F3): suppress replays independently of relay message
-		// ids — identical envelope bytes are never delivered twice.
-		// Replays are routine dedup, not failures (v0.9.1): the
-		// instant-wake daemon's dashboard push legitimately marks
-		// envelopes seen before the next inbox poll runs, so counting
-		// them as skipped would print the corruption warning on every
-		// such race and break the "no new messages." sentinel contract
-		// that poll-based wake scripts rely on.
+		// ids — identical envelope bytes are never delivered twice to
+		// the same consumer. Replays are routine dedup, not failures
+		// (v0.9.1): they stay silent so the "no new messages." sentinel
+		// contract that poll-based wake scripts rely on holds.
+		// Suppression is per consumer (issue #45, v0.9.2): a message
+		// the dashboard pusher already pushed is still new to the
+		// inbox poller, and vice versa.
 		h := envelope.DedupHash(c.cfg.Address, m.From, m.Eph, m.Nonce, m.SentAt, m.Ct, m.Sig)
 		if seen[h] {
 			continue
@@ -1385,7 +1463,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 		newHashes = append(newHashes, h)
 	}
 	if markSeen {
-		c.recordSeenEnvelopes(newHashes)
+		c.recordSeen(consumer, newHashes)
 	}
 	return out, lastID, skipped, filtered, newHashes, nil
 }
@@ -1394,7 +1472,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 // without advancing the inbox cursor or marking anything seen. Review
 // is read-only: it never changes delivery state.
 func (c *Client) InboxReview(limit int) ([]Message, error) {
-	msgs, _, _, _, _, err := c.inbox(0, limit, false)
+	msgs, _, _, _, _, err := c.inbox(0, limit, false, seenConsumerInbox)
 	if err != nil {
 		return nil, err
 	}
@@ -1548,18 +1626,27 @@ func (c *Client) ReportSpam(envelopeID int64) error {
 // relay, so a bounded window is sufficient.
 const maxSeenEnvelopeHashes = 1000
 
-// seenEnvelopeSet returns the client's delivered-envelope hashes as a set.
-func (c *Client) seenEnvelopeSet() map[string]bool {
-	seen := make(map[string]bool, len(c.cfg.SeenEnvelopeHashes))
-	for _, h := range c.cfg.SeenEnvelopeHashes {
+// seenSet returns one consumer's delivered-envelope hashes as a set.
+// Replay suppression is per consumer (issue #45): the inbox poller and
+// the dashboard pusher each suppress only envelopes they themselves
+// delivered, so neither can consume the other's messages.
+func (c *Client) seenSet(which seenConsumer) map[string]bool {
+	var stored []string
+	if which == seenConsumerPush {
+		stored = c.cfg.SeenPushHashes
+	} else {
+		stored = c.cfg.SeenInboxHashes
+	}
+	seen := make(map[string]bool, len(stored))
+	for _, h := range stored {
 		seen[h] = true
 	}
 	return seen
 }
 
-// recordSeenEnvelopes persists newly delivered envelope hashes,
-// dropping the oldest beyond the bound.
-func (c *Client) recordSeenEnvelopes(hashes []string) {
+// recordSeen persists newly delivered envelope hashes for one
+// consumer, dropping the oldest beyond the bound.
+func (c *Client) recordSeen(which seenConsumer, hashes []string) {
 	if len(hashes) == 0 {
 		return
 	}
@@ -1568,21 +1655,10 @@ func (c *Client) recordSeenEnvelopes(hashes []string) {
 	// recorded by a concurrent process are merged, not clobbered
 	// (v0.6.11 F5).
 	_ = c.cfg.Update(func(fresh *Config) error {
-		known := make(map[string]bool, len(fresh.SeenEnvelopeHashes))
-		for _, h := range fresh.SeenEnvelopeHashes {
-			known[h] = true
-		}
-		for _, h := range hashes {
-			if h == "" {
-				continue // quarantine sentinel: held, not delivered
-			}
-			if !known[h] {
-				known[h] = true
-				fresh.SeenEnvelopeHashes = append(fresh.SeenEnvelopeHashes, h)
-			}
-		}
-		if len(fresh.SeenEnvelopeHashes) > maxSeenEnvelopeHashes {
-			fresh.SeenEnvelopeHashes = fresh.SeenEnvelopeHashes[len(fresh.SeenEnvelopeHashes)-maxSeenEnvelopeHashes:]
+		if which == seenConsumerPush {
+			fresh.SeenPushHashes = unionSeen(fresh.SeenPushHashes, hashes)
+		} else {
+			fresh.SeenInboxHashes = unionSeen(fresh.SeenInboxHashes, hashes)
 		}
 		return nil
 	})
@@ -1879,7 +1955,9 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 	// as seen only inside acknowledged push batches below, so a failed
 	// batch's messages are re-fetched on retry instead of being
 	// suppressed as replays while the cursor advances past them.
-	msgs, lastID, _, _, hashes, err := c.inbox(c.cfg.DashboardCursor, 200, false)
+	// The push consumer uses its own replay set (issue #45): envelopes
+	// the inbox poller already delivered are still new to the pusher.
+	msgs, lastID, _, _, hashes, err := c.inbox(c.cfg.DashboardCursor, 200, false, seenConsumerPush)
 	if err != nil {
 		return 0, err
 	}
@@ -1919,14 +1997,16 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 		pushed += n
 		// Envelopes are marked seen only now that the dashboard has
 		// them: a failed batch stays re-fetchable, and replay
-		// suppression still works across ticks (v0.6.11 F3).
+		// suppression still works across ticks (v0.6.11 F3). The push
+		// consumer's own set (issue #45) — inbox delivery is tracked
+		// separately and must not suppress a push.
 		var hashes []string
 		for _, it := range batch {
 			if !it.sent && it.hash != "" {
 				hashes = append(hashes, it.hash)
 			}
 		}
-		c.recordSeenEnvelopes(hashes)
+		c.recordSeen(seenConsumerPush, hashes)
 		_ = c.cfg.Update(func(fresh *Config) error {
 			if inboxMax > fresh.DashboardCursor {
 				fresh.DashboardCursor = inboxMax

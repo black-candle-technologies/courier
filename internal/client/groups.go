@@ -669,7 +669,7 @@ func (c *Client) GroupInbox(groupID string) ([]Message, error) {
 		return nil, fmt.Errorf("bad relay response: %w", err)
 	}
 
-	seen := c.seenEnvelopeSet()
+	seen := c.seenSet(seenConsumerInbox)
 	var newHashes []string
 	var out []Message
 	skipped := 0
@@ -815,7 +815,7 @@ func (c *Client) GroupInbox(groupID string) ([]Message, error) {
 		seen[h] = true
 		newHashes = append(newHashes, h)
 	}
-	c.recordSeenEnvelopes(newHashes)
+	c.recordSeen(seenConsumerInbox, newHashes)
 	g.InboxCursor = lastID
 	if err := updateGroups(func(gs map[string]*groupState) error {
 		gs[groupID] = g
