@@ -63,7 +63,9 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 	}
 
-	// Daily retention pruning.
+	// Daily retention pruning. Blobs follow the same retention policy as
+	// envelopes, so attachment ciphertext expires with the messages that
+	// reference it.
 	go func() {
 		t := time.NewTicker(24 * time.Hour)
 		defer t.Stop()
@@ -73,10 +75,18 @@ func main() {
 			} else if n > 0 {
 				log.Printf("pruned %d envelopes older than %d days", n, *retainDays)
 			}
+			if n, err := st.PruneBlobs(*retainDays); err != nil {
+				log.Printf("prune blobs: %v", err)
+			} else if n > 0 {
+				log.Printf("pruned %d blobs older than %d days", n, *retainDays)
+			}
 		}
 	}()
 	if n, err := st.Prune(*retainDays); err == nil && n > 0 {
 		log.Printf("pruned %d old envelopes on startup", n)
+	}
+	if n, err := st.PruneBlobs(*retainDays); err == nil && n > 0 {
+		log.Printf("pruned %d old blobs on startup", n)
 	}
 
 	go func() {

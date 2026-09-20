@@ -26,6 +26,18 @@ type Envelope struct {
 	Sig        string // base64url Ed25519 signature (v0.2.0+)
 }
 
+// Blob is one stored attachment blob: the framed, encrypted chunks.
+// The relay sees ciphertext only; the data key is wrapped for the
+// recipient in the attachment manifest, which travels inside the
+// message ciphertext.
+type Blob struct {
+	BlobID    string // base64url 32 random bytes, client-generated
+	Recipient string // ed25519:<base64url> address the blob was uploaded for
+	Uploader  string // ed25519:<base64url> address that uploaded it
+	Size      int64  // bytes of the framed ciphertext
+	Data      []byte // opaque encrypted chunk frames
+}
+
 // Store wraps a SQLite database.
 type Store struct {
 	db *sql.DB
@@ -90,6 +102,20 @@ CREATE TABLE IF NOT EXISTS dashboard_messages (
 	UNIQUE(user_id, courier_id)
 );
 CREATE INDEX IF NOT EXISTS idx_dashboard_messages_user ON dashboard_messages(user_id, courier_id);
+
+-- Attachments: one row per encrypted file blob. data is the framed,
+-- secretbox-sealed chunks (ciphertext only); the data key is wrapped for
+-- the recipient in the attachment manifest inside the message ciphertext.
+-- Blobs expire with the same retention policy as envelopes.
+CREATE TABLE IF NOT EXISTS blobs (
+	blob_id     TEXT PRIMARY KEY,
+	recipient   TEXT NOT NULL,
+	uploader    TEXT NOT NULL,
+	size        INTEGER NOT NULL,
+	data        BLOB NOT NULL,
+	received_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_blobs_recipient ON blobs(recipient);
 `
 
 // migrate adds columns introduced after the table was first created.
@@ -274,6 +300,52 @@ func (s *Store) Count() (int64, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+// ---- Attachment blobs ----
+
+// SaveBlob stores an attachment blob. Blob ids are client-generated
+// random 256-bit values, so a re-upload of the same blob is idempotent:
+// the existing row wins and stored=false is reported, mirroring the
+// envelope replay behavior.
+func (s *Store) SaveBlob(b *Blob) (stored bool, err error) {
+	res, err := s.db.Exec(
+		`INSERT OR IGNORE INTO blobs (blob_id, recipient, uploader, size, data)
+		 VALUES (?, ?, ?, ?, ?)`,
+		b.BlobID, b.Recipient, b.Uploader, b.Size, b.Data,
+	)
+	if err != nil {
+		return false, fmt.Errorf("insert blob: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("insert blob: %w", err)
+	}
+	return n > 0, nil
+}
+
+// GetBlob returns a blob by id, or sql.ErrNoRows if unknown.
+func (s *Store) GetBlob(blobID string) (*Blob, error) {
+	var b Blob
+	err := s.db.QueryRow(
+		`SELECT blob_id, recipient, uploader, size, data FROM blobs WHERE blob_id = ?`,
+		blobID,
+	).Scan(&b.BlobID, &b.Recipient, &b.Uploader, &b.Size, &b.Data)
+	if err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
+// PruneBlobs deletes blobs received more than retainDays ago, reusing
+// the envelope retention policy. Returns the number of rows deleted.
+func (s *Store) PruneBlobs(retainDays int) (int64, error) {
+	cutoff := time.Now().AddDate(0, 0, -retainDays).Unix()
+	res, err := s.db.Exec(`DELETE FROM blobs WHERE received_at < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("prune blobs: %w", err)
+	}
+	return res.RowsAffected()
 }
 
 // KeyAnnouncement is one published encryption key for an address.

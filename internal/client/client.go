@@ -676,6 +676,17 @@ func relayErr(data []byte) error {
 // key is used when they rotated; otherwise the address-derived key.
 // Returns the relay message id.
 func (c *Client) Send(toOrName, body string) (int64, error) {
+	return c.SendWithAttachments(toOrName, body, nil)
+}
+
+// SendWithAttachments encrypts body for the agent at toOrName and
+// attaches the files at attachPaths. Each file is encrypted under a fresh
+// random data key, chunked, and uploaded to the relay as an opaque blob
+// before the message is sent; the message ciphertext carries the
+// manifests (with the data keys wrapped for the recipient), so the relay
+// never sees filenames, MIME types, plaintext hashes, or data keys.
+// Returns the relay message id.
+func (c *Client) SendWithAttachments(toOrName, body string, attachPaths []string) (int64, error) {
 	address, err := c.cfg.ResolveRecipient(toOrName)
 	if err != nil {
 		return 0, err
@@ -692,7 +703,34 @@ func (c *Client) Send(toOrName, body string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	eph, nonce, ct, err := crypto.Seal(&toX, []byte(body))
+	// Encrypt and upload each attachment first: the message references
+	// the blobs, so a failed upload aborts the send rather than leaving
+	// a message that points at blobs that do not exist.
+	var manifests []envelope.AttachmentManifest
+	for _, p := range attachPaths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return 0, fmt.Errorf("attach %s: %w", p, err)
+		}
+		m, blob, err := EncryptAttachment(data, p, toX, address)
+		if err != nil {
+			return 0, fmt.Errorf("attach %s: %w", p, err)
+		}
+		if err := c.uploadBlob(address, toEd, m.BlobID, blob); err != nil {
+			return 0, fmt.Errorf("attach %s: %w", p, err)
+		}
+		manifests = append(manifests, m)
+	}
+	var plain []byte
+	if len(manifests) > 0 {
+		plain, err = json.Marshal(messagePayload{Version: 1, Body: body, Attachments: manifests})
+		if err != nil {
+			return 0, fmt.Errorf("encode payload: %w", err)
+		}
+	} else {
+		plain = []byte(body)
+	}
+	eph, nonce, ct, err := crypto.Seal(&toX, plain)
 	if err != nil {
 		return 0, err
 	}
@@ -725,6 +763,97 @@ func (c *Client) Send(toOrName, body string) (int64, error) {
 	// conversation. A logging failure must never fail the send itself.
 	_ = appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: body, SentAt: sentAt})
 	return out.ID, nil
+}
+
+// uploadBlob stores one encrypted attachment blob on the relay. The
+// request is signed by the uploader over the recipient, the random blob
+// id, the exact byte size, and a timestamp, so the relay can attribute
+// stored blobs and reject replays.
+func (c *Client) uploadBlob(toAddr string, toEd [32]byte, blobID string, blob []byte) error {
+	id, err := c.cfg.Identity()
+	if err != nil {
+		return err
+	}
+	blobIDRaw, err := base64.RawURLEncoding.DecodeString(blobID)
+	if err != nil {
+		return fmt.Errorf("bad blob id: %w", err)
+	}
+	ts := time.Now().Unix()
+	sig := id.Sign(envelope.BlobUpload(id.EdPub[:], toEd[:], blobIDRaw, int64(len(blob)), ts))
+	q := url.Values{}
+	q.Set("from", c.cfg.Address)
+	q.Set("to", toAddr)
+	q.Set("blob_id", blobID)
+	q.Set("size", fmt.Sprintf("%d", len(blob)))
+	q.Set("ts", fmt.Sprintf("%d", ts))
+	q.Set("sig", base64.RawURLEncoding.EncodeToString(sig))
+	hc, err := c.httpClient()
+	if err != nil {
+		return err
+	}
+	resp, err := hc.Post(c.cfg.RelayURL+"/v1/blobs?"+q.Encode(), "application/octet-stream", bytes.NewReader(blob))
+	if err != nil {
+		return fmt.Errorf("relay unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode != http.StatusCreated {
+		return relayErr(data)
+	}
+	return nil
+}
+
+// downloadBlob fetches one attachment blob's ciphertext. The request is
+// signed by the recipient (this agent) over the blob id with a fresh
+// timestamp, mirroring inbox reads — only the address the blob was
+// uploaded for can fetch it.
+func (c *Client) downloadBlob(blobID string) ([]byte, error) {
+	id, err := c.cfg.Identity()
+	if err != nil {
+		return nil, err
+	}
+	toEd, err := crypto.ParseAddress(c.cfg.Address)
+	if err != nil {
+		return nil, fmt.Errorf("bad address: %w", err)
+	}
+	blobIDRaw, err := base64.RawURLEncoding.DecodeString(blobID)
+	if err != nil || len(blobIDRaw) != 32 {
+		return nil, fmt.Errorf("bad blob id")
+	}
+	ts := time.Now().Unix()
+	sig := id.Sign(envelope.BlobRequest(toEd[:], blobIDRaw, ts))
+	u := fmt.Sprintf("%s/v1/blobs/%s?ts=%d&sig=%s",
+		c.cfg.RelayURL, blobID, ts, base64.RawURLEncoding.EncodeToString(sig))
+	hc, err := c.httpClient()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := hc.Get(u)
+	if err != nil {
+		return nil, fmt.Errorf("relay unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, envelope.MaxBlobBytes+1))
+	if resp.StatusCode != http.StatusOK {
+		return nil, relayErr(data)
+	}
+	return data, nil
+}
+
+// DownloadAttachment fetches and verifies one attachment from a received
+// message: it downloads the blob as the recipient, re-authenticates every
+// chunk, and checks the reassembled size and SHA256 against the manifest.
+// It fails closed — tampered, truncated, or missing data is an error,
+// never a file.
+func (c *Client) DownloadAttachment(a IncomingAttachment) ([]byte, error) {
+	if a.KeyError != nil {
+		return nil, fmt.Errorf("no usable data key: %w", a.KeyError)
+	}
+	blob, err := c.downloadBlob(a.Manifest.BlobID)
+	if err != nil {
+		return nil, err
+	}
+	return DecryptAttachment(blob, a.Manifest, a.DataKey)
 }
 
 // SentEntry is one locally recorded outbound message: the plaintext the
@@ -804,11 +933,12 @@ func appendSentLog(e SentEntry) error {
 
 // Message is one decrypted, signature-verified inbox message.
 type Message struct {
-	ID         int64
-	From       string // authenticated sender address
-	Body       string
-	SentAt     int64
-	ReceivedAt int64
+	ID          int64
+	From        string // authenticated sender address
+	Body        string
+	SentAt      int64
+	ReceivedAt  int64
+	Attachments []IncomingAttachment // verified manifests (data keys unwrapped when possible)
 }
 
 // Inbox fetches envelopes addressed to this agent after message id `after`,
@@ -935,9 +1065,50 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 			skipped++
 			continue
 		}
+		// Split a decrypted payload into its body text and attachment
+		// manifests. Manifests are validated and their data keys are
+		// unwrapped with this recipient's keys; a manifest whose key
+		// cannot be opened is kept with KeyError set, so the message is
+		// still delivered and the failure is visible, never silent.
+		body, manifests := parseMessagePayload(plain)
+		var atts []IncomingAttachment
+		for _, mf := range manifests {
+			ia := IncomingAttachment{Manifest: mf}
+			if err := envelope.ValidateManifest(&mf); err != nil {
+				ia.KeyError = fmt.Errorf("bad manifest: %w", err)
+			} else {
+				var wk *envelope.WrappedKey
+				for i := range mf.Keys {
+					if mf.Keys[i].Recipient == c.cfg.Address {
+						wk = &mf.Keys[i]
+						break
+					}
+				}
+				if wk == nil {
+					ia.KeyError = errors.New("no wrapped data key for this recipient")
+				} else {
+					var uerr error
+					opened := false
+					for _, xp := range c.cfg.encryptionPrivKeys() {
+						if dk, err := UnwrapDataKey(*wk, xp); err == nil {
+							ia.DataKey = dk
+							opened = true
+							break
+						} else {
+							uerr = err
+						}
+					}
+					if !opened {
+						ia.KeyError = uerr
+					}
+				}
+			}
+			atts = append(atts, ia)
+		}
 		out = append(out, Message{
-			ID: m.ID, From: m.From, Body: string(plain),
+			ID: m.ID, From: m.From, Body: body,
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
+			Attachments: atts,
 		})
 		// Only successfully delivered messages are marked seen: a
 		// message that fails verification or decryption now may become
