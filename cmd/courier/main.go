@@ -31,7 +31,7 @@ import (
 	"github.com/mattn/go-isatty"
 )
 
-const version = "0.7.0"
+const version = "0.7.1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -263,10 +263,15 @@ func cmdSend(args []string) error {
 	file := fs.String("file", "", "read message body from file")
 	var attach stringSliceFlag
 	fs.Var(&attach, "attach", "attach a file (repeatable, max 25 MiB each)")
-	if err := fs.Parse(args); err != nil {
-		return err
+	// Accept flags before or after the positional address/message, as the
+	// usage string documents: Go's flag package stops parsing at the first
+	// positional argument, so extract them manually first.
+	positional, fileVal, attachVals := splitSendArgs(args)
+	if fileVal != "" {
+		*file = fileVal
 	}
-	rest := fs.Args()
+	attach = append(attach, attachVals...)
+	rest := positional
 	if len(rest) < 1 {
 		return fmt.Errorf("usage: courier send <address|contact> <message|-> [--file path] [--attach file]...")
 	}
@@ -307,6 +312,31 @@ func cmdSend(args []string) error {
 	}
 	fmt.Println()
 	return nil
+}
+
+// splitSendArgs extracts --file/--attach flags from any position in the
+// send command's arguments, returning the remaining positional arguments.
+// Go's flag package stops parsing at the first positional, but the usage
+// string documents flags after the message, so this keeps both working.
+func splitSendArgs(args []string) (positional []string, file string, attach []string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--attach" && i+1 < len(args):
+			attach = append(attach, args[i+1])
+			i++
+		case strings.HasPrefix(a, "--attach="):
+			attach = append(attach, strings.TrimPrefix(a, "--attach="))
+		case a == "--file" && i+1 < len(args):
+			file = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--file="):
+			file = strings.TrimPrefix(a, "--file=")
+		default:
+			positional = append(positional, a)
+		}
+	}
+	return positional, file, attach
 }
 
 // stringSliceFlag is a repeatable string flag (e.g. --attach a --attach b).
