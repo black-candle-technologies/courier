@@ -158,9 +158,9 @@ func TestTruncateQuote(t *testing.T) {
 	// Multibyte safety: no broken rune at the cut. "é" is 2 bytes, so
 	// a 500-byte cap holds 250 of them, never a half-rune.
 	uni := strings.Repeat("é", maxReplyQuoteLen+10)
-	q = truncateQuote(uni)
-	if q != strings.Repeat("é", maxReplyQuoteLen/2) {
-		t.Fatalf("unicode quote mangled: %q", q)
+	qu := truncateQuote(uni)
+	if qu != strings.Repeat("é", maxReplyQuoteLen/2) {
+		t.Fatalf("unicode quote mangled: %q", qu)
 	}
 }
 
