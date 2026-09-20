@@ -27,6 +27,49 @@ var dashboardRegisterDomain = []byte("courier-dashboard-register-v1\x00")
 // validate as another.
 var inboxRequestDomain = []byte("courier-inbox-req-v1\x00")
 
+// blobUploadDomain separates blob-upload authorization signatures: the
+// uploader signs the blob id, recipient, byte size, and timestamp, so the
+// relay can attribute stored blobs to an identity.
+var blobUploadDomain = []byte("courier-blob-upload-v1\x00")
+
+// blobRequestDomain separates blob-download authorization signatures,
+// mirroring inbox requests: only the blob's recipient can fetch it.
+var blobRequestDomain = []byte("courier-blob-req-v1\x00")
+
+// BlobUpload builds the canonical bytes an uploader signs to authorize
+// storing a blob: it binds the uploader, the intended recipient, the
+// random blob id, the exact byte size, and a timestamp. The relay verifies
+// this before accepting the bytes, so blob storage is attributable, not
+// anonymous.
+func BlobUpload(from, to, blobID []byte, size, ts int64) []byte {
+	out := make([]byte, 0, len(blobUploadDomain)+32+32+32+8+8)
+	out = append(out, blobUploadDomain...)
+	out = append(out, from...)   // 32 bytes Ed25519 (uploader)
+	out = append(out, to...)     // 32 bytes Ed25519 (recipient)
+	out = append(out, blobID...) // 32 bytes random blob id
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(size))
+	out = append(out, b[:]...)
+	binary.BigEndian.PutUint64(b[:], uint64(ts))
+	out = append(out, b[:]...)
+	return out
+}
+
+// BlobRequest builds the canonical bytes a recipient signs to authorize
+// downloading a blob, mirroring InboxRequest. The relay verifies the
+// signature against the blob's stored recipient, so only the address the
+// blob was uploaded for can fetch its ciphertext.
+func BlobRequest(address, blobID []byte, ts int64) []byte {
+	out := make([]byte, 0, len(blobRequestDomain)+32+32+8)
+	out = append(out, blobRequestDomain...)
+	out = append(out, address...) // 32 bytes Ed25519 (recipient)
+	out = append(out, blobID...)  // 32 bytes random blob id
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(ts))
+	out = append(out, b[:]...)
+	return out
+}
+
 // InboxRequest builds the canonical bytes a recipient signs to authorize
 // reading their own inbox (v0.6.11, F10). The relay verifies the
 // signature against the requested address, so only the address owner can

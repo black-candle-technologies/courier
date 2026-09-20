@@ -5,8 +5,8 @@
 //
 //	courier init [--relay URL] [--force]   create your identity
 //	courier address                      print your address (public key)
-//	courier send <address> <message|->   send a message ("-" reads stdin)
-//	courier inbox [--all] [--limit N] [--follow]
+//	courier send <address> <message|-> [--attach file]...
+//	courier inbox [--all] [--limit N] [--follow] [--attachments-dir dir]
 //	courier stdio                        JSON-lines bridge for agents
 //	courier serve [--listen 127.0.0.1:8471]
 //	courier version
@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -90,7 +91,9 @@ func usage() {
   courier init --repin                   re-pin the relay certificate
   courier address                        print your address (public key)
   courier send <address|contact> <msg>    send a message ("-" reads stdin)
+      [--attach <file>]...               attach files (E2E encrypted, 25 MiB max each)
   courier inbox [--all] [--limit N] [--follow [--interval 5s]]
+      [--attachments-dir <dir>]          download verified attachments into dir
   courier contacts add <name> <address>  save a contact
   courier contacts list                  list contacts
   courier contacts show <name>           show a contact's address
@@ -231,12 +234,14 @@ func cmdAddress() error {
 func cmdSend(args []string) error {
 	fs := flag.NewFlagSet("send", flag.ContinueOnError)
 	file := fs.String("file", "", "read message body from file")
+	var attach stringSliceFlag
+	fs.Var(&attach, "attach", "attach a file (repeatable, max 25 MiB each)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	rest := fs.Args()
 	if len(rest) < 1 {
-		return fmt.Errorf("usage: courier send <address|contact> <message|-> [--file path]")
+		return fmt.Errorf("usage: courier send <address|contact> <message|-> [--file path] [--attach file]...")
 	}
 	address := rest[0]
 	var body string
@@ -265,19 +270,68 @@ func cmdSend(args []string) error {
 	if err != nil {
 		return err
 	}
-	id, err := client.New(cfg).Send(address, body)
+	id, err := client.New(cfg).SendWithAttachments(address, body, attach)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("sent (id %d)\n", id)
+	fmt.Printf("sent (id %d)", id)
+	if len(attach) > 0 {
+		fmt.Printf(" with %d attachment(s)", len(attach))
+	}
+	fmt.Println()
+	return nil
+}
+
+// stringSliceFlag is a repeatable string flag (e.g. --attach a --attach b).
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string { return strings.Join(*s, ",") }
+func (s *stringSliceFlag) Set(v string) error {
+	*s = append(*s, v)
 	return nil
 }
 
 func printMessages(msgs []client.Message) {
 	for _, m := range msgs {
 		ts := time.Unix(m.ReceivedAt, 0).UTC().Format("2006-01-02 15:04:05Z")
-		fmt.Printf("[#%d] from %s at %s\n%s\n\n", m.ID, m.From, ts, m.Body)
+		fmt.Printf("[#%d] from %s at %s\n%s\n", m.ID, m.From, ts, m.Body)
+		for _, a := range m.Attachments {
+			mf := a.Manifest
+			if a.KeyError != nil {
+				fmt.Printf("  [attachment] %s (%d bytes): cannot decrypt: %v\n", mf.Filename, mf.Size, a.KeyError)
+				continue
+			}
+			fmt.Printf("  [attachment] %s (%s, %d bytes, sha256:%s)\n", mf.Filename, mf.MIME, mf.Size, mf.SHA256)
+		}
+		fmt.Println()
 	}
+}
+
+// saveAttachment writes verified attachment data into dir, never
+// overwriting an existing file (a numeric suffix is added instead). The
+// manifest filename is a validated bare name, so no path traversal is
+// possible; filepath.Base is applied defensively anyway.
+func saveAttachment(dir string, filename string, data []byte) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	name := filepath.Base(filename)
+	path := filepath.Join(dir, name)
+	if _, err := os.Stat(path); err == nil {
+		ext := filepath.Ext(name)
+		base := strings.TrimSuffix(name, ext)
+		for i := 2; ; i++ {
+			p := filepath.Join(dir, fmt.Sprintf("%s-%d%s", base, i, ext))
+			if _, err := os.Stat(p); os.IsNotExist(err) {
+				path = p
+				break
+			}
+		}
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func cmdInbox(args []string) error {
@@ -286,6 +340,7 @@ func cmdInbox(args []string) error {
 	limit := fs.Int("limit", 50, "max messages per fetch")
 	follow := fs.Bool("follow", false, "keep polling for new messages")
 	interval := fs.Duration("interval", 5*time.Second, "poll interval with --follow")
+	attachDir := fs.String("attachments-dir", "", "download and verify attachments into this directory")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -319,6 +374,23 @@ func cmdInbox(args []string) error {
 			return false, nil
 		}
 		printMessages(msgs)
+		if *attachDir != "" {
+			for _, m := range msgs {
+				for _, a := range m.Attachments {
+					data, err := cl.DownloadAttachment(a)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "[#%d] attachment %q: download failed: %v\n", m.ID, a.Manifest.Filename, err)
+						continue
+					}
+					path, err := saveAttachment(*attachDir, a.Manifest.Filename, data)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "[#%d] attachment %q: save failed: %v\n", m.ID, a.Manifest.Filename, err)
+						continue
+					}
+					fmt.Printf("[#%d] attachment saved: %s\n", m.ID, path)
+				}
+			}
+		}
 		if skipped > 0 {
 			fmt.Fprintf(os.Stderr, "(%d message(s) failed signature/decryption and were dropped)\n", skipped)
 		}
