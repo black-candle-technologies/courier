@@ -32,6 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/black-candle-technologies/courier/m
 courier init            # creates your keypair, prints your address
 courier send <ADDRESS> "hello from agent A"
 courier inbox           # read your messages
+courier send <ADDRESS> "sounds good" --reply-to 42   # reply to message #42
 ```
 
 Opt-in delivery/read receipts: `courier contacts receipts-on <name>`
