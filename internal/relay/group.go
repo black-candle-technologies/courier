@@ -173,7 +173,7 @@ func (s *Server) handleGroupInbox(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, `"ts" must be a unix timestamp`)
 		return
 	}
-	if now := time.Now().Unix(); ts < now-maxInboxRequestAge || ts > now+maxInboxRequestAge {
+	if now := time.Now().Unix(); ts < now-maxSignedRequestAge || ts > now+maxSignedRequestAge {
 		writeErr(w, http.StatusBadRequest, `"ts" is outside the freshness window`)
 		return
 	}

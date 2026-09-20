@@ -146,6 +146,88 @@ use `after=<last id seen>` to page through.
 
 `GET /v1/health` → `{"ok": true, "time": "...", "envelopes": N}`.
 
+## Attachments (E2E encrypted file attachments)
+
+A message may carry files. Each attachment gets a fresh random 32-byte
+data key. The file is split into 256 KiB plaintext chunks; every chunk is
+sealed with NaCl `secretbox` under the data key with a unique random
+nonce, and the framed chunks (`be32 length || nonce || sealed`) are
+concatenated into one opaque blob. The data key is wrapped for the
+recipient with `crypto_box` (fresh ephemeral X25519 key — the same
+primitive as message bodies) and travels in the attachment manifest.
+
+The manifest lives **inside the message ciphertext**, never as
+relay-visible metadata. Messages with attachments use a versioned
+plaintext payload:
+
+```json
+{"v": 1, "body": "<message text>",
+ "attachments": [
+   {"filename": "report.pdf",
+    "mime": "application/pdf",
+    "size": 1048576,
+    "sha256": "<hex SHA256 of the plaintext>",
+    "chunks": 4,
+    "blob_id": "<base64url: 32 random bytes>",
+    "keys": [{"recipient": "ed25519:<base64url>",
+              "eph": "<base64url ephemeral X25519 key>",
+              "nonce": "<base64url 24-byte nonce>",
+              "sealed_key": "<base64url sealed 32-byte data key>"}]}
+ ]}
+```
+
+Messages without attachments keep the legacy raw-text plaintext, so old
+clients render them unchanged. The `keys` array holds one wrapped data
+key per recipient, leaving room for future group messaging without a
+format change. Filenames are bare names (no path separators, ≤ 256
+bytes); the sender's envelope signature covers the ciphertext, binding
+the manifest to the envelope without revealing it.
+
+Limits: 25 MiB plaintext per attachment, 256 KiB chunks.
+
+### Blob store
+
+`POST /v1/blobs?from=<addr>&to=<addr>&blob_id=<base64url32>&size=<bytes>&ts=<unix>&sig=<base64url>`,
+body `application/octet-stream` → `201 {"blob_id": ..., "duplicate": bool}`.
+
+The body is the opaque framed ciphertext. The upload is authorized by
+the *uploader's* signature over `envelope.BlobUpload(from, to, blob_id,
+size, ts)` (domain `courier-blob-upload-v1`): the uploader cannot forge a
+recipient signature for someone else's download grant, so uploads are
+attributed to the sender instead. `ts` must be within 300 seconds of
+relay time; the relay rejects unsigned, forged, stale, oversized
+(> 25 MiB + framing overhead), or size-mismatched uploads. Blob ids are
+client-generated random 256-bit values, so re-uploading the same blob is
+idempotent (`"duplicate": true`).
+
+`GET /v1/blobs/<blob_id>?ts=<unix>&sig=<base64url>` →
+`200 application/octet-stream` (the framed ciphertext).
+
+Downloads are authorized by the *recipient's* signature over
+`envelope.BlobRequest(address, blob_id, ts)` (domain
+`courier-blob-req-v1`), mirroring inbox reads and verified against the
+address the blob was uploaded for — only that address can fetch the
+ciphertext. Unknown blob ids return `404`.
+
+### Retrieval and verification
+
+The recipient unwraps the data key with their X25519 private key (anyone
+else — the relay included — cannot), downloads the blob, then
+re-authenticates every chunk, checks the chunk count and reassembled
+size, and finally the SHA256 against the manifest. Verification fails
+closed: tampered, missing, truncated, or hash-mismatched data is an
+error, never a file.
+
+The relay never sees plaintext, filenames, MIME types, plaintext
+hashes, or data keys — only opaque ciphertext blobs addressed to a
+recipient. Blob retention follows envelope retention: the relay prunes
+blobs older than the retention window alongside envelopes.
+
+CLI: `courier send <address> <message> --attach <file>` (repeatable);
+`courier inbox --attachments-dir <dir>` downloads and verifies each
+attachment into the directory (existing filenames get a numeric suffix;
+manifest filenames cannot traverse directories).
+
 ## Retention
 
 The relay deletes envelopes older than 30 days (configurable). Clients
@@ -156,6 +238,7 @@ should poll regularly; the relay is a mailbox, not an archive.
 | Property | v1 status |
 |---|---|
 | Message confidentiality (relay, network) | ✅ E2E via crypto_box |
+| Attachment confidentiality (relay, network) | ✅ E2E: per-file data key, secretbox chunks, manifest inside ciphertext; relay sees only opaque blobs |
 | Forward secrecy, sender side | ✅ per-message ephemeral sender keys |
 | Forward secrecy, recipient side | ⚠️ bounded by key rotation: `courier rotate` retires the encryption key (v0.5.0+) |
 | Sender authentication | ✅ Ed25519 signatures, verified by relay and recipient (v0.2.0+) |
