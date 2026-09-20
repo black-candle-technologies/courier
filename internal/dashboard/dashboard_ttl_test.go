@@ -97,12 +97,13 @@ func TestPushDisappearingMessages(t *testing.T) {
 }
 
 // TestUntilRendersCountdown checks the template countdown helper.
+// The +2s padding defeats unix-second truncation (the helper floors).
 func TestUntilRendersCountdown(t *testing.T) {
 	now := time.Now()
-	if got := until(now.Add(5 * time.Minute).Unix()); got != "in 5m" {
+	if got := until(now.Add(5*time.Minute + 2*time.Second).Unix()); got != "in 5m" {
 		t.Errorf("until(+5m) = %q", got)
 	}
-	if got := until(now.Add(2 * time.Hour).Unix()); got != "in 2h" {
+	if got := until(now.Add(2*time.Hour + 2*time.Second).Unix()); got != "in 2h" {
 		t.Errorf("until(+2h) = %q", got)
 	}
 	if got := until(now.Add(-time.Minute).Unix()); got != "expired" {
