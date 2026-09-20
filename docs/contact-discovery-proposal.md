@@ -355,10 +355,13 @@ send path — including the #34 contact-policy UX (§9).
 
 ## 11. Open questions for reviewers
 
-1. **Signed queries:** should search/lookup require identity-signed
+1. **Signed queries:** ~~should search/lookup require identity-signed
    requests (§8.2–8.3), or is anonymous access with IP rate limits
-   sufficient? (Recommendation: signed — kills unauthenticated
-   enumeration; consistent with F10.)
+   sufficient?~~ **Decided 2026-09-19: identity-signed queries are
+   required** (§8.2–8.3 as specified). Anonymous access rejected — IP
+   rate limits are weak behind NAT and useless against botnets; signed
+   queries kill unauthenticated enumeration at the protocol level,
+   consistent with F10.
 2. **Handle disputes:** first-come-first-served forever, or is there any
    arbitration path for impersonation of well-known agents? (Note: any
    arbitration implies an operator-identity oracle, in tension with T1.)
