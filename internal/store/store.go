@@ -271,6 +271,18 @@ func migrate(db *sql.DB) error {
 		PRIMARY KEY (user_id, peer))`); err != nil {
 		return err
 	}
+	// issue #48: per-user peer verification states for the dashboard.
+	// The agent pushes them with its peer labels; the dashboard only
+	// displays what the agent reports — it never verifies identities
+	// itself. Rows older than the display TTL are ignored.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS dashboard_peer_verified(
+		user_id    INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
+		peer       TEXT NOT NULL,
+		status     TEXT NOT NULL,
+		updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+		PRIMARY KEY (user_id, peer))`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -909,6 +921,7 @@ const peerExpr = `COALESCE(NULLIF(peer,''), sender)`
 type DashboardThread struct {
 	Peer     string
 	Handle   string // "@handle" display label, "" when unknown
+	Verified string // "verified"|"stale"|"": contact trust badge (issue #48)
 	Count    int64
 	LastTS   int64
 	LastBody string
@@ -961,6 +974,9 @@ func (s *Store) DashboardThreads(userID int64, userAddr string, limit int) ([]Da
 	// while rows from the first are still open.
 	handles, _ := s.PeerHandles(userID, peerHandleTTL)
 
+	// issue #48: peer verification badges, same pattern as handles.
+	verified, _ := s.PeerVerified(userID, peerVerifiedTTL)
+
 	// Latest message per peer.
 	const tpeer = `COALESCE(NULLIF(t.peer,''), t.sender)`
 	lrows, err := s.db.Query(
@@ -987,6 +1003,7 @@ func (s *Store) DashboardThreads(userID int64, userAddr string, limit int) ([]Da
 		th.LastOut = sender == userAddr
 		th.Unread = unreadByPeer[th.Peer]
 		th.Handle = handles[th.Peer]
+		th.Verified = verified[th.Peer]
 		out = append(out, th)
 	}
 	return out, lrows.Err()
@@ -997,6 +1014,16 @@ func (s *Store) DashboardThreads(userID int64, userAddr string, limit int) ([]Da
 // entries older than this are ignored so unregistered handles fade
 // rather than lingering forever.
 const peerHandleTTL = 7 * 24 * time.Hour
+
+// peerVerifiedTTL is the display TTL for pushed contact-verification
+// states (issue #48). Same refresh cadence as handle labels: the agent
+// re-pushes at most every 24h, and verification changes force an early
+// refresh.
+const peerVerifiedTTL = 7 * 24 * time.Hour
+
+// verifiedStatuses are the only peer-verification states the dashboard
+// accepts from an agent push.
+var verifiedStatuses = map[string]bool{"verified": true, "stale": true}
 
 // SavePeerHandle records the agent-resolved directory handle for a peer
 // (upsert). handle must already be normalized; empty clears the label.
@@ -1029,6 +1056,46 @@ func (s *Store) PeerHandles(userID int64, ttl time.Duration) (map[string]string,
 			return out, err
 		}
 		out[peer] = handle
+	}
+	return out, rows.Err()
+}
+
+// SavePeerVerified records the agent-reported verification state for a
+// peer (upsert). status must be "verified" or "stale"; anything else is
+// rejected by the caller. An empty status clears the badge.
+func (s *Store) SavePeerVerified(userID int64, peer, status string) error {
+	if status == "" {
+		_, err := s.db.Exec(`DELETE FROM dashboard_peer_verified WHERE user_id = ? AND peer = ?`,
+			userID, peer)
+		return err
+	}
+	if !verifiedStatuses[status] {
+		return fmt.Errorf("bad verification status %q", status)
+	}
+	_, err := s.db.Exec(`INSERT INTO dashboard_peer_verified(user_id, peer, status, updated_at)
+		VALUES(?, ?, ?, strftime('%s','now'))
+		ON CONFLICT(user_id, peer) DO UPDATE SET status = excluded.status,
+		updated_at = excluded.updated_at`, userID, peer, status)
+	return err
+}
+
+// PeerVerified returns fresh (within ttl) peer→status verification
+// states for a user.
+func (s *Store) PeerVerified(userID int64, ttl time.Duration) (map[string]string, error) {
+	out := map[string]string{}
+	cutoff := time.Now().Add(-ttl).Unix()
+	rows, err := s.db.Query(`SELECT peer, status FROM dashboard_peer_verified
+		WHERE user_id = ? AND updated_at >= ?`, userID, cutoff)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var peer, status string
+		if err := rows.Scan(&peer, &status); err != nil {
+			return out, err
+		}
+		out[peer] = status
 	}
 	return out, rows.Err()
 }

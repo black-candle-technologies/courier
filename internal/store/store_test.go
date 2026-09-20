@@ -356,3 +356,53 @@ func TestPeerHandlesExpiry(t *testing.T) {
 		t.Fatal("cleared handle should be gone")
 	}
 }
+
+// TestPeerVerifiedRoundTrip: save/refresh/TTL/clear of peer verification
+// badges (issue #48).
+func TestPeerVerifiedRoundTrip(t *testing.T) {
+	s := testStore(t)
+	const userID = 1
+	const peer = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	if err := s.SavePeerVerified(userID, peer, "verified"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.PeerVerified(userID, 7*24*3600*1e9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[peer] != "verified" {
+		t.Fatalf("fresh status not returned: %v", got)
+	}
+	// Upsert to stale.
+	if err := s.SavePeerVerified(userID, peer, "stale"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.PeerVerified(userID, 7*24*3600*1e9)
+	if got[peer] != "stale" {
+		t.Fatalf("upsert failed: %v", got)
+	}
+	// Bad status rejected.
+	if err := s.SavePeerVerified(userID, peer, "bogus"); err == nil {
+		t.Fatal("bad status accepted")
+	}
+	// Backdate beyond the TTL: ignored.
+	if _, err := s.db.Exec(`UPDATE dashboard_peer_verified SET updated_at = 0
+		WHERE user_id = ? AND peer = ?`, userID, peer); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.PeerVerified(userID, 7*24*3600*1e9)
+	if _, ok := got[peer]; ok {
+		t.Fatal("stale verification should be ignored")
+	}
+	// Empty status clears.
+	if err := s.SavePeerVerified(userID, peer, "verified"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SavePeerVerified(userID, peer, ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.PeerVerified(userID, 7*24*3600*1e9)
+	if _, ok := got[peer]; ok {
+		t.Fatal("cleared verification should be gone")
+	}
+}

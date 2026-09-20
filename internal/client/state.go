@@ -580,7 +580,7 @@ func (c *Client) sendStateEvents(peer string, events []StateEvent) (int64, error
 	for _, ev := range prepared {
 		summaries = append(summaries, stateSummary(address, ev))
 	}
-	id, err := c.sendSealed(address, plain, strings.Join(summaries, "; "))
+	id, err := c.sendSealed(address, plain, strings.Join(summaries, "; "), true)
 	if err != nil {
 		return 0, err
 	}

@@ -7,6 +7,7 @@
 //	courier address                      print your address (public key)
 //	courier send <address> <message|-> [--attach file]...
 //	courier inbox [--all] [--limit N] [--follow] [--attachments-dir dir]
+//	courier backup create|restore|export-sync|import-sync
 //	courier stdio                        JSON-lines bridge for agents
 //	courier serve [--listen 127.0.0.1:8471]
 //	courier version
@@ -77,10 +78,14 @@ func main() {
 		err = cmdGroup(os.Args[2:])
 	case "state":
 		err = cmdState(os.Args[2:])
+	case "channel":
+		err = cmdChannel(os.Args[2:])
 	case "rotate":
 		err = cmdRotate(os.Args[2:])
 	case "publish-key":
 		err = cmdPublishKey()
+	case "backup":
+		err = cmdBackup(os.Args[2:])
 	case "update":
 		err = cmdUpdate()
 	case "dashboard":
@@ -130,8 +135,10 @@ func usage() {
   courier unblock <address|contact>      unblock a sender
   courier report-spam <message-id>       report a message as spam (throttles repeat offenders)
   courier contacts add <name> <address>  save a contact
-  courier contacts list                  list contacts
-  courier contacts show <name>           show a contact's address
+  courier contacts list                  list contacts (with trust state)
+  courier contacts show <name>           show a contact's address and trust state
+  courier contacts verify <name> [--yes] verify a contact out of band (safety number)
+  courier contacts unverify <name>       clear a contact's verification
   courier contacts remove <name>         delete a contact
   courier group create --name <name> [addr...]
                                          create an encrypted group (you are admin)
@@ -143,6 +150,15 @@ func usage() {
                                          share a task (state machine: assign/done/reopen)
   courier state list <peer>              list shared notes + tasks
   courier state sync <peer>              catch-up: fetch and apply missed state events
+  courier channel create <name>          create a private channel (you are admin)
+  courier channel invite <channel-id>    mint a one-time out-of-band join code
+  courier channel join <inviter> <code>   join a private channel via OOB code
+  courier channel send <channel-id> <msg> send a message to the channel
+  courier channel inbox <channel-id>     read channel messages
+  courier channel list                   list your private channels
+  courier channel remove <channel-id> <addr|contact>
+                                         remove a member (admin; rotates the channel key)
+  courier channel leave <channel-id>     leave a private channel
   courier directory register <handle> [--visibility public|unlisted|private]
       [--caps a,b] [--policy open|contacts]
                                          claim a handle (first-come, signed)
@@ -162,6 +178,13 @@ func usage() {
   courier directory dismiss <id>         dismiss a pending introduction
   courier rotate                         rotate encryption key (durable crypto)
   courier publish-key                    re-announce your encryption key
+  courier backup create [--output f]     write an encrypted identity backup
+                                         (seed + live keys, passphrase-protected)
+  courier backup restore [--force] <file>
+                                         install a backup as this machine's identity
+  courier backup export-sync [--output f]
+                                         write an encrypted sync envelope (live keys)
+  courier backup import-sync <file>      merge a sync envelope's keys into this identity
   courier update                         check for and install updates
   courier config set auto_update false   opt out of automatic update installs
   courier config set dm_policy contacts hold messages from unknown senders for review
@@ -765,12 +788,13 @@ func writeSvcJSON(w http.ResponseWriter, code int, v any) {
 
 func cmdContacts(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: courier contacts <add|list|show|remove> ...")
+		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|remove> ...")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
 		return err
 	}
+	cl := client.New(cfg)
 	switch args[0] {
 	case "add":
 		if len(args) != 3 {
@@ -791,7 +815,17 @@ func cmdContacts(args []string) error {
 		}
 		sort.Strings(names)
 		for _, n := range names {
-			fmt.Printf("%-24s %s\n", n, cfg.Contacts[n])
+			st, _ := cl.ContactTrust(n)
+			var badge string
+			switch st {
+			case client.TrustVerified:
+				badge = "✓ verified"
+			case client.TrustStale:
+				badge = "⚠ stale"
+			default:
+				badge = "• unverified"
+			}
+			fmt.Printf("%-24s %-12s %s\n", n, badge, cfg.Contacts[n])
 		}
 	case "show":
 		if len(args) != 2 {
@@ -802,6 +836,47 @@ func cmdContacts(args []string) error {
 			return err
 		}
 		fmt.Println(addr)
+		st, detail := cl.ContactTrust(args[1])
+		fmt.Printf("trust: %s (%s)\n", st, detail)
+		if rec, ok := cfg.StoredVerification(args[1]); ok {
+			fmt.Printf("verified: %s\n", time.Unix(rec.VerifiedAt, 0).Format(time.RFC3339))
+			fmt.Printf("safety number: %s\n", rec.SafetyNumber)
+		}
+	case "verify":
+		if len(args) < 2 || len(args) > 3 {
+			return fmt.Errorf("usage: courier contacts verify <name> [--yes]")
+		}
+		name := args[1]
+		yes := len(args) == 3 && args[2] == "--yes"
+		number, _, err := cl.SafetyNumberForContact(name)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Safety number for %q:\n\n  %s\n\n", name, number)
+		fmt.Printf("Compare this number with %q over a separate channel (a call,\n", name)
+		fmt.Println("video chat, or in person). Both sides must see the same number.")
+		if !yes {
+			fmt.Print("Do the numbers match? [y/N] ")
+			var answer string
+			fmt.Scanln(&answer)
+			answer = strings.ToLower(strings.TrimSpace(answer))
+			if answer != "y" && answer != "yes" {
+				fmt.Println("not verified.")
+				return nil
+			}
+		}
+		if err := cl.VerifyContact(name); err != nil {
+			return err
+		}
+		fmt.Printf("contact %q verified.\n", name)
+	case "unverify":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: courier contacts unverify <name>")
+		}
+		if err := cl.UnverifyContact(args[1]); err != nil {
+			return err
+		}
+		fmt.Printf("verification for %q cleared.\n", args[1])
 	case "remove", "rm", "delete":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: courier contacts remove <name>")
@@ -811,7 +886,7 @@ func cmdContacts(args []string) error {
 		}
 		fmt.Printf("contact %q removed.\n", args[1])
 	default:
-		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|remove)", args[0])
+		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|remove)", args[0])
 	}
 	return nil
 }
