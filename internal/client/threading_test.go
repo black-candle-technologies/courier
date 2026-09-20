@@ -155,17 +155,12 @@ func TestTruncateQuote(t *testing.T) {
 	if q := truncateQuote(long); len(q) != maxReplyQuoteLen {
 		t.Fatalf("long quote not bounded: len %d", len(q))
 	}
-	// Multibyte safety: no broken rune at the cut.
+	// Multibyte safety: no broken rune at the cut. "é" is 2 bytes, so
+	// a 500-byte cap holds 250 of them, never a half-rune.
 	uni := strings.Repeat("é", maxReplyQuoteLen+10)
-	q := truncateQuote(uni)
-	if len(q) != maxReplyQuoteLen {
-		t.Fatalf("unicode cut wrong length: %d", len(q))
-	}
-	for _, r := range q {
-		_ = r // ranges over valid runes; a broken encoding would surface in tests via vet
-	}
-	if q != strings.Repeat("é", maxReplyQuoteLen) {
-		t.Fatalf("unicode quote mangled")
+	q = truncateQuote(uni)
+	if q != strings.Repeat("é", maxReplyQuoteLen/2) {
+		t.Fatalf("unicode quote mangled: %q", q)
 	}
 }
 

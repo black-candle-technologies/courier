@@ -55,8 +55,9 @@ type replyInfo struct {
 const maxReplyQuoteLen = 500
 
 // truncateQuote trims a parent snippet to a single line of at most
-// maxReplyQuoteLen chars, collapsing internal whitespace. Quotes are
-// display hints, not content: lossy is fine, unbounded is not.
+// maxReplyQuoteLen bytes (cut on a rune boundary, never mid-rune),
+// collapsing internal whitespace. Quotes are display hints, not
+// content: lossy is fine, unbounded is not.
 func truncateQuote(s string) string {
 	s = strings.Join(strings.Fields(s), " ")
 	if len(s) <= maxReplyQuoteLen {

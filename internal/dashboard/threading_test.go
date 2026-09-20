@@ -20,7 +20,7 @@ func TestPushReplyThreading(t *testing.T) {
 	srv := testServer(t)
 	id := testIdentity(t)
 	addr := crypto.FormatAddress(id.EdPub[:])
-	token := register(t, srv, "lane", "pw12345678", id)
+	token := register(t, srv, "lane", "temporary-password-123", id)
 
 	peer := crypto.FormatAddress(testIdentity(t).EdPub[:])
 	payload, _ := json.Marshal(map[string]any{"messages": []map[string]any{
@@ -72,7 +72,7 @@ func TestPushReplyThreading(t *testing.T) {
 	}
 
 	// The thread view renders the quote block (HTML-escaped).
-	cookie := login(t, srv, "lane", "pw12345678")
+	cookie := login(t, srv, "lane", "temporary-password-123")
 	// Password must be changed first; do it, then re-login.
 	form := url.Values{"password": {"a-new-password-123"}, "confirm": {"a-new-password-123"}}
 	req = httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
