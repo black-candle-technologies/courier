@@ -288,6 +288,62 @@ func TestDirectorySearchPublicOnly(t *testing.T) {
 	}
 }
 
+// TestDirectorySearchResultsVerifiable is the regression test for the
+// v0.8.1 relay hotfix: search results must carry every field the
+// registration signature covers (notably contact_policy), so a client
+// can verify the binding exactly as it does for lookup results.
+func TestDirectorySearchResultsVerifiable(t *testing.T) {
+	srv := dirTestServer(t)
+	alice, _ := crypto.GenerateIdentity()
+	dirAnnounce(t, srv, alice)
+
+	addr := crypto.FormatAddress(alice.EdPub[:])
+	sig := alice.Sign(envelope.DirectoryRegister("zverify", alice.EdPub[:], 1001, "public", "contacts", []string{"chat"}))
+	rec := postDirectory(t, srv, map[string]any{
+		"handle": "zverify", "address": addr,
+		"capabilities": []string{"chat"}, "contact_policy": "contacts",
+		"visibility": "public", "epoch": 1001, "sig": b64.EncodeToString(sig),
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("register: got %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	rec = getDir(t, srv, signedDirURL(t, alice, "search", map[string]string{"q": "zver"}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("search: got %d, body %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Results []struct {
+			Handle        string   `json:"handle"`
+			Address       string   `json:"address"`
+			Capabilities  []string `json:"capabilities"`
+			ContactPolicy string   `json:"contact_policy"`
+			Visibility    string   `json:"visibility"`
+			Epoch         int64    `json:"epoch"`
+			Sig           string   `json:"sig"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) != 1 {
+		t.Fatalf("want 1 result, got %d", len(out.Results))
+	}
+	r := out.Results[0]
+	if r.ContactPolicy == "" {
+		t.Fatal("search result omits contact_policy: clients cannot verify the binding")
+	}
+	rawSig, err := b64.DecodeString(r.Sig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canon := envelope.DirectoryRegister(r.Handle, alice.EdPub[:], r.Epoch,
+		r.Visibility, r.ContactPolicy, r.Capabilities)
+	if !crypto.Verify(alice.EdPub[:], canon, rawSig) {
+		t.Fatal("search result signature does not verify with the served fields")
+	}
+}
+
 func TestDirectoryTombstone(t *testing.T) {
 	srv := dirTestServer(t)
 	alice, _ := crypto.GenerateIdentity()

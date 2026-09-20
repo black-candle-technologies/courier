@@ -65,16 +65,18 @@ type directoryProfile struct {
 
 // directorySearchResult is the minimal search hit: the verifiable
 // binding fields plus display fields. Search identifies candidates;
-// the full profile (contact policy, registration time) comes from
-// lookup.
+// the full profile (registration time) comes from lookup. Contact
+// policy is included because it is part of the signed canonical
+// bytes — without it clients cannot verify the binding signature.
 type directorySearchResult struct {
-	Handle       string   `json:"handle"`
-	Address      string   `json:"address"`
-	Capabilities []string `json:"capabilities"`
-	Visibility   string   `json:"visibility"`
-	Epoch        int64    `json:"epoch"`
-	Sig          string   `json:"sig"`
-	TransferFrom string   `json:"transfer_from,omitempty"`
+	Handle        string   `json:"handle"`
+	Address       string   `json:"address"`
+	Capabilities  []string `json:"capabilities"`
+	ContactPolicy string   `json:"contact_policy"`
+	Visibility    string   `json:"visibility"`
+	Epoch         int64    `json:"epoch"`
+	Sig           string   `json:"sig"`
+	TransferFrom  string   `json:"transfer_from,omitempty"`
 }
 
 func profileJSON(e *store.DirectoryEntry) directoryProfile {
@@ -530,21 +532,22 @@ func (s *Server) handleDirectorySearch(w http.ResponseWriter, r *http.Request) {
 	}
 	// Search returns a dedicated minimal struct: the verifiable binding
 	// fields (handle, address, epoch, sig, transfer_from) plus display
-	// fields (capabilities, visibility). No contact policy or
-	// registration time — search identifies candidates; lookup gives
-	// the full profile. The epoch and sig are required so clients can
-	// verify the binding instead of trusting the relay.
+	// fields (capabilities, contact policy, visibility). No registration
+	// time — search identifies candidates; lookup gives the full
+	// profile. The epoch, sig, and contact policy are required so
+	// clients can verify the binding instead of trusting the relay.
 	results := make([]directorySearchResult, 0, len(entries))
 	for i := range entries {
 		e := &entries[i]
 		results = append(results, directorySearchResult{
-			Handle:       e.Handle,
-			Address:      e.Address,
-			Capabilities: e.Capabilities,
-			Visibility:   e.Visibility,
-			Epoch:        e.Epoch,
-			Sig:          e.Sig,
-			TransferFrom: e.TransferFrom,
+			Handle:        e.Handle,
+			Address:       e.Address,
+			Capabilities:  e.Capabilities,
+			ContactPolicy: e.ContactPolicy,
+			Visibility:    e.Visibility,
+			Epoch:         e.Epoch,
+			Sig:           e.Sig,
+			TransferFrom:  e.TransferFrom,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"results": results})
