@@ -343,16 +343,16 @@ send path — including the #34 contact-policy UX (§9).
   (§11), then file the implementation issue.
 - **Phase 1 — Prototype (v0.8.0).** Relay `directory` table + endpoints,
   client `directory` commands, handle resolution in `courier send`,
-  PROTOCOL.md spec, regression tests (registration round-trip, squatting
-  attempt rejected, epoch-replay rejected, enumeration rate limits,
-  private-handle oracle indistinguishability). New endpoints are additive;
-  pre-0.8.0 clients are unaffected. No relay redeploy beyond the normal
-  release process.
+  signed introduction-envelope protocol for `private` handles (decided
+  §11 Q6), PROTOCOL.md spec, regression tests (registration round-trip,
+  squatting attempt rejected, epoch-replay rejected, enumeration rate
+  limits, private-handle oracle indistinguishability, introduction
+  round-trip). New endpoints are additive; pre-0.8.0 clients are
+  unaffected. No relay redeploy beyond the normal release process.
 - **Phase 2 — Hardening.** Tune rate limits from real usage; add
   relay-operator reserved-handle config; monitor for scraping patterns;
   document operator guidance for handle choice (T1 residual risk).
-- **Phase 3 — Future.** Introduction protocol for `private` handles
-  (signed introduction envelopes); federated directory sync if Courier
+- **Phase 3 — Future.** Federated directory sync if Courier
   ever goes multi-relay.
 
 ## 11. Open questions for reviewers
@@ -388,8 +388,12 @@ send path — including the #34 contact-policy UX (§9).
    identity?~~ **Decided 2026-09-19: a pre-existing key announcement is
    required.** Weak anti-parking hurdle; not real sybil resistance, just
    a deterrent against drive-by handle squatting.
-6. **Introductions:** is a signed introduction-envelope protocol for
-   `private` handles in scope for v0.8.0, or deferred to Phase 3?
+6. **Introductions:** ~~is a signed introduction-envelope protocol for
+   `private` handles in scope for v0.8.0, or deferred to Phase 3?~~
+   **Decided 2026-09-19: in scope for v0.8.0.** The signed
+   introduction-envelope protocol for `private` handles is part of the
+   Phase 1 prototype — otherwise `private` (the default visibility)
+   would have no in-band introduction path at all.
 7. **Capability vocabulary:** free-form tokens (bounded) or a registry of
    well-known capabilities? Who curates the registry if the latter?
 
