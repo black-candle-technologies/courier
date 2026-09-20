@@ -5,8 +5,11 @@ package envelope
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
+	"strings"
 )
 
 // Domain separates Courier envelope signatures from every other use of the
@@ -153,4 +156,120 @@ func DedupHash(to, from, eph, nonce string, sentAt int64, ct, sig string) string
 	binary.BigEndian.PutUint64(b[:], uint64(sentAt))
 	h.Write(b[:])
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// ---- Group messaging (issue #32) ----
+
+// GroupIDPrefix marks group identifiers. A group ID is
+// "group:<base64url>" carrying 128 bits of randomness.
+const GroupIDPrefix = "group:"
+
+// GroupIDLen is the raw group-ID length in bytes (128 bits).
+const GroupIDLen = 16
+
+// ParseGroupID validates a group ID string and returns its raw bytes.
+func ParseGroupID(s string) ([16]byte, error) {
+	var out [16]byte
+	if !strings.HasPrefix(s, GroupIDPrefix) {
+		return out, fmt.Errorf("group id must start with %q", GroupIDPrefix)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(s, GroupIDPrefix))
+	if err != nil {
+		return out, fmt.Errorf("invalid group id: %w", err)
+	}
+	if len(raw) != GroupIDLen {
+		return out, fmt.Errorf("invalid group id: want %d bytes, got %d", GroupIDLen, len(raw))
+	}
+	copy(out[:], raw)
+	return out, nil
+}
+
+// FormatGroupID renders raw group-ID bytes in "group:<base64url>" form.
+func FormatGroupID(raw [16]byte) string {
+	return GroupIDPrefix + base64.RawURLEncoding.EncodeToString(raw[:])
+}
+
+// groupEnvelopeDomain separates group-message signatures from every other
+// use of the sender's Ed25519 key.
+var groupEnvelopeDomain = []byte("courier-group-envelope-v1\x00")
+
+// groupIDHashDomain separates the group-ID hashing used inside
+// GroupCanonical.
+var groupIDHashDomain = []byte("courier-group-id-v1\x00")
+
+// GroupCanonical returns the exact bytes covered by a group-message sender
+// signature. The recipient is the group ID, hashed to 32 bytes so the
+// encoding stays fixed-length and unambiguous; the sender-key epoch is
+// covered so a captured envelope cannot be replayed under a different
+// epoch. The eph field is 32 random bytes (kept for envelope-shape
+// compatibility); group messages use symmetric sender keys, not X25519.
+func GroupCanonical(groupID string, from []byte, keyEpoch int64, eph, nonce []byte, sentAt int64, ct []byte) []byte {
+	out := make([]byte, 0, len(groupEnvelopeDomain)+32+32+8+32+24+8+len(ct))
+	out = append(out, groupEnvelopeDomain...)
+	gid := sha256.Sum256(append(groupIDHashDomain, groupID...))
+	out = append(out, gid[:]...) // 32 bytes
+	out = append(out, from...)   // 32 bytes Ed25519 (sender address key)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(keyEpoch))
+	out = append(out, b[:]...)
+	out = append(out, eph...)   // 32 bytes
+	out = append(out, nonce...) // 24 bytes
+	binary.BigEndian.PutUint64(b[:], uint64(sentAt))
+	out = append(out, b[:]...)
+	out = append(out, ct...)
+	return out
+}
+
+// Group membership-control actions.
+const (
+	GroupControlCreate        = "create"
+	GroupControlAdd           = "add"
+	GroupControlRemove        = "remove"
+	GroupControlTransferAdmin = "transfer-admin"
+)
+
+// groupControlDomain separates group membership-control signatures from
+// every other use of the signer's Ed25519 key.
+var groupControlDomain = []byte("courier-group-control-v1\x00")
+
+// GroupControl returns the exact bytes covered by a group membership
+// control signature. Controls are signed by the group admin (create: by
+// the creator, who becomes the initial admin). The epoch strictly
+// increases by 1 per control, so replays and reorderings are rejected by
+// the relay.
+func GroupControl(groupID, action, target, admin string, epoch int64) []byte {
+	out := make([]byte, 0, len(groupControlDomain)+len(groupID)+len(action)+len(target)+len(admin)+4+8)
+	out = append(out, groupControlDomain...)
+	for _, s := range []string{groupID, action, target, admin} {
+		out = append(out, s...)
+		out = append(out, 0x00)
+	}
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(epoch))
+	out = append(out, b[:]...)
+	return out
+}
+
+// groupInboxRequestDomain separates group-read authorization signatures
+// from every other use of the member's Ed25519 key.
+var groupInboxRequestDomain = []byte("courier-group-inbox-req-v1\x00")
+
+// GroupInboxRequest builds the canonical bytes a member signs to authorize
+// reading a group's envelopes. The relay verifies the signature against
+// the member's address key and checks current membership, so only current
+// members can read the group's ciphertext and control feed.
+func GroupInboxRequest(groupID string, member []byte, after, limit, ts int64) []byte {
+	out := make([]byte, 0, len(groupInboxRequestDomain)+len(groupID)+1+32+8+8+8)
+	out = append(out, groupInboxRequestDomain...)
+	out = append(out, groupID...)
+	out = append(out, 0x00)
+	out = append(out, member...) // 32 bytes Ed25519 (requesting member)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(after))
+	out = append(out, b[:]...)
+	binary.BigEndian.PutUint64(b[:], uint64(limit))
+	out = append(out, b[:]...)
+	binary.BigEndian.PutUint64(b[:], uint64(ts))
+	out = append(out, b[:]...)
+	return out
 }

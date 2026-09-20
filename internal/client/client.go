@@ -1005,6 +1005,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 			SentAt     int64  `json:"sent_at"`
 			ReceivedAt int64  `json:"received_at"`
 			Sig        string `json:"sig"`
+			Kind       string `json:"kind"`
 		} `json:"messages"`
 	}
 	if err := json.Unmarshal(data, &in); err != nil {
@@ -1021,6 +1022,13 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 		// replayed messages too (v0.6.11 F4).
 		if m.ID > lastID {
 			lastID = m.ID
+		}
+		// issue #32: skip envelope kinds this client does not
+		// understand (sent by newer clients) without stalling the
+		// cursor.
+		if m.Kind != "" && m.Kind != "dm" {
+			skipped++
+			continue
 		}
 		// v0.6.11 (F3): suppress replays independently of relay message
 		// ids — identical envelope bytes are never delivered twice.
@@ -1065,6 +1073,16 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 			skipped++
 			continue
 		}
+
+		// issue #32: group protocol direct messages (sender-key
+		// distributions and group invitations) are consumed by the
+		// group layer and never surface as chat messages.
+		if gp, ok := parseGroupDMPayload(plain); ok {
+			c.handleGroupDM(m.From, gp)
+			seen[h] = true
+			newHashes = append(newHashes, h)
+			continue
+		}
 		// Split a decrypted payload into its body text and attachment
 		// manifests. Manifests are validated and their data keys are
 		// unwrapped with this recipient's keys; a manifest whose key
@@ -1104,6 +1122,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 				}
 			}
 			atts = append(atts, ia)
+
 		}
 		out = append(out, Message{
 			ID: m.ID, From: m.From, Body: body,

@@ -16,14 +16,16 @@ import (
 // Envelope is one stored message, ciphertext only.
 type Envelope struct {
 	ID         int64
-	To         string // v0.2.0+ "ed25519:<base64url>" address
+	To         string // v0.2.0+ "ed25519:<base64url>" address, or "group:<base64url>" (issue #32)
 	From       string // sender address (signature-authenticated in v0.2.0+)
-	Eph        string // base64url ephemeral X25519 public key
+	Eph        string // base64url ephemeral X25519 public key (32 random bytes for group messages)
 	Nonce      string // base64url nonce
 	Ct         string // base64url ciphertext
 	SentAt     int64  // unix seconds, sender's clock
 	ReceivedAt int64  // unix seconds, relay's clock
 	Sig        string // base64url Ed25519 signature (v0.2.0+)
+	Kind       string // "" or "dm" for direct messages, "group" for group messages (issue #32)
+	KeyEpoch   int64  // sender-key epoch for group messages (issue #32); 0 otherwise
 }
 
 // Blob is one stored attachment blob: the framed, encrypted chunks.
@@ -54,7 +56,9 @@ CREATE TABLE IF NOT EXISTS envelopes (
 	sent_at     INTEGER NOT NULL,
 	received_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
 	sig         TEXT NOT NULL DEFAULT '',
-	env_hash    TEXT
+	env_hash    TEXT,
+	kind        TEXT NOT NULL DEFAULT '',
+	key_epoch   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_envelopes_recipient ON envelopes(recipient, id);
 -- The UNIQUE index on env_hash is created by the v0.6.11 (F3) migration,
@@ -157,6 +161,44 @@ func migrate(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_envelopes_env_hash ON envelopes(env_hash)`); err != nil {
 		return err
 	}
+	// issue #32: envelope kind ("" or "dm" for direct messages, "group"
+	// for group messages). Empty for pre-group envelopes.
+	if err := addColumn(`ALTER TABLE envelopes ADD COLUMN kind TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	// issue #32: sender-key epoch for group messages (0 for direct
+	// messages). Covered by the group envelope signature; tells the
+	// reader which sender key sealed the body.
+	if err := addColumn(`ALTER TABLE envelopes ADD COLUMN key_epoch INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	// issue #32: group messaging tables.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS groups(
+		group_id     TEXT PRIMARY KEY,
+		name         TEXT NOT NULL DEFAULT '',
+		admin        TEXT NOT NULL,
+		member_epoch INTEGER NOT NULL DEFAULT 1,
+		created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')))`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS group_members(
+		group_id TEXT NOT NULL,
+		member   TEXT NOT NULL,
+		PRIMARY KEY (group_id, member))`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS group_controls(
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		group_id   TEXT NOT NULL,
+		action     TEXT NOT NULL,
+		target     TEXT NOT NULL DEFAULT '',
+		admin      TEXT NOT NULL,
+		epoch      INTEGER NOT NULL,
+		sig        TEXT NOT NULL,
+		created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+		UNIQUE(group_id, epoch))`); err != nil {
+		return err
+	}
 	// v0.6.9: per-thread read state for unread badges.
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS dashboard_seen(
 		user_id      INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
@@ -231,10 +273,10 @@ func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) Save(e *Envelope) (id int64, stored bool, err error) {
 	h := envelope.DedupHash(e.To, e.From, e.Eph, e.Nonce, e.SentAt, e.Ct, e.Sig)
 	res, err := s.db.Exec(
-		`INSERT INTO envelopes (recipient, sender, eph, nonce, ct, sent_at, sig, env_hash)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO envelopes (recipient, sender, eph, nonce, ct, sent_at, sig, env_hash, kind, key_epoch)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(env_hash) DO NOTHING`,
-		e.To, e.From, e.Eph, e.Nonce, e.Ct, e.SentAt, e.Sig, h,
+		e.To, e.From, e.Eph, e.Nonce, e.Ct, e.SentAt, e.Sig, h, e.Kind, e.KeyEpoch,
 	)
 	if err != nil {
 		return 0, false, fmt.Errorf("insert: %w", err)
@@ -261,7 +303,7 @@ func (s *Store) Save(e *Envelope) (id int64, stored bool, err error) {
 // oldest first.
 func (s *Store) List(recipient string, after int64, limit int) ([]Envelope, error) {
 	rows, err := s.db.Query(
-		`SELECT id, recipient, sender, eph, nonce, ct, sent_at, received_at, sig
+		`SELECT id, recipient, sender, eph, nonce, ct, sent_at, received_at, sig, kind, key_epoch
 		 FROM envelopes WHERE recipient = ? AND id > ?
 		 ORDER BY id ASC LIMIT ?`,
 		recipient, after, limit,
@@ -274,7 +316,7 @@ func (s *Store) List(recipient string, after int64, limit int) ([]Envelope, erro
 	var out []Envelope
 	for rows.Next() {
 		var e Envelope
-		if err := rows.Scan(&e.ID, &e.To, &e.From, &e.Eph, &e.Nonce, &e.Ct, &e.SentAt, &e.ReceivedAt, &e.Sig); err != nil {
+		if err := rows.Scan(&e.ID, &e.To, &e.From, &e.Eph, &e.Nonce, &e.Ct, &e.SentAt, &e.ReceivedAt, &e.Sig, &e.Kind, &e.KeyEpoch); err != nil {
 			return nil, fmt.Errorf("scan: %w", err)
 		}
 		out = append(out, e)
@@ -708,4 +750,235 @@ func (s *Store) DashboardThreadMessages(userID int64, peer string, limit int) ([
 		out[i], out[j] = out[j], out[i]
 	}
 	return out, nil
+}
+
+// ---- Group messaging (issue #32) ----
+
+// Group is a group's relay-side record.
+type Group struct {
+	ID          string
+	Name        string
+	Admin       string
+	MemberEpoch int64
+}
+
+// GroupControlRecord is one stored membership-control message.
+type GroupControlRecord struct {
+	Action string
+	Target string
+	Admin  string
+	Epoch  int64
+	Sig    string
+}
+
+// GetGroup returns the group record, or (nil, nil) if it does not exist.
+func (s *Store) GetGroup(groupID string) (*Group, error) {
+	var g Group
+	err := s.db.QueryRow(
+		`SELECT group_id, name, admin, member_epoch FROM groups WHERE group_id = ?`,
+		groupID,
+	).Scan(&g.ID, &g.Name, &g.Admin, &g.MemberEpoch)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get group: %w", err)
+	}
+	return &g, nil
+}
+
+// IsGroupMember reports whether member is currently in the group roster.
+func (s *Store) IsGroupMember(groupID, member string) (bool, error) {
+	var one int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM group_members WHERE group_id = ? AND member = ?`,
+		groupID, member,
+	).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("group member lookup: %w", err)
+	}
+	return true, nil
+}
+
+// GroupRoster returns the group's current member addresses, sorted.
+func (s *Store) GroupRoster(groupID string) ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT member FROM group_members WHERE group_id = ? ORDER BY member`,
+		groupID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("group roster: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var m string
+		if err := rows.Scan(&m); err != nil {
+			return nil, fmt.Errorf("group roster scan: %w", err)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// ApplyGroupControl validates and applies one membership-control message
+// in a transaction. Rules:
+//
+//   - create: the group must not exist; the signer becomes the initial
+//     admin and sole member. epoch must be 1.
+//   - add/remove/transfer-admin: the group must exist, the signer must be
+//     the current admin, and epoch must be exactly member_epoch+1
+//     (strict monotonicity; replays and reorderings are rejected).
+//   - remove: target must be a current member and not the admin (transfer
+//     adminship first).
+//   - transfer-admin: target must be a current member.
+func (s *Store) ApplyGroupControl(groupID, name, action, target, admin string, epoch int64, sig string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("group control tx: %w", err)
+	}
+	defer tx.Rollback()
+	if action == envelope.GroupControlCreate {
+		var exists int
+		err := tx.QueryRow(`SELECT 1 FROM groups WHERE group_id = ?`, groupID).Scan(&exists)
+		if err == nil {
+			return fmt.Errorf("group %q already exists", groupID)
+		}
+		if err != sql.ErrNoRows {
+			return fmt.Errorf("group lookup: %w", err)
+		}
+		if epoch != 1 {
+			return fmt.Errorf("create control must have epoch 1, got %d", epoch)
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO groups(group_id, name, admin, member_epoch) VALUES (?, ?, ?, ?)`,
+			groupID, name, admin, epoch,
+		); err != nil {
+			return fmt.Errorf("create group: %w", err)
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO group_members(group_id, member) VALUES (?, ?)`,
+			groupID, admin,
+		); err != nil {
+			return fmt.Errorf("seed member: %w", err)
+		}
+	} else {
+		var curAdmin string
+		var curEpoch int64
+		err := tx.QueryRow(
+			`SELECT admin, member_epoch FROM groups WHERE group_id = ?`,
+			groupID,
+		).Scan(&curAdmin, &curEpoch)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("group %q does not exist", groupID)
+		}
+		if err != nil {
+			return fmt.Errorf("group lookup: %w", err)
+		}
+		if admin != curAdmin {
+			return fmt.Errorf("control must be signed by the group admin")
+		}
+		if epoch != curEpoch+1 {
+			return fmt.Errorf("control epoch must be %d, got %d", curEpoch+1, epoch)
+		}
+		var one int
+		targetMember := tx.QueryRow(
+			`SELECT 1 FROM group_members WHERE group_id = ? AND member = ?`,
+			groupID, target,
+		).Scan(&one) == nil
+		switch action {
+		case envelope.GroupControlAdd:
+			if targetMember {
+				return fmt.Errorf("member %q is already in the group", target)
+			}
+			if _, err := tx.Exec(
+				`INSERT INTO group_members(group_id, member) VALUES (?, ?)`,
+				groupID, target,
+			); err != nil {
+				return fmt.Errorf("add member: %w", err)
+			}
+		case envelope.GroupControlRemove:
+			if !targetMember {
+				return fmt.Errorf("member %q is not in the group", target)
+			}
+			if target == curAdmin {
+				return fmt.Errorf("cannot remove the admin; transfer adminship first")
+			}
+			if _, err := tx.Exec(
+				`DELETE FROM group_members WHERE group_id = ? AND member = ?`,
+				groupID, target,
+			); err != nil {
+				return fmt.Errorf("remove member: %w", err)
+			}
+		case envelope.GroupControlTransferAdmin:
+			if !targetMember {
+				return fmt.Errorf("member %q is not in the group", target)
+			}
+			if _, err := tx.Exec(
+				`UPDATE groups SET admin = ? WHERE group_id = ?`,
+				target, groupID,
+			); err != nil {
+				return fmt.Errorf("transfer admin: %w", err)
+			}
+		default:
+			return fmt.Errorf("unknown group control action %q", action)
+		}
+		if _, err := tx.Exec(
+			`UPDATE groups SET member_epoch = ? WHERE group_id = ?`,
+			epoch, groupID,
+		); err != nil {
+			return fmt.Errorf("bump member epoch: %w", err)
+		}
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO group_controls(group_id, action, target, admin, epoch, sig)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		groupID, action, target, admin, epoch, sig,
+	); err != nil {
+		return fmt.Errorf("record control: %w", err)
+	}
+	return tx.Commit()
+}
+
+// GroupControls returns the group's membership-control feed in epoch
+// order (capped at maxControls; controls are small but unbounded in
+// principle).
+func (s *Store) GroupControls(groupID string) ([]GroupControlRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT action, target, admin, epoch, sig FROM group_controls
+		 WHERE group_id = ? ORDER BY epoch ASC LIMIT 10000`,
+		groupID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("group controls: %w", err)
+	}
+	defer rows.Close()
+	var out []GroupControlRecord
+	for rows.Next() {
+		var c GroupControlRecord
+		if err := rows.Scan(&c.Action, &c.Target, &c.Admin, &c.Epoch, &c.Sig); err != nil {
+			return nil, fmt.Errorf("group controls scan: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// GroupMaxEnvelopeID returns the highest envelope id stored for the
+// group, or 0 if the group has no messages yet. Used as the join cursor
+// handed to a newly added member.
+func (s *Store) GroupMaxEnvelopeID(groupID string) (int64, error) {
+	var id sql.NullInt64
+	if err := s.db.QueryRow(
+		`SELECT MAX(id) FROM envelopes WHERE recipient = ?`, groupID,
+	).Scan(&id); err != nil {
+		return 0, fmt.Errorf("group max id: %w", err)
+	}
+	if !id.Valid {
+		return 0, nil
+	}
+	return id.Int64, nil
 }

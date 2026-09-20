@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/crypto"
@@ -56,6 +57,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/blobs/{blob_id}", s.handleBlobDownload)
 	mux.HandleFunc("POST /v1/keys", s.handleKeyAnnounce)
 	mux.HandleFunc("GET /v1/keys/{address}", s.handleKeyLookup)
+	// issue #32: group messaging.
+	mux.HandleFunc("POST /v1/groups/control", s.handleGroupControl)
 	return mux
 }
 
@@ -70,14 +73,19 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 }
 
 // sendRequest is the wire format for POST /v1/send. See PROTOCOL.md.
+// Kind/KeyEpoch carry issue #32 group messages: kind is "" (or "dm")
+// for direct messages and "group" for group messages; key_epoch is the
+// sender's group sender-key epoch covered by the group signature.
 type sendRequest struct {
-	To     string `json:"to"`
-	From   string `json:"from"`
-	Eph    string `json:"eph"`
-	Nonce  string `json:"nonce"`
-	Ct     string `json:"ct"`
-	SentAt int64  `json:"sent_at"`
-	Sig    string `json:"sig"`
+	To       string `json:"to"`
+	From     string `json:"from"`
+	Eph      string `json:"eph"`
+	Nonce    string `json:"nonce"`
+	Ct       string `json:"ct"`
+	SentAt   int64  `json:"sent_at"`
+	Sig      string `json:"sig"`
+	Kind     string `json:"kind,omitempty"`
+	KeyEpoch int64  `json:"key_epoch,omitempty"`
 }
 
 // parseAddress strictly validates a v0.2.0+ "ed25519:<base64url>" address.
@@ -103,6 +111,15 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	var req sendRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxCiphertextBytes+8192)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	// issue #32: envelopes addressed to a group ID take the group path.
+	if strings.HasPrefix(req.To, envelope.GroupIDPrefix) {
+		s.handleGroupSend(w, req)
+		return
+	}
+	if req.Kind != "" && req.Kind != "dm" {
+		writeErr(w, http.StatusBadRequest, `"kind" must be "" or "dm" for direct messages`)
 		return
 	}
 	to, err := parseAddress(req.To)
@@ -245,6 +262,12 @@ func (s *Server) handleKeyLookup(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	// issue #32: reads addressed to a group ID take the group path, with
+	// a signed membership authorization instead of an address-key one.
+	if strings.HasPrefix(q.Get("to"), envelope.GroupIDPrefix) {
+		s.handleGroupInbox(w, r)
+		return
+	}
 	to := q.Get("to")
 	toEd, err := parseAddress(to)
 	if err != nil {
