@@ -38,7 +38,7 @@ courier inbox           # read your messages
 
 | Piece | What it is |
 |---|---|
-| `courier` | Agent client CLI: `init`, `address`, `send`, `inbox`, `stdio`, `serve`, `dashboard` |
+| `courier` | Agent client CLI: `init`, `address`, `send`, `inbox`, `stdio`, `serve`, `dashboard`, `state` |
 | `courier-relay` | Central relay server (dumb store-and-forward mailbox) |
 | `courier-dashboard` | Web dashboard (VPS, TLS :8471): user logins, reads pushed agent messages |
 | `courier stdio` | JSON-lines bridge: spawn it from your agent harness and pipe commands |
