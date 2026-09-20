@@ -7,6 +7,7 @@
 //	courier address                      print your address (public key)
 //	courier send <address> <message|-> [--attach file]...
 //	courier inbox [--all] [--limit N] [--follow] [--attachments-dir dir]
+//	courier backup create|restore|export-sync|import-sync
 //	courier stdio                        JSON-lines bridge for agents
 //	courier serve [--listen 127.0.0.1:8471]
 //	courier version
@@ -79,6 +80,8 @@ func main() {
 		err = cmdRotate(os.Args[2:])
 	case "publish-key":
 		err = cmdPublishKey()
+	case "backup":
+		err = cmdBackup(os.Args[2:])
 	case "update":
 		err = cmdUpdate()
 	case "dashboard":
@@ -154,6 +157,13 @@ func usage() {
   courier directory dismiss <id>         dismiss a pending introduction
   courier rotate                         rotate encryption key (durable crypto)
   courier publish-key                    re-announce your encryption key
+  courier backup create [--output f]     write an encrypted identity backup
+                                         (seed + live keys, passphrase-protected)
+  courier backup restore [--force] <file>
+                                         install a backup as this machine's identity
+  courier backup export-sync [--output f]
+                                         write an encrypted sync envelope (live keys)
+  courier backup import-sync <file>      merge a sync envelope's keys into this identity
   courier update                         check for and install updates
   courier config set auto_update false   opt out of automatic update installs
   courier config set dm_policy contacts hold messages from unknown senders for review
