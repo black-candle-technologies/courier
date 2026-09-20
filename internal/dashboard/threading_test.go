@@ -75,7 +75,7 @@ func TestPushReplyThreading(t *testing.T) {
 	cookie := login(t, srv, "lane", "pw12345678")
 	// Password must be changed first; do it, then re-login.
 	form := url.Values{"password": {"a-new-password-123"}, "confirm": {"a-new-password-123"}}
-	req := httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
+	req = httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.AddCookie(cookie)
 	rec = httptest.NewRecorder()
