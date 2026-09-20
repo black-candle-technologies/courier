@@ -139,6 +139,22 @@ func migrate(db *sql.DB) error {
 		PRIMARY KEY (user_id, peer))`); err != nil {
 		return err
 	}
+	// Spam/abuse reports (metadata-only filtering). One row per
+	// (sender, reporter) pair: only distinct reporters count toward the
+	// throttle threshold, and re-reports are idempotent. reported_at
+	// implements decay: only reports inside the throttle window count.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS spam_reports(
+		sender      TEXT NOT NULL,
+		reporter    TEXT NOT NULL,
+		envelope_id INTEGER NOT NULL,
+		reported_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+		PRIMARY KEY (sender, reporter))`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_spam_reports_sender
+		ON spam_reports(sender, reported_at)`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -318,6 +334,53 @@ func (s *Store) GetKey(address string) (*KeyAnnouncement, error) {
 		return nil, err
 	}
 	return &k, nil
+}
+
+// ---- spam / abuse reports (metadata-only filtering) ----
+
+// EnvelopeByID returns one envelope by its id, or sql.ErrNoRows. Used to
+// authorize spam reports: only the envelope's recipient may report it.
+func (s *Store) EnvelopeByID(id int64) (*Envelope, error) {
+	var e Envelope
+	err := s.db.QueryRow(
+		`SELECT id, recipient, sender, eph, nonce, ct, sent_at, received_at, sig
+		 FROM envelopes WHERE id = ?`,
+		id,
+	).Scan(&e.ID, &e.To, &e.From, &e.Eph, &e.Nonce, &e.Ct, &e.SentAt, &e.ReceivedAt, &e.Sig)
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+// RecordSpamReport records that reporter flagged sender's message
+// envelopeID as spam. It is idempotent per (sender, reporter): only
+// distinct reporters count toward the throttle threshold, so one angry
+// recipient cannot throttle a sender alone. The reporter must be the
+// envelope's recipient — enforced by the caller.
+func (s *Store) RecordSpamReport(sender, reporter string, envelopeID int64) error {
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO spam_reports(sender, reporter, envelope_id)
+		 VALUES (?, ?, ?)`,
+		sender, reporter, envelopeID,
+	)
+	return err
+}
+
+// DistinctReporterCount counts the distinct reporters who flagged sender
+// within the last windowSecs seconds. Reports age out of the window, so
+// a sender's throttle decays over time once they stop spamming.
+func (s *Store) DistinctReporterCount(sender string, windowSecs int64) (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(DISTINCT reporter) FROM spam_reports
+		 WHERE sender = ? AND reported_at >= strftime('%s','now') - ?`,
+		sender, windowSecs,
+	).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // ---- v0.6.0: dashboard ----

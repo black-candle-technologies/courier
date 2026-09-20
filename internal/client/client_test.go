@@ -375,7 +375,6 @@ func signAnn(t *testing.T, id *crypto.Identity, address, pub string, epoch int64
 		id.Sign(envelope.KeyAnnounce(toEd[:], raw, epoch)))
 }
 
-
 func TestExpectedDashboardFingerprint(t *testing.T) {
 	newCfg := func(relay, dash, pin string) *Config {
 		return &Config{RelayURL: relay, DashboardURL: dash, RelayFingerprint: pin}
@@ -451,7 +450,7 @@ func TestInboxSuppressesReplayedEnvelopes(t *testing.T) {
 	h := envelope.DedupHash(cfg.Address, "ed25519:from", "eph", "nonce", sentAt, "ct", "sig")
 	cfg.SeenEnvelopeHashes = []string{h}
 
-	msgs, _, skipped, err := cl.Inbox(0, 100)
+	msgs, _, skipped, _, err := cl.Inbox(0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -469,7 +468,7 @@ func TestInboxDoesNotMarkUndeliveredSeen(t *testing.T) {
 
 	// The canned message fails address parsing, so it is dropped — and
 	// must NOT be recorded as seen (it may become readable later).
-	msgs, _, skipped, err := cl.Inbox(0, 100)
+	msgs, _, skipped, _, err := cl.Inbox(0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -515,7 +514,7 @@ func TestInboxAdvancesPastUndecryptable(t *testing.T) {
 	cfg.RelayURL = ts.URL
 	cl := New(cfg)
 
-	msgs, lastID, skipped, err := cl.Inbox(0, 100)
+	msgs, lastID, skipped, _, err := cl.Inbox(0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -541,7 +540,7 @@ func TestInboxSendsSignedRequest(t *testing.T) {
 	cfg.RelayURL = ts.URL
 	cl := New(cfg)
 
-	if _, _, _, err := cl.Inbox(7, 25); err != nil {
+	if _, _, _, _, err := cl.Inbox(7, 25); err != nil {
 		t.Fatal(err)
 	}
 	if gotQ.Get("to") != cfg.Address || gotQ.Get("after") != "7" || gotQ.Get("limit") != "25" {

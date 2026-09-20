@@ -33,6 +33,13 @@ func main() {
 	retainDays := flag.Int("retain-days", 30, "delete envelopes older than this many days")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate file (default: <dbdir>/tls.crt, generated if missing)")
 	tlsKey := flag.String("tls-key", "", "TLS key file (default: <dbdir>/tls.key, generated if missing)")
+	// Metadata-only abuse controls (see PROTOCOL.md). All limits are
+	// deliberately generous: legitimate bursty agent traffic must not
+	// notice them; rejections are explicit 429s, never silent drops.
+	sendBurst := flag.Float64("send-burst", 100, "per-sender token-bucket burst: max sends in a burst")
+	sendRate := flag.Float64("send-rate", 2, "per-sender sustained send rate, sends per second")
+	spamThreshold := flag.Int("spam-threshold", 3, "distinct reporters within the spam window that throttle a sender")
+	spamWindowHours := flag.Float64("spam-window-hours", 168, "sliding window (hours) over which spam reports count; older reports decay")
 	flag.Parse()
 
 	st, err := store.Open(*dbPath)
@@ -57,8 +64,13 @@ func main() {
 	log.Print("clients must pin this fingerprint (see INSTALL.md)")
 
 	srv := &http.Server{
-		Addr:         *addr,
-		Handler:      loggingMiddleware(relay.New(st).Routes()),
+		Addr: *addr,
+		Handler: loggingMiddleware(relay.NewWithConfig(st, relay.Config{
+			SendBurst:           *sendBurst,
+			SendRatePerSec:      *sendRate,
+			SpamReportThreshold: *spamThreshold,
+			SpamReportWindow:    time.Duration(*spamWindowHours * float64(time.Hour)),
+		}).Routes()),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
