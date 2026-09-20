@@ -448,7 +448,7 @@ func TestInboxSuppressesReplayedEnvelopes(t *testing.T) {
 	// Pretend this envelope was already delivered: it must be
 	// suppressed even though the relay served it again.
 	h := envelope.DedupHash(cfg.Address, "ed25519:from", "eph", "nonce", sentAt, "ct", "sig")
-	cfg.SeenEnvelopeHashes = []string{h}
+	cfg.SeenInboxHashes = []string{h}
 
 	msgs, _, skipped, _, err := cl.Inbox(0, 100)
 	if err != nil {
@@ -478,30 +478,186 @@ func TestInboxDoesNotMarkUndeliveredSeen(t *testing.T) {
 	if len(msgs) != 0 || skipped != 1 {
 		t.Fatalf("msgs=%d skipped=%d, want 0/1", len(msgs), skipped)
 	}
-	if len(cfg.SeenEnvelopeHashes) != 0 {
-		t.Fatalf("undelivered message was marked seen: %v", cfg.SeenEnvelopeHashes)
+	if len(cfg.SeenInboxHashes) != 0 {
+		t.Fatalf("undelivered message was marked seen: %v", cfg.SeenInboxHashes)
 	}
 }
 
-func TestRecordSeenEnvelopesBounded(t *testing.T) {
+func TestRecordSeenBounded(t *testing.T) {
 	cfg := testConfig(t)
 	cl := New(cfg)
 	var hashes []string
 	for i := 0; i < maxSeenEnvelopeHashes+10; i++ {
 		hashes = append(hashes, fmt.Sprintf("hash-%d", i))
 	}
-	cl.recordSeenEnvelopes(hashes)
-	if len(cfg.SeenEnvelopeHashes) != maxSeenEnvelopeHashes {
-		t.Fatalf("want %d hashes, got %d", maxSeenEnvelopeHashes, len(cfg.SeenEnvelopeHashes))
+	cl.recordSeen(seenConsumerInbox, hashes)
+	if len(cfg.SeenInboxHashes) != maxSeenEnvelopeHashes {
+		t.Fatalf("want %d hashes, got %d", maxSeenEnvelopeHashes, len(cfg.SeenInboxHashes))
 	}
 	// Oldest dropped, newest retained.
-	if cfg.SeenEnvelopeHashes[0] != "hash-10" {
-		t.Fatalf("oldest not dropped: %s", cfg.SeenEnvelopeHashes[0])
+	if cfg.SeenInboxHashes[0] != "hash-10" {
+		t.Fatalf("oldest not dropped: %s", cfg.SeenInboxHashes[0])
 	}
 	// Re-recording is idempotent.
-	cl.recordSeenEnvelopes([]string{"hash-10"})
-	if len(cfg.SeenEnvelopeHashes) != maxSeenEnvelopeHashes {
-		t.Fatalf("duplicate grew the set: %d", len(cfg.SeenEnvelopeHashes))
+	cl.recordSeen(seenConsumerInbox, []string{"hash-10"})
+	if len(cfg.SeenInboxHashes) != maxSeenEnvelopeHashes {
+		t.Fatalf("duplicate grew the set: %d", len(cfg.SeenInboxHashes))
+	}
+	// The push consumer's set is untouched.
+	if len(cfg.SeenPushHashes) != 0 {
+		t.Fatalf("inbox recording leaked into push set: %v", cfg.SeenPushHashes)
+	}
+}
+
+func TestMigrateSeenSets(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SeenEnvelopeHashes = []string{"a", "b", "c"}
+	cfg.SeenInboxHashes = []string{"b", "d"} // pre-existing entries survive
+	migrateSeenSets(cfg)
+	if len(cfg.SeenEnvelopeHashes) != 0 {
+		t.Fatalf("legacy field not dropped: %v", cfg.SeenEnvelopeHashes)
+	}
+	for _, h := range []string{"a", "b", "c", "d"} {
+		found := false
+		for _, got := range cfg.SeenInboxHashes {
+			if got == h {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("inbox set missing %q after migration: %v", h, cfg.SeenInboxHashes)
+		}
+	}
+	if len(cfg.SeenInboxHashes) != 4 {
+		t.Fatalf("inbox set has dupes after migration: %v", cfg.SeenInboxHashes)
+	}
+	for _, h := range []string{"a", "b", "c"} {
+		found := false
+		for _, got := range cfg.SeenPushHashes {
+			if got == h {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("push set missing %q after migration: %v", h, cfg.SeenPushHashes)
+		}
+	}
+	// Second run is a no-op.
+	migrateSeenSets(cfg)
+	if len(cfg.SeenInboxHashes) != 4 || len(cfg.SeenPushHashes) != 3 {
+		t.Fatal("migration is not idempotent")
+	}
+}
+
+// issue #45: the inbox poller and the dashboard pusher are independent
+// consumers. Each must deliver every message even when the other got
+// there first — the old shared seen set let one consumer starve the
+// other, so a pushed message never woke a worker.
+func TestPushThenInboxStillDelivers(t *testing.T) {
+	cfg := testConfig(t)
+	sender, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	envs := []map[string]any{pushTestEnvelope(t, sender, cfg, 1, "hello")}
+	pc := &pushCapture{}
+	ts := httptest.NewServer(pc.handler(envs))
+	t.Cleanup(ts.Close)
+	cfg.RelayURL = ts.URL
+	cfg.DashboardURL = ts.URL
+	cfg.DashboardToken = "test-token"
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	cl := New(cfg)
+
+	// The pusher wins the race: the message reaches the dashboard and
+	// is recorded in the push consumer's set only.
+	pushed, err := cl.DashboardPush()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pushed != 1 {
+		t.Fatalf("pushed = %d, want 1", pushed)
+	}
+	if len(cfg.SeenPushHashes) != 1 {
+		t.Fatalf("push set = %d hashes, want 1", len(cfg.SeenPushHashes))
+	}
+	if len(cfg.SeenInboxHashes) != 0 {
+		t.Fatalf("push leaked into inbox set: %v", cfg.SeenInboxHashes)
+	}
+
+	// The inbox poller must still deliver it — under the old shared
+	// set this came back empty and no worker ever woke.
+	msgs, _, _, _, err := cl.Inbox(0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].Body != "hello" {
+		t.Fatalf("inbox after push delivered %d messages, want 1 with body hello", len(msgs))
+	}
+	if len(cfg.SeenInboxHashes) != 1 {
+		t.Fatalf("inbox set = %d hashes, want 1", len(cfg.SeenInboxHashes))
+	}
+	// A second inbox poll suppresses the replay within the same
+	// consumer.
+	msgs, _, _, _, err = cl.Inbox(0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("replay not suppressed on second inbox poll: %d messages", len(msgs))
+	}
+}
+
+// issue #45, reverse direction: when the inbox poller wins the race,
+// the dashboard pusher must still push the message body — under the
+// old shared set the push came back empty and the dashboard never saw
+// the message.
+func TestInboxThenPushStillDelivers(t *testing.T) {
+	cfg := testConfig(t)
+	sender, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	envs := []map[string]any{pushTestEnvelope(t, sender, cfg, 1, "hello")}
+	pc := &pushCapture{}
+	ts := httptest.NewServer(pc.handler(envs))
+	t.Cleanup(ts.Close)
+	cfg.RelayURL = ts.URL
+	cfg.DashboardURL = ts.URL
+	cfg.DashboardToken = "test-token"
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	cl := New(cfg)
+
+	msgs, _, _, _, err := cl.Inbox(0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("inbox delivered %d messages, want 1", len(msgs))
+	}
+	if len(cfg.SeenInboxHashes) != 1 {
+		t.Fatalf("inbox set = %d hashes, want 1", len(cfg.SeenInboxHashes))
+	}
+	if len(cfg.SeenPushHashes) != 0 {
+		t.Fatalf("inbox leaked into push set: %v", cfg.SeenPushHashes)
+	}
+
+	pushed, err := cl.DashboardPush()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pushed != 1 {
+		t.Fatalf("pushed = %d, want 1", pushed)
+	}
+	if len(pc.batchCounts) != 1 || pc.batchCounts[0] != 1 {
+		t.Fatalf("dashboard received %v batches, want one batch of 1", pc.batchCounts)
+	}
+	if len(cfg.SeenPushHashes) != 1 {
+		t.Fatalf("push set = %d hashes, want 1", len(cfg.SeenPushHashes))
 	}
 }
 
