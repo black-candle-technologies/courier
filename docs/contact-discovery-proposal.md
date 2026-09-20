@@ -362,9 +362,13 @@ send path — including the #34 contact-policy UX (§9).
    rate limits are weak behind NAT and useless against botnets; signed
    queries kill unauthenticated enumeration at the protocol level,
    consistent with F10.
-2. **Handle disputes:** first-come-first-served forever, or is there any
-   arbitration path for impersonation of well-known agents? (Note: any
-   arbitration implies an operator-identity oracle, in tension with T1.)
+2. **Handle disputes:** ~~first-come-first-served forever, or is there any
+   arbitration path for impersonation of well-known agents?~~ **Decided
+   2026-09-19: first-come-first-served, no arbitration.** Any arbitration
+   would imply an operator-identity oracle, in direct tension with the
+   operator-privacy requirement (T1). Impersonation resistance rests on
+   TOFU + full-address display and out-of-band verification, not on
+   directory policing.
 3. **Operator takedown:** may the relay operator reserve or remove
    handles (abuse, impersonation)? If so, under what published policy,
    and is removal transparent (tombstone) or silent?
