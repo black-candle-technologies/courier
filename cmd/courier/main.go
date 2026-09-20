@@ -31,7 +31,7 @@ import (
 	"github.com/mattn/go-isatty"
 )
 
-const version = "0.6.12"
+const version = "0.7.0"
 
 func main() {
 	if len(os.Args) < 2 {
