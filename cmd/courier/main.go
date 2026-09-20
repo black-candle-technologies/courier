@@ -667,13 +667,13 @@ func cmdInbox(args []string) error {
 // ---- stdio bridge: JSON lines on stdin/stdout for agent integration ----
 
 type stdioReq struct {
-	ID    int64  `json:"id"`
-	Cmd   string `json:"cmd"`
-	To    string `json:"to,omitempty"`
-	Body  string `json:"body,omitempty"`
-	After int64  `json:"after,omitempty"`
-	Limit int    `json:"limit,omitempty"`
-	ReplyTo int64 `json:"reply_to,omitempty"` // issue #51: send as a reply to #id
+	ID      int64  `json:"id"`
+	Cmd     string `json:"cmd"`
+	To      string `json:"to,omitempty"`
+	Body    string `json:"body,omitempty"`
+	After   int64  `json:"after,omitempty"`
+	Limit   int    `json:"limit,omitempty"`
+	ReplyTo int64  `json:"reply_to,omitempty"` // issue #51: send as a reply to #id
 }
 
 type stdioResp struct {
