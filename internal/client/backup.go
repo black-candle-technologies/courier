@@ -138,7 +138,16 @@ func RestoreBackup(passphrase, raw []byte, force bool) (*Config, error) {
 			Address:          p.Address,
 			EncKeys:          keys,
 		}
-		return out.saveAtomic()
+		if err := out.saveAtomic(); err != nil {
+			return err
+		}
+		// issue #50: a restored identity is a new device — erase any
+		// FS sessions from the previous device state. Session roots
+		// derive from ephemeral-ephemeral DH, so the backup's seed
+		// cannot reconstruct them; keeping stale sessions would only
+		// let this device read peers' FS messages it should no longer
+		// see.
+		return removeFSState()
 	})
 	if err != nil {
 		return nil, err

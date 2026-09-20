@@ -988,16 +988,45 @@ func (c *Client) send(toOrName, body string, attachPaths []string, logSent bool)
 	if err != nil {
 		return 0, fmt.Errorf("recipient key: %w", err)
 	}
-	// Encrypt and upload each attachment first: the message references
-	// the blobs, so a failed upload aborts the send rather than leaving
-	// a message that points at blobs that do not exist.
+	// Forward-secrecy sessions (issue #50): when an FS session is
+	// established with the peer, the message body is wrapped in an FS
+	// frame and attachment data keys are wrapped with the FS
+	// message-derived wrap key. The FS init handshake is best-effort:
+	// it is attempted opportunistically, and this message goes legacy
+	// until the peer accepts.
+	//
+	// FS applies only to human sends (logSent=true). Machine protocol
+	// traffic (group/channel/shared-state DMs, logSent=false) stays on
+	// legacy encryption by design, so protocol payloads never enter an
+	// FS session's ratchet.
+	var fsOut *fsSendOutput
+	if logSent {
+		var err error
+		fsOut, err = c.fsPrepareSend(address)
+		if err != nil {
+			return 0, fmt.Errorf("fs prepare: %w", err)
+		}
+	}
+	// If we fail after deriving FS keys but before sealing, erase them.
+	defer func() {
+		if fsOut != nil {
+			fsOut.erase()
+			fsOut = nil
+		}
+	}()
 	var manifests []envelope.AttachmentManifest
 	for _, p := range attachPaths {
 		data, err := os.ReadFile(p)
 		if err != nil {
 			return 0, fmt.Errorf("attach %s: %w", p, err)
 		}
-		m, blob, err := EncryptAttachment(data, p, toX, address)
+		var m envelope.AttachmentManifest
+		var blob []byte
+		if fsOut != nil {
+			m, blob, err = EncryptAttachmentFS(data, p, fsOut.WrapKey, address)
+		} else {
+			m, blob, err = EncryptAttachment(data, p, toX, address)
+		}
 		if err != nil {
 			return 0, fmt.Errorf("attach %s: %w", p, err)
 		}
@@ -1014,6 +1043,15 @@ func (c *Client) send(toOrName, body string, attachPaths []string, logSent bool)
 		}
 	} else {
 		plain = []byte(body)
+	}
+	if fsOut != nil {
+		plain, err = fsSealMessage(fsOut, plain)
+		if err != nil {
+			return 0, fmt.Errorf("fs seal: %w", err)
+		}
+		// Sealed: the message key and wrap key have been consumed;
+		// fsSealMessage erases them, so disarm the deferred erase.
+		fsOut = nil
 	}
 	return c.sendSealed(address, plain, body, logSent)
 }
@@ -1433,6 +1471,32 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			continue
 		}
 
+		// issue #50: forward-secrecy frames are consumed by the FS
+		// layer and never surface as chat messages. Handshake frames
+		// (init/accept) are answered silently; message frames are
+		// decrypted into the inner plaintext, which is then dispatched
+		// exactly like a legacy DM below. Frames that fail decryption
+		// count as skipped (genuine failures), matching the existing
+		// docstring.
+		var fsWrapKey *[32]byte
+		if fp, ok := parseFSPayload(plain); ok {
+			switch fp.Type {
+			case fsTypeInit, fsTypeAccept:
+				c.handleFSHandshake(m.From, fp)
+				seen[h] = true
+				newHashes = append(newHashes, h)
+				continue
+			case fsTypeMsg:
+				inner, wk, ferr := c.fsDecryptMessage(m.From, fp)
+				if ferr != nil {
+					skipped++
+					continue
+				}
+				plain = inner
+				fsWrapKey = wk // attachment data-key unwrap, below
+			}
+		}
+
 		// issue #32: group protocol direct messages (sender-key
 		// distributions and group invitations) are consumed by the
 		// group layer and never surface as chat messages.
@@ -1522,6 +1586,14 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 				}
 				if wk == nil {
 					ia.KeyError = errors.New("no wrapped data key for this recipient")
+				} else if fsWrapKey != nil {
+					// issue #50: FS messages wrap attachment data
+					// keys under the message-derived key.
+					if dk, err := UnwrapDataKeyFS(*wk, *fsWrapKey); err == nil {
+						ia.DataKey = dk
+					} else {
+						ia.KeyError = err
+					}
 				} else {
 					var uerr error
 					opened := false
@@ -1541,6 +1613,12 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			}
 			atts = append(atts, ia)
 
+		}
+		// The FS wrap key exists only for this message's manifests;
+		// erase it now that the data keys are extracted.
+		if fsWrapKey != nil {
+			crypto.Zero(fsWrapKey[:])
+			fsWrapKey = nil
 		}
 		msg := Message{
 			ID: m.ID, From: m.From, Body: body,

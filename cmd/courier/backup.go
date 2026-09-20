@@ -210,6 +210,7 @@ func cmdBackupRestore(args []string) error {
 	fmt.Println("identity restored. Your address:")
 	fmt.Println("  " + cfg.Address)
 	fmt.Printf("  encryption keys: %d\n", len(cfg.EncKeys))
+	fmt.Println("  forward-secrecy sessions were erased: this is a new device, so peers will re-handshake on the next message.")
 	// Best effort: announce the current key so the relay directory is
 	// correct for this device. A stale backup's announcement is safely
 	// rejected as a rollback; `courier publish-key` republishes later.

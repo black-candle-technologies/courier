@@ -32,7 +32,7 @@ import (
 	"github.com/mattn/go-isatty"
 )
 
-const version = "0.10.0"
+const version = "0.11.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -84,6 +84,8 @@ func main() {
 		err = cmdChannel(os.Args[2:])
 	case "rotate":
 		err = cmdRotate(os.Args[2:])
+	case "fs":
+		err = cmdFS(os.Args[2:])
 	case "publish-key":
 		err = cmdPublishKey()
 	case "backup":
@@ -183,6 +185,12 @@ func usage() {
   courier directory dismiss <id>         dismiss a pending introduction
   courier rotate                         rotate encryption key (durable crypto)
   courier publish-key                    re-announce your encryption key
+  courier fs status [<peer>]             show forward-secrecy sessions
+  courier fs start <peer>                initiate a forward-secrecy handshake
+  courier fs on <peer>                   mark a peer FS-capable and initiate
+  courier fs off <peer>                  disable FS for a peer (erases session)
+  courier fs rekey <peer>                rotate the FS ratchet on next send
+  courier fs forget <peer>               erase the FS session for a peer
   courier backup create [--output f]     write an encrypted identity backup
                                          (seed + live keys, passphrase-protected)
   courier backup restore [--force] <file>
