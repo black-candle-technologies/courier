@@ -312,3 +312,47 @@ func TestDashboardThreadMessagesNewest500(t *testing.T) {
 		}
 	}
 }
+
+// TestPeerHandlesExpiry: pushed handle labels fade after the TTL so
+// unregistered handles do not linger forever (issue #39).
+func TestPeerHandlesExpiry(t *testing.T) {
+	s := testStore(t)
+	const userID = 1
+	const peer = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	if err := s.SavePeerHandle(userID, peer, "oldhandle"); err != nil {
+		t.Fatal(err)
+	}
+	handles, err := s.PeerHandles(userID, 7*24*3600*1e9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handles[peer] != "oldhandle" {
+		t.Fatalf("fresh handle not returned: %v", handles)
+	}
+	// Backdate beyond the TTL.
+	if _, err := s.db.Exec(`UPDATE dashboard_peer_handles SET updated_at = 0
+		WHERE user_id = ? AND peer = ?`, userID, peer); err != nil {
+		t.Fatal(err)
+	}
+	handles, err = s.PeerHandles(userID, 7*24*3600*1e9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := handles[peer]; ok {
+		t.Fatal("stale handle should be ignored")
+	}
+	// Empty handle clears the label.
+	if err := s.SavePeerHandle(userID, peer, "newhandle"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SavePeerHandle(userID, peer, ""); err != nil {
+		t.Fatal(err)
+	}
+	handles, err = s.PeerHandles(userID, 7*24*3600*1e9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := handles[peer]; ok {
+		t.Fatal("cleared handle should be gone")
+	}
+}

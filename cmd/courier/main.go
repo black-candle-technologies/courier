@@ -69,6 +69,8 @@ func main() {
 		err = cmdReportSpam(os.Args[2:])
 	case "request":
 		err = cmdRequest(os.Args[2:])
+	case "directory":
+		err = cmdDirectory(os.Args[2:])
 	case "group":
 		err = cmdGroup(os.Args[2:])
 	case "rotate":
@@ -100,7 +102,9 @@ func usage() {
   courier init [--relay URL] [--force]   create your identity (keypair)
   courier init --repin                   re-pin the relay certificate
   courier address                        print your address (public key)
-  courier send <address|contact> <msg>    send a message ("-" reads stdin)
+  courier send <address|contact|@handle> <msg>
+                                         send a message ("-" reads stdin); --force confirms
+                                         first-contact or contacts-policy handle sends
       [--attach <file>]...               attach files (E2E encrypted, 25 MiB max each)
   courier inbox [--all] [--limit N] [--follow [--interval 5s]] [--requests]
       [--attachments-dir <dir>]          download verified attachments into dir
@@ -123,6 +127,23 @@ func usage() {
                                          create an encrypted group (you are admin)
   courier group send <group-id> <msg>    send a message to the group
   courier group inbox <group-id>         read new group messages
+  courier directory register <handle> [--visibility public|unlisted|private]
+      [--caps a,b] [--policy open|contacts]
+                                         claim a handle (first-come, signed)
+  courier directory update [--visibility ...] [--caps a,b] [--clear-caps] [--policy ...]
+  courier directory unregister           release your handle
+  courier directory transfer <handle> <address>
+  courier directory lookup <handle>      resolve a handle to an address
+  courier directory search <prefix>      search public handles
+  courier directory reverse <address>    listed handle(s) for an address
+  courier directory request <contact> <handle> [--note text]
+                                         ask a mutual contact for an introduction
+  courier directory introductions        list pending introductions/requests
+  courier directory forward <id> [--note text]
+                                         forward an introduction request to its target
+  courier directory accept <id> [--greet text]
+                                         accept an introduction (adds contact, greets)
+  courier directory dismiss <id>         dismiss a pending introduction
   courier rotate                         rotate encryption key (durable crypto)
   courier publish-key                    re-announce your encryption key
   courier update                         check for and install updates
@@ -263,10 +284,21 @@ func cmdSend(args []string) error {
 	file := fs.String("file", "", "read message body from file")
 	var attach stringSliceFlag
 	fs.Var(&attach, "attach", "attach a file (repeatable, max 25 MiB each)")
+	// --force may appear anywhere; strip it before splitSendArgs so the
+	// v0.7.1 positional parsing (and its regression tests) is untouched.
+	var force bool
+	noForce := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == "--force" {
+			force = true
+			continue
+		}
+		noForce = append(noForce, a)
+	}
 	// Accept flags before or after the positional address/message, as the
 	// usage string documents: Go's flag package stops parsing at the first
 	// positional argument, so extract them manually first.
-	positional, fileVal, attachVals := splitSendArgs(args)
+	positional, fileVal, attachVals := splitSendArgs(noForce)
 	if fileVal != "" {
 		*file = fileVal
 	}
@@ -302,7 +334,29 @@ func cmdSend(args []string) error {
 	if err != nil {
 		return err
 	}
-	id, err := client.New(cfg).SendWithAttachments(address, body, attach)
+	cl := client.New(cfg)
+	// Contact discovery (issue #39): @handle and handle:<name> resolve
+	// via the directory. The resolved address is always shown; sending
+	// to a handle for the first time, or to a contacts-policy handle,
+	// requires --force so squatting and misdirection stay visible.
+	if addr, profile, isHandle, herr := cl.ResolveHandleTarget(address); herr != nil {
+		return fmt.Errorf("handle resolution failed: %w", herr)
+	} else if isHandle {
+		fmt.Fprintf(os.Stderr, "resolved @%s -> %s\n", profile.Handle, addr)
+		firstContact := cfg.IsFirstContact(addr)
+		contactsOnly := profile.ContactPolicy == "contacts"
+		if firstContact {
+			fmt.Fprintf(os.Stderr, "first contact: this address is not in your contacts — verify it out of band.\n")
+		}
+		if contactsOnly {
+			fmt.Fprintf(os.Stderr, "note: @%s only accepts DMs from contacts; your message may be held for review.\n", profile.Handle)
+		}
+		if (firstContact || contactsOnly) && !force {
+			return fmt.Errorf("re-run with --force to confirm the recipient")
+		}
+		address = addr
+	}
+	id, err := cl.SendWithAttachments(address, body, attach)
 	if err != nil {
 		return err
 	}
@@ -498,6 +552,12 @@ func cmdInbox(args []string) error {
 		}
 		if skipped > 0 {
 			fmt.Fprintf(os.Stderr, "(%d message(s) failed signature/decryption and were dropped)\n", skipped)
+		}
+		// issue #39: introduction protocol DMs are consumed, not shown
+		// above — surface a pointer so pending introductions are not
+		// missed.
+		if n := len(cl.PendingIntroductions()); n > 0 {
+			fmt.Fprintf(os.Stderr, "(%d pending introduction(s): `courier directory introductions` to review)\n", n)
 		}
 		return true, nil
 	}

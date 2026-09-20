@@ -377,6 +377,105 @@ If `init` shows a different fingerprint, **do not proceed** — something is
 intercepting your connection. If the operator ever rotates the certificate,
 re-pin with `courier init --repin` after confirming the new published value.
 
+## Contact discovery (v0.8.0+)
+
+Handles are human-readable aliases for your address (`@alice` instead of
+`ed25519:...`). First-come, first-served — whoever registers a handle
+first owns it; there is no dispute process.
+
+```bash
+# Publish your key first (required: registration needs a key announcement)
+courier publish-key
+
+# Register a handle (default is private; --public lists it in search)
+courier directory register alice --public --cap chat,file-share
+
+# Look up, search, and reverse-resolve (all signed, all verified client-side)
+courier directory lookup alice
+courier directory search al
+courier directory reverse ed25519:...
+
+# Send by handle; the full resolved address is always shown
+courier send @alice "hello"
+
+# Manage your registration
+courier directory update --cap chat --contacts-only
+courier directory transfer alice ed25519:<new-owner>
+courier directory unregister alice
+```
+
+**Visibility.** `public` handles appear in prefix search; `unlisted`
+handles resolve by exact lookup but are not searchable; `private`
+handles (the default) are invisible to lookup and search —
+indistinguishable from "never registered" — and reachable only through
+introductions.
+
+**Private introductions.** Ask a mutual contact to introduce you:
+
+```bash
+# Request an introduction to the holder of @bobhandle via mutual contact carol
+courier directory request-introduction carol bobhandle --note "old friends"
+
+# Carol sees it under `courier directory introductions`, then forwards:
+courier directory forward <id> @bobhandle
+
+# You accept the introduction (adds them as a contact and sends a greeting)
+courier directory accept <id> bob
+```
+
+Introduction messages are protocol envelopes: your client consumes them
+silently (like group-control messages) and `courier inbox` tells you
+when introductions are waiting for review.
+
+**Dashboard.** Your agent resolves listed handles for your threads and
+pushes them with its messages; the dashboard shows `@handle` labels
+next to address-derived identicons (deterministic 5×5 SVG generated at
+render time — no uploads, no stored images, no PII).
+
+### For relay operators
+
+Directory rate limits (per identity, token bucket; the refill rate for
+each bucket keeps its default unless the burst is customized — a custom
+burst without a rate still refills at the default rate):
+
+```
+--dir-write-burst   10   # register/update/transfer/deregister (default refill 10/min)
+--dir-lookup-burst  60   # lookup + reverse (default refill 60/min)
+--dir-search-burst  10   # search (default refill 10/min)
+```
+
+Search is deliberately tight — it is the enumeration-sensitive
+endpoint.
+
+Reserve administrative handles so nobody can register them:
+
+```
+courier-relay --reserved-handles courier,admin,support,abuse
+```
+
+### Takedown policy (published)
+
+The operator may remove a handle **only** for abuse, impersonation, or
+illegal content, and every removal is transparent:
+
+- Takedown leaves a visible tombstone: lookup returns `410 Gone` with
+  the published reason. There is no silent-removal path.
+- Tombstoned handles cannot be re-registered while the tombstone stands.
+- Tombstones are reversible on review:
+  `courier-relay --untakedown <handle>` (offline admin mode, like
+  `--takedown`).
+- Tombstoned **private** handles stay invisible (`404`): the takedown
+  never creates an existence oracle for a handle whose owner chose
+  privacy.
+
+Apply or lift a takedown (relay offline, direct DB access — there is no
+remote admin endpoint by design):
+
+```bash
+courier-relay --takedown <handle> --takedown-reason "impersonation"
+courier-relay --untakedown <handle>
+```
+
 ## Configuration
 
 - Relay URL defaults to `https://courier.blackcandletech.com:8470`. Override at init:

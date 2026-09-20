@@ -110,6 +110,27 @@ type Config struct {
 	// senders, visibly counted but never mixed into the inbox.
 	// Reversible with `courier request undismiss`.
 	Dismissed []string `json:"dismissed,omitempty"`
+	// Contact discovery (issue #39, v0.8.0). DirectoryHandle is this
+	// agent's registered handle; DirectoryEpoch is the last directory
+	// epoch used (strictly increasing, survives restarts). Introductions
+	// are pending introduction requests/introductions awaiting a
+	// decision. HandleCache maps peer addresses to listed handles for
+	// dashboard display (24h TTL, bounded).
+	DirectoryHandle string                      `json:"directory_handle,omitempty"`
+	DirectoryEpoch  int64                       `json:"directory_epoch,omitempty"`
+	Introductions   []PendingIntroduction       `json:"introductions,omitempty"`
+	HandleCache     map[string]HandleCacheEntry `json:"handle_cache,omitempty"`
+	// HandleRefreshAt is the last time refreshPeerHandles pushed a
+	// handles-only update; refreshed at most once per 24h so inactive
+	// threads get their labels without a message batch.
+	HandleRefreshAt int64 `json:"handle_refresh_at,omitempty"`
+}
+
+// HandleCacheEntry is a cached address→handle mapping with a local
+// timestamp; entries older than 24h are refreshed on next use.
+type HandleCacheEntry struct {
+	Handle string `json:"handle"`
+	At     int64  `json:"at"`
 }
 
 func configPath() (string, error) {
@@ -1073,11 +1094,11 @@ func appendSentLog(e SentEntry) error {
 
 // Message is one decrypted, signature-verified inbox message.
 type Message struct {
-	ID         int64
-	From       string // authenticated sender address
-	Body       string
-	SentAt     int64
-	ReceivedAt int64
+	ID          int64
+	From        string // authenticated sender address
+	Body        string
+	SentAt      int64
+	ReceivedAt  int64
 	Attachments []IncomingAttachment // verified manifests (data keys unwrapped when possible)
 	// Flags carries the machine-readable reasons a message was
 	// flagged for review. Client-derived: "first_contact" (sender not
@@ -1252,6 +1273,20 @@ func (c *Client) inbox(after int64, limit int, markSeen bool) ([]Message, int64,
 			seen[h] = true
 			newHashes = append(newHashes, h)
 			continue
+		}
+		// issue #39: introduction protocol DMs are consumed by the
+		// introduction layer and never surface as chat messages (same
+		// as group-control DMs, issue #32). Valid payloads are recorded
+		// as pending introductions, listed via
+		// `courier directory introductions`. Payloads that fail
+		// validation (bad signature, unknown parties) fall through as
+		// ordinary messages — never silently swallowed.
+		if ip, ok := parseIntroductionPayload(plain); ok {
+			if _, rec := c.recordIntroduction(m.From, m.ID, ip); rec {
+				seen[h] = true
+				newHashes = append(newHashes, h)
+				continue
+			}
 		}
 		// Split a decrypted payload into its body text and attachment
 		// manifests. Manifests are validated and their data keys are
@@ -1902,7 +1937,64 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 		}
 		return nil
 	})
+	// issue #39: refresh handle labels for known peers even when there
+	// are no new messages, so inactive threads eventually show (or lose)
+	// their @handle. At most once a day; the dashboard ignores stale
+	// labels after its own TTL.
+	c.refreshPeerHandles(hc)
 	return pushed, nil
+}
+
+// refreshPeerHandles pushes a handles-only update for every cached peer
+// whose label may be stale, at most once per 24h. Without this, threads
+// with no new messages would never get (or lose) their @handle label,
+// because handles are otherwise only attached to message batches.
+func (c *Client) refreshPeerHandles(hc *http.Client) {
+	if time.Now().Unix()-c.cfg.HandleRefreshAt < 24*3600 {
+		return
+	}
+	peers := make([]string, 0, len(c.cfg.HandleCache))
+	for peer := range c.cfg.HandleCache {
+		peers = append(peers, peer)
+	}
+	// Also cover named contacts: their handles may have been registered
+	// after the last refresh.
+	for _, addr := range c.cfg.Contacts {
+		peers = append(peers, addr)
+	}
+	handles := map[string]string{}
+	seen := map[string]bool{}
+	for _, peer := range peers {
+		if seen[peer] {
+			continue
+		}
+		seen[peer] = true
+		if h := c.PeerHandle(peer); h != "" {
+			handles[peer] = h
+		}
+	}
+	// Mark the refresh even when there is nothing to push, so a peer
+	// set with no listed handles does not retry every minute.
+	_ = c.cfg.Update(func(fresh *Config) error {
+		fresh.HandleRefreshAt = time.Now().Unix()
+		return nil
+	})
+	if len(handles) == 0 {
+		return
+	}
+	body, _ := json.Marshal(map[string]any{
+		"messages": []any{},
+		"handles":  handles,
+	})
+	req, _ := http.NewRequest(http.MethodPost, c.cfg.DashboardURL+"/v1/dashboard/push", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.cfg.DashboardToken)
+	resp, err := hc.Do(req)
+	if err != nil {
+		return
+	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+	resp.Body.Close()
 }
 
 // pushBatch POSTs one bounded batch of messages to the dashboard and
@@ -1921,7 +2013,27 @@ func (c *Client) pushBatch(hc *http.Client, batch []pushItem) (stored int, inbox
 			inboxMax = it.msg.CourierID
 		}
 	}
-	body, _ := json.Marshal(map[string]any{"messages": msgs})
+	// issue #39: attach listed handles for the batch's peers so the
+	// dashboard can display them. PeerHandle is cached (24h TTL), so the
+	// per-minute push does not query the directory for every thread.
+	handles := map[string]string{}
+	for _, it := range batch {
+		peer := it.msg.From
+		if it.msg.To != "" {
+			peer = it.msg.To
+		}
+		if _, done := handles[peer]; done {
+			continue
+		}
+		if h := c.PeerHandle(peer); h != "" {
+			handles[peer] = h
+		}
+	}
+	payload := map[string]any{"messages": msgs}
+	if len(handles) > 0 {
+		payload["handles"] = handles
+	}
+	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequest(http.MethodPost, c.cfg.DashboardURL+"/v1/dashboard/push", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.cfg.DashboardToken)

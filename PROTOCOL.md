@@ -621,3 +621,159 @@ The relay is authoritative for membership; local state is a cache.
   which itself reveals existence — same as any membership check).
 - No group metadata privacy beyond ciphertext: the relay sees the
   roster, admin, and message timing/volume.
+
+## Contact discovery (issue #39, v0.8.0)
+
+Handles are human-readable aliases bound to Ed25519 identities by signed
+relay registrations. The relay stores only the allowed fields — handle,
+address, capabilities, contact policy, visibility, epoch, signature —
+and rejects any registration carrying fields outside that set (fail
+closed). There are no PII fields in the directory schema, ever.
+
+### Handles
+
+- Syntax: 3–32 chars, `[a-z0-9_-]`, must start with `[a-z0-9]`.
+  Normalized to lowercase; uppercase input is accepted and lowercased.
+- First-come, first-served, no arbitration. The handle belongs to
+  whoever registers it first; disputes are not adjudicated (operator
+  identity verification would itself be a privacy oracle).
+- Visibility: `public` (listed, searchable), `unlisted` (resolvable by
+  exact lookup, not searchable), `private` (default; resolvable only via
+  introductions — see below).
+- Capabilities: bounded free-form tokens (≤ 8 tokens, each 1–32 chars of
+  `[a-z0-9_-]`), normalized to lowercase. No curated registry.
+- Contact policy: `open` (anyone may message) or `contacts` (first
+  contact from a non-contact warns and requires `--force`).
+- Registration requires a pre-existing signed key announcement for the
+  address (`GET /v1/keys/{address}` must return a row) — a weak,
+  nearly-free hurdle against drive-by handle parking, not real sybil
+  resistance.
+- The operator may reserve administrative handles (e.g. `courier`,
+  `admin`, `support`) via relay config; they can never be registered.
+
+### Signed writes
+
+All directory writes are signed by the holder's Ed25519 identity key.
+Epochs are strictly increasing per handle; stale epochs are rejected
+(replay-safe). Canonical forms (fields joined with `0x00` separators,
+epoch as big-endian uint64):
+
+- Register/update:
+  `courier-directory-register-v1 || 0x00 || handle || 0x00 ||`
+  `address_ed25519(32) || epoch_be64 || 0x00 || visibility || 0x00 ||`
+  `contact_policy || 0x00 || capabilities joined by 0x00`
+- Transfer (signed by the *current* holder only; no release/re-register
+  race):
+  `courier-directory-transfer-v1 || 0x00 || handle || 0x00 ||`
+  `new_address_ed25519(32) || epoch_be64`
+- Deregister:
+  `courier-directory-deregister-v1 || 0x00 || handle || 0x00 ||`
+  `address_ed25519(32) || epoch_be64`
+
+Deregistration deletes the row (the holder's own choice). Operator
+takedown is distinct: it leaves a transparent tombstone (see below).
+
+### Verifying a served profile
+
+Lookup/search/reverse responses carry the stored `sig` so clients verify
+the binding themselves instead of trusting the relay:
+
+- If the last write was a register/update, `sig` verifies as the
+  register canonical form above under the profile's own address.
+- If the last write was a transfer, `sig` is the *previous* holder's
+  transfer signature and the response includes `transfer_from` naming
+  the key it verifies against:
+  `courier-directory-transfer-v1 || 0x00 || handle || 0x00 ||`
+  `profile_address_ed25519(32) || epoch_be64` verified by `transfer_from`.
+- A profile that verifies neither way is rejected; the client never
+  resolves a handle to an unverified address.
+- A later update by the new owner replaces the transfer signature with
+  a fresh registration signature and clears `transfer_from`.
+
+### Signed queries
+
+Lookup, search, and reverse lookup require identity-signed requests
+(no anonymous enumeration):
+
+`courier-directory-query-v1 || 0x00 || querier_ed25519(32) || 0x00 ||`
+`op || 0x00 || query || 0x00 || ts_be64`
+
+where `op` is `lookup`, `search`, or `reverse`, `query` is the handle /
+prefix / address, and `ts` is a unix timestamp within the freshness
+window (5 minutes). Per-identity rate limits: lookups 60/min, searches
+10/min (search is enumeration-sensitive, so its budget is deliberately
+tight), writes 10/min.
+
+- `GET /v1/directory/lookup?handle=<h>&querier=<addr>&ts=<ts>&sig=<sig>`
+  — exact match. Returns the profile, or 404.
+- `GET /v1/directory/search?q=<prefix>&...` — public handles with the
+  given lowercase prefix only (no substring, no wildcards, no total
+  counts). Returns minimal verifiable hits (handle, address,
+  capabilities, visibility, epoch, sig).
+- `GET /v1/directory/reverse?address=<addr>&...` — listed
+  (non-private) handles for an address the querier already knows.
+
+### Private handles and indistinguishability
+
+A `private` handle returns 404 from lookup/reverse, indistinguishable
+from "never registered" — there is no oracle for private-handle
+existence. This holds even under operator takedown: a tombstoned
+private handle still returns 404 (the tombstone blocks re-registration
+at write time but never surfaces). Search only covers `public` handles.
+
+### Introduction protocol (private handles)
+
+Private handles are reachable only through introductions via mutual
+contacts. All introduction envelopes are ordinary pairwise-encrypted
+direct messages carrying a JSON payload with `type` discriminator:
+
+- `introduction-request`: `{type, from, to, handle, ts, sig}` — `from`
+  asks mutual contact `to` for an introduction to the holder of
+  `handle`. Signed by `from` over
+  `courier-introduction-request-v1 || 0x00 || from_ed25519(32) || 0x00 ||`
+  `to_ed25519(32) || 0x00 || handle || 0x00 || ts_be64`.
+- `introduction`: `{type, from, to, subject, subject_handle, note, ts,
+  sig}` — mutual contact `from` introduces `subject` to `to`. Signed by
+  `from` over
+  `courier-introduction-v1 || 0x00 || from_ed25519(32) || 0x00 ||`
+  `to_ed25519(32) || 0x00 || subject_ed25519(32) || 0x00 || ts_be64`.
+
+Timestamps must be within 24h (freshness). The requester and the
+introducer must both be contacts of the recipient; otherwise the
+payload is ignored. Introduction DMs are consumed by the client like
+group-control DMs — they never surface as chat messages — and appear
+under `courier directory introductions` for accept/forward/dismiss.
+`courier inbox` prints a pointer when introductions are pending.
+
+### Operator takedown (transparent tombstones)
+
+Under the published takedown policy (see INSTALL.md), the operator may
+tombstone a handle for abuse/impersonation. The row stays: the handle
+cannot be re-registered, and lookup returns `410 Gone` with the
+published reason — takedowns are visible, never silent. Tombstones are
+reversible (`--untakedown`). Tombstoned private handles stay 404 (see
+above).
+
+### Client behavior
+
+- `courier directory register <handle> [--public|--unlisted|--private]
+  [--cap chat,...] [--contacts-only]` — register (default private).
+- `courier directory update ...` / `unregister` / `transfer <handle>
+  <address>` — signed writes.
+- `courier directory lookup <handle>` / `search <prefix>` /
+  `reverse <address>` — signed queries with profile verification.
+- `courier send @handle <message>` or `courier send handle:<name>
+  <message>` — resolves via lookup; prints the full resolved address.
+  First contact and `contacts`-policy warnings require `--force`.
+- `courier directory introductions` — list pending; `accept <id>
+  [name]`, `forward <id> @handle`, `dismiss <id>`.
+- The dashboard shows agent-resolved `@handle` labels (pushed by the
+  agent, never queried by the dashboard) with address-derived
+  identicons (deterministic 5×5 SVG, no uploads, no PII).
+
+### Backward compatibility
+
+All directory endpoints are additive. Pre-v0.8.0 clients never call
+them and are unaffected. Introduction DMs are ordinary encrypted direct
+messages; old clients display their JSON as chat text (harmless) while
+new clients consume them silently.

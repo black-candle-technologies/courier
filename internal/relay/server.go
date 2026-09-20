@@ -54,6 +54,24 @@ type Config struct {
 	// SpamReportWindow bounds how long reports count toward the
 	// threshold; older reports decay away.
 	SpamReportWindow time.Duration
+	// DirWriteBurst / DirWriteRatePerSec bound directory writes
+	// (register/update/transfer/deregister) per identity. Writes are
+	// rare; the defaults are generous.
+	DirWriteBurst      float64
+	DirWriteRatePerSec float64
+	// DirLookupBurst / DirLookupRatePerSec bound directory lookups and
+	// reverse lookups per identity (suggested: 60/min).
+	DirLookupBurst      float64
+	DirLookupRatePerSec float64
+	// DirSearchBurst / DirSearchRatePerSec bound directory searches per
+	// identity (suggested: 10/min). Search is the enumeration-sensitive
+	// endpoint, so its budget is deliberately tight.
+	DirSearchBurst      float64
+	DirSearchRatePerSec float64
+	// ReservedHandles are operator-reserved administrative handles
+	// (e.g. "courier", "admin", "support"): they can never be
+	// registered by anyone. Normalized to lowercase.
+	ReservedHandles []string
 }
 
 // DefaultConfig returns the standard abuse-control tuning: generous
@@ -67,6 +85,12 @@ func DefaultConfig() Config {
 		SendRatePerSec:      2,
 		SpamReportThreshold: 3,
 		SpamReportWindow:    7 * 24 * time.Hour,
+		DirWriteBurst:       10,
+		DirWriteRatePerSec:  10.0 / 60,
+		DirLookupBurst:      60,
+		DirLookupRatePerSec: 1,
+		DirSearchBurst:      10,
+		DirSearchRatePerSec: 10.0 / 60,
 	}
 }
 
@@ -75,18 +99,59 @@ type Server struct {
 	store   *store.Store
 	cfg     Config
 	limiter *Limiter
+	// Directory rate limiters are separate from the send limiter so
+	// directory enumeration budgets never interfere with messaging.
+	dirWriteLimiter  *Limiter
+	dirLookupLimiter *Limiter
+	dirSearchLimiter *Limiter
+	// reserved holds operator-reserved handles (lowercase).
+	reserved map[string]bool
 }
 
 // New returns a Server backed by st with default abuse-control tuning.
 func New(st *store.Store) *Server { return NewWithConfig(st, DefaultConfig()) }
 
 // NewWithConfig returns a Server backed by st with custom abuse-control
-// tuning (used by tests and operators via relay flags).
+// tuning (used by tests and operators via relay flags). Directory
+// limiter fields left at zero inherit the defaults, so configs built
+// with only the pre-v0.8.0 fields keep working. Burst and rate are
+// filled independently: setting a custom burst without a rate still
+// gets the default refill (a zero rate would otherwise block the
+// endpoint forever once the burst is spent).
 func NewWithConfig(st *store.Store, cfg Config) *Server {
+	def := DefaultConfig()
+	if cfg.DirWriteBurst <= 0 {
+		cfg.DirWriteBurst = def.DirWriteBurst
+	}
+	if cfg.DirWriteRatePerSec <= 0 {
+		cfg.DirWriteRatePerSec = def.DirWriteRatePerSec
+	}
+	if cfg.DirLookupBurst <= 0 {
+		cfg.DirLookupBurst = def.DirLookupBurst
+	}
+	if cfg.DirLookupRatePerSec <= 0 {
+		cfg.DirLookupRatePerSec = def.DirLookupRatePerSec
+	}
+	if cfg.DirSearchBurst <= 0 {
+		cfg.DirSearchBurst = def.DirSearchBurst
+	}
+	if cfg.DirSearchRatePerSec <= 0 {
+		cfg.DirSearchRatePerSec = def.DirSearchRatePerSec
+	}
+	reserved := make(map[string]bool, len(cfg.ReservedHandles))
+	for _, h := range cfg.ReservedHandles {
+		if n, err := envelope.NormalizeHandle(strings.ToLower(h)); err == nil {
+			reserved[n] = true
+		}
+	}
 	return &Server{
-		store:   st,
-		cfg:     cfg,
-		limiter: NewLimiter(cfg.SendBurst, cfg.SendRatePerSec),
+		store:            st,
+		cfg:              cfg,
+		limiter:          NewLimiter(cfg.SendBurst, cfg.SendRatePerSec),
+		dirWriteLimiter:  NewLimiter(cfg.DirWriteBurst, cfg.DirWriteRatePerSec),
+		dirLookupLimiter: NewLimiter(cfg.DirLookupBurst, cfg.DirLookupRatePerSec),
+		dirSearchLimiter: NewLimiter(cfg.DirSearchBurst, cfg.DirSearchRatePerSec),
+		reserved:         reserved,
 	}
 }
 
@@ -103,6 +168,12 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/report", s.handleReport)
 	// issue #32: group messaging.
 	mux.HandleFunc("POST /v1/groups/control", s.handleGroupControl)
+	// issue #39: contact-discovery directory.
+	mux.HandleFunc("POST /v1/directory", s.handleDirectory)
+	mux.HandleFunc("POST /v1/directory/transfer", s.handleDirectoryTransfer)
+	mux.HandleFunc("GET /v1/directory/lookup", s.handleDirectoryLookup)
+	mux.HandleFunc("GET /v1/directory/search", s.handleDirectorySearch)
+	mux.HandleFunc("GET /v1/directory/reverse", s.handleDirectoryReverse)
 	return mux
 }
 
