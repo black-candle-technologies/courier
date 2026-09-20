@@ -3,12 +3,9 @@ package client
 
 import (
 	"crypto/rand"
-	"encoding/base64"
 	"strings"
 	"testing"
 )
-
-func b64enc(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
 
 // TestJoinCodeRoundTrip: format -> parse is the identity, and the code
 // is 6 groups of 4 characters.
