@@ -266,11 +266,11 @@ the address, no upload, no stored field, no PII surface.
 - **Deregistration:** `POST /v1/directory` with `visibility: private` and a
   tombstone flag, or a dedicated signed tombstone; the relay removes the
   row (or marks it and stops serving it).
-- **Anti-sybil note:** registration is cheap (any valid Ed25519 identity
-  can register). Requiring a pre-existing key announcement
-  (`GET /v1/keys/{address}`) is a weak but nearly free hurdle against
-  drive-by handle parking — recommended, with the caveat that it is not
-  real sybil resistance (see §11.5).
+- **Anti-sybil note:** registration requires a pre-existing key
+  announcement for the address (`GET /v1/keys/{address}` must return a
+  row) — a weak but nearly free hurdle against drive-by handle parking
+  (decided §11 Q5). This is not real sybil resistance, only a parking
+  deterrent.
 
 ### 8.2 Lookup (exact handle)
 
@@ -383,9 +383,11 @@ send path — including the #34 contact-policy UX (§9).
    entirely in v1?~~ **Decided 2026-09-19: yes — deterministic,
    address-derived identicons.** Generated client-side from the address
    for dashboard display; no uploads, no stored field, no PII surface.
-5. **Registration hurdle:** require a pre-existing key announcement to
+5. **Registration hurdle:** ~~require a pre-existing key announcement to
    register a handle (weak anti-parking), or allow any valid Ed25519
-   identity?
+   identity?~~ **Decided 2026-09-19: a pre-existing key announcement is
+   required.** Weak anti-parking hurdle; not real sybil resistance, just
+   a deterrent against drive-by handle squatting.
 6. **Introductions:** is a signed introduction-envelope protocol for
    `private` handles in scope for v0.8.0, or deferred to Phase 3?
 7. **Capability vocabulary:** free-form tokens (bounded) or a registry of
