@@ -19,7 +19,8 @@ func TestPushDisappearingMessages(t *testing.T) {
 	srv := testServer(t)
 	id := testIdentity(t)
 	addr := crypto.FormatAddress(id.EdPub[:])
-	token: <redacted>
+	testPW := "correct horse battery staple"
+	token := register(t, srv, "ttluser", testPW, id)
 	now := time.Now().Unix()
 
 	payload, _ := json.Marshal(map[string]any{"messages": []map[string]any{
