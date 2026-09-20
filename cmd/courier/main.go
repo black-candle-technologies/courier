@@ -76,6 +76,8 @@ func main() {
 		err = cmdDirectory(os.Args[2:])
 	case "group":
 		err = cmdGroup(os.Args[2:])
+	case "state":
+		err = cmdState(os.Args[2:])
 	case "channel":
 		err = cmdChannel(os.Args[2:])
 	case "rotate":
@@ -142,6 +144,12 @@ func usage() {
                                          create an encrypted group (you are admin)
   courier group send <group-id> <msg>    send a message to the group
   courier group inbox <group-id>         read new group messages
+  courier state note add <peer> --title <t>
+                                         share a note with a collaborator
+  courier state task add <peer> --title <t> [--assignee <a>]
+                                         share a task (state machine: assign/done/reopen)
+  courier state list <peer>              list shared notes + tasks
+  courier state sync <peer>              catch-up: fetch and apply missed state events
   courier channel create <name>          create a private channel (you are admin)
   courier channel invite <channel-id>    mint a one-time out-of-band join code
   courier channel join <inviter> <code>   join a private channel via OOB code

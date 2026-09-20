@@ -807,3 +807,66 @@ All directory endpoints are additive. Pre-v0.8.0 clients never call
 them and are unaffected. Introduction DMs are ordinary encrypted direct
 messages; old clients display their JSON as chat text (harmless) while
 new clients consume them silently.
+
+## Shared agent state (issue #49)
+
+Two collaborating agents keep shared notes and tasks. State is an
+append-only log of signed events carried **inside ordinary encrypted
+DMs** — no new relay semantics, no new endpoints. Each side folds the
+log into the current view; the relay never sees plaintext.
+
+### Wire format
+
+The DM plaintext is a JSON object (instead of chat text or an
+attachment manifest):
+
+```json
+{"cs":1,"t":"state","v":1,"events":[{...}, ...]}
+```
+
+- `cs: 1` — magic marking the payload as shared-state.
+- `t: "state"`, `v: 1` — payload type and version.
+- `events` — 1–50 events, each the author's next per-author sequence
+  numbers (`seq` starts at 1 and increments per author per
+  conversation).
+
+Recipients parse the payload after authenticated decryption; unknown
+`cs`/`v` or malformed events are ignored (never applied). A state
+payload from a sender held for review (contacts policy, quarantine,
+or reported) is **not** applied — it falls through as an ordinary
+message so a stranger cannot write into the shared log.
+
+### Event kinds
+
+| Kind | Fields | Effect |
+|---|---|---|
+| `note-add` | `note_id`, `title`, `body?` | Creates the note (content immutable afterwards) |
+| `note-done` | `note_id`, `done` | Last-writer-wins done flag |
+| `task-add` | `task_id`, `title`, `body?`, `assignee`, `escalate?` | Creates the task; assignee must be one of the two collaborators |
+| `task-assign` | `task_id`, `assignee` | Reassigns; **only the assigner** may issue |
+| `task-done` | `task_id` | **Only the assignee** may issue |
+| `task-reopen` | `task_id` | **Only the assigner** may issue |
+
+Every event carries `author` (Ed25519 address, stamped by the
+applier), `seq`, and `sent_at`. Events fold in `(sent_at, author,
+seq)` order, so both writers derive identical state regardless of
+arrival order. Task transitions check authorization at fold time:
+events from the wrong party are ignored by the fold but kept in the
+log as the audit trail. Task history is archived, never pruned.
+
+### Local storage and sync
+
+The log lives at `~/.courier/state.json` (0600), one conversation per
+peer address. Catch-up is an ordinary inbox fetch
+(`courier state sync <peer>`) with its own replay-suppression set, so
+it never starves inbox delivery or dashboard pushes (issue #45).
+Search is a local case-insensitive substring match over decrypted
+titles and bodies. Note events older than N days
+(`courier state compact <peer> [--days N]`, default 90) collapse into
+a snapshot; task events are retained for the archive.
+
+### Backward compatibility
+
+State DMs are ordinary envelopes. Pre-v0.10.0 clients display the
+payload JSON as chat text (harmless) while new clients consume it
+silently. No relay changes were required.
