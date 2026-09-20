@@ -1237,7 +1237,7 @@ func (s *Store) DashboardThreadMessages(userID int64, peer string, limit int) ([
 	for rows.Next() {
 		var m DashboardMessage
 		if err := rows.Scan(&m.ID, &m.CourierID, &m.Sender, &m.Recipient, &m.Body, &m.SentAt, &m.ReceivedAt, &m.ReplyTo, &m.Quote, &m.ExpiresAt); err != nil {
-		return nil, err
+			return nil, err
 		}
 		out = append(out, m)
 	}
