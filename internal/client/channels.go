@@ -366,13 +366,15 @@ func (c *Client) ChannelInvite(channelID string) (string, error) {
 }
 
 // sendChannelDM marshals a channel protocol payload and DMs it to addr.
+// Protocol DMs bypass the sent log (sendProtocolDM): they are machine
+// traffic, not chat, and must not be pushed to the dashboard.
 func (c *Client) sendChannelDM(addr string, p channelDMPayload) error {
 	p.Magic = channelDMMagic
 	raw, err := json.Marshal(p)
 	if err != nil {
 		return err
 	}
-	_, err = c.Send(addr, string(raw))
+	_, err = c.sendProtocolDM(addr, string(raw))
 	return err
 }
 
@@ -389,39 +391,54 @@ func (c *Client) ChannelJoin(inviter, code string) error {
 	if err != nil {
 		return err
 	}
-	if err := c.sendChannelDM(inviterAddr, channelDMPayload{
-		Type:   channelJoinRequest,
-		Secret: base64.RawURLEncoding.EncodeToString(secret),
-	}); err != nil {
-		return fmt.Errorf("join request failed: %w", err)
-	}
-	if err := updateChannels(func(cs *channelStore) error {
-		if cs.Pending == nil {
-			cs.Pending = map[string]int64{}
-		}
-		cs.Pending[inviterAddr] = time.Now().Unix()
-		return nil
-	}); err != nil {
+	if err := c.sendChannelJoinRequest(inviterAddr, secret); err != nil {
 		return err
 	}
 	// Wait for the inviter's agent to process the request (it polls its
 	// own inbox about every minute, faster with the wake daemon).
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
+		if c.channelJoined(inviterAddr) {
+			return nil
+		}
 		time.Sleep(5 * time.Second)
-		cs, err := loadChannels()
-		if err != nil {
-			continue
-		}
-		for _, ch := range cs.Channels {
-			if ch.Admin == inviterAddr && inChannelRoster(ch.Roster, c.cfg.Address) {
-				return nil
-			}
-		}
 		// Drain the inbox so the accept is processed promptly.
 		_, _, _, _, _ = c.Inbox(0, 50)
 	}
 	return fmt.Errorf("join request sent but no accept arrived within 60s; the inviter's agent may be offline — retry `courier channel join` later")
+}
+
+// sendChannelJoinRequest sends the join-request DM and records the
+// pending join used to correlate the accept.
+func (c *Client) sendChannelJoinRequest(inviterAddr string, secret []byte) error {
+	if err := c.sendChannelDM(inviterAddr, channelDMPayload{
+		Type:   channelJoinRequest,
+		Secret: base64.RawURLEncoding.EncodeToString(secret),
+	}); err != nil {
+		return fmt.Errorf("join request failed: %w", err)
+	}
+	return updateChannels(func(cs *channelStore) error {
+		if cs.Pending == nil {
+			cs.Pending = map[string]int64{}
+		}
+		cs.Pending[inviterAddr] = time.Now().Unix()
+		return nil
+	})
+}
+
+// channelJoined reports whether this client now holds a channel
+// administered by inviterAddr that includes itself.
+func (c *Client) channelJoined(inviterAddr string) bool {
+	cs, err := loadChannels()
+	if err != nil {
+		return false
+	}
+	for _, ch := range cs.Channels {
+		if ch.Admin == inviterAddr && inChannelRoster(ch.Roster, c.cfg.Address) {
+			return true
+		}
+	}
+	return false
 }
 
 // channelMsgInner is the secretbox-sealed body of a channel message.

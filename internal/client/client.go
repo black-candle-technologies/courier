@@ -945,6 +945,17 @@ func (c *Client) Send(toOrName, body string) (int64, error) {
 // never sees filenames, MIME types, plaintext hashes, or data keys.
 // Returns the relay message id.
 func (c *Client) SendWithAttachments(toOrName, body string, attachPaths []string) (int64, error) {
+	return c.send(toOrName, body, attachPaths, true)
+}
+
+// sendProtocolDM sends a machine-protocol DM (channel handshake traffic)
+// without recording it in the sent log: protocol DMs are not chat and
+// must not be pushed to the dashboard as sent messages.
+func (c *Client) sendProtocolDM(toOrName, body string) (int64, error) {
+	return c.send(toOrName, body, nil, false)
+}
+
+func (c *Client) send(toOrName, body string, attachPaths []string, logSent bool) (int64, error) {
 	address, err := c.cfg.ResolveRecipient(toOrName)
 	if err != nil {
 		return 0, err
@@ -1019,7 +1030,10 @@ func (c *Client) SendWithAttachments(toOrName, body string, attachPaths []string
 	}
 	// Best-effort local record so the dashboard can thread the
 	// conversation. A logging failure must never fail the send itself.
-	_ = appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: body, SentAt: sentAt})
+	// Protocol DMs skip the log: they are machine traffic, not chat.
+	if logSent {
+		_ = appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: body, SentAt: sentAt})
+	}
 	return out.ID, nil
 }
 
