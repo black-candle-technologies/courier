@@ -109,6 +109,76 @@ func ceilSeconds(d time.Duration) time.Duration {
 	return s * time.Second
 }
 
+// PreAuthLimitPerMinute bounds unauthenticated ingest attempts per
+// source IP (F4). 401s are audit-logged, so without a pre-auth limit
+// any process that can reach the localhost port could grow bridge.db
+// unboundedly with junk rows. Over-limit attempts get 429 with no
+// audit row; the flood is noted once per window in the server logs.
+const PreAuthLimitPerMinute = 60
+
+// preAuthWindow is one IP's unauthenticated-attempt counter for the
+// current minute.
+type preAuthWindow struct {
+	minute int64 // unix minutes
+	count  int
+	logged bool // over-limit log line already emitted this minute
+}
+
+// PreAuthLimiter is a coarse per-IP fixed-window limiter for
+// unauthenticated ingest attempts. It is not a security boundary —
+// just a backstop against audit-log flooding (F4).
+type PreAuthLimiter struct {
+	mu    sync.Mutex
+	limit int
+	hits  map[string]*preAuthWindow
+	now   func() time.Time // overridable in tests
+}
+
+// NewPreAuthLimiter builds a limiter allowing limit unauthenticated
+// attempts per IP per minute.
+func NewPreAuthLimiter(limit int) *PreAuthLimiter {
+	return &PreAuthLimiter{limit: limit, hits: map[string]*preAuthWindow{}, now: time.Now}
+}
+
+// Allow consumes one unauthenticated-attempt slot for ip. It returns
+// allowed=false with a retry-after when ip is over budget. logIt is
+// true exactly once per minute per ip when the budget is first
+// exceeded, so the caller can note the flood without spamming logs.
+func (l *PreAuthLimiter) Allow(ip string) (allowed bool, retryAfter time.Duration, logIt bool) {
+	now := l.now()
+	min := now.Unix() / 60
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Opportunistic sweep: the map is tiny (localhost-only), but stale
+	// entries should not accumulate forever.
+	if len(l.hits) > 1024 {
+		for k, w := range l.hits {
+			if w.minute < min-1 {
+				delete(l.hits, k)
+			}
+		}
+	}
+	w, ok := l.hits[ip]
+	if !ok || w.minute != min {
+		w = &preAuthWindow{minute: min}
+		l.hits[ip] = w
+	}
+	w.count++
+	if w.count <= l.limit {
+		return true, 0, false
+	}
+	if !w.logged {
+		w.logged = true
+		logIt = true
+	}
+	// Retry once the current minute rolls over.
+	retryAfter = time.Until(now.Truncate(time.Minute).Add(time.Minute))
+	if retryAfter < time.Second {
+		retryAfter = time.Second
+	}
+	return false, retryAfter, logIt
+}
+
 // Remaining reports the whole tokens currently available in each
 // bucket, for the status endpoint's quota display.
 func (r *RateLimiter) Remaining(key string) (perMinute, perHour int) {

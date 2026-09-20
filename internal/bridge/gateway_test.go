@@ -403,3 +403,88 @@ func TestConfirmTokenSingleUse(t *testing.T) {
 		t.Fatalf("cross-token confirm: code = %d, want 400", rec3.Code)
 	}
 }
+
+// TestConfirmTokenBoundToBody (F1): a confirm token is bound to the
+// body it was issued for. Approving body A must not authorize sending
+// body B.
+func TestConfirmTokenBoundToBody(t *testing.T) {
+	f := newGwFixture(t)
+	// First send → 449 with a confirm token for body "hello".
+	rec := f.ingest(t, f.raw, ingestJSON(f.addr, "hello", ""))
+	if rec.Code != StatusConfirmationRequired {
+		t.Fatalf("first send code = %d, want 449", rec.Code)
+	}
+	var cr map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &cr)
+	ct, _ := cr["confirm_token"].(string)
+	if ct == "" {
+		t.Fatal("no confirm_token in 449")
+	}
+	// Replay the token with a DIFFERENT body → must be rejected, not sent.
+	rec = f.ingest(t, f.raw, ingestJSON(f.addr, "evil", ct))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("mismatched-body confirm: code = %d, want 400", rec.Code)
+	}
+	if len(f.stub.calls) != 0 {
+		t.Fatalf("sender called %d times; mismatched body must not send", len(f.stub.calls))
+	}
+	// The token was single-use: even the originally approved body now fails.
+	rec = f.ingest(t, f.raw, ingestJSON(f.addr, "hello", ct))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("reused confirm token: code = %d, want 400", rec.Code)
+	}
+	// And the recipient was never marked confirmed.
+	confirmed, err := f.store.IsConfirmed(f.tok.ID, f.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed {
+		t.Fatal("recipient marked confirmed after mismatched-body attempt")
+	}
+}
+
+// TestUnauthenticatedFloodLimited (F4): unauthenticated attempts are
+// audit-logged up to the pre-auth budget; beyond it they get 429 with
+// no audit row.
+func TestUnauthenticatedFloodLimited(t *testing.T) {
+	f := newGwFixture(t)
+	f.gw.preAuth = NewPreAuthLimiter(3)
+	var codes []int
+	for i := 0; i < 5; i++ {
+		rec := f.ingest(t, "bad-token", ingestJSON(f.addr, "x", ""))
+		codes = append(codes, rec.Code)
+	}
+	for i, c := range codes[:3] {
+		if c != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: code = %d, want 401", i, c)
+		}
+	}
+	for i, c := range codes[3:] {
+		if c != http.StatusTooManyRequests {
+			t.Fatalf("attempt %d: code = %d, want 429", i+3, c)
+		}
+	}
+	rows, err := f.store.ListAudit(AuditFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n401 := 0
+	for _, r := range rows {
+		if r.Outcome == RejectedOutcome(RejectUnauthorized) {
+			n401++
+		}
+	}
+	if n401 != 3 {
+		t.Fatalf("unauthorized audit rows = %d, want 3 (429s must not write rows)", n401)
+	}
+}
+
+// TestDisclosureMentionsAllPlaintextHops (F7): the short disclosure
+// must name every plaintext hop, including the MCP server.
+func TestDisclosureMentionsAllPlaintextHops(t *testing.T) {
+	for _, hop := range []string{"MCP server", "bridge gateway", "OpenAI"} {
+		if !strings.Contains(DisclosureText, hop) {
+			t.Errorf("DisclosureText missing plaintext hop %q", hop)
+		}
+	}
+}

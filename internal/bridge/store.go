@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
@@ -70,6 +71,11 @@ CREATE TABLE IF NOT EXISTS pending_confirmations(
 // Store is the gateway's persistent state.
 type Store struct {
 	db *sql.DB
+	// mu serializes audit-chain appends and finalizes so concurrent
+	// ingests cannot read the same chain head and fork the chain (F2).
+	// All Store users live in one process (the gateway; the CLI never
+	// appends), so a process-local mutex is sufficient.
+	mu sync.Mutex
 }
 
 // OpenStore opens (creating if needed) the bridge database at path.

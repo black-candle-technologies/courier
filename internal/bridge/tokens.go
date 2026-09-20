@@ -16,6 +16,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/crypto"
@@ -76,7 +78,11 @@ func (t *Token) Status(now int64) string {
 // newTokenID generates a random token id (128 bits, hex).
 func newTokenID() string {
 	var b [16]byte
-	_, _ = rand.Read(b[:]) // crypto/rand failure here is vanishingly unlikely; id collision is caught by the PK
+	if _, err := rand.Read(b[:]); err != nil {
+		// Vanishingly unlikely; log it. An all-zero id collides on the
+		// primary key and surfaces as an insert error (fail-safe).
+		log.Printf("bridge: crypto/rand failed generating token id: %v", err)
+	}
 	return hex.EncodeToString(b[:])
 }
 
@@ -210,10 +216,21 @@ func (s *Store) ListTokens() ([]*Token, error) {
 	return out, rows.Err()
 }
 
+// escapeLike escapes LIKE wildcards (%, _, and the escape character
+// itself) so a label containing them is matched literally. Without
+// this, `revoke --name "%"` would match every token id (F5).
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
+}
+
 // findToken resolves a label or id prefix to a token id. It is an error
 // if the reference is ambiguous or unknown.
 func (s *Store) findToken(labelOrID string) (string, error) {
-	rows, err := s.db.Query(`SELECT id FROM tokens WHERE id=? OR id LIKE ? OR label=?`, labelOrID, labelOrID+"%", labelOrID)
+	rows, err := s.db.Query(`SELECT id FROM tokens WHERE id=? OR id LIKE ? ESCAPE '\' OR label=?`,
+		labelOrID, escapeLike(labelOrID)+"%", labelOrID)
 	if err != nil {
 		return "", fmt.Errorf("find token: %w", err)
 	}
@@ -243,8 +260,8 @@ func (s *Store) findToken(labelOrID string) (string, error) {
 func (s *Store) RevokeToken(labelOrID string) (int, error) {
 	now := time.Now().Unix()
 	res, err := s.db.Exec(
-		`UPDATE tokens SET revoked_at=? WHERE revoked_at=0 AND (id=? OR id LIKE ? OR label=?)`,
-		now, labelOrID, labelOrID+"%", labelOrID,
+		`UPDATE tokens SET revoked_at=? WHERE revoked_at=0 AND (id=? OR id LIKE ? ESCAPE '\' OR label=?)`,
+		now, labelOrID, escapeLike(labelOrID)+"%", labelOrID,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("revoke token: %w", err)

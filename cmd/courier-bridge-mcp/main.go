@@ -38,7 +38,7 @@ const version = "0.11.0"
 // §2.1, §3.3): it begins the send_to_agent description so the warning
 // surfaces inside ChatGPT's own tool UI.
 const sendToolDescription = `⚠️ Messages sent through this tool are NOT end-to-end encrypted. ` +
-	`They pass in plaintext through the bridge gateway (and are visible to OpenAI via ChatGPT web) ` +
+	`They pass in plaintext through this MCP server and the bridge gateway (and are visible to OpenAI via ChatGPT web) ` +
 	`before delivery as ordinary Courier messages. Do not send secrets. ` +
 	`Bridged messages are marked as untrusted input and never trigger agent actions without the recipient's approval.
 

@@ -10,6 +10,15 @@
 // detects tampering or gaps. Retention pruning (default 1 year, per the
 // user-confirmed plan) deletes old rows; the verifier reports the prune
 // point explicitly instead of crying "gap."
+//
+// Threat model (F3): the chain detects accidental corruption and
+// tampering by anyone who cannot rewrite the whole database. It does
+// NOT defend against a privileged attacker with write access to
+// bridge.db — they can recompute a consistent chain and `audit
+// --verify` will pass. Treat verification as tamper-evidence against
+// unsophisticated tampering, not as proof against a compromised host.
+// A future improvement is anchoring the chain head somewhere external
+// (even a log line shipped off-host) on a schedule.
 package bridge
 
 import (
@@ -81,8 +90,12 @@ func (s *Store) lastHash() (string, error) {
 }
 
 // AppendAudit appends one audit row, chaining its hash to the previous
-// row. It returns the new row id.
+// row. Appends and finalizes are serialized on the store mutex so two
+// concurrent ingests cannot read the same chain head and fork the
+// chain (F2). It returns the new row id.
 func (s *Store) AppendAudit(e *AuditEntry) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	prev, err := s.lastHash()
 	if err != nil {
 		return 0, fmt.Errorf("audit chain head: %w", err)
@@ -104,7 +117,11 @@ func (s *Store) AppendAudit(e *AuditEntry) (int64, error) {
 // FinalizeAudit updates the outcome/envelope of a previously appended
 // row (the send → audit ordering means the row is reserved before the
 // relay round-trip) and re-chains its hash over the final content.
+// It takes the store mutex: finalizing rewrites a row_hash, so it must
+// not interleave with an append that is reading the chain head (F2).
 func (s *Store) FinalizeAudit(id int64, outcome string, envelopeID int64, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var e AuditEntry
 	err := s.db.QueryRow(
 		`SELECT id,ts,token_id,token_label,recipient,body_sha256,body_size,prev_hash

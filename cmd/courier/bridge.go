@@ -137,7 +137,7 @@ func cmdBridgeTokenIssue(dbPath string, args []string) error {
 		fmt.Printf("expires:   %s\n", time.Unix(tok.ExpiresAt, 0).UTC().Format(time.RFC3339))
 	}
 	fmt.Println()
-	fmt.Println("Non-E2E reminder: this token lets ChatGPT web send plaintext through the bridge.")
+	fmt.Println("Non-E2E reminder: this token lets ChatGPT web send plaintext through the MCP server and bridge gateway (not end-to-end encrypted).")
 	return nil
 }
 
@@ -277,6 +277,8 @@ func cmdBridgeAudit(args []string) error {
 			fmt.Printf(" (chain starts at row %d: older rows pruned per retention)", firstID)
 		}
 		fmt.Println()
+		fmt.Println("note: the chain detects accidental corruption and unsophisticated tampering,")
+		fmt.Println("not a privileged rewrite of bridge.db (see docs/bridge.md for the threat model)")
 		return nil
 	}
 	rows, err := st.ListAudit(bridge.AuditFilter{TokenLabel: *label, Outcome: *outcome, Limit: *limit})

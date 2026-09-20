@@ -174,3 +174,41 @@ func TestRevokeAll(t *testing.T) {
 		}
 	}
 }
+
+// TestRevokeWildcardLabelEscaped (F5): a label containing LIKE
+// wildcards must be matched literally. `revoke --name "%"` must not
+// revoke every token.
+func TestRevokeWildcardLabelEscaped(t *testing.T) {
+	s := testStore(t)
+	_, tok1, err := s.IssueToken("100%", []string{testAddr(1)}, 0, "pepper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.IssueToken("other", []string{testAddr(2)}, 0, "pepper"); err != nil {
+		t.Fatal(err)
+	}
+	// findToken("100%") resolves the literal label.
+	id, err := s.findToken("100%")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != tok1.ID {
+		t.Fatalf("findToken(%q) = %q, want %q", "100%", id, tok1.ID)
+	}
+	// RevokeToken("100%") revokes exactly the one token.
+	n, err := s.RevokeToken("100%")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("revoked %d tokens, want 1", n)
+	}
+	// A bare "%" matches nothing (no id starts with a literal %).
+	n, err = s.RevokeToken("%")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf(`RevokeToken("%%") revoked %d tokens, want 0`, n)
+	}
+}

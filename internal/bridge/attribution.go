@@ -34,8 +34,11 @@ func HasBanner(body string) bool {
 }
 
 // StripBanner removes a leading bridge banner, returning the original
-// body. It is a display helper only; the banner must always be shown
-// to recipients, never silently stripped.
+// body. It is a display helper only: it must NEVER be used to hide the
+// banner from message recipients. The banner is mandatory disclosure;
+// any future caller must ensure the recipient still sees it (e.g. it
+// is rendered separately in the UI). Stripping attribution from what a
+// recipient sees would break the bridge's trust model.
 func StripBanner(body string) string {
 	if !HasBanner(body) {
 		return body

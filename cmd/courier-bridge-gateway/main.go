@@ -134,7 +134,7 @@ func cmdServe(args []string) error {
 	home := fs.String("home", "/opt/courier-bridge", "bridge home dir")
 	addr := fs.String("addr", "127.0.0.1:8473", "listen address")
 	dbPath := fs.String("db", "", "bridge.db path (default $home/bridge.db)")
-	allowRemote := fs.Bool("allow-remote", false, "permit binding a non-loopback address (not recommended)")
+	allowRemote := fs.Bool("allow-remote", false, "permit binding a non-loopback address (NOT recommended: bearer tokens travel as cleartext HTTP; only use behind a TLS-terminating reverse proxy you trust)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -154,6 +154,12 @@ func cmdServe(args []string) error {
 		if ip == nil || !ip.IsLoopback() {
 			return fmt.Errorf("refusing to bind non-loopback %q without --allow-remote (the gateway must stay localhost-only)", host)
 		}
+	}
+	if *allowRemote {
+		fmt.Fprintln(os.Stderr, "WARNING: --allow-remote is set: the gateway will bind a non-loopback address.")
+		fmt.Fprintln(os.Stderr, "WARNING: ingest bearer tokens travel in PLAINTEXT HTTP. Only use --allow-remote")
+		fmt.Fprintln(os.Stderr, "WARNING: behind a TLS-terminating reverse proxy you trust, on a network you trust.")
+		log.Printf("WARNING: --allow-remote: binding %s with cleartext HTTP bearer auth — a TLS-terminating reverse proxy is required", *addr)
 	}
 	db := *dbPath
 	if db == "" {

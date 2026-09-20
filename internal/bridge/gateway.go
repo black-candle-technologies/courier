@@ -7,15 +7,21 @@
 //
 // Enforcement order per ingest (fail fast, cheapest checks first):
 //
-//  1. Token valid, not revoked, not expired → else 401.
+//  1. Token valid, not revoked, not expired → else 401. Unauthenticated
+//     attempts are audit-logged, but a coarse per-IP pre-auth limiter
+//     429s floods without writing a row (F4).
 //  2. Body ≤ 64 KiB (UTF-8 bytes, measured before wrapping) → else 413.
 //  3. Recipient in the token's allowlist → else 403 (the allowlist is
 //     never disclosed in the error).
-//  4. Per-token rate limit → else 429 with Retry-After.
-//  5. Recipient parses as a Courier address → else 400.
-//  6. First-send-per-(token, recipient) confirmation round-trip → else
-//     449 confirmation_required.
+//  4. Recipient parses as a Courier address → else 400.
+//  5. First-send-per-(token, recipient) confirmation round-trip → else
+//     449 confirmation_required. The 449 response itself does not
+//     consume rate-limit quota; quota is spent only on actual sends.
+//  6. Per-token rate limit → else 429 with Retry-After.
 //  7. Wrap + send as the bridge identity, then append the audit record.
+//
+// Internal-error (500) paths intentionally write no audit row — the
+// store may be the thing that's broken; server logs are the backstop.
 //
 // The MCP server is NOT a trust boundary: the gateway re-validates
 // everything. A compromised MCP server gains nothing beyond what its
@@ -28,6 +34,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -50,10 +58,11 @@ const ConfirmTTL = 10 * time.Minute
 const StatusConfirmationRequired = 449
 
 // DisclosureText is the mandatory plain-language non-E2E disclosure.
-// It ships in the MCP tool description, the status endpoint, and
-// docs/bridge.md (plan §3.3).
+// It ships in the 449 confirmation payload, the status endpoint, and
+// docs/bridge.md (plan §3.3). It names every plaintext hop: the MCP
+// server sees tool-call arguments, the gateway sees everything.
 const DisclosureText = "Messages sent through this bridge are NOT end-to-end encrypted. " +
-	"They pass in plaintext through the bridge gateway (and are visible to OpenAI via ChatGPT web) " +
+	"They pass in plaintext through the MCP server and the bridge gateway (and are visible to OpenAI via ChatGPT web) " +
 	"before being delivered as ordinary Courier messages. Do not send secrets. " +
 	"Bridged messages are marked as untrusted input and never trigger agent actions without approval."
 
@@ -78,6 +87,7 @@ type Gateway struct {
 	address   string // bridge identity address
 	gatewayFP string // hex SHA-256 of the bridge Ed25519 public key
 	limiter   *RateLimiter
+	preAuth   *PreAuthLimiter // coarse per-IP limiter for unauthenticated attempts (F4)
 	bodyCap   int
 	version   string
 	now       func() time.Time // overridable in tests
@@ -95,6 +105,7 @@ func NewGateway(store *Store, sender Sender, pepper, address string, edPub []byt
 		address:   address,
 		gatewayFP: hex.EncodeToString(fp[:]),
 		limiter:   NewRateLimiter(),
+		preAuth:   NewPreAuthLimiter(PreAuthLimitPerMinute),
 		bodyCap:   DefaultBodyCap,
 		version:   version,
 		now:       time.Now,
@@ -153,6 +164,7 @@ func (g *Gateway) authenticate(r *http.Request) (*Token, error) {
 }
 
 // handleHealth is the unauthenticated liveness probe (monitoring §8).
+// It exposes only the version string — no sensitive data.
 func (g *Gateway) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, errJSON(405, "method not allowed"))
@@ -189,6 +201,19 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	tok, err := g.authenticate(r)
 	if err != nil {
+		// 401s are audit-logged, so unauthenticated attempts pass a
+		// coarse per-IP limiter first: over-limit floods get 429 with
+		// no audit row, and the flood is noted in the server logs (F4).
+		ip := clientIP(r)
+		allowed, retryAfter, logIt := g.preAuth.Allow(ip)
+		if logIt {
+			log.Printf("bridge: unauthenticated ingest flood from %s (>%d/min); 429 without audit row", ip, PreAuthLimitPerMinute)
+		}
+		if !allowed {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retryAfter.Seconds())))
+			writeJSON(w, http.StatusTooManyRequests, errJSON(429, "too many unauthenticated requests"))
+			return
+		}
 		g.audit(nil, "", nil, RejectedOutcome(RejectUnauthorized), 0, "")
 		writeJSON(w, http.StatusUnauthorized, errJSON(401, "unauthorized"))
 		return
@@ -226,12 +251,6 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errJSON(400, "bad recipient address"))
 		return
 	}
-	if ok, retryAfter := g.limiter.Allow(tok.ID); !ok {
-		g.audit(tok, req.Recipient, &req.Body, RejectedOutcome(RejectRateLimited), 0, "")
-		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retryAfter.Seconds())))
-		writeJSON(w, http.StatusTooManyRequests, errJSON(429, "rate limit exceeded"))
-		return
-	}
 	// Wrap before hashing: the audit records the exact bytes sent.
 	wrapped := WrapBody(req.Body)
 	sum := SHA256Hex([]byte(wrapped))
@@ -257,7 +276,7 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		if err := g.consumePendingConfirmation(tok.ID, req.Recipient, req.ConfirmToken); err != nil {
+		if err := g.consumePendingConfirmation(tok.ID, req.Recipient, req.ConfirmToken, sum); err != nil {
 			g.auditFull(tok, req.Recipient, sum, int64(len(wrapped)), RejectedOutcome(RejectBadRequest), 0, "bad confirm token")
 			writeJSON(w, http.StatusBadRequest, errJSON(400, "invalid or expired confirm token"))
 			return
@@ -266,6 +285,15 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, errJSON(500, "internal error"))
 			return
 		}
+	}
+	// Per-token rate limit. This runs after the confirmation round-trip
+	// so the 449 response does not consume quota: one logical first send
+	// costs one quota unit, not two (N5).
+	if ok, retryAfter := g.limiter.Allow(tok.ID); !ok {
+		g.audit(tok, req.Recipient, &req.Body, RejectedOutcome(RejectRateLimited), 0, "")
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retryAfter.Seconds())))
+		writeJSON(w, http.StatusTooManyRequests, errJSON(429, "rate limit exceeded"))
+		return
 	}
 	// Reserve the audit row so the wire metadata can reference it.
 	auditID, err := g.store.AppendAudit(&AuditEntry{
@@ -355,28 +383,43 @@ func (g *Gateway) newPendingConfirmation(tokenID, recipient, bodySHA string) (st
 }
 
 // consumePendingConfirmation validates a confirm token and consumes it
-// (single-use). On success the caller marks the recipient confirmed.
-func (g *Gateway) consumePendingConfirmation(tokenID, recipient, raw string) error {
+// (single-use). The token is bound to the body it was issued for: the
+// presented body's hash must match the stored body_sha256, otherwise a
+// token approved for one message could be replayed for a different
+// message, defeating the first-send human-approval control (F1).
+// On success the caller marks the recipient confirmed.
+func (g *Gateway) consumePendingConfirmation(tokenID, recipient, raw, bodySHA string) error {
 	sum := sha256.Sum256([]byte(raw))
-	var dbTokenID, dbRecipient string
+	var dbTokenID, dbRecipient, dbBodySHA string
 	var expiresAt int64
 	err := g.store.db.QueryRow(
-		`SELECT token_id,recipient,expires_at FROM pending_confirmations WHERE token=?`,
+		`SELECT token_id,recipient,body_sha256,expires_at FROM pending_confirmations WHERE token=?`,
 		hex.EncodeToString(sum[:]),
-	).Scan(&dbTokenID, &dbRecipient, &expiresAt)
+	).Scan(&dbTokenID, &dbRecipient, &dbBodySHA, &expiresAt)
 	if err != nil {
 		return fmt.Errorf("unknown confirm token")
 	}
 	now := g.now().Unix()
 	// Single-use: delete regardless of outcome.
 	_, _ = g.store.db.Exec(`DELETE FROM pending_confirmations WHERE token=?`, hex.EncodeToString(sum[:]))
-	if dbTokenID != tokenID || dbRecipient != recipient {
+	if dbTokenID != tokenID || dbRecipient != recipient || dbBodySHA != bodySHA {
 		return fmt.Errorf("confirm token does not match")
 	}
 	if now > expiresAt {
 		return fmt.Errorf("confirm token expired")
 	}
 	return nil
+}
+
+// clientIP extracts the client IP from the request's remote address,
+// for the pre-auth limiter (F4). The gateway is localhost-only by
+// default, so this is normally 127.0.0.1 or ::1.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // IsConfirmed reports whether (token, recipient) completed the

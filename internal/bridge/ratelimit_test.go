@@ -103,3 +103,34 @@ func TestRateLimiterRemaining(t *testing.T) {
 		t.Fatalf("quota after one send = %d, want %d", pm, RateBurst-1)
 	}
 }
+
+// TestPreAuthLimiterBudget (F4): the pre-auth limiter allows the
+// budget per IP per minute, then denies with logIt exactly once.
+func TestPreAuthLimiterBudget(t *testing.T) {
+	l := NewPreAuthLimiter(3)
+	ip := "127.0.0.1"
+	for i := 0; i < 3; i++ {
+		ok, _, logIt := l.Allow(ip)
+		if !ok || logIt {
+			t.Fatalf("attempt %d: ok=%v logIt=%v, want allowed", i, ok, logIt)
+		}
+	}
+	ok, retryAfter, logIt := l.Allow(ip)
+	if ok {
+		t.Fatal("4th attempt allowed over budget of 3")
+	}
+	if !logIt {
+		t.Fatal("logIt=false on first over-budget attempt")
+	}
+	if retryAfter <= 0 {
+		t.Fatal("no retry-after on denial")
+	}
+	// Still denied, but logIt fires only once per window.
+	if _, _, logIt := l.Allow(ip); logIt {
+		t.Fatal("logIt=true twice in one window")
+	}
+	// A different IP has its own budget.
+	if ok, _, _ := l.Allow("::1"); !ok {
+		t.Fatal("other IP denied")
+	}
+}

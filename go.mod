@@ -1,5 +1,7 @@
 module github.com/black-candle-technologies/courier
 
+// go >= 1.25 is required by github.com/modelcontextprotocol/go-sdk v1.7.0
+// (bridge MCP server); the rest of the module builds on older toolchains.
 go 1.25.0
 
 require (

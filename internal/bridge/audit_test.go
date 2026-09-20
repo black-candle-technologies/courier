@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -140,5 +141,47 @@ func TestAuditListFilter(t *testing.T) {
 	// Newest first.
 	if rows[0].ID < rows[1].ID {
 		t.Fatal("not newest-first")
+	}
+}
+
+// TestAuditConcurrentAppends (F2): concurrent appends must not fork
+// the hash chain. Without serialization, two ingests can read the same
+// chain head and insert rows with the same prev_hash.
+func TestAuditConcurrentAppends(t *testing.T) {
+	s := testStore(t)
+	const goroutines = 16
+	const perG = 25
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines*perG)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perG; i++ {
+				_, err := s.AppendAudit(&AuditEntry{
+					Ts: int64(g*perG + i), TokenID: "t", TokenLabel: "l",
+					Recipient: testAddr(1), BodySHA256: "s", BodySize: 1,
+					Outcome: OutcomeSent,
+				})
+				if err != nil {
+					errs <- err
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	ok, checked, _, err := s.VerifyAudit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("audit chain forked under concurrent appends")
+	}
+	if checked != goroutines*perG {
+		t.Fatalf("checked = %d, want %d", checked, goroutines*perG)
 	}
 }

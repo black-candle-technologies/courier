@@ -34,13 +34,19 @@ operator's explicit approval.
   tools: `send_to_agent`, `bridge_status`, `list_bridge_recipients`.
   One server instance = one ingest token = one bridge user. The MCP
   server is **not** a trust boundary: the gateway re-validates
-  everything.
+  everything. The MCP server URL itself confers send rights (the bearer
+  token lives in the server's environment, one instance per user) —
+  treat the URL as a secret.
 - **`courier-bridge-gateway`** — localhost-only service on the VPS
   (`127.0.0.1:8473`). Owns the bridge identity, enforces tokens /
   allowlists / rate limits / the 64 KiB body cap, wraps the attribution
   banner, sends via the standard Courier client path, and appends to
   the hash-chained audit log. From the relay's perspective it is an
-  ordinary client: **no relay changes, no protocol wire changes.**
+  ordinary client: **no relay changes, no protocol wire changes.** The
+  `--allow-remote` escape hatch permits non-loopback binding, but the
+  ingest API is cleartext HTTP — bearer tokens would travel in the
+  clear. Only use `--allow-remote` behind a TLS-terminating reverse
+  proxy you trust, on a network you trust.
 
 ## Attribution
 
@@ -72,7 +78,15 @@ recipients can pin the bridge address locally with
 - Default 1-year expiry; revocation is immediate; rotation keeps the
   old token valid for a grace period (default 24h).
 - Rate limits: 10 sends/min, 100 sends/hour, burst 5 per token.
-  Exceeding them returns `429` with `Retry-After`.
+  Exceeding them returns `429` with `Retry-After`. The 449 confirmation
+  response does not consume quota — one logical first send costs one
+  quota unit.
+- Token labels ride inside the E2E payload (`BridgeMeta.token_label`)
+  and are visible to recipients — don't put secrets or sensitive
+  operational detail in labels.
+- Labels are not required to be unique. `revoke --name` revokes every
+  token carrying the label; `rotate --name` requires the label to
+  identify exactly one token.
 
 ## Confirmation round-trip
 
@@ -85,13 +99,33 @@ recipient proceed (still rate-limited).
 
 ## Audit log
 
-`bridge.db`, table `bridge_audit`: append-only, hash-chained,
+`bridge.db`, table `audit`: append-only, hash-chained,
 **metadata only** (timestamp, token label, recipient, body SHA-256,
 body size, outcome, envelope id). Message bodies are never logged.
-Rejections are logged too. Verify with
+Rejections are logged too — including 401s, which pass through a
+coarse per-IP pre-auth limiter (60/min; over-limit floods get 429 with
+no audit row and are noted in the server logs). Verify with
 `courier bridge audit --verify`; retention is 1 year, then pruned
-(the verifier reports the prune point). Phase 2 adds the dashboard
-admin view; until then the log is inspected via the CLI on the VPS.
+(the verifier reports the prune point). Threat model: the chain
+detects accidental corruption and unsophisticated tampering, not a
+privileged rewrite of `bridge.db` (there is no external anchor yet —
+a scheduled off-host chain-head anchor is future work). Phase 2 adds
+the dashboard admin view; until then the log is inspected via the CLI
+on the VPS.
+
+## Phase 2 (planned)
+
+- Dashboard admin audit view (the `courier bridge audit` equivalent in
+  the UI).
+- Attribution rendering from the pinned bridge-address list
+  (`courier bridge trust`).
+- **Client-side untrusted-input enforcement:** bridged messages must be
+  treated as untrusted input in the recipient agent's loop as a
+  technical control, not just operator policy. Phase 1 relies on the
+  banner plus the receiving operator's approval rule; phase 2 makes the
+  "never trigger agent actions without approval" guarantee structural.
+- Relay-side advisory bridge flag (coordinated in advance; no protocol
+  break).
 
 ## Runbook (phase 1, CLI on the VPS)
 
