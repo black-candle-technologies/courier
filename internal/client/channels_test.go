@@ -98,7 +98,7 @@ func channelStateFor(t *testing.T, home, id string) *channelState {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ch, ok := cs[id]
+	ch, ok := cs.Channels[id]
 	if !ok {
 		t.Fatalf("no local state for channel %s", id)
 	}
