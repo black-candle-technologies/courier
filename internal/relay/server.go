@@ -5,10 +5,13 @@
 package relay
 
 import (
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/crypto"
@@ -27,10 +30,14 @@ const MaxInboxLimit = 200
 // exceed the client's 8 MiB read limit. 1 MiB leaves ample headroom.
 const MaxInboxPageBytes = 1 << 20
 
-// maxInboxRequestAge bounds the inbox-request timestamp: the relay
+// maxSignedRequestAge bounds signed request timestamps: the relay
 // rejects requests older or newer than 300 seconds (v0.6.11 F10), so a
 // captured signed request cannot be replayed indefinitely.
-const maxInboxRequestAge = 300
+const maxSignedRequestAge = 300
+
+// MaxBlobUploadBytes caps a blob upload body: the largest attachment
+// plus framing overhead, with slack for the HTTP framing.
+const MaxBlobUploadBytes = envelope.MaxBlobBytes + 8192
 
 // Config tunes the relay's metadata-only abuse controls. All filtering
 // uses sender/recipient metadata — the relay never sees plaintext — and
@@ -89,9 +96,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 	mux.HandleFunc("POST /v1/send", s.handleSend)
 	mux.HandleFunc("GET /v1/inbox", s.handleInbox)
+	mux.HandleFunc("POST /v1/blobs", s.handleBlobUpload)
+	mux.HandleFunc("GET /v1/blobs/{blob_id}", s.handleBlobDownload)
 	mux.HandleFunc("POST /v1/keys", s.handleKeyAnnounce)
 	mux.HandleFunc("GET /v1/keys/{address}", s.handleKeyLookup)
 	mux.HandleFunc("POST /v1/report", s.handleReport)
+	// issue #32: group messaging.
+	mux.HandleFunc("POST /v1/groups/control", s.handleGroupControl)
 	return mux
 }
 
@@ -106,14 +117,19 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 }
 
 // sendRequest is the wire format for POST /v1/send. See PROTOCOL.md.
+// Kind/KeyEpoch carry issue #32 group messages: kind is "" (or "dm")
+// for direct messages and "group" for group messages; key_epoch is the
+// sender's group sender-key epoch covered by the group signature.
 type sendRequest struct {
-	To     string `json:"to"`
-	From   string `json:"from"`
-	Eph    string `json:"eph"`
-	Nonce  string `json:"nonce"`
-	Ct     string `json:"ct"`
-	SentAt int64  `json:"sent_at"`
-	Sig    string `json:"sig"`
+	To       string `json:"to"`
+	From     string `json:"from"`
+	Eph      string `json:"eph"`
+	Nonce    string `json:"nonce"`
+	Ct       string `json:"ct"`
+	SentAt   int64  `json:"sent_at"`
+	Sig      string `json:"sig"`
+	Kind     string `json:"kind,omitempty"`
+	KeyEpoch int64  `json:"key_epoch,omitempty"`
 }
 
 // parseAddress strictly validates a v0.2.0+ "ed25519:<base64url>" address.
@@ -139,6 +155,15 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	var req sendRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxCiphertextBytes+8192)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	// issue #32: envelopes addressed to a group ID take the group path.
+	if strings.HasPrefix(req.To, envelope.GroupIDPrefix) {
+		s.handleGroupSend(w, req)
+		return
+	}
+	if req.Kind != "" && req.Kind != "dm" {
+		writeErr(w, http.StatusBadRequest, `"kind" must be "" or "dm" for direct messages`)
 		return
 	}
 	to, err := parseAddress(req.To)
@@ -329,7 +354,7 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, `"envelope_id" must be a positive message id`)
 		return
 	}
-	if now := time.Now().Unix(); req.Ts < now-maxInboxRequestAge || req.Ts > now+maxInboxRequestAge {
+	if now := time.Now().Unix(); req.Ts < now-maxSignedRequestAge || req.Ts > now+maxSignedRequestAge {
 		writeErr(w, http.StatusBadRequest, `"ts" is outside the freshness window`)
 		return
 	}
@@ -367,6 +392,12 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	// issue #32: reads addressed to a group ID take the group path, with
+	// a signed membership authorization instead of an address-key one.
+	if strings.HasPrefix(q.Get("to"), envelope.GroupIDPrefix) {
+		s.handleGroupInbox(w, r)
+		return
+	}
 	to := q.Get("to")
 	toEd, err := parseAddress(to)
 	if err != nil {
@@ -407,7 +438,7 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, `"ts" must be a unix timestamp`)
 		return
 	}
-	if now := time.Now().Unix(); ts < now-maxInboxRequestAge || ts > now+maxInboxRequestAge {
+	if now := time.Now().Unix(); ts < now-maxSignedRequestAge || ts > now+maxSignedRequestAge {
 		writeErr(w, http.StatusBadRequest, `"ts" is outside the freshness window`)
 		return
 	}
@@ -476,4 +507,139 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"messages": out})
+}
+
+// ---- Attachments: encrypted blob store ----
+
+// parseBlobAuth parses and freshness-checks the common signed-request
+// query params used by the blob endpoints (ts, sig), mirroring the
+// inbox-request authorization style.
+func parseBlobAuth(get func(string) string) (ts int64, sig []byte, err error) {
+	t := get("ts")
+	if t == "" {
+		return 0, nil, fmt.Errorf(`"ts" query param is required`)
+	}
+	if _, err := fmt.Sscanf(t, "%d", &ts); err != nil {
+		return 0, nil, fmt.Errorf(`"ts" must be a unix timestamp`)
+	}
+	if now := time.Now().Unix(); ts < now-maxSignedRequestAge || ts > now+maxSignedRequestAge {
+		return 0, nil, fmt.Errorf(`"ts" is outside the freshness window`)
+	}
+	sig, err = base64.RawURLEncoding.DecodeString(get("sig"))
+	if err != nil || len(sig) != 64 {
+		return 0, nil, fmt.Errorf(`"sig" must be a base64url Ed25519 signature`)
+	}
+	return ts, sig, nil
+}
+
+// handleBlobUpload stores one encrypted attachment blob.
+//
+//	POST /v1/blobs?from=<addr>&to=<addr>&blob_id=<b64url32>&size=<bytes>&ts=<unix>&sig=<b64url>
+//
+// The body is the opaque framed ciphertext. Authorization is a
+// sender-signed statement binding the uploader, the intended recipient,
+// the random blob id, the exact byte size, and a timestamp — so blob
+// storage is attributable, and the recipient's signed inbox messages
+// later tell them exactly which blob ids to fetch. The relay enforces
+// the size cap and replays are idempotent: re-uploading the same blob id
+// returns the stored record (duplicate=true) instead of a second row.
+func (s *Server) handleBlobUpload(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	from, err := parseAddress(q.Get("from"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"from": %v`, err))
+		return
+	}
+	to, err := parseAddress(q.Get("to"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"to": %v`, err))
+		return
+	}
+	blobIDRaw, err := base64.RawURLEncoding.DecodeString(q.Get("blob_id"))
+	if err != nil || len(blobIDRaw) != 32 {
+		writeErr(w, http.StatusBadRequest, `"blob_id" must be base64url 32 random bytes`)
+		return
+	}
+	var size int64
+	if _, err := fmt.Sscanf(q.Get("size"), "%d", &size); err != nil || size <= 0 || size > envelope.MaxBlobBytes {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"size" must be a positive integer <= %d`, envelope.MaxBlobBytes))
+		return
+	}
+	ts, sig, err := parseBlobAuth(q.Get)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !crypto.Verify(from[:], envelope.BlobUpload(from[:], to[:], blobIDRaw, size, ts), sig) {
+		writeErr(w, http.StatusUnauthorized, "blob upload signature verification failed")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, MaxBlobUploadBytes+1))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "failed to read blob body")
+		return
+	}
+	if int64(len(body)) != size {
+		writeErr(w, http.StatusBadRequest, "body size does not match the declared size")
+		return
+	}
+	stored, err := s.store.SaveBlob(&store.Blob{
+		BlobID:    q.Get("blob_id"),
+		Recipient: q.Get("to"),
+		Uploader:  q.Get("from"),
+		Size:      size,
+		Data:      body,
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store failed")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"blob_id": q.Get("blob_id"), "duplicate": !stored})
+}
+
+// handleBlobDownload returns one stored blob's ciphertext.
+//
+//	GET /v1/blobs/<blob_id>?ts=<unix>&sig=<b64url>
+//
+// Authorization is a recipient-signed, freshness-checked request over
+// the blob id — mirroring inbox reads — verified against the address
+// the blob was uploaded for. Anyone else, the relay included, gets
+// ciphertext they cannot use; the blob is returned only to its
+// recipient. Unknown blob ids 404 without leaking whether an id was
+// ever valid for a different recipient.
+func (s *Server) handleBlobDownload(w http.ResponseWriter, r *http.Request) {
+	blobID := r.PathValue("blob_id")
+	blobIDRaw, err := base64.RawURLEncoding.DecodeString(blobID)
+	if err != nil || len(blobIDRaw) != 32 {
+		writeErr(w, http.StatusBadRequest, `"blob_id" must be base64url 32 random bytes`)
+		return
+	}
+	blob, err := s.store.GetBlob(blobID)
+	if err == sql.ErrNoRows {
+		writeErr(w, http.StatusNotFound, "unknown blob")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store failed")
+		return
+	}
+	recipient, err := parseAddress(blob.Recipient)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "stored recipient is corrupt")
+		return
+	}
+	q := r.URL.Query()
+	ts, sig, err := parseBlobAuth(q.Get)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if !crypto.Verify(recipient[:], envelope.BlobRequest(recipient[:], blobIDRaw, ts), sig) {
+		writeErr(w, http.StatusUnauthorized, "blob request signature verification failed")
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(blob.Data)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(blob.Data)
 }

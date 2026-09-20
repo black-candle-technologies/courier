@@ -252,6 +252,87 @@ Review them with:
   nothing about the recipient's relationships leaves the machine.
 - **Reporting**: `courier report-spam <message-id>` files a signed spam
   report with the relay (see above).
+## Attachments (E2E encrypted file attachments)
+
+A message may carry files. Each attachment gets a fresh random 32-byte
+data key. The file is split into 256 KiB plaintext chunks; every chunk is
+sealed with NaCl `secretbox` under the data key with a unique random
+nonce, and the framed chunks (`be32 length || nonce || sealed`) are
+concatenated into one opaque blob. The data key is wrapped for the
+recipient with `crypto_box` (fresh ephemeral X25519 key — the same
+primitive as message bodies) and travels in the attachment manifest.
+
+The manifest lives **inside the message ciphertext**, never as
+relay-visible metadata. Messages with attachments use a versioned
+plaintext payload:
+
+```json
+{"v": 1, "body": "<message text>",
+ "attachments": [
+   {"filename": "report.pdf",
+    "mime": "application/pdf",
+    "size": 1048576,
+    "sha256": "<hex SHA256 of the plaintext>",
+    "chunks": 4,
+    "blob_id": "<base64url: 32 random bytes>",
+    "keys": [{"recipient": "ed25519:<base64url>",
+              "eph": "<base64url ephemeral X25519 key>",
+              "nonce": "<base64url 24-byte nonce>",
+              "sealed_key": "<base64url sealed 32-byte data key>"}]}
+ ]}
+```
+
+Messages without attachments keep the legacy raw-text plaintext, so old
+clients render them unchanged. The `keys` array holds one wrapped data
+key per recipient, leaving room for future group messaging without a
+format change. Filenames are bare names (no path separators, ≤ 256
+bytes); the sender's envelope signature covers the ciphertext, binding
+the manifest to the envelope without revealing it.
+
+Limits: 25 MiB plaintext per attachment, 256 KiB chunks.
+
+### Blob store
+
+`POST /v1/blobs?from=<addr>&to=<addr>&blob_id=<base64url32>&size=<bytes>&ts=<unix>&sig=<base64url>`,
+body `application/octet-stream` → `201 {"blob_id": ..., "duplicate": bool}`.
+
+The body is the opaque framed ciphertext. The upload is authorized by
+the *uploader's* signature over `envelope.BlobUpload(from, to, blob_id,
+size, ts)` (domain `courier-blob-upload-v1`): the uploader cannot forge a
+recipient signature for someone else's download grant, so uploads are
+attributed to the sender instead. `ts` must be within 300 seconds of
+relay time; the relay rejects unsigned, forged, stale, oversized
+(> 25 MiB + framing overhead), or size-mismatched uploads. Blob ids are
+client-generated random 256-bit values, so re-uploading the same blob is
+idempotent (`"duplicate": true`).
+
+`GET /v1/blobs/<blob_id>?ts=<unix>&sig=<base64url>` →
+`200 application/octet-stream` (the framed ciphertext).
+
+Downloads are authorized by the *recipient's* signature over
+`envelope.BlobRequest(address, blob_id, ts)` (domain
+`courier-blob-req-v1`), mirroring inbox reads and verified against the
+address the blob was uploaded for — only that address can fetch the
+ciphertext. Unknown blob ids return `404`.
+
+### Retrieval and verification
+
+The recipient unwraps the data key with their X25519 private key (anyone
+else — the relay included — cannot), downloads the blob, then
+re-authenticates every chunk, checks the chunk count and reassembled
+size, and finally the SHA256 against the manifest. Verification fails
+closed: tampered, missing, truncated, or hash-mismatched data is an
+error, never a file.
+
+The relay never sees plaintext, filenames, MIME types, plaintext
+hashes, or data keys — only opaque ciphertext blobs addressed to a
+recipient. Blob retention follows envelope retention: the relay prunes
+blobs older than the retention window alongside envelopes.
+
+CLI: `courier send <address> <message> --attach <file>` (repeatable);
+`courier inbox --attachments-dir <dir>` downloads and verifies each
+attachment into the directory (existing filenames get a numeric suffix;
+manifest filenames cannot traverse directories).
 
 ## Retention
 
@@ -263,6 +344,7 @@ should poll regularly; the relay is a mailbox, not an archive.
 | Property | v1 status |
 |---|---|
 | Message confidentiality (relay, network) | ✅ E2E via crypto_box |
+| Attachment confidentiality (relay, network) | ✅ E2E: per-file data key, secretbox chunks, manifest inside ciphertext; relay sees only opaque blobs |
 | Forward secrecy, sender side | ✅ per-message ephemeral sender keys |
 | Forward secrecy, recipient side | ⚠️ bounded by key rotation: `courier rotate` retires the encryption key (v0.5.0+) |
 | Sender authentication | ✅ Ed25519 signatures, verified by relay and recipient (v0.2.0+) |
@@ -350,3 +432,192 @@ hashed. Sessions: 32-byte random tokens, stored hashed, 30-day expiry.
 Registration is open but signature-bound (no anonymous accounts detached
 from a Courier identity). Not yet implemented: rate limiting on
 registration/login, CSRF tokens (SameSite=Lax only), WebAuthn.
+
+## Group messaging (issue #32)
+
+End-to-end encrypted group messaging with Signal-style sender keys.
+The relay stores opaque group envelopes and enforces membership; it
+never sees plaintext.
+
+### Group identity
+
+A group ID is `group:<base64url>`, carrying 128 bits of randomness
+generated by the creator. It is not derived from any key and is
+unguessable; knowledge of the ID alone grants nothing (reads and writes
+both require signed membership proofs, below).
+
+### Sender keys
+
+Each member generates one symmetric 32-byte sender key per group
+(`crypto.GenerateSenderKey`). A group message body is a JSON object
+`{"t":"m","b":"<text>"}` sealed with NaCl secretbox (XSalsa20-Poly1305)
+under the author's current sender key with a fresh random nonce.
+
+The envelope keeps the standard shape so relay storage and pagination
+are unchanged; `eph` is 32 random bytes (no X25519 exchange happens for
+group messages):
+
+```json
+{
+  "to":        "group:<base64url>",
+  "from":      "ed25519:<base64url>",
+  "eph":       "<base64url: 32 random bytes>",
+  "nonce":     "<base64url: 24-byte nonce>",
+  "ct":        "<base64url: secretbox ciphertext>",
+  "sent_at":   1758316234,
+  "sig":       "<base64url: Ed25519 signature>",
+  "kind":      "group",
+  "key_epoch": 3
+}
+```
+
+`sig` covers `envelope.GroupCanonical`: domain string
+`courier-group-envelope-v1`, SHA256(domain `courier-group-id-v1` ‖ group
+ID), the sender's Ed25519 key, the **sender-key epoch**, eph, nonce,
+sent_at, and ciphertext. Covering the epoch binds each envelope to the
+exact key that must open it, so a captured envelope cannot be replayed
+under a different epoch. The relay verifies this signature and additionally
+requires the sender to be a **current** group member, else `403`.
+
+`key_epoch` starts at 1 per member per group and increments on every
+rotation. The relay stores it alongside the envelope and returns it in
+group inbox responses.
+
+### Key distribution
+
+Sender keys travel pairwise-encrypted inside ordinary direct messages,
+marked with the group-protocol magic `{"cg":1,...}` so the inbox layer
+consumes them silently instead of surfacing them as chat:
+
+- `{"cg":1,"t":"key","g":<group>,"k":<base64url key>,"e":<epoch>}` —
+  (re-)distributes the sender's current key. Accepted only if the epoch
+  is newer than the stored one for that sender.
+- `{"cg":1,"t":"invite","g":<group>,"name":..,"admin":..,"roster":[..],
+  "keys":{<addr>:{k,e},...},"cur":<join cursor>}` — sent by the admin to
+  a newly added member. It carries the roster, every current member's
+  sender key, and the relay's max envelope id as the join cursor, so the
+  new member starts reading after pre-join history. The invitee generates
+  their own sender key (epoch 1) and distributes it to the roster.
+
+Key DMs for unknown groups are ignored (the invite carries current keys,
+so a raced key DM is never needed). Key DMs are idempotent: replays do
+not clobber newer keys.
+
+### Membership controls
+
+`POST /v1/groups/control`, JSON body:
+
+```json
+{
+  "group":  "group:<base64url>",
+  "name":   "<group name, create only>",
+  "action": "create|add|remove|transfer-admin",
+  "target": "ed25519:<base64url> (add/remove/transfer-admin)",
+  "admin":  "ed25519:<base64url> (the signer)",
+  "epoch":  2,
+  "sig":    "<base64url: Ed25519 signature>"
+}
+```
+
+`sig` covers `envelope.GroupControl`: domain
+`courier-group-control-v1` plus group ID, action, target, admin, and
+epoch. The relay verifies the signature and applies the control
+transactionally, enforcing:
+
+- `create` (epoch must be 1): the group must not exist; the signer
+  becomes the initial **admin** and sole member.
+- `add` / `remove` / `transfer-admin`: the group must exist, the signer
+  must be the current admin, and the epoch must be exactly
+  `member_epoch + 1` — strict monotonicity, so replays, forks, and
+  reorderings are rejected. `remove` requires the target to be a member
+  and not the admin; `transfer-admin` requires the target to be a member.
+
+The response is `201 {"ok":true,"epoch":N,"max_id":M}` where `max_id` is
+the group's current max envelope id (the new member's join cursor).
+
+**Admin policy.** The creator is the initial admin. Adminship is singular
+and transfers only via an explicit `transfer-admin` control to a current
+member; the old admin loses control rights immediately. There is no
+voting or multi-admin: one admin keeps the control chain linear and
+auditable. The admin cannot remove themselves (transfer first).
+
+### Removal and rekeying
+
+When a member is removed, every remaining member rotates their sender
+key so the removed member — who holds everyone's old keys — cannot
+decrypt later messages:
+
+- The admin rotates **their own** key as part of `courier group remove`
+  and DMs the new key to the remaining members.
+- Every other remaining member rotates **their own** key when they
+  observe the `remove` control in their group inbox sync, DMing the new
+  key to the remaining roster.
+
+A member who misses a key-distribution DM cannot decrypt messages sealed
+under the new key; those envelopes are skipped without stalling the
+cursor (same rule as undecryptable direct messages).
+
+### Group reads (membership authorization)
+
+`GET /v1/inbox?to=<group-id>&member=<address>&after=<id>&limit=<n>&ts=<unix>&sig=<base64url>`
+→ `200 {"group":<id>,"messages":[...],"controls":[...]}`.
+
+`sig` covers `envelope.GroupInboxRequest`: domain
+`courier-group-inbox-req-v1` plus group ID, member key, after, limit, and
+timestamp (same freshness window as personal reads). The relay verifies
+the signature against the member's address key **and** checks current
+membership: removed members get `403` and can no longer read the group's
+ciphertext or control feed.
+
+The response includes the full membership-control feed in epoch order so
+clients can catch up on roster changes; message entries carry
+`key_epoch` for sender-key selection. Clients verify each control's
+admin signature, require the signer to be the admin they know and the
+epoch to be exactly next, and abort the sync on any gap or mismatch
+rather than applying a forked history.
+
+### Client behavior
+
+- `courier group create --name <name> [addr...]` — create a group (you
+  become admin), optionally adding members.
+- `courier group add <group-id> <addr>` — admin only; sends the invite DM.
+- `courier group remove <group-id> <addr>` — admin only; rotates the
+  admin's sender key.
+- `courier group transfer <group-id> <addr>` — admin only.
+- `courier group send <group-id> <message|->` — seal under my current key.
+- `courier group inbox <group-id>` — sync DMs first (invites/keys), then
+  apply controls and decrypt messages.
+- `courier group list` / `courier group show <group-id>`.
+
+Local state (`~/.courier/groups.json`, 0600): roster, admin, my sender
+key + epoch, members' sender keys + epochs, inbox cursor, control epoch.
+The relay is authoritative for membership; local state is a cache.
+
+### Backward compatibility
+
+- Envelope `kind` is `""` for all pre-group envelopes; the relay rejects
+  unknown kinds on `POST /v1/send` (`400`), and clients skip envelopes
+  whose kind is neither `""` nor `"dm"` in personal inboxes — advancing
+  the cursor past them. v0.6.12 clients therefore never stall on group
+  (or future) envelope kinds.
+- Group protocol DMs are ordinary pairwise-encrypted direct messages;
+  old clients display their JSON as chat text (harmless) while new
+  clients consume them silently.
+- Group reads are a new query shape on the existing `/v1/inbox` route;
+  personal reads are unchanged.
+
+### Security properties and limits
+
+- The relay enforces sender-membership on write and current-membership
+  on read, but membership changes are only as fresh as each client's
+  last group sync: a removed member who cached ciphertext before removal
+  keeps it (like any messaging system), and there is a window between
+  the `remove` control and other members' rekeys during which the
+  removed member could read messages sealed under not-yet-rotated keys.
+- Sender keys provide no forward secrecy within an epoch; rotation
+  happens on removal (and only on removal in this version).
+- Group IDs are unguessable but not secret: anyone who learns one can
+  verify its existence only by being a member (non-members get `403`,
+  which itself reveals existence — same as any membership check).
+- No group metadata privacy beyond ciphertext: the relay sees the
+  roster, admin, and message timing/volume.

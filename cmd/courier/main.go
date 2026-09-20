@@ -5,8 +5,8 @@
 //
 //	courier init [--relay URL] [--force]   create your identity
 //	courier address                      print your address (public key)
-//	courier send <address> <message|->   send a message ("-" reads stdin)
-//	courier inbox [--all] [--limit N] [--follow]
+//	courier send <address> <message|-> [--attach file]...
+//	courier inbox [--all] [--limit N] [--follow] [--attachments-dir dir]
 //	courier stdio                        JSON-lines bridge for agents
 //	courier serve [--listen 127.0.0.1:8471]
 //	courier version
@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,6 +69,8 @@ func main() {
 		err = cmdReportSpam(os.Args[2:])
 	case "request":
 		err = cmdRequest(os.Args[2:])
+	case "group":
+		err = cmdGroup(os.Args[2:])
 	case "rotate":
 		err = cmdRotate(os.Args[2:])
 	case "publish-key":
@@ -98,8 +101,10 @@ func usage() {
   courier init --repin                   re-pin the relay certificate
   courier address                        print your address (public key)
   courier send <address|contact> <msg>    send a message ("-" reads stdin)
+      [--attach <file>]...               attach files (E2E encrypted, 25 MiB max each)
   courier inbox [--all] [--limit N] [--follow [--interval 5s]] [--requests]
-                                         list message requests held for review
+      [--attachments-dir <dir>]          download verified attachments into dir
+                                         --requests lists held message requests instead
   courier request list                   list message requests held for review
   courier request accept <id> [--as <name>]
                                          accept a request (first contact joins contacts)
@@ -114,6 +119,10 @@ func usage() {
   courier contacts list                  list contacts
   courier contacts show <name>           show a contact's address
   courier contacts remove <name>         delete a contact
+  courier group create --name <name> [addr...]
+                                         create an encrypted group (you are admin)
+  courier group send <group-id> <msg>    send a message to the group
+  courier group inbox <group-id>         read new group messages
   courier rotate                         rotate encryption key (durable crypto)
   courier publish-key                    re-announce your encryption key
   courier update                         check for and install updates
@@ -252,12 +261,14 @@ func cmdAddress() error {
 func cmdSend(args []string) error {
 	fs := flag.NewFlagSet("send", flag.ContinueOnError)
 	file := fs.String("file", "", "read message body from file")
+	var attach stringSliceFlag
+	fs.Var(&attach, "attach", "attach a file (repeatable, max 25 MiB each)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	rest := fs.Args()
 	if len(rest) < 1 {
-		return fmt.Errorf("usage: courier send <address|contact> <message|-> [--file path]")
+		return fmt.Errorf("usage: courier send <address|contact> <message|-> [--file path] [--attach file]...")
 	}
 	address := rest[0]
 	var body string
@@ -286,11 +297,24 @@ func cmdSend(args []string) error {
 	if err != nil {
 		return err
 	}
-	id, err := client.New(cfg).Send(address, body)
+	id, err := client.New(cfg).SendWithAttachments(address, body, attach)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("sent (id %d)\n", id)
+	fmt.Printf("sent (id %d)", id)
+	if len(attach) > 0 {
+		fmt.Printf(" with %d attachment(s)", len(attach))
+	}
+	fmt.Println()
+	return nil
+}
+
+// stringSliceFlag is a repeatable string flag (e.g. --attach a --attach b).
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string { return strings.Join(*s, ",") }
+func (s *stringSliceFlag) Set(v string) error {
+	*s = append(*s, v)
 	return nil
 }
 
@@ -301,7 +325,16 @@ func printMessages(msgs []client.Message) {
 		if len(m.Flags) > 0 {
 			flagStr = " [" + strings.Join(m.Flags, ",") + "]"
 		}
-		fmt.Printf("[#%d] from %s at %s%s\n%s\n\n", m.ID, m.From, ts, flagStr, m.Body)
+		fmt.Printf("[#%d] from %s at %s%s\n%s\n", m.ID, m.From, ts, flagStr, m.Body)
+		for _, a := range m.Attachments {
+			mf := a.Manifest
+			if a.KeyError != nil {
+				fmt.Printf("  [attachment] %s (%d bytes): cannot decrypt: %v\n", mf.Filename, mf.Size, a.KeyError)
+				continue
+			}
+			fmt.Printf("  [attachment] %s (%s, %d bytes, sha256:%s)\n", mf.Filename, mf.MIME, mf.Size, mf.SHA256)
+		}
+		fmt.Println()
 	}
 }
 
@@ -316,6 +349,33 @@ func printRequests(reqs []client.Message) {
 	printMessages(reqs)
 }
 
+// saveAttachment writes verified attachment data into dir, never
+// overwriting an existing file (a numeric suffix is added instead). The
+// manifest filename is a validated bare name, so no path traversal is
+// possible; filepath.Base is applied defensively anyway.
+func saveAttachment(dir string, filename string, data []byte) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	name := filepath.Base(filename)
+	path := filepath.Join(dir, name)
+	if _, err := os.Stat(path); err == nil {
+		ext := filepath.Ext(name)
+		base := strings.TrimSuffix(name, ext)
+		for i := 2; ; i++ {
+			p := filepath.Join(dir, fmt.Sprintf("%s-%d%s", base, i, ext))
+			if _, err := os.Stat(p); os.IsNotExist(err) {
+				path = p
+				break
+			}
+		}
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
 func cmdInbox(args []string) error {
 	fs := flag.NewFlagSet("inbox", flag.ContinueOnError)
 	all := fs.Bool("all", false, "show all messages, not just new ones")
@@ -324,6 +384,7 @@ func cmdInbox(args []string) error {
 	interval := fs.Duration("interval", 5*time.Second, "poll interval with --follow")
 	requests := fs.Bool("requests", false, "list message requests held for review, instead of the inbox")
 	quarantine := fs.Bool("quarantine", false, "deprecated alias for --requests")
+	attachDir := fs.String("attachments-dir", "", "download and verify attachments into this directory")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -387,6 +448,23 @@ func cmdInbox(args []string) error {
 		}
 		if len(reqs) > 0 {
 			printRequests(reqs)
+		}
+		if *attachDir != "" {
+			for _, m := range delivered {
+				for _, a := range m.Attachments {
+					data, err := cl.DownloadAttachment(a)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "[#%d] attachment %q: download failed: %v\n", m.ID, a.Manifest.Filename, err)
+						continue
+					}
+					path, err := saveAttachment(*attachDir, a.Manifest.Filename, data)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "[#%d] attachment %q: save failed: %v\n", m.ID, a.Manifest.Filename, err)
+						continue
+					}
+					fmt.Printf("[#%d] attachment saved: %s\n", m.ID, path)
+				}
+			}
 		}
 		if skipped > 0 {
 			fmt.Fprintf(os.Stderr, "(%d message(s) failed signature/decryption and were dropped)\n", skipped)

@@ -35,6 +35,7 @@ import (
 	"filippo.io/edwards25519/field"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/nacl/box"
+	"golang.org/x/crypto/nacl/secretbox"
 )
 
 var b64 = base64.RawURLEncoding
@@ -227,6 +228,50 @@ func Open(priv, ephPub, nonce, ciphertext []byte) ([]byte, error) {
 	copy(e[:], ephPub)
 	copy(n[:], nonce)
 	plain, ok := box.Open(nil, ciphertext, &n, &e, &p)
+	if !ok {
+		return nil, errors.New("decryption failed: wrong key or corrupted message")
+	}
+	return plain, nil
+}
+
+// ---- Group messaging: symmetric sender keys (issue #32) ----
+
+// GenerateSenderKey creates a fresh 32-byte symmetric sender key. Each
+// group member holds one sender key per group; group message bodies are
+// sealed under the author's current sender key with secretbox.
+func GenerateSenderKey() ([32]byte, error) {
+	var k [32]byte
+	if _, err := rand.Read(k[:]); err != nil {
+		return k, fmt.Errorf("sender key: %w", err)
+	}
+	return k, nil
+}
+
+// SealSymmetric encrypts plaintext under a 32-byte symmetric key with NaCl
+// secretbox (XSalsa20-Poly1305), returning a fresh random nonce and the
+// ciphertext.
+func SealSymmetric(key *[32]byte, plaintext []byte) (nonce, ciphertext []byte, err error) {
+	var n [NonceLen]byte
+	if _, err := rand.Read(n[:]); err != nil {
+		return nil, nil, fmt.Errorf("nonce: %w", err)
+	}
+	sealed := secretbox.Seal(nil, plaintext, &n, key)
+	return n[:], sealed, nil
+}
+
+// OpenSymmetric decrypts a secretbox ciphertext under the symmetric key.
+func OpenSymmetric(key, nonce, ciphertext []byte) ([]byte, error) {
+	if len(key) != PubKeyLen {
+		return nil, errors.New("bad sender key length")
+	}
+	if len(nonce) != NonceLen {
+		return nil, errors.New("bad nonce length")
+	}
+	var k [32]byte
+	var n [NonceLen]byte
+	copy(k[:], key)
+	copy(n[:], nonce)
+	plain, ok := secretbox.Open(nil, ciphertext, &n, &k)
 	if !ok {
 		return nil, errors.New("decryption failed: wrong key or corrupted message")
 	}
