@@ -25,7 +25,8 @@ func TestUpdateReloadsFreshState(t *testing.T) {
 	}
 
 	if err := cfgA.Update(func(fresh *Config) error {
-		fresh.AutoUpdate = true
+		t := true
+		fresh.AutoUpdate = &t
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -38,11 +39,11 @@ func TestUpdateReloadsFreshState(t *testing.T) {
 	if reloaded.Cursor != 42 {
 		t.Fatalf("stale Update clobbered cursor: got %d, want 42", reloaded.Cursor)
 	}
-	if !reloaded.AutoUpdate {
+	if !reloaded.AutoUpdateEnabled() {
 		t.Fatal("Update did not apply its own mutation")
 	}
 	// The receiver is refreshed to the saved state.
-	if cfgA.Cursor != 42 || !cfgA.AutoUpdate {
+	if cfgA.Cursor != 42 || !cfgA.AutoUpdateEnabled() {
 		t.Fatalf("receiver not refreshed: %+v", cfgA)
 	}
 }

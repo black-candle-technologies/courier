@@ -30,14 +30,14 @@ import (
 	"github.com/mattn/go-isatty"
 )
 
-const version = "0.6.11"
+const version = "0.6.12"
 
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
 	}
-	// v0.5.0+: opportunistic update check (at most once per 24h). Notices
+	// v0.5.0+: opportunistic update check (at most once per 12h). Notices
 	// go to stderr so stdout stays machine-readable (stdio/serve).
 	if os.Args[1] != "update" && client.ConfigExists() {
 		if cfg, err := client.LoadConfig(); err == nil {
@@ -98,7 +98,7 @@ func usage() {
   courier rotate                         rotate encryption key (durable crypto)
   courier publish-key                    re-announce your encryption key
   courier update                         check for and install updates
-  courier config set auto_update true    auto-install updates when found
+  courier config set auto_update false   opt out of automatic update installs
   courier dashboard setup [--username NAME]
                                          create your web dashboard login
   courier dashboard push [--follow]      forward new messages to the dashboard
@@ -637,7 +637,7 @@ func cmdConfig(args []string) error {
 		return err
 	}
 	if len(args) == 0 {
-		fmt.Printf("auto_update=%v\n", cfg.AutoUpdate)
+		fmt.Printf("auto_update=%v\n", cfg.AutoUpdateEnabled())
 		fmt.Printf("relay=%s\n", cfg.RelayURL)
 		fmt.Printf("address=%s\n", cfg.Address)
 		return nil
@@ -649,7 +649,7 @@ func cmdConfig(args []string) error {
 		}
 		switch args[1] {
 		case "auto_update":
-			fmt.Println(cfg.AutoUpdate)
+			fmt.Println(cfg.AutoUpdateEnabled())
 		case "relay":
 			fmt.Println(cfg.RelayURL)
 		case "address":
@@ -667,13 +667,15 @@ func cmdConfig(args []string) error {
 			if err != nil {
 				return fmt.Errorf("auto_update must be true or false")
 			}
-			cfg.AutoUpdate = v
+			cfg.AutoUpdate = &v
 			if err := cfg.Save(); err != nil {
 				return err
 			}
 			fmt.Printf("auto_update=%v\n", v)
 			if v {
 				fmt.Println("courier will now install new releases automatically when found.")
+			} else {
+				fmt.Println("automatic update installs disabled; run `courier update` manually to stay current.")
 			}
 		case "relay":
 			u := strings.TrimSpace(args[2])
