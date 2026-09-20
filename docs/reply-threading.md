@@ -33,7 +33,7 @@ The DM plaintext gains a v2 versioned payload:
 
 ```json
 {"v": 2, "body": "<message text>",
- "reply_to": 42, "quote": "<parent snippet, ≤500 chars>",
+ "reply_to": 42, "quote": "<parent snippet, ≤500 bytes>",
  "attachments": [ ... ] }
 ```
 
@@ -90,7 +90,7 @@ yes, 3 works
 
 **Reply cache** (`~/.courier/thread_cache.jsonl`, 0600, capped at
 1000 entries): every successfully decrypted+verified DM delivery
-records `{courier_id, from, snippet (≤500 chars), sent_at}`. It is a
+records `{courier_id, from, snippet (≤500 bytes), sent_at}`. It is a
 best-effort local accelerator, written on the inbox path (all
 consumers: inbox poller, dashboard pusher, review). It makes
 "see [#42], reply to it" work for inbound parents without a relay
