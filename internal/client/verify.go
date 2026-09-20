@@ -4,9 +4,9 @@
 // channel, that they agree on each other's identity and current
 // encryption keys. Both sides compute the same number independently:
 //
-//	safety = digits(SHA256("courier-safety-v1" ||
+//	safety = digits(SHA512("courier-safety-v1" ||
 //	    min(addrA,addrB) || max(addrA,addrB) ||
-//	    xA || epochA || xB || epochB))
+//	    xA || epochA || xB || epochB)[0:36])
 //
 // addrA/addrB are the raw 32-byte Ed25519 public keys (sorted); (x,epoch)
 // pairs are each party's current X25519 encryption key and its epoch,
@@ -21,7 +21,7 @@ package client
 
 import (
 	"bytes"
-	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
 	"fmt"
 	"strings"
@@ -93,7 +93,7 @@ func SafetyNumber(ownAddr, contactAddr string, ownPub, contactPub [32]byte, ownE
 		firstPub, secondPub = contactPub, ownPub
 		firstEpoch, secondEpoch = contactEpoch, ownEpoch
 	}
-	h := sha256.New()
+	h := sha512.New()
 	h.Write([]byte(safetyNumberDomain))
 	h.Write(firstEd[:])
 	h.Write(secondEd[:])
@@ -104,7 +104,7 @@ func SafetyNumber(ownAddr, contactAddr string, ownPub, contactPub [32]byte, ownE
 	h.Write(secondPub[:])
 	binary.BigEndian.PutUint64(buf[:], uint64(secondEpoch))
 	h.Write(buf[:])
-	sum := h.Sum(nil)[:30] // 240 bits: 12 groups x 20 bits
+	sum := h.Sum(nil)[:36] // 12 groups x 3 bytes
 	var groups []string
 	for i := 0; i < 12; i++ {
 		v := uint32(sum[3*i])<<16 | uint32(sum[3*i+1])<<8 | uint32(sum[3*i+2])

@@ -11,7 +11,7 @@ counterparty and joins the private channel.
 Both parties must compute the *same* number independently, Signal-style:
 
 ```
-safety = digits(SHA256("courier-safety-v1" ||
+safety = digits(SHA512("courier-safety-v1" ||
     min(addrA, addrB) || max(addrA, addrB) ||
     xA || epochA || xB || epochB))
 ```
