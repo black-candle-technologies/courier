@@ -72,6 +72,10 @@ type Config struct {
 	Cursor           int64             `json:"cursor"`                      // last inbox message id seen
 	RelayFingerprint string            `json:"relay_fingerprint,omitempty"` // hex SHA256 of relay cert
 	Contacts         map[string]string `json:"contacts,omitempty"`          // name -> ed25519:<base64url> address
+	// issue #48 (phase 1): out-of-band contact verifications, keyed by
+	// contact name. A record pins the address + key epoch the safety
+	// number was computed over; if either changes, trust goes stale.
+	ContactVerifications map[string]ContactVerification `json:"contact_verifications,omitempty"`
 	EncKeys          []EncKey          `json:"enc_keys,omitempty"`          // current first; lazily migrated
 	AutoUpdate       *bool             `json:"auto_update,omitempty"`       // nil = unset: auto-install newer releases (v0.6.12+ default); false opts out
 	UpdateCheckedAt  int64             `json:"update_checked_at,omitempty"` // unix seconds of last update check
@@ -438,9 +442,12 @@ func (c *Config) AddContact(name, address string) error {
 	return c.Save()
 }
 
-// RemoveContact deletes a contact. It is not an error if absent.
+// RemoveContact deletes a contact and its verification record (issue
+// #48: a removed contact's trust must not resurrect if re-added). It is
+// not an error if absent.
 func (c *Config) RemoveContact(name string) error {
 	delete(c.Contacts, name)
+	delete(c.ContactVerifications, name)
 	return c.Save()
 }
 
@@ -693,26 +700,38 @@ func (c *Client) PublishKey() error {
 // address. A relay that substitutes keys — or omits the signature — fails
 // closed instead of silently downgrading confidentiality.
 func (c *Client) recipientKey(address string) ([32]byte, error) {
+	k, _, err := c.recipientKeyWithEpoch(address)
+	return k, err
+}
+
+// recipientKeyWithEpoch is recipientKey plus the key-directory epoch of
+// the returned key: the announcement epoch when the contact published a
+// key, or 0 when the key is address-derived because they never published
+// (deterministic, so both sides of a safety-number computation agree).
+// Needed by contact verification (issue #48), which pins the epoch the
+// safety number was computed over.
+func (c *Client) recipientKeyWithEpoch(address string) ([32]byte, int64, error) {
 	var out [32]byte
 	hc, err := c.httpClient()
 	if err != nil {
-		return out, err
+		return out, 0, err
 	}
 	resp, err := hc.Get(c.cfg.RelayURL + "/v1/keys/" + url.PathEscape(address))
 	if err != nil {
-		return out, fmt.Errorf("relay unreachable: %w", err)
+		return out, 0, fmt.Errorf("relay unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 	if resp.StatusCode == http.StatusNotFound {
 		toEd, err := crypto.ParseAddress(address)
 		if err != nil {
-			return out, err
+			return out, 0, err
 		}
-		return crypto.Ed25519PubToX25519(toEd[:])
+		k, err := crypto.Ed25519PubToX25519(toEd[:])
+		return k, 0, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return out, relayErr(data)
+		return out, 0, relayErr(data)
 	}
 	var ann struct {
 		X25519Pub string `json:"x25519_pub"`
@@ -720,9 +739,10 @@ func (c *Client) recipientKey(address string) ([32]byte, error) {
 		Sig       string `json:"sig"`
 	}
 	if err := json.Unmarshal(data, &ann); err != nil {
-		return out, fmt.Errorf("bad relay response: %w", err)
+		return out, 0, fmt.Errorf("bad relay response: %w", err)
 	}
-	return c.verifyKeyAnnouncement(address, ann.X25519Pub, ann.Epoch, ann.Sig)
+	k, err := c.verifyKeyAnnouncement(address, ann.X25519Pub, ann.Epoch, ann.Sig)
+	return k, ann.Epoch, err
 }
 
 // verifyKeyAnnouncement authenticates one key-directory announcement and
@@ -925,6 +945,17 @@ func (c *Client) Send(toOrName, body string) (int64, error) {
 // never sees filenames, MIME types, plaintext hashes, or data keys.
 // Returns the relay message id.
 func (c *Client) SendWithAttachments(toOrName, body string, attachPaths []string) (int64, error) {
+	return c.send(toOrName, body, attachPaths, true)
+}
+
+// sendProtocolDM sends a machine-protocol DM (channel handshake traffic)
+// without recording it in the sent log: protocol DMs are not chat and
+// must not be pushed to the dashboard as sent messages.
+func (c *Client) sendProtocolDM(toOrName, body string) (int64, error) {
+	return c.send(toOrName, body, nil, false)
+}
+
+func (c *Client) send(toOrName, body string, attachPaths []string, logSent bool) (int64, error) {
 	address, err := c.cfg.ResolveRecipient(toOrName)
 	if err != nil {
 		return 0, err
@@ -999,7 +1030,10 @@ func (c *Client) SendWithAttachments(toOrName, body string, attachPaths []string
 	}
 	// Best-effort local record so the dashboard can thread the
 	// conversation. A logging failure must never fail the send itself.
-	_ = appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: body, SentAt: sentAt})
+	// Protocol DMs skip the log: they are machine traffic, not chat.
+	if logSent {
+		_ = appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: body, SentAt: sentAt})
+	}
 	return out.ID, nil
 }
 
@@ -1361,6 +1395,15 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// group layer and never surface as chat messages.
 		if gp, ok := parseGroupDMPayload(plain); ok {
 			c.handleGroupDM(m.From, gp)
+			seen[h] = true
+			newHashes = append(newHashes, h)
+			continue
+		}
+		// issue #48: channel protocol direct messages (join requests
+		// and accepts, channel messages, rekeys, leaves) are consumed
+		// by the channel layer and never surface as chat messages.
+		if cp, ok := parseChannelDMPayload(plain); ok {
+			c.handleChannelDM(m.From, cp)
 			seen[h] = true
 			newHashes = append(newHashes, h)
 			continue
@@ -2066,6 +2109,19 @@ func (c *Client) refreshPeerHandles(hc *http.Client) {
 			handles[peer] = h
 		}
 	}
+	// issue #48: push contact trust states alongside the handle labels.
+	// Only contacts carry verification; verified/stale peers get a
+	// badge in the dashboard, unverified peers get none.
+	verified := map[string]string{}
+	for name := range c.cfg.Contacts {
+		addr, err := c.cfg.LookupContact(name)
+		if err != nil {
+			continue
+		}
+		if st, _ := c.ContactTrust(name); st == TrustVerified || st == TrustStale {
+			verified[addr] = st.String()
+		}
+	}
 	// Mark the refresh even when there is nothing to push, so a peer
 	// set with no listed handles does not retry every minute.
 	_ = c.cfg.Update(func(fresh *Config) error {
@@ -2078,6 +2134,7 @@ func (c *Client) refreshPeerHandles(hc *http.Client) {
 	body, _ := json.Marshal(map[string]any{
 		"messages": []any{},
 		"handles":  handles,
+		"verified": verified,
 	})
 	req, _ := http.NewRequest(http.MethodPost, c.cfg.DashboardURL+"/v1/dashboard/push", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")

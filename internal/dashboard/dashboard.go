@@ -269,6 +269,7 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Messages []pushMessage     `json:"messages"`
 		Handles  map[string]string `json:"handles,omitempty"`
+		Verified map[string]string `json:"verified,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
@@ -296,6 +297,21 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 			handle = h
 		}
 		if err := s.store.SavePeerHandle(user.ID, peer, handle); err != nil {
+			writeErr(w, http.StatusInternalServerError, "store failed")
+			return
+		}
+	}
+	// issue #48: peer verification badges. Same trust model as handles:
+	// the agent reports its out-of-band verification state and the
+	// dashboard only displays it. Unknown peers get no badge.
+	for peer, status := range req.Verified {
+		if _, err := crypto.ParseAddress(peer); err != nil {
+			continue
+		}
+		if status != "verified" && status != "stale" {
+			continue
+		}
+		if err := s.store.SavePeerVerified(user.ID, peer, status); err != nil {
 			writeErr(w, http.StatusInternalServerError, "store failed")
 			return
 		}
@@ -525,13 +541,17 @@ func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
 	}
 	// issue #39: show the peer's listed handle when the agent resolved
 	// one; the dashboard never queries the directory itself.
-	var peerHandle string
+	// issue #48: same for the verification badge.
+	var peerHandle, peerVerified string
 	if handles, err := s.store.PeerHandles(u.ID, 7*24*time.Hour); err == nil {
 		peerHandle = handles[peer]
 	}
+	if verified, err := s.store.PeerVerified(u.ID, 7*24*time.Hour); err == nil {
+		peerVerified = verified[peer]
+	}
 	render(w, threadTmpl, map[string]any{
 		"User": u.Username, "Peer": peer, "PeerHandle": peerHandle,
-		"Messages": views,
+		"PeerVerified": peerVerified, "Messages": views,
 	})
 }
 
@@ -789,6 +809,9 @@ input:focus{border-color:var(--accent);outline:none}
 .thread-main{flex:1;min-width:0}
 .thread-top{display:flex;align-items:baseline;gap:.6rem;justify-content:space-between}
 .thread-top .sender{flex:1;min-width:0}
+/* issue #48: contact-verification badges */
+.vbadge{display:inline-block;margin-left:.35rem;color:#2f9e44;font-weight:700}
+.vbadge.stale{color:#d99413}
 .preview{margin:.25rem 0 0;font-size:.9rem;color:var(--muted);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .count{flex:none;min-width:1.6rem;height:1.6rem;border-radius:999px;background:var(--line);
@@ -900,7 +923,7 @@ const appTmpl = pageHead + `
 {{identicon .Peer}}
 <div class="thread-main">
 <div class="thread-top">
-{{if .Handle}}<span class="sender" title="{{.Peer}}">@{{.Handle}}</span>{{else}}<span class="sender" title="{{.Peer}}">{{senderShort .Peer}}</span>{{end}}
+{{if .Handle}}<span class="sender" title="{{.Peer}}">@{{.Handle}}</span>{{else}}<span class="sender" title="{{.Peer}}">{{senderShort .Peer}}</span>{{end}}{{if eq .Verified "verified"}}<span class="vbadge" title="Identity verified out of band">✓</span>{{else if eq .Verified "stale"}}<span class="vbadge stale" title="Their encryption key changed — re-verify out of band">⚠</span>{{end}}
 <span class="when" data-ts="{{.LastTS}}">{{ago .LastTS}}</span>
 </div>
 <p class="preview">{{.Preview}}</p>
@@ -971,7 +994,7 @@ window.addEventListener('appinstalled',function(){btn.hidden=true;deferred=null;
 const threadTmpl = pageHead + `
 <header class="appbar"><div class="appbar-inner">
 <a class="back" href="/app" aria-label="Back to threads">‹</a>
-<h1 class="thread-title" title="{{.Peer}}">{{if .PeerHandle}}@{{.PeerHandle}}{{else}}{{senderShort .Peer}}{{end}}</h1>
+<h1 class="thread-title" title="{{.Peer}}">{{if .PeerHandle}}@{{.PeerHandle}}{{else}}{{senderShort .Peer}}{{end}}{{if eq .PeerVerified "verified"}}<span class="vbadge" title="Identity verified out of band">✓</span>{{else if eq .PeerVerified "stale"}}<span class="vbadge stale" title="Their encryption key changed — re-verify out of band">⚠</span>{{end}}</h1>
 <span class="user" title="{{.User}}">{{.User}}</span>
 </div></header>
 <div class="wrap thread-wrap">
