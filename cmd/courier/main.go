@@ -5,7 +5,7 @@
 //
 //	courier init [--relay URL] [--force]   create your identity
 //	courier address                      print your address (public key)
-//	courier send <address> <message|-> [--attach file]...
+//	courier send <address> <message|-> [--attach file]... [--reply-to id]
 //	courier inbox [--all] [--limit N] [--follow] [--attachments-dir dir]
 //	courier backup create|restore|export-sync|import-sync
 //	courier stdio                        JSON-lines bridge for agents
@@ -119,6 +119,7 @@ func usage() {
                                          send a message ("-" reads stdin); --force confirms
                                          first-contact or contacts-policy handle sends
       [--attach <file>]...               attach files (E2E encrypted, 25 MiB max each)
+      [--reply-to <id>]                  reply to message #id (quotes it, threads the view)
   courier inbox [--all] [--limit N] [--follow [--interval 5s]] [--requests]
       [--attachments-dir <dir>]          download verified attachments into dir
                                          --requests lists held message requests instead
@@ -353,14 +354,28 @@ func cmdSend(args []string) error {
 	// Accept flags before or after the positional address/message, as the
 	// usage string documents: Go's flag package stops parsing at the first
 	// positional argument, so extract them manually first.
-	positional, fileVal, attachVals := splitSendArgs(noForce)
+	positional, fileVal, replyToVal, attachVals := splitSendArgs(noForce)
 	if fileVal != "" {
 		*file = fileVal
 	}
 	attach = append(attach, attachVals...)
+	// issue #51: reply threading. The parent is a relay envelope id as
+	// shown by `courier inbox` ([#id]); the client resolves the parent
+	// snippet best-effort at send time.
+	var replyTo int64
+	if replyToVal != "" {
+		n, err := strconv.ParseInt(replyToVal, 10, 64)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("invalid --reply-to %q: want a positive message id", replyToVal)
+		}
+		replyTo = n
+		if _, ok := client.LookupReplyParent(replyTo); !ok {
+			fmt.Fprintf(os.Stderr, "warning: parent message #%d not found locally; sending reply reference anyway\n", replyTo)
+		}
+	}
 	rest := positional
 	if len(rest) < 1 {
-		return fmt.Errorf("usage: courier send <address|contact> <message|-> [--file path] [--attach file]...")
+		return fmt.Errorf("usage: courier send <address|contact> <message|-> [--file path] [--attach file]... [--reply-to id]")
 	}
 	address := rest[0]
 	var body string
@@ -380,7 +395,7 @@ func cmdSend(args []string) error {
 	case len(rest) >= 2:
 		body = strings.Join(rest[1:], " ")
 	default:
-		return fmt.Errorf("usage: courier send <address> <message|-> [--file path]")
+		return fmt.Errorf("usage: courier send <address> <message|-> [--file path] [--reply-to id]")
 	}
 	if strings.TrimSpace(body) == "" {
 		return fmt.Errorf("refusing to send an empty message")
@@ -411,11 +426,14 @@ func cmdSend(args []string) error {
 		}
 		address = addr
 	}
-	id, err := cl.SendWithAttachments(address, body, attach)
+	id, err := cl.SendReplyWithAttachments(address, body, attach, replyTo)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("sent (id %d)", id)
+	if replyTo > 0 {
+		fmt.Printf(" in reply to #%d", replyTo)
+	}
 	if len(attach) > 0 {
 		fmt.Printf(" with %d attachment(s)", len(attach))
 	}
@@ -433,7 +451,7 @@ func cmdSend(args []string) error {
 // send command's arguments, returning the remaining positional arguments.
 // Go's flag package stops parsing at the first positional, but the usage
 // string documents flags after the message, so this keeps both working.
-func splitSendArgs(args []string) (positional []string, file string, attach []string) {
+func splitSendArgs(args []string) (positional []string, file, replyTo string, attach []string) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -447,11 +465,16 @@ func splitSendArgs(args []string) (positional []string, file string, attach []st
 			i++
 		case strings.HasPrefix(a, "--file="):
 			file = strings.TrimPrefix(a, "--file=")
+		case a == "--reply-to" && i+1 < len(args):
+			replyTo = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--reply-to="):
+			replyTo = strings.TrimPrefix(a, "--reply-to=")
 		default:
 			positional = append(positional, a)
 		}
 	}
-	return positional, file, attach
+	return positional, file, replyTo, attach
 }
 
 // stringSliceFlag is a repeatable string flag (e.g. --attach a --attach b).
@@ -470,7 +493,14 @@ func printMessages(msgs []client.Message) {
 		if len(m.Flags) > 0 {
 			flagStr = " [" + strings.Join(m.Flags, ",") + "]"
 		}
-		fmt.Printf("[#%d] from %s at %s%s\n%s\n", m.ID, m.From, ts, flagStr, m.Body)
+		fmt.Printf("[#%d] from %s at %s%s\n", m.ID, m.From, ts, flagStr)
+		// issue #51: reply threading. The parent snippet is
+		// best-effort (see inbox resolution); a parent known nowhere
+		// renders as a bare reference, never a failure.
+		if m.ReplyTo > 0 {
+			fmt.Printf("↩ in reply to #%d%s\n", m.ReplyTo, formatReplyQuote(m.ReplyQuote))
+		}
+		fmt.Printf("%s\n", m.Body)
 		for _, a := range m.Attachments {
 			mf := a.Manifest
 			if a.KeyError != nil {
@@ -481,6 +511,21 @@ func printMessages(msgs []client.Message) {
 		}
 		fmt.Println()
 	}
+}
+
+// formatReplyQuote renders the parent snippet for a reply line: `:
+// "first 160 chars…"`, or "" when the parent is unknown. The snippet is
+// already single-line (see client.truncateQuote); this only bounds the
+// display width.
+func formatReplyQuote(q string) string {
+	if q == "" {
+		return ""
+	}
+	const maxShow = 160
+	if len(q) > maxShow {
+		q = q[:maxShow] + "…"
+	}
+	return fmt.Sprintf(": %q", q)
 }
 
 // printRequests prints held message requests as a dedicated section,
@@ -646,12 +691,13 @@ func cmdInbox(args []string) error {
 // ---- stdio bridge: JSON lines on stdin/stdout for agent integration ----
 
 type stdioReq struct {
-	ID    int64  `json:"id"`
-	Cmd   string `json:"cmd"`
-	To    string `json:"to,omitempty"`
-	Body  string `json:"body,omitempty"`
-	After int64  `json:"after,omitempty"`
-	Limit int    `json:"limit,omitempty"`
+	ID      int64  `json:"id"`
+	Cmd     string `json:"cmd"`
+	To      string `json:"to,omitempty"`
+	Body    string `json:"body,omitempty"`
+	After   int64  `json:"after,omitempty"`
+	Limit   int    `json:"limit,omitempty"`
+	ReplyTo int64  `json:"reply_to,omitempty"` // issue #51: send as a reply to #id
 }
 
 type stdioResp struct {
@@ -672,6 +718,8 @@ type stdioMessage struct {
 	ReceivedAt int64    `json:"received_at"`
 	Flags      []string `json:"flags,omitempty"`
 	Request    bool     `json:"request,omitempty"`
+	ReplyTo    int64    `json:"reply_to,omitempty"`
+	ReplyQuote string   `json:"reply_quote,omitempty"`
 }
 
 func cmdStdio() error {
@@ -706,7 +754,7 @@ func cmdStdio() error {
 				reply(stdioResp{ID: req.ID, OK: false, Error: `"to" and "body" required`})
 				continue
 			}
-			id, err := cl.Send(req.To, req.Body)
+			id, err := cl.SendReply(req.To, req.Body, req.ReplyTo)
 			if err != nil {
 				reply(stdioResp{ID: req.ID, OK: false, Error: err.Error()})
 				continue
@@ -728,6 +776,7 @@ func cmdStdio() error {
 					ID: m.ID, From: m.From, Body: m.Body,
 					SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
 					Flags: m.Flags, Request: m.Request,
+					ReplyTo: m.ReplyTo, ReplyQuote: m.ReplyQuote,
 				})
 			}
 			reply(stdioResp{ID: req.ID, OK: true, Messages: sm})
@@ -776,14 +825,15 @@ func cmdServe(args []string) error {
 	})
 	mux.HandleFunc("POST /send", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			To   string `json:"to"`
-			Body string `json:"body"`
+			To      string `json:"to"`
+			Body    string `json:"body"`
+			ReplyTo int64  `json:"reply_to"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 			writeSvcJSON(w, 400, map[string]string{"error": "invalid JSON"})
 			return
 		}
-		id, err := cl.Send(req.To, req.Body)
+		id, err := cl.SendReply(req.To, req.Body, req.ReplyTo)
 		if err != nil {
 			writeSvcJSON(w, 502, map[string]string{"error": err.Error()})
 			return

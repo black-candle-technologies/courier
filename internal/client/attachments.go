@@ -38,18 +38,40 @@ type messagePayload struct {
 	Attachments []envelope.AttachmentManifest `json:"attachments"`
 }
 
-// parseMessagePayload splits a decrypted plaintext into its body text and
-// attachment manifests. Anything that is not a v1 payload carrying
-// attachments is treated as legacy raw text.
-func parseMessagePayload(plain []byte) (string, []envelope.AttachmentManifest) {
-	var p messagePayload
+// parseMessagePayload splits a decrypted plaintext into its body text,
+// attachment manifests, and reply threading metadata (issue #51).
+// Anything that is not a recognized versioned payload is treated as
+// legacy raw text, so old and foreign payloads never fail delivery.
+//
+// v1 keeps its exact legacy semantics: only payloads carrying
+// attachments are structured; a v1 without attachments (or any
+// unrecognized version) renders as raw text. v2 adds optional
+// reply_to/quote alongside optional attachments; reply metadata on a
+// v1 payload is ignored (v1 semantics are frozen).
+func parseMessagePayload(plain []byte) (string, []envelope.AttachmentManifest, replyInfo) {
+	var p replyPayload
 	if err := json.Unmarshal(plain, &p); err != nil {
-		return string(plain), nil
+		return string(plain), nil, replyInfo{}
 	}
-	if p.Version != 1 || len(p.Attachments) == 0 {
-		return string(plain), nil
+	switch p.Version {
+	case 1:
+		if len(p.Attachments) == 0 {
+			return string(plain), nil, replyInfo{}
+		}
+		return p.Body, p.Attachments, replyInfo{}
+	case replyPayloadVersion:
+		rp, ok := parseReplyPayload(plain)
+		if !ok {
+			return string(plain), nil, replyInfo{}
+		}
+		var r replyInfo
+		if rp.ReplyTo > 0 {
+			r = replyInfo{To: rp.ReplyTo, Quote: rp.Quote}
+		}
+		return rp.Body, rp.Attachments, r
+	default:
+		return string(plain), nil, replyInfo{}
 	}
-	return p.Body, p.Attachments
 }
 
 // IncomingAttachment is one attachment manifest from a received message,

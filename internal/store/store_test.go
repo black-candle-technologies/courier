@@ -192,7 +192,7 @@ func TestDashboardThreadsUnreadCounts(t *testing.T) {
 
 	push := func(courierID int64, sender, peer, body string, ts int64) {
 		t.Helper()
-		if _, err := s.SaveDashboardMessage(uid, courierID, sender, self, peer, body, ts, ts); err != nil {
+		if _, err := s.SaveDashboardMessage(uid, courierID, sender, self, peer, body, ts, ts, 0, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -284,7 +284,7 @@ func TestDashboardThreadMessagesNewest500(t *testing.T) {
 	peer := "ed25519:peer"
 	for i := int64(1); i <= 600; i++ {
 		body := "msg-" + strconv.FormatInt(i, 10)
-		if _, err := s.SaveDashboardMessage(uid, i, peer, self, peer, body, i, i); err != nil {
+		if _, err := s.SaveDashboardMessage(uid, i, peer, self, peer, body, i, i, 0, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -404,5 +404,35 @@ func TestPeerVerifiedRoundTrip(t *testing.T) {
 	got, _ = s.PeerVerified(userID, 7*24*3600*1e9)
 	if _, ok := got[peer]; ok {
 		t.Fatal("cleared verification should be gone")
+	}
+}
+
+// TestDashboardMessageReplyThreading verifies the issue #51 reply_to /
+// quote columns round-trip through SaveDashboardMessage and
+// DashboardThreadMessages, and that the migration leaves pre-threading
+// rows with zero values.
+func TestDashboardMessageReplyThreading(t *testing.T) {
+	s := testStore(t)
+	uid := int64(1)
+	self := "ed25519:self"
+	peer := "ed25519:peer"
+	if _, err := s.SaveDashboardMessage(uid, 1, peer, "", peer, "parent", 100, 100, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SaveDashboardMessage(uid, 2, self, peer, peer, "reply", 101, 101, 1, "parent"); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := s.DashboardThreadMessages(uid, peer, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %d, want 2", len(msgs))
+	}
+	if msgs[0].ReplyTo != 0 || msgs[0].Quote != "" {
+		t.Fatalf("plain message got reply metadata: %+v", msgs[0])
+	}
+	if msgs[1].ReplyTo != 1 || msgs[1].Quote != "parent" {
+		t.Fatalf("reply metadata lost: %+v", msgs[1])
 	}
 }
