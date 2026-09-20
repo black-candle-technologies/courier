@@ -60,6 +60,8 @@ func main() {
 		err = cmdServe(os.Args[2:])
 	case "contacts":
 		err = cmdContacts(os.Args[2:])
+	case "group":
+		err = cmdGroup(os.Args[2:])
 	case "rotate":
 		err = cmdRotate(os.Args[2:])
 	case "publish-key":
@@ -95,6 +97,10 @@ func usage() {
   courier contacts list                  list contacts
   courier contacts show <name>           show a contact's address
   courier contacts remove <name>         delete a contact
+  courier group create --name <name> [addr...]
+                                         create an encrypted group (you are admin)
+  courier group send <group-id> <msg>    send a message to the group
+  courier group inbox <group-id>         read new group messages
   courier rotate                         rotate encryption key (durable crypto)
   courier publish-key                    re-announce your encryption key
   courier update                         check for and install updates
