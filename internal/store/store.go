@@ -223,6 +223,54 @@ func migrate(db *sql.DB) error {
 		ON spam_reports(sender, reported_at)`); err != nil {
 		return err
 	}
+	// issue #39: contact-discovery directory. One row per handle
+	// (handle is the primary key: first-come-first-served, §11 Q2).
+	// capabilities are 0x00-joined tokens. tombstone marks an operator
+	// takedown: the row stays so the handle cannot be re-registered and
+	// the removal is visible (transparent takedown, §11 Q3).
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS directory(
+		handle           TEXT PRIMARY KEY,
+		address          TEXT NOT NULL,
+		capabilities     TEXT NOT NULL DEFAULT '',
+		contact_policy   TEXT NOT NULL DEFAULT 'open',
+		visibility       TEXT NOT NULL DEFAULT 'private',
+		epoch            INTEGER NOT NULL,
+		signature        TEXT NOT NULL DEFAULT '',
+		transfer_from    TEXT NOT NULL DEFAULT '',
+		tombstone        INTEGER NOT NULL DEFAULT 0,
+		tombstone_reason TEXT NOT NULL DEFAULT '',
+		registered_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+		updated_at       INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+	)`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_directory_address
+		ON directory(address)`); err != nil {
+		return err
+	}
+	// v0.8.0 (issue #39): transfer proof. When a handle is transferred,
+	// the stored signature is the previous holder's transfer signature
+	// (not a registration signature by the new owner), so the previous
+	// holder's address is kept alongside it. Clients verify the binding
+	// as: register-sig by the profile address, or transfer-sig by
+	// transfer_from over (handle, new address, epoch).
+	if err := addColumn(`ALTER TABLE directory ADD COLUMN transfer_from TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	// issue #39: per-user peer handle labels for the dashboard. The
+	// agent resolves listed handles via the signed directory reverse
+	// endpoint and pushes them with its messages; the dashboard only
+	// displays what the agent tells it — it never queries the directory
+	// itself (it holds no identity key). Stale on purpose: rows older
+	// than the display TTL are ignored so unregistered handles fade.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS dashboard_peer_handles(
+		user_id    INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
+		peer       TEXT NOT NULL,
+		handle     TEXT NOT NULL,
+		updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+		PRIMARY KEY (user_id, peer))`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -450,6 +498,220 @@ func (s *Store) GetKey(address string) (*KeyAnnouncement, error) {
 	return &k, nil
 }
 
+// ---- contact discovery directory (issue #39) ----
+
+// DirectoryEntry is one handle registration: a signed binding of a
+// handle to an Ed25519 identity. The relay stores only the allowed
+// fields (§7 of the design); no PII fields exist in the schema.
+type DirectoryEntry struct {
+	Handle          string
+	Address         string   // ed25519:<base64url> owner identity
+	Capabilities    []string // bounded free-form tokens
+	ContactPolicy   string   // "open" | "contacts"
+	Visibility      string   // "public" | "unlisted" | "private"
+	Epoch           int64    // monotonic; strictly increasing updates only
+	Sig             string   // base64url Ed25519 signature (see TransferFrom)
+	TransferFrom    string   // previous holder, when Sig is a transfer signature; "" otherwise
+	Tombstone       bool     // operator takedown marker (transparent, §11 Q3)
+	TombstoneReason string   // published takedown reason
+	RegisteredAt    int64
+	UpdatedAt       int64
+}
+
+// directoryColumns lists the served columns in scan order.
+const directoryColumns = `handle, address, capabilities, contact_policy,
+	visibility, epoch, signature, transfer_from, tombstone, tombstone_reason,
+	registered_at, updated_at`
+
+func scanDirectoryRows(rows *sql.Rows) ([]DirectoryEntry, error) {
+	var out []DirectoryEntry
+	for rows.Next() {
+		var e DirectoryEntry
+		var caps string
+		var tombstone int
+		if err := rows.Scan(&e.Handle, &e.Address, &caps, &e.ContactPolicy,
+			&e.Visibility, &e.Epoch, &e.Sig, &e.TransferFrom, &tombstone, &e.TombstoneReason,
+			&e.RegisteredAt, &e.UpdatedAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if caps != "" {
+			e.Capabilities = strings.Split(caps, "\x00")
+		}
+		e.Tombstone = tombstone != 0
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	return out, nil
+}
+
+// SaveDirectory inserts or updates a handle registration. Only the
+// current holder's address with a strictly greater epoch is applied
+// (F9 pattern); anything else is a no-op returning applied=false. The
+// caller distinguishes stale-epoch / wrong-owner / tombstoned via
+// GetDirectory before calling.
+func (s *Store) SaveDirectory(d *DirectoryEntry) (applied bool, err error) {
+	caps := strings.Join(d.Capabilities, "\x00")
+	res, err := s.db.Exec(
+		`INSERT INTO directory (handle, address, capabilities, contact_policy,
+			visibility, epoch, signature, transfer_from, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, '', strftime('%s','now'))
+		 ON CONFLICT(handle) DO UPDATE SET
+			capabilities = excluded.capabilities,
+			contact_policy = excluded.contact_policy,
+			visibility = excluded.visibility,
+			epoch = excluded.epoch,
+			signature = excluded.signature,
+			transfer_from = '',
+			tombstone = 0,
+			tombstone_reason = '',
+			updated_at = strftime('%s','now')
+		 WHERE excluded.epoch > directory.epoch
+		   AND directory.address = excluded.address
+		   AND directory.tombstone = 0`,
+		d.Handle, d.Address, caps, d.ContactPolicy, d.Visibility, d.Epoch, d.Sig,
+	)
+	if err != nil {
+		return false, fmt.Errorf("save directory: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("save directory: %w", err)
+	}
+	return n > 0, nil
+}
+
+// GetDirectory returns the entry for a handle (already normalized to
+// lowercase by the caller), or sql.ErrNoRows.
+func (s *Store) GetDirectory(handle string) (*DirectoryEntry, error) {
+	rows, err := s.db.Query(
+		`SELECT `+directoryColumns+` FROM directory WHERE handle = ?`, handle)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := scanDirectoryRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return &entries[0], nil
+}
+
+// DirectoryByAddress returns all non-tombstoned, non-private entries for
+// an address, public first. Used by the signed reverse-lookup endpoint
+// (dashboard handle display).
+func (s *Store) DirectoryByAddress(address string) ([]DirectoryEntry, error) {
+	rows, err := s.db.Query(
+		`SELECT `+directoryColumns+` FROM directory
+		 WHERE address = ? AND tombstone = 0 AND visibility != 'private'
+		 ORDER BY CASE visibility WHEN 'public' THEN 0 ELSE 1 END, handle`,
+		address)
+	if err != nil {
+		return nil, err
+	}
+	return scanDirectoryRows(rows)
+}
+
+// SearchDirectory returns public, non-tombstoned handles with the given
+// lowercase prefix, ordered alphabetically, capped at limit. Prefix-only:
+// no substring, no wildcards, no total counts (anti-enumeration, T2).
+func (s *Store) SearchDirectory(prefix string, limit int) ([]DirectoryEntry, error) {
+	esc := strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(prefix, `\`, `\\`), `%`, `\%`), `_`, `\_`)
+	rows, err := s.db.Query(
+		`SELECT `+directoryColumns+` FROM directory
+		 WHERE handle LIKE ? ESCAPE '\' AND visibility = 'public' AND tombstone = 0
+		 ORDER BY handle LIMIT ?`, esc+`%`, limit)
+	if err != nil {
+		return nil, err
+	}
+	return scanDirectoryRows(rows)
+}
+
+// TransferDirectory moves a handle to a new owner address. The caller
+// verifies the transfer signature (signed by the current holder) before
+// calling; the epoch guard makes replays a no-op. The previous holder's
+// address is recorded as transfer_from so clients can verify the
+// transfer signature against the right key.
+func (s *Store) TransferDirectory(handle, newAddress string, epoch int64, sig string) (bool, error) {
+	res, err := s.db.Exec(
+		`UPDATE directory SET address = ?, epoch = ?, signature = ?,
+			transfer_from = address,
+			tombstone = 0, tombstone_reason = '',
+			updated_at = strftime('%s','now')
+		 WHERE handle = ? AND ? > epoch AND tombstone = 0`,
+		newAddress, epoch, sig, handle, epoch,
+	)
+	if err != nil {
+		return false, fmt.Errorf("transfer directory: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("transfer directory: %w", err)
+	}
+	return n > 0, nil
+}
+
+// DeregisterDirectory deletes a handle registration. Only the owning
+// address may deregister its own handle (holder's choice; distinct from
+// operator takedown, which leaves a visible tombstone).
+func (s *Store) DeregisterDirectory(handle, address string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM directory WHERE handle = ? AND address = ?`,
+		handle, address)
+	if err != nil {
+		return false, fmt.Errorf("deregister directory: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("deregister directory: %w", err)
+	}
+	return n > 0, nil
+}
+
+// TombstoneDirectory applies an operator takedown: the row stays so the
+// handle cannot be re-registered and the removal is visible via lookup
+// (transparent takedown under a published policy, §11 Q3). No silent
+// removals: the reason is stored and served.
+func (s *Store) TombstoneDirectory(handle, reason string) (bool, error) {
+	res, err := s.db.Exec(
+		`UPDATE directory SET tombstone = 1, tombstone_reason = ?,
+			updated_at = strftime('%s','now')
+		 WHERE handle = ? AND tombstone = 0`,
+		reason, handle,
+	)
+	if err != nil {
+		return false, fmt.Errorf("tombstone directory: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("tombstone directory: %w", err)
+	}
+	return n > 0, nil
+}
+
+// UntombstoneDirectory lifts an operator takedown, restoring the entry
+// to service. Used when a takedown is reversed on review.
+func (s *Store) UntombstoneDirectory(handle string) (bool, error) {
+	res, err := s.db.Exec(
+		`UPDATE directory SET tombstone = 0, tombstone_reason = '',
+			updated_at = strftime('%s','now')
+		 WHERE handle = ? AND tombstone = 1`, handle,
+	)
+	if err != nil {
+		return false, fmt.Errorf("untombstone directory: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("untombstone directory: %w", err)
+	}
+	return n > 0, nil
+}
+
 // ---- spam / abuse reports (metadata-only filtering) ----
 
 // EnvelopeByID returns one envelope by its id, or sql.ErrNoRows. Used to
@@ -642,9 +904,11 @@ func (s *Store) SaveDashboardMessage(userID, courierID int64, sender, recipient,
 const peerExpr = `COALESCE(NULLIF(peer,''), sender)`
 
 // DashboardThread is one conversation: all messages exchanged with a
-// single counterparty address.
+// single counterparty address. Handle is the peer's listed directory
+// handle when the agent has resolved one ("" otherwise).
 type DashboardThread struct {
 	Peer     string
+	Handle   string // "@handle" display label, "" when unknown
 	Count    int64
 	LastTS   int64
 	LastBody string
@@ -692,6 +956,11 @@ func (s *Store) DashboardThreads(userID int64, userAddr string, limit int) ([]Da
 	}
 	urows.Close()
 
+	// Peer handle labels, fetched before the next query: the store
+	// holds a single SQLite connection, so a second query cannot run
+	// while rows from the first are still open.
+	handles, _ := s.PeerHandles(userID, peerHandleTTL)
+
 	// Latest message per peer.
 	const tpeer = `COALESCE(NULLIF(t.peer,''), t.sender)`
 	lrows, err := s.db.Query(
@@ -717,9 +986,51 @@ func (s *Store) DashboardThreads(userID int64, userAddr string, limit int) ([]Da
 		}
 		th.LastOut = sender == userAddr
 		th.Unread = unreadByPeer[th.Peer]
+		th.Handle = handles[th.Peer]
 		out = append(out, th)
 	}
 	return out, lrows.Err()
+}
+
+// peerHandleTTL is how long a pushed peer-handle label stays valid for
+// display. Handles are refreshed by the agent's push (24h client cache);
+// entries older than this are ignored so unregistered handles fade
+// rather than lingering forever.
+const peerHandleTTL = 7 * 24 * time.Hour
+
+// SavePeerHandle records the agent-resolved directory handle for a peer
+// (upsert). handle must already be normalized; empty clears the label.
+func (s *Store) SavePeerHandle(userID int64, peer, handle string) error {
+	if handle == "" {
+		_, err := s.db.Exec(`DELETE FROM dashboard_peer_handles WHERE user_id = ? AND peer = ?`,
+			userID, peer)
+		return err
+	}
+	_, err := s.db.Exec(`INSERT INTO dashboard_peer_handles(user_id, peer, handle, updated_at)
+		VALUES(?, ?, ?, strftime('%s','now'))
+		ON CONFLICT(user_id, peer) DO UPDATE SET handle = excluded.handle,
+		updated_at = excluded.updated_at`, userID, peer, handle)
+	return err
+}
+
+// PeerHandles returns fresh (within ttl) peer→handle labels for a user.
+func (s *Store) PeerHandles(userID int64, ttl time.Duration) (map[string]string, error) {
+	out := map[string]string{}
+	cutoff := time.Now().Add(-ttl).Unix()
+	rows, err := s.db.Query(`SELECT peer, handle FROM dashboard_peer_handles
+		WHERE user_id = ? AND updated_at >= ?`, userID, cutoff)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var peer, handle string
+		if err := rows.Scan(&peer, &handle); err != nil {
+			return out, err
+		}
+		out[peer] = handle
+	}
+	return out, rows.Err()
 }
 
 // MarkThreadSeen records that the user has viewed a thread up to lastID.

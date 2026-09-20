@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -40,6 +41,19 @@ func main() {
 	sendRate := flag.Float64("send-rate", 2, "per-sender sustained send rate, sends per second")
 	spamThreshold := flag.Int("spam-threshold", 3, "distinct reporters within the spam window that throttle a sender")
 	spamWindowHours := flag.Float64("spam-window-hours", 168, "sliding window (hours) over which spam reports count; older reports decay")
+	// Contact-discovery directory controls (issue #39).
+	reservedHandles := flag.String("reserved-handles", "", "comma-separated operator-reserved handles (e.g. \"courier,admin,support\"): never registrable")
+	dirWriteBurst := flag.Float64("dir-write-burst", 10, "per-identity directory write burst (register/update/transfer/deregister)")
+	dirLookupBurst := flag.Float64("dir-lookup-burst", 60, "per-identity directory lookup burst")
+	dirSearchBurst := flag.Float64("dir-search-burst", 10, "per-identity directory search burst")
+	// Operator takedown admin mode: applies (or lifts) a transparent
+	// tombstone and exits without serving. Takedowns are public by
+	// construction — a reason is required — and must follow the
+	// published takedown policy (see INSTALL.md). No HTTP admin
+	// endpoint exists, so takedowns cannot be triggered remotely.
+	takedown := flag.String("takedown", "", "tombstone a directory handle for abuse (admin mode: applies and exits)")
+	takedownReason := flag.String("takedown-reason", "", "public reason for the takedown (required with -takedown)")
+	untakedown := flag.String("untakedown", "", "lift a directory handle tombstone (admin mode: applies and exits)")
 	flag.Parse()
 
 	st, err := store.Open(*dbPath)
@@ -47,6 +61,44 @@ func main() {
 		log.Fatalf("db: %v", err)
 	}
 	defer st.Close()
+
+	dirServer := relay.NewWithConfig(st, relay.Config{
+		SendBurst:           *sendBurst,
+		SendRatePerSec:      *sendRate,
+		SpamReportThreshold: *spamThreshold,
+		SpamReportWindow:    time.Duration(*spamWindowHours * float64(time.Hour)),
+		DirWriteBurst:       *dirWriteBurst,
+		DirLookupBurst:      *dirLookupBurst,
+		DirSearchBurst:      *dirSearchBurst,
+		ReservedHandles:     splitCSV(*reservedHandles),
+	})
+
+	// Admin mode: takedown / untakedown, then exit.
+	if *takedown != "" {
+		if *takedownReason == "" {
+			log.Fatal("-takedown-reason is required: takedowns are public")
+		}
+		ok, err := dirServer.TombstoneHandle(*takedown, *takedownReason)
+		if err != nil {
+			log.Fatalf("takedown: %v", err)
+		}
+		if !ok {
+			log.Fatalf("takedown: handle %q is not listed", *takedown)
+		}
+		log.Printf("tombstoned handle %q: %s", *takedown, *takedownReason)
+		return
+	}
+	if *untakedown != "" {
+		ok, err := dirServer.UntombstoneHandle(*untakedown)
+		if err != nil {
+			log.Fatalf("untakedown: %v", err)
+		}
+		if !ok {
+			log.Fatalf("untakedown: handle %q is not tombstoned", *untakedown)
+		}
+		log.Printf("lifted tombstone on handle %q", *untakedown)
+		return
+	}
 
 	// TLS: self-signed cert, generated on first run.
 	dbDir := filepath.Dir(*dbPath)
@@ -70,6 +122,10 @@ func main() {
 			SendRatePerSec:      *sendRate,
 			SpamReportThreshold: *spamThreshold,
 			SpamReportWindow:    time.Duration(*spamWindowHours * float64(time.Hour)),
+			DirWriteBurst:       *dirWriteBurst,
+			DirLookupBurst:      *dirLookupBurst,
+			DirSearchBurst:      *dirSearchBurst,
+			ReservedHandles:     splitCSV(*reservedHandles),
 		}).Routes()),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
@@ -122,4 +178,16 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
 	})
+}
+
+// splitCSV splits a comma-separated flag value, trimming spaces and
+// dropping empties.
+func splitCSV(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

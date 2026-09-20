@@ -267,7 +267,8 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Messages []pushMessage `json:"messages"`
+		Messages []pushMessage     `json:"messages"`
+		Handles  map[string]string `json:"handles,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
@@ -276,6 +277,28 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	if len(req.Messages) > 200 {
 		writeErr(w, http.StatusBadRequest, "at most 200 messages per push")
 		return
+	}
+	// issue #39: peer handle labels. The agent resolves listed handles
+	// via the signed directory reverse endpoint and pushes them; the
+	// dashboard only displays what the agent reports — it never queries
+	// the directory itself (it holds no identity key). Handles are
+	// validated like any other directory input; an empty value clears
+	// a stale label.
+	for peer, handle := range req.Handles {
+		if _, err := crypto.ParseAddress(peer); err != nil {
+			continue
+		}
+		if handle != "" {
+			h, err := envelope.NormalizeHandle(handle)
+			if err != nil {
+				continue
+			}
+			handle = h
+		}
+		if err := s.store.SavePeerHandle(user.ID, peer, handle); err != nil {
+			writeErr(w, http.StatusInternalServerError, "store failed")
+			return
+		}
 	}
 	stored := 0
 	for _, m := range req.Messages {
@@ -500,7 +523,16 @@ func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
 		}
 		views = append(views, msgView{DashboardMessage: m, Out: m.Sender == u.CourierAddress, TS: ts})
 	}
-	render(w, threadTmpl, map[string]any{"User": u.Username, "Peer": peer, "Messages": views})
+	// issue #39: show the peer's listed handle when the agent resolved
+	// one; the dashboard never queries the directory itself.
+	var peerHandle string
+	if handles, err := s.store.PeerHandles(u.ID, 7*24*time.Hour); err == nil {
+		peerHandle = handles[peer]
+	}
+	render(w, threadTmpl, map[string]any{
+		"User": u.Username, "Peer": peer, "PeerHandle": peerHandle,
+		"Messages": views,
+	})
 }
 
 func (s *Server) handleChangePasswordForm(w http.ResponseWriter, r *http.Request) {
@@ -574,6 +606,7 @@ func render(w http.ResponseWriter, tmpl string, data any) {
 		"senderShort":    senderShort,
 		"senderInitials": senderInitials,
 		"senderHue":      senderHue,
+		"identicon":      identicon,
 	}).Parse(tmpl))
 	_ = t.Execute(w, data)
 }
@@ -631,6 +664,35 @@ func senderHue(addr string) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(addr))
 	return int(h.Sum32() % 360)
+}
+
+// identicon renders a deterministic, address-derived identicon as inline
+// SVG: a 5x5 horizontally-symmetric block pattern in a stable hue
+// (issue #39). It is generated at display time from the address alone —
+// nothing is uploaded, nothing is stored, and no PII beyond the address
+// the dashboard already holds is involved. The center cell is always
+// filled so no address renders blank.
+func identicon(addr string) template.HTML {
+	sum := sha256.Sum256([]byte("courier-identicon/v1:" + addr))
+	hue := (int(sum[0])<<8 | int(sum[1])) % 360
+	bits := uint16(sum[2])<<8 | uint16(sum[3]) | 1<<8 // center cell (r=2,c=2) always on
+	var sb strings.Builder
+	sb.WriteString(`<svg class="identicon" viewBox="0 0 5 5" role="img" aria-label="sender identicon">`)
+	fmt.Fprintf(&sb, `<rect width="5" height="5" rx="1" fill="hsl(%d 30%% 90%%)"/>`, hue)
+	fmt.Fprintf(&sb, `<g fill="hsl(%d 55%% 42%%)">`, hue)
+	for r := 0; r < 5; r++ {
+		for c := 0; c < 3; c++ {
+			if bits&(1<<(r*3+c)) == 0 {
+				continue
+			}
+			fmt.Fprintf(&sb, `<rect x="%d" y="%d" width="1" height="1"/>`, c, r)
+			if c < 2 {
+				fmt.Fprintf(&sb, `<rect x="%d" y="%d" width="1" height="1"/>`, 4-c, r)
+			}
+		}
+	}
+	sb.WriteString(`</g></svg>`)
+	return template.HTML(sb.String())
 }
 
 // pageHead holds the shared document head and the responsive stylesheet.
@@ -714,6 +776,7 @@ input:focus{border-color:var(--accent);outline:none}
 /* threads */
 .avatar{flex:none;width:2.3rem;height:2.3rem;border-radius:50%;color:#fff;
   display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.78rem}
+.identicon{flex:none;width:2.3rem;height:2.3rem;border-radius:28%;box-shadow:inset 0 0 0 1px var(--line)}
 .sender{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.84rem;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .when{font-size:.78rem;color:var(--muted)}
@@ -834,10 +897,10 @@ const appTmpl = pageHead + `
 </form>
 {{if .Threads}}
 {{range .Threads}}<a class="thread" href="/app/thread?with={{.Peer}}">
-<span class="avatar" style="background:hsl({{senderHue .Peer}} 55% 38%)" aria-hidden="true">{{senderInitials .Peer}}</span>
+{{identicon .Peer}}
 <div class="thread-main">
 <div class="thread-top">
-<span class="sender" title="{{.Peer}}">{{senderShort .Peer}}</span>
+{{if .Handle}}<span class="sender" title="{{.Peer}}">@{{.Handle}}</span>{{else}}<span class="sender" title="{{.Peer}}">{{senderShort .Peer}}</span>{{end}}
 <span class="when" data-ts="{{.LastTS}}">{{ago .LastTS}}</span>
 </div>
 <p class="preview">{{.Preview}}</p>
@@ -908,7 +971,7 @@ window.addEventListener('appinstalled',function(){btn.hidden=true;deferred=null;
 const threadTmpl = pageHead + `
 <header class="appbar"><div class="appbar-inner">
 <a class="back" href="/app" aria-label="Back to threads">‹</a>
-<h1 class="thread-title" title="{{.Peer}}">{{senderShort .Peer}}</h1>
+<h1 class="thread-title" title="{{.Peer}}">{{if .PeerHandle}}@{{.PeerHandle}}{{else}}{{senderShort .Peer}}{{end}}</h1>
 <span class="user" title="{{.User}}">{{.User}}</span>
 </div></header>
 <div class="wrap thread-wrap">

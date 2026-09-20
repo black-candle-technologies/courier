@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -175,6 +176,198 @@ func SpamReport(reporter []byte, envelopeID, ts int64) []byte {
 	binary.BigEndian.PutUint64(b[:], uint64(envelopeID))
 	out = append(out, b[:]...)
 	binary.BigEndian.PutUint64(b[:], uint64(ts))
+	out = append(out, b[:]...)
+	return out
+}
+
+// ---- Contact discovery (issue #39, v0.8.0) ----
+
+// directoryRegisterDomain separates directory-registration signatures
+// from every other use of the identity key: a signature for one can never
+// validate as another.
+var directoryRegisterDomain = []byte("courier-directory-register-v1\x00")
+
+// Directory visibilities.
+const (
+	DirectoryPublic   = "public"
+	DirectoryUnlisted = "unlisted"
+	DirectoryPrivate  = "private"
+)
+
+// DirectoryContactPolicies mirrors the #34 dm_policy values; the lookup
+// response carries the target's policy so the sender's client can warn
+// before first contact.
+const (
+	DirectoryPolicyOpen     = "open"
+	DirectoryPolicyContacts = "contacts"
+)
+
+// MaxDirectoryCapabilities bounds the capability token list; each token is
+// bounded by MaxDirectoryCapabilityLen. Tokens are matched
+// opportunistically by clients; there is no curated registry.
+const (
+	MaxDirectoryCapabilities  = 8
+	MaxDirectoryCapabilityLen = 32
+	DirectorySearchMinLen     = 2
+	DirectorySearchMaxResults = 20
+)
+
+// handlePattern validates directory handles: same charset as contacts and
+// dashboard usernames, 3-32 chars.
+var handlePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{2,31}$`)
+
+// NormalizeHandle lowercases and validates a directory handle.
+func NormalizeHandle(h string) (string, error) {
+	h = strings.ToLower(strings.TrimSpace(h))
+	if !handlePattern.MatchString(h) {
+		return "", fmt.Errorf("invalid handle %q: 3-32 chars, [a-z0-9_-], must start with [a-z0-9]", h)
+	}
+	return h, nil
+}
+
+// capabilityPattern validates capability tokens: 1-32 chars of
+// [a-z0-9_-], starting with [a-z0-9]. Tokens are matched
+// opportunistically by clients; there is no curated registry.
+var capabilityPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+
+// ValidateCapabilities checks the bounded free-form capability tokens.
+func ValidateCapabilities(caps []string) error {
+	if len(caps) > MaxDirectoryCapabilities {
+		return fmt.Errorf("too many capabilities: max %d", MaxDirectoryCapabilities)
+	}
+	for _, c := range caps {
+		c = strings.ToLower(strings.TrimSpace(c))
+		if !capabilityPattern.MatchString(c) {
+			return fmt.Errorf("invalid capability %q: 1-32 chars, [a-z0-9_-]", c)
+		}
+	}
+	return nil
+}
+
+// DirectoryRegister builds the canonical bytes a handle owner signs to
+// register or update a directory entry. It binds handle, address, epoch,
+// visibility, contact policy, and capabilities, mirroring
+// courier-key-announce-v1 and courier-dashboard-register-v1.
+func DirectoryRegister(handle string, addressEd25519 []byte, epoch int64, visibility, contactPolicy string, capabilities []string) []byte {
+	out := make([]byte, 0, len(directoryRegisterDomain)+len(handle)+32+8+64)
+	out = append(out, directoryRegisterDomain...)
+	out = append(out, handle...)
+	out = append(out, 0x00)
+	out = append(out, addressEd25519...) // 32 bytes Ed25519 (owner identity)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(epoch))
+	out = append(out, b[:]...)
+	out = append(out, 0x00)
+	out = append(out, visibility...)
+	out = append(out, 0x00)
+	out = append(out, contactPolicy...)
+	out = append(out, 0x00)
+	out = append(out, strings.Join(capabilities, "\x00")...)
+	return out
+}
+
+// directoryTransferDomain separates handle-transfer signatures from every
+// other use of the identity key.
+var directoryTransferDomain = []byte("courier-directory-transfer-v1\x00")
+
+// DirectoryTransfer builds the canonical bytes the current handle holder
+// signs to transfer a handle to a new address. Only the current holder
+// can authorize a transfer, so there is no release-and-re-register race a
+// squatter could win.
+func DirectoryTransfer(handle string, newAddressEd25519 []byte, epoch int64) []byte {
+	out := make([]byte, 0, len(directoryTransferDomain)+len(handle)+32+8+2)
+	out = append(out, directoryTransferDomain...)
+	out = append(out, handle...)
+	out = append(out, 0x00)
+	out = append(out, newAddressEd25519...) // 32 bytes Ed25519 (new owner)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(epoch))
+	out = append(out, b[:]...)
+	return out
+}
+
+// directoryQueryDomain separates directory-query signatures (lookup,
+// search, reverse lookup) from every other use of the identity key,
+// mirroring the F10 inbox-request pattern: signed queries make
+// enumeration attributable and rate-limitable per identity.
+var directoryQueryDomain = []byte("courier-directory-query-v1\x00")
+
+// DirectoryQuery builds the canonical bytes a querier signs to authorize
+// a directory lookup/search/reverse query. The signature is verified
+// against the querier's address key, binding every query to an identity.
+func DirectoryQuery(querierEd25519 []byte, op, query string, ts int64) []byte {
+	out := make([]byte, 0, len(directoryQueryDomain)+32+len(op)+len(query)+8+3)
+	out = append(out, directoryQueryDomain...)
+	out = append(out, querierEd25519...) // 32 bytes Ed25519 (querier)
+	out = append(out, 0x00)
+	out = append(out, op...) // "lookup", "search", or "reverse"
+	out = append(out, 0x00)
+	out = append(out, query...)
+	out = append(out, 0x00)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(ts))
+	out = append(out, b[:]...)
+	return out
+}
+
+// introductionRequestDomain separates introduction-request signatures
+// from every other use of the identity key.
+var introductionRequestDomain = []byte("courier-introduction-req-v1\x00")
+
+// IntroductionRequest builds the canonical bytes a requester signs when
+// asking a mutual contact to introduce them to a private handle's owner.
+// It travels inside the normal E2E-encrypted DM to the mutual contact.
+func IntroductionRequest(requester, introducer []byte, handle string, ts int64) []byte {
+	out := make([]byte, 0, len(introductionRequestDomain)+32+32+len(handle)+8+3)
+	out = append(out, introductionRequestDomain...)
+	out = append(out, requester...)  // 32 bytes Ed25519 (requester)
+	out = append(out, introducer...) // 32 bytes Ed25519 (mutual contact)
+	out = append(out, handle...)
+	out = append(out, 0x00)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(ts))
+	out = append(out, b[:]...)
+	return out
+}
+
+// introductionDomain separates introduction signatures from every other
+// use of the identity key.
+var introductionDomain = []byte("courier-introduction-v1\x00")
+
+// Introduction builds the canonical bytes an introducer signs when
+// forwarding an introduction to the target. It binds introducer,
+// subject (requester), and recipient, and travels inside the normal
+// E2E-encrypted DM to the target.
+func Introduction(introducer, subject, recipient []byte, ts int64) []byte {
+	out := make([]byte, 0, len(introductionDomain)+32+32+32+8)
+	out = append(out, introductionDomain...)
+	out = append(out, introducer...) // 32 bytes Ed25519 (mutual contact)
+	out = append(out, subject...)    // 32 bytes Ed25519 (requester)
+	out = append(out, recipient...)  // 32 bytes Ed25519 (target)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(ts))
+	out = append(out, b[:]...)
+	return out
+}
+
+// directoryDeregisterDomain separates handle-deregistration signatures
+// from every other use of the identity key. Deregistration MUST NOT
+// reuse the registration canonical bytes: registration signatures are
+// public (served in lookup responses), so a distinct domain is required
+// to keep a registration from being replayed as a deregistration.
+var directoryDeregisterDomain = []byte("courier-directory-deregister-v1\x00")
+
+// DirectoryDeregister builds the canonical bytes a handle owner signs to
+// delete their own registration. Only the owning address can deregister;
+// operator takedowns use tombstones instead (visible, §11 Q3).
+func DirectoryDeregister(handle string, addressEd25519 []byte, epoch int64) []byte {
+	out := make([]byte, 0, len(directoryDeregisterDomain)+len(handle)+32+8+2)
+	out = append(out, directoryDeregisterDomain...)
+	out = append(out, handle...)
+	out = append(out, 0x00)
+	out = append(out, addressEd25519...) // 32 bytes Ed25519 (owner identity)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(epoch))
 	out = append(out, b[:]...)
 	return out
 }
