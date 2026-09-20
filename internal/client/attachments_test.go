@@ -214,14 +214,17 @@ func TestMessagePayloadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, manifests := parseMessagePayload(mustMarshal(t, messagePayload{Version: 1, Body: "hi", Attachments: []envelope.AttachmentManifest{m}}))
+	body, manifests, rinfo := parseMessagePayload(mustMarshal(t, messagePayload{Version: 1, Body: "hi", Attachments: []envelope.AttachmentManifest{m}}))
 	if body != "hi" || len(manifests) != 1 || manifests[0].Filename != "f.txt" {
 		t.Fatalf("payload not parsed: %q %+v", body, manifests)
 	}
+	if rinfo.To != 0 || rinfo.Quote != "" {
+		t.Fatalf("v1 payload must not carry reply metadata: %+v", rinfo)
+	}
 	// Legacy raw text is untouched, even if it looks vaguely like JSON.
 	for _, raw := range []string{"hello world", `{"v":1}`, `{"v":1,"body":"x"}`, "\x00\x01 binary"} {
-		b, ms := parseMessagePayload([]byte(raw))
-		if b != raw || len(ms) != 0 {
+		b, ms, r := parseMessagePayload([]byte(raw))
+		if b != raw || len(ms) != 0 || r.To != 0 {
 			t.Fatalf("raw text %q misparsed", raw)
 		}
 	}

@@ -144,6 +144,16 @@ func migrate(db *sql.DB) error {
 	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN peer TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
+	// issue #51: reply threading. reply_to is the parent relay envelope
+	// id (0 when not a reply); quote is the agent-provided parent
+	// snippet for display. The dashboard never decrypts: the agent
+	// reports, the dashboard displays (same trust model as handles).
+	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN reply_to INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN quote TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
 	// v0.6.11: key announcements now carry their Ed25519 signature so
 	// senders can authenticate the directory response (F1).
 	if err := addColumn(`ALTER TABLE keys ADD COLUMN signature TEXT NOT NULL DEFAULT ''`); err != nil {
@@ -889,18 +899,23 @@ type DashboardMessage struct {
 	Body       string
 	SentAt     int64
 	ReceivedAt int64
+	// ReplyTo is the parent relay envelope id (issue #51); 0 when the
+	// message is not a reply. Quote is the agent-provided parent
+	// snippet for display ("" when unknown).
+	ReplyTo int64
+	Quote   string
 }
 
 // SaveDashboardMessage stores a pushed message; duplicates (same user +
 // courier id) are ignored. It reports whether the row was actually
 // inserted. peer is the counterparty address: the sender for inbound
 // messages, the recipient for outbound ones.
-func (s *Store) SaveDashboardMessage(userID, courierID int64, sender, recipient, peer, body string, sentAt, receivedAt int64) (bool, error) {
+func (s *Store) SaveDashboardMessage(userID, courierID int64, sender, recipient, peer, body string, sentAt, receivedAt int64, replyTo int64, quote string) (bool, error) {
 	res, err := s.db.Exec(
 		`INSERT OR IGNORE INTO dashboard_messages
-		 (user_id, courier_id, sender, recipient, peer, body, sent_at, received_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		userID, courierID, sender, recipient, peer, body, sentAt, receivedAt)
+		 (user_id, courier_id, sender, recipient, peer, body, sent_at, received_at, reply_to, quote)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		userID, courierID, sender, recipient, peer, body, sentAt, receivedAt, replyTo, quote)
 	if err != nil {
 		return false, err
 	}
@@ -1166,7 +1181,7 @@ func (s *Store) SearchThreadPeers(userID int64, q string) ([]string, error) {
 // shows recent history instead of the oldest 500 messages.
 func (s *Store) DashboardThreadMessages(userID int64, peer string, limit int) ([]DashboardMessage, error) {
 	rows, err := s.db.Query(
-		`SELECT id, courier_id, sender, recipient, body, sent_at, received_at
+		`SELECT id, courier_id, sender, recipient, body, sent_at, received_at, reply_to, quote
 		 FROM dashboard_messages
 		 WHERE user_id = ? AND `+peerExpr+` = ?
 		 ORDER BY COALESCE(sent_at, received_at) DESC, id DESC LIMIT ?`,
@@ -1178,7 +1193,7 @@ func (s *Store) DashboardThreadMessages(userID int64, peer string, limit int) ([
 	var out []DashboardMessage
 	for rows.Next() {
 		var m DashboardMessage
-		if err := rows.Scan(&m.ID, &m.CourierID, &m.Sender, &m.Recipient, &m.Body, &m.SentAt, &m.ReceivedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.CourierID, &m.Sender, &m.Recipient, &m.Body, &m.SentAt, &m.ReceivedAt, &m.ReplyTo, &m.Quote); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

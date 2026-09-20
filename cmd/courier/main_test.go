@@ -11,6 +11,7 @@ func TestSplitSendArgs(t *testing.T) {
 		args     []string
 		wantPos  []string
 		wantFile string
+		wantRply string
 		wantAtt  []string
 	}{
 		{
@@ -42,15 +43,30 @@ func TestSplitSendArgs(t *testing.T) {
 			args:    []string{"ed25519:abc", "hello", "world"},
 			wantPos: []string{"ed25519:abc", "hello", "world"},
 		},
+		{
+			name:     "reply-to anywhere",
+			args:     []string{"--reply-to", "42", "ed25519:abc", "hello"},
+			wantPos:  []string{"ed25519:abc", "hello"},
+			wantRply: "42",
+		},
+		{
+			name:     "reply-to equals form after positionals",
+			args:     []string{"ed25519:abc", "hello", "--reply-to=43"},
+			wantPos:  []string{"ed25519:abc", "hello"},
+			wantRply: "43",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pos, file, att := splitSendArgs(tc.args)
+			pos, file, replyTo, att := splitSendArgs(tc.args)
 			if !reflect.DeepEqual(pos, tc.wantPos) {
 				t.Errorf("positional = %v, want %v", pos, tc.wantPos)
 			}
 			if file != tc.wantFile {
 				t.Errorf("file = %q, want %q", file, tc.wantFile)
+			}
+			if replyTo != tc.wantRply {
+				t.Errorf("replyTo = %q, want %q", replyTo, tc.wantRply)
 			}
 			if !reflect.DeepEqual(att, tc.wantAtt) {
 				t.Errorf("attach = %v, want %v", att, tc.wantAtt)

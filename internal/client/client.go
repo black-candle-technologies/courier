@@ -947,6 +947,30 @@ func (c *Client) Send(toOrName, body string) (int64, error) {
 	return c.SendWithAttachments(toOrName, body, nil)
 }
 
+// SendReply encrypts and signs body for the agent at toOrName as a reply
+// to the parent message replyTo (a relay envelope id, as shown by
+// `courier inbox`). The parent snippet is resolved best-effort from the
+// local sent log and reply cache and embedded in the message so the
+// recipient can render the quote even without a local copy; when the
+// parent is unknown locally the reply still sends, referencing the id.
+// Returns the relay message id.
+func (c *Client) SendReply(toOrName, body string, replyTo int64) (int64, error) {
+	return c.SendReplyWithAttachments(toOrName, body, nil, replyTo)
+}
+
+// SendReplyWithAttachments is SendWithAttachments as a reply to the
+// parent message replyTo. See SendReply.
+func (c *Client) SendReplyWithAttachments(toOrName, body string, attachPaths []string, replyTo int64) (int64, error) {
+	if replyTo < 0 {
+		return 0, fmt.Errorf("invalid reply-to id %d: want a positive message id", replyTo)
+	}
+	var quote string
+	if replyTo > 0 {
+		quote, _ = LookupReplyParent(replyTo)
+	}
+	return c.send(toOrName, body, attachPaths, replyTo, quote, true)
+}
+
 // SendWithAttachments encrypts body for the agent at toOrName and
 // attaches the files at attachPaths. Each file is encrypted under a fresh
 // random data key, chunked, and uploaded to the relay as an opaque blob
@@ -955,17 +979,17 @@ func (c *Client) Send(toOrName, body string) (int64, error) {
 // never sees filenames, MIME types, plaintext hashes, or data keys.
 // Returns the relay message id.
 func (c *Client) SendWithAttachments(toOrName, body string, attachPaths []string) (int64, error) {
-	return c.send(toOrName, body, attachPaths, true)
+	return c.send(toOrName, body, attachPaths, 0, "", true)
 }
 
 // sendProtocolDM sends a machine-protocol DM (channel handshake traffic)
 // without recording it in the sent log: protocol DMs are not chat and
 // must not be pushed to the dashboard as sent messages.
 func (c *Client) sendProtocolDM(toOrName, body string) (int64, error) {
-	return c.send(toOrName, body, nil, false)
+	return c.send(toOrName, body, nil, 0, "", false)
 }
 
-func (c *Client) send(toOrName, body string, attachPaths []string, logSent bool) (int64, error) {
+func (c *Client) send(toOrName, body string, attachPaths []string, replyTo int64, quote string, logSent bool) (int64, error) {
 	address, err := c.cfg.ResolveRecipient(toOrName)
 	if err != nil {
 		return 0, err
@@ -997,23 +1021,20 @@ func (c *Client) send(toOrName, body string, attachPaths []string, logSent bool)
 		manifests = append(manifests, m)
 	}
 	var plain []byte
-	if len(manifests) > 0 {
-		plain, err = json.Marshal(messagePayload{Version: 1, Body: body, Attachments: manifests})
-		if err != nil {
-			return 0, fmt.Errorf("encode payload: %w", err)
-		}
-	} else {
-		plain = []byte(body)
+	plain, err = encodeMessageBody(body, manifests, replyTo, quote)
+	if err != nil {
+		return 0, fmt.Errorf("encode payload: %w", err)
 	}
-	return c.sendSealed(address, plain, body, logSent)
+	return c.sendSealed(address, plain, body, replyTo, quote, logSent)
 }
 
 // sendSealed encrypts plain for address and posts it as a DM. sentLogBody
 // is the human-readable summary recorded in the local sent log (and shown
 // on the dashboard); it may differ from the plaintext, e.g. for protocol
-// payloads like shared-state events (issue #49). logSent=false skips the
+// payloads like shared-state events (issue #49). replyTo/quote thread
+// the sent log for human replies (issue #51). logSent=false skips the
 // sent log for machine protocol DMs (channel handshakes).
-func (c *Client) sendSealed(address string, plain []byte, sentLogBody string, logSent bool) (int64, error) {
+func (c *Client) sendSealed(address string, plain []byte, sentLogBody string, replyTo int64, quote string, logSent bool) (int64, error) {
 	toEd, err := crypto.ParseAddress(address)
 	if err != nil {
 		return 0, err
@@ -1059,7 +1080,7 @@ func (c *Client) sendSealed(address string, plain []byte, sentLogBody string, lo
 	// conversation. A logging failure must never fail the send itself.
 	// Protocol DMs skip the log: they are machine traffic, not chat.
 	if logSent {
-		_ = appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: sentLogBody, SentAt: sentAt})
+		_ = appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: sentLogBody, SentAt: sentAt, ReplyTo: replyTo, Quote: quote})
 	}
 	return out.ID, nil
 }
@@ -1163,6 +1184,12 @@ type SentEntry struct {
 	To        string `json:"to"`
 	Body      string `json:"body"`
 	SentAt    int64  `json:"sent_at"`
+	// ReplyTo/Quote thread the sent log (issue #51): the parent
+	// envelope id this message replied to and the parent snippet
+	// embedded at send time. Replies are human chat, so they are
+	// logged like any send (unlike machine protocol DMs).
+	ReplyTo int64  `json:"reply_to,omitempty"`
+	Quote   string `json:"quote,omitempty"`
 }
 
 // maxSentLog is the cap on the local sent log; older entries are dropped.
@@ -1238,6 +1265,13 @@ type Message struct {
 	SentAt      int64
 	ReceivedAt  int64
 	Attachments []IncomingAttachment // verified manifests (data keys unwrapped when possible)
+	// ReplyTo is the relay envelope id of the parent message this
+	// message replies to (issue #51); 0 when not a reply.
+	ReplyTo int64 `json:"reply_to,omitempty"`
+	// ReplyQuote is the best-effort parent snippet for display:
+	// resolved locally when possible, else the sender's embedded
+	// quote, else "" (rendered as a bare "in reply to #id").
+	ReplyQuote string `json:"reply_quote,omitempty"`
 	// Flags carries the machine-readable reasons a message was
 	// flagged for review. Client-derived: "first_contact" (sender not
 	// in contacts and not self), "quarantined_by_policy" (held by the
@@ -1349,6 +1383,9 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 	// issue #49: shared-state events newly applied during this fetch,
 	// with envelope metadata for the dashboard push announcements.
 	var stateApplied []appliedStateEvent
+	// issue #51: reply-cache entries for this fetch's deliveries,
+	// flushed once after the loop.
+	var cacheEntries []replyCacheEntry
 	seen := c.seenSet(consumer)
 	for _, m := range in.Messages {
 		// Track the highest inspected envelope id regardless of
@@ -1483,12 +1520,13 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 				continue
 			}
 		}
-		// Split a decrypted payload into its body text and attachment
-		// manifests. Manifests are validated and their data keys are
+		// Split a decrypted payload into its body text, attachment
+		// manifests, and reply threading metadata (issue #51).
+		// Manifests are validated and their data keys are
 		// unwrapped with this recipient's keys; a manifest whose key
 		// cannot be opened is kept with KeyError set, so the message is
 		// still delivered and the failure is visible, never silent.
-		body, manifests := parseMessagePayload(plain)
+		body, manifests, rinfo := parseMessagePayload(plain)
 		var atts []IncomingAttachment
 		for _, mf := range manifests {
 			ia := IncomingAttachment{Manifest: mf}
@@ -1528,7 +1566,15 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			ID: m.ID, From: m.From, Body: body,
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
 			Attachments: atts,
+			ReplyTo:     rinfo.To, ReplyQuote: rinfo.Quote,
 		}
+		// issue #51: remember this delivery in the reply cache so a
+		// later reply to it can quote the parent without a relay
+		// round-trip. Best effort; delivery never depends on it.
+		cacheEntries = append(cacheEntries, replyCacheEntry{
+			CourierID: m.ID, From: m.From,
+			Snippet: truncateQuote(body), SentAt: m.SentAt,
+		})
 		// Machine-readable flag reasons. "first_contact" is derived
 		// locally (sender not in contacts and not self); the rest are
 		// relay-attached sender-reputation metadata (advisory). Flags
@@ -1566,6 +1612,54 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		seen[h] = true
 		newHashes = append(newHashes, h)
 	}
+	// issue #51: resolve reply quotes. A locally-known parent snippet
+	// (my sent log, or an earlier delivery on this machine) is this
+	// recipient's own copy of the parent bytes, so it takes precedence
+	// over the sender's embedded quote; the embedded quote covers
+	// parents unknown locally (other devices, aged-out logs). A parent
+	// known nowhere renders as a bare "in reply to #id".
+	needLocal := false
+	for i := range out {
+		if out[i].ReplyTo > 0 && out[i].ReplyQuote == "" {
+			needLocal = true
+			break
+		}
+	}
+	if needLocal {
+		// Load once per fetch, not once per reply. The current batch
+		// comes first: a parent and its reply can arrive together.
+		local := make(map[int64]string)
+		for _, m := range out {
+			if m.Body != "" {
+				local[m.ID] = truncateQuote(m.Body)
+			}
+		}
+		if sent, err := readSentLog(); err == nil {
+			for _, e := range sent {
+				if e.Body != "" {
+					if _, ok := local[e.CourierID]; !ok {
+						local[e.CourierID] = truncateQuote(e.Body)
+					}
+				}
+			}
+		}
+		for _, e := range readReplyCache() {
+			if e.Snippet != "" {
+				if _, ok := local[e.CourierID]; !ok {
+					local[e.CourierID] = e.Snippet
+				}
+			}
+		}
+		for i := range out {
+			if out[i].ReplyTo > 0 && out[i].ReplyQuote == "" {
+				if q, ok := local[out[i].ReplyTo]; ok {
+					out[i].ReplyQuote = q
+				}
+			}
+		}
+	}
+	// Best-effort reply cache write; delivery never depends on it.
+	writeReplyCache(cacheEntries)
 	if markSeen {
 		c.recordSeen(consumer, newHashes)
 	}
@@ -1990,6 +2084,8 @@ func sameURLHost(a, b string) bool {
 
 // pushMsg is one decrypted message forwarded to the dashboard. To is set
 // for outbound messages the agent sent; it is empty for inbox messages.
+// ReplyTo/Quote carry reply threading metadata (issue #51) for the
+// dashboard's quote rendering; the dashboard never decrypts.
 type pushMsg struct {
 	CourierID  int64  `json:"courier_id"`
 	From       string `json:"from"`
@@ -1997,6 +2093,8 @@ type pushMsg struct {
 	Body       string `json:"body"`
 	SentAt     int64  `json:"sent_at"`
 	ReceivedAt int64  `json:"received_at"`
+	ReplyTo    int64  `json:"reply_to,omitempty"`
+	Quote      string `json:"quote,omitempty"`
 }
 
 // Bounds for a single dashboard push request (v0.6.11 F11). The
@@ -2079,6 +2177,7 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 		items = append(items, pushItem{hash: hashes[i], msg: pushMsg{
 			CourierID: m.ID, From: m.From, Body: m.Body,
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
+			ReplyTo: m.ReplyTo, Quote: m.ReplyQuote,
 		}})
 	}
 	// issue #49: newly applied shared-state events are announced to
@@ -2102,6 +2201,7 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 			items = append(items, pushItem{sent: true, msg: pushMsg{
 				CourierID: e.CourierID, From: c.cfg.Address, To: e.To,
 				Body: e.Body, SentAt: e.SentAt, ReceivedAt: e.SentAt,
+				ReplyTo: e.ReplyTo, Quote: e.Quote,
 			}})
 		}
 	}

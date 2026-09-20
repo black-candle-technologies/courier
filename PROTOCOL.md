@@ -364,6 +364,61 @@ CLI: `courier send <address> <message> --attach <file>` (repeatable);
 attachment into the directory (existing filenames get a numeric suffix;
 manifest filenames cannot traverse directories).
 
+## Reply threading (issue #51)
+
+A message can reference a parent message, so conversations quote and
+thread. The parent is referenced by **relay envelope id** — the `#id`
+`courier inbox` prints and the sent log records. Envelope ids are
+relay-wide unique, so the reference is unambiguous in both DM
+directions without any coordination layer.
+
+### Wire format
+
+The reference lives inside the **E2E-encrypted DM plaintext** — no
+relay changes, no new endpoints, no migration. Messages that are
+replies (with or without attachments) use a v2 versioned payload:
+
+```json
+{"v": 2, "body": "<message text>",
+ "reply_to": 42, "quote": "<parent snippet, ≤500 chars>",
+ "attachments": [ ... ]}
+```
+
+`reply_to` / `quote` are optional; `attachments` keeps the v1 manifest
+shape. Plain messages stay raw text; attachment-only messages keep the
+exact v1 wire. The sender's envelope signature covers the ciphertext as
+before, so a third party cannot forge a reply reference onto someone
+else's message.
+
+### Backward compatibility
+
+Pre-v0.11.0 clients treat any non-v1 payload as raw text: a v2 reply
+renders on old clients as the JSON blob — the message is delivered,
+nothing crashes, the body text is preserved. (The established
+"harmless" degradation, as with introduction DMs and shared-state
+events.) v1 semantics are frozen: a v1 payload never carries reply
+metadata.
+
+### Client behavior
+
+- `courier send <address> <message> --reply-to <id>` — sends a reply.
+  The client embeds the parent snippet best-effort (sent log, then the
+  local reply cache `~/.courier/thread_cache.jsonl` populated by inbox
+  deliveries); when the parent is unknown locally it warns and sends
+  anyway — the id is authoritative.
+- `courier inbox` renders `↩ in reply to #42: "snippet"` above the
+  body. Snippet resolution prefers the recipient's own local copy of
+  the parent (sent log / reply cache / same batch) over the sender's
+  embedded quote — a malicious sender could misquote — and degrades to
+  a bare `↩ in reply to #42` when the parent is known nowhere.
+- Replies are human chat: they are recorded in the local sent log like
+  any send (unlike machine protocol DMs). No new protocol DMs are
+  introduced.
+- The dashboard renders a quote block in the thread view. The
+  dashboard never decrypts: the agent pushes `reply_to` + `quote` with
+  each message (same trust model as pushed handle labels), stored in
+  new `dashboard_messages` columns.
+
 ## Retention
 
 The relay deletes envelopes older than 30 days (configurable). Clients

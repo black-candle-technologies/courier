@@ -240,6 +240,10 @@ type pushMessage struct {
 	Body       string `json:"body"`
 	SentAt     int64  `json:"sent_at"`
 	ReceivedAt int64  `json:"received_at"`
+	// issue #51: reply threading, reported by the agent (which
+	// decrypted the envelope); the dashboard never decrypts.
+	ReplyTo int64  `json:"reply_to,omitempty"`
+	Quote   string `json:"quote,omitempty"`
 }
 
 func bearerToken(r *http.Request) string {
@@ -324,6 +328,17 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		if _, err := crypto.ParseAddress(m.From); err != nil {
 			continue
 		}
+		// issue #51: the agent reports reply threading; the dashboard
+		// only displays it. Sanitize defensively: a negative id is not
+		// a reply, and the quote is length-bounded for storage.
+		replyTo := m.ReplyTo
+		if replyTo < 0 {
+			replyTo = 0
+		}
+		quote := m.Quote
+		if len(quote) > 4096 {
+			quote = quote[:4096]
+		}
 		// peer is the counterparty: the sender for inbound messages, the
 		// recipient for outbound ones the agent sent itself.
 		peer := m.From
@@ -338,7 +353,7 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 			recipient = m.To
 			peer = m.To
 		}
-		inserted, err := s.store.SaveDashboardMessage(user.ID, m.CourierID, m.From, recipient, peer, m.Body, m.SentAt, m.ReceivedAt)
+		inserted, err := s.store.SaveDashboardMessage(user.ID, m.CourierID, m.From, recipient, peer, m.Body, m.SentAt, m.ReceivedAt, replyTo, quote)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "store failed")
 			return
@@ -847,6 +862,12 @@ input:focus{border-color:var(--accent);outline:none}
 .row.out .bubble .msg-body{color:var(--accent-ink)}
 .row.out .bubble .when{color:var(--accent-ink);opacity:.75}
 .bubble .when{display:block;margin-top:.3rem;font-size:.75rem;text-align:right}
+/* issue #51: reply quote block inside a bubble */
+.reply{margin:0 0 .35rem;padding:.3rem .6rem;border-left:3px solid var(--line);
+  font-size:.8rem;color:var(--muted)}
+.row.out .reply{border-left-color:var(--accent-ink);color:var(--accent-ink);opacity:.85}
+.reply .reply-quote{display:block;margin-top:.15rem;font-style:italic;
+  white-space:pre-wrap;word-break:break-word}
 /* empty state */
 .empty{text-align:center;padding:3rem 1.5rem;color:var(--muted)}
 .empty-mark{font-size:2.5rem;margin-bottom:.5rem}
@@ -1000,6 +1021,7 @@ const threadTmpl = pageHead + `
 <div class="wrap thread-wrap">
 {{range .Messages}}<div class="row{{if .Out}} out{{end}}">
 <div class="bubble">
+{{if .ReplyTo}}<blockquote class="reply">↩ in reply to #{{.ReplyTo}}{{if .Quote}}<span class="reply-quote">{{.Quote}}</span>{{end}}</blockquote>{{end}}
 <p class="msg-body">{{.Body}}</p>
 <span class="when" data-ts="{{.TS}}">{{ago .TS}}</span>
 </div>
