@@ -112,7 +112,9 @@ before the legitimate agent, then social-engineers its contacts.
 *Accepted limitations:* there is no global arbitration for "who deserves a
 handle" — that would require an operator-identity oracle, which T1 forbids.
 Relay operators may reserve a small set of administrative handles
-(`courier`, `admin`, `support`) via server config. See open question §11.2.
+(`courier`, `admin`, `support`) via server config. Operator removals for
+abuse are transparent: a tombstone is published and the action follows a
+documented policy — no silent removals (decided §11 Q3).
 
 ### T4 — Spam enablement
 
@@ -369,9 +371,13 @@ send path — including the #34 contact-policy UX (§9).
    operator-privacy requirement (T1). Impersonation resistance rests on
    TOFU + full-address display and out-of-band verification, not on
    directory policing.
-3. **Operator takedown:** may the relay operator reserve or remove
+3. **Operator takedown:** ~~may the relay operator reserve or remove
    handles (abuse, impersonation)? If so, under what published policy,
-   and is removal transparent (tombstone) or silent?
+   and is removal transparent (tombstone) or silent?~~ **Decided
+   2026-09-19: transparent takedown under a published policy.** The
+   operator may reserve administrative handles via server config and may
+   remove handles for abuse/impersonation, but every removal publishes a
+   visible tombstone and follows a documented policy — no silent removals.
 4. **Identicons:** allow deterministic, address-derived identicons
    (no upload, no PII surface) for dashboard display — or skip visuals
    entirely in v1?
