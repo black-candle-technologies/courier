@@ -353,10 +353,3 @@ func taskMark(state string) string {
 	}
 	return "📌"
 }
-
-func shortAddr(addr string) string {
-	if len(addr) > 16 {
-		return addr[:16]
-	}
-	return addr
-}
