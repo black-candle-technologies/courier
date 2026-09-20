@@ -394,8 +394,13 @@ send path — including the #34 contact-policy UX (§9).
    introduction-envelope protocol for `private` handles is part of the
    Phase 1 prototype — otherwise `private` (the default visibility)
    would have no in-band introduction path at all.
-7. **Capability vocabulary:** free-form tokens (bounded) or a registry of
-   well-known capabilities? Who curates the registry if the latter?
+7. **Capability vocabulary:** ~~free-form tokens (bounded) or a registry of
+   well-known capabilities? Who curates the registry if the latter?~~
+   **Decided 2026-09-19: free-form tokens (bounded).** No curated
+   registry — capabilities are short tokens (≤ 8 tokens, each ≤ 32 chars
+   per §7), and clients match on them opportunistically. A registry would
+   need a curator, which reintroduces central authority over agent
+   identity.
 
 ---
 
