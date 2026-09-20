@@ -1776,7 +1776,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			ID: m.ID, From: m.From, Body: body,
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
 			Attachments: atts, ExpiresAt: expiresAt,
-			ReplyTo:     rinfo.To, ReplyQuote: rinfo.Quote,
+			ReplyTo: rinfo.To, ReplyQuote: rinfo.Quote,
 		}
 		// issue #51: remember this delivery in the reply cache so a
 		// later reply to it can quote the parent without a relay
