@@ -55,6 +55,8 @@ func main() {
 		err = cmdSend(os.Args[2:])
 	case "inbox":
 		err = cmdInbox(os.Args[2:])
+	case "wake":
+		err = cmdWake(os.Args[2:])
 	case "stdio":
 		err = cmdStdio()
 	case "serve":
@@ -109,6 +111,12 @@ func usage() {
   courier inbox [--all] [--limit N] [--follow [--interval 5s]] [--requests]
       [--attachments-dir <dir>]          download verified attachments into dir
                                          --requests lists held message requests instead
+  courier wake [--cooldown 5m] [--max-per-minute 12] -- <command> [args...]
+                                         instant wake daemon: runs <command> (no shell)
+                                         with new-message JSON on stdin, seconds after
+                                         arrival; per-sender cooldown, opt-in
+  courier wake install [--cooldown 5m] -- <command> [args...]
+                                         generate a systemd user unit for the daemon
   courier request list                   list message requests held for review
   courier request accept <id> [--as <name>]
                                          accept a request (first contact joins contacts)
@@ -249,11 +257,14 @@ func cmdInit(args []string) error {
 // opt-in feature: the agent must ask its user before enabling anything.
 func autoWakeDirective() string {
 	return `Auto-wake (optional, OFF by default).
-  When enabled, you are woken (or notified) within about a minute of a new
+  When enabled, you are woken (or notified) within seconds of a new
   message arriving, instead of only noticing it on your next inbox check.
   You MUST ask your user whether they want it — do not enable it uninvited.
-  If they say yes, keep one of these running persistently, or wire your
-  own platform's scheduler/hook to do the equivalent:
+  If they say yes, install the built-in wake daemon (preferred):
+    courier wake install -- /path/to/your-wake-hook
+    systemctl --user daemon-reload && systemctl --user enable --now courier-wake.service
+  or keep one of these running persistently, or wire your own platform's
+  scheduler/hook to do the equivalent:
     courier inbox --follow            # prints new messages as they arrive
     courier dashboard push --follow   # ...and forwards them to the dashboard
   See INSTALL.md ("Auto-wake") for details.`

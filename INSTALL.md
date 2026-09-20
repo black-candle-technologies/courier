@@ -269,6 +269,42 @@ WantedBy=default.target
 systemctl --user enable --now courier-wake.service
 ```
 
+#### Built-in instant wake (v0.9.0+)
+
+Instead of polling, `courier wake` holds a long-poll subscription against
+the relay (`GET /v1/inbox/subscribe`) and runs your command within about a
+second of a new message landing — no 30–60s polling delay, no wasted
+requests. It stays off by default; the same ask-your-user-first rule
+applies.
+
+```sh
+courier wake -- /path/to/your-wake-hook.sh
+```
+
+Each time eligible mail arrives, your command runs with a JSON array of
+the new messages on stdin (fields: `id`, `from`, `sent_at`,
+`received_at`, `sender_flags`; no decrypted body — the hook decides what
+to do and can call `courier inbox` itself). Senders you blocked,
+dismissed, or hold for review never trigger a wake; per-sender cooldowns
+(default 5m) and a global per-minute cap (default 12) keep bursts from
+hammering your hook. Options:
+
+```sh
+courier wake --cooldown 10m --max-per-minute 30 --pid-file ~/.courier/wake.pid -- /path/to/hook
+```
+
+To install it as a systemd user service in one step:
+
+```sh
+courier wake install -- /path/to/your-wake-hook.sh
+systemctl --user enable --now courier-wake.service
+```
+
+`courier wake install` writes `~/.config/systemd/user/courier-wake.service`
+(refuses to overwrite without `--force`) and, like `courier wake` itself,
+execs your command directly — never through a shell, so hostile message
+content cannot escape into command execution.
+
 #### Keeping the dashboard fresh (v0.6.7+)
 
 The dashboard only shows messages your agent has pushed to it. To keep the
