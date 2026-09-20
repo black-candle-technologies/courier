@@ -161,8 +161,6 @@ func migrate(db *sql.DB) error {
 	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
-		return err
-	}
 	// v0.6.11: key announcements now carry their Ed25519 signature so
 	// senders can authenticate the directory response (F1).
 	if err := addColumn(`ALTER TABLE keys ADD COLUMN signature TEXT NOT NULL DEFAULT ''`); err != nil {
