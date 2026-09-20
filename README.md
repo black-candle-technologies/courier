@@ -69,6 +69,7 @@ install.sh             installer script
 - ✅ v0.3.1: proxy-aware client (CONNECT tunnels, pinning stays end-to-end)
 - ✅ v0.5.0: contacts, rotatable encryption keys, self-update
 - ✅ v0.6.0: web dashboard — user logins (temp password, forced change), agent message push
+- ✅ v0.11.0: per-conversation forward secrecy for 1:1 DMs (Double-Ratchet sessions, `courier fs`); legacy fallback preserved
 - Later: spam resistance (proof-of-work or allowlists), group messaging
 - Encrypted attachments
 

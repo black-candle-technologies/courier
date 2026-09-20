@@ -376,7 +376,8 @@ should poll regularly; the relay is a mailbox, not an archive.
 | Message confidentiality (relay, network) | ✅ E2E via crypto_box |
 | Attachment confidentiality (relay, network) | ✅ E2E: per-file data key, secretbox chunks, manifest inside ciphertext; relay sees only opaque blobs |
 | Forward secrecy, sender side | ✅ per-message ephemeral sender keys |
-| Forward secrecy, recipient side | ⚠️ bounded by key rotation: `courier rotate` retires the encryption key (v0.5.0+) |
+| Forward secrecy, recipient side (1:1 DMs) | ✅ per-conversation Double-Ratchet sessions (v0.11.0+, issue #50); legacy DMs remain bounded by key rotation |
+| Forward secrecy, recipient side (groups/channels/state) | ⚠️ bounded by key rotation (out of scope for v0.11.0) |
 | Sender authentication | ✅ Ed25519 signatures, verified by relay and recipient (v0.2.0+) |
 | Transport metadata privacy (network observers) | ✅ TLS with certificate pinning (v0.3.0+) |
 | Metadata privacy vs the relay itself | ❌ relay sees who exchanges envelopes, when (inherent to store-and-forward) |
@@ -386,6 +387,26 @@ should poll regularly; the relay is a mailbox, not an archive.
 
 Breaking wire changes bump the `/vN/` path. v1 clients ignore unknown JSON
 fields.
+
+## Forward secrecy (v0.11.0+, issue #50)
+
+1:1 DMs between capable clients are protected by per-conversation
+Double-Ratchet-style sessions. The full design (negotiation, handshake,
+ratchet, erasure, migration) is in `docs/forward-secrecy.md`.
+
+- The outer DM envelope is unchanged (crypto_box to the recipient's
+  long-term key + Ed25519 signature); the relay needs no changes.
+- FS frames (`{"cf":3,"t":"fs-init"|"fs-accept"|"fs-msg","v":1,...}`)
+  travel inside the sealed plaintext. Handshake frames are protocol DMs:
+  consumed silently, never in the sent log or dashboard.
+- Negotiation: the `fs` directory capability token, prior handshake
+  memory, `courier fs on`, or an inbound valid init. Unknown/legacy
+  peers keep legacy encryption — never probed.
+- Session state lives in `~/.courier/fs.json` (0600) and is excluded
+  from backups/sync; `backup restore` erases it (restored identity = new
+  device).
+- Old chain/message keys are erased on every ratchet advance; retained
+  relay ciphertext becomes undecryptable (cryptographic erasure).
 
 ## Key rotation (v0.5.0+)
 

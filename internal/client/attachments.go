@@ -65,8 +65,33 @@ const frameOverhead = 4 + 24 + 16
 
 // EncryptAttachment encrypts plaintext for recipient (whose X25519 public
 // key is toX) and returns the manifest plus the opaque blob to upload.
-// filename may be a path; only the base name is kept.
+// filename may be a path; only the base name is kept. The data key is
+// wrapped with crypto_box to the recipient's long-term key (legacy
+// path; FS messages use EncryptAttachmentFS).
 func EncryptAttachment(plaintext []byte, filename string, toX [32]byte, recipient string) (envelope.AttachmentManifest, []byte, error) {
+	return encryptAttachment(plaintext, filename, recipient, func(dataKey [32]byte) (eph, nonce, sealed []byte, err error) {
+		return crypto.Seal(&toX, dataKey[:])
+	})
+}
+
+// EncryptAttachmentFS encrypts plaintext for an FS-session message: the
+// blob layout and manifest shape are identical to EncryptAttachment,
+// but the data key is secretbox-sealed under the FS message-derived
+// wrap key (issue #50 §5.2), so compromising the recipient's long-term
+// key later cannot unwrap attachments from retained FS ciphertext.
+// The unused Eph field carries 32 zero bytes to keep the manifest
+// validation identical.
+func EncryptAttachmentFS(plaintext []byte, filename string, wrapKey [32]byte, recipient string) (envelope.AttachmentManifest, []byte, error) {
+	return encryptAttachment(plaintext, filename, recipient, func(dataKey [32]byte) (eph, nonce, sealed []byte, err error) {
+		var n [24]byte
+		if _, err := rand.Read(n[:]); err != nil {
+			return nil, nil, nil, fmt.Errorf("rand: %w", err)
+		}
+		return make([]byte, 32), n[:], secretbox.Seal(nil, dataKey[:], &n, &wrapKey), nil
+	})
+}
+
+func encryptAttachment(plaintext []byte, filename string, recipient string, wrap func(dataKey [32]byte) (eph, nonce, sealed []byte, err error)) (envelope.AttachmentManifest, []byte, error) {
 	var m envelope.AttachmentManifest
 	if len(plaintext) == 0 {
 		return m, nil, fmt.Errorf("cannot attach an empty file")
@@ -101,7 +126,7 @@ func EncryptAttachment(plaintext []byte, filename string, toX [32]byte, recipien
 		blob = append(blob, nonce[:]...)
 		blob = append(blob, sealed...)
 	}
-	eph, nonce, sealedKey, err := crypto.Seal(&toX, dataKey[:])
+	eph, nonce, sealedKey, err := wrap(dataKey)
 	if err != nil {
 		return m, nil, fmt.Errorf("wrap data key: %w", err)
 	}
@@ -151,6 +176,35 @@ func UnwrapDataKey(wk envelope.WrappedKey, privX [32]byte) ([32]byte, error) {
 		return out, fmt.Errorf("unwrapped data key has wrong length %d", len(raw))
 	}
 	copy(out[:], raw)
+	return out, nil
+}
+
+// UnwrapDataKeyFS opens one FS-wrapped data key with the message-derived
+// wrap key (issue #50 §5.2). The Eph field is ignored on this path.
+func UnwrapDataKeyFS(wk envelope.WrappedKey, wrapKey [32]byte) ([32]byte, error) {
+	var out [32]byte
+	nonce, err := b64.DecodeString(wk.Nonce)
+	if err != nil {
+		return out, fmt.Errorf("bad nonce: %w", err)
+	}
+	sealed, err := b64.DecodeString(wk.SealedKey)
+	if err != nil {
+		return out, fmt.Errorf("bad sealed key: %w", err)
+	}
+	if len(nonce) != 24 {
+		return out, fmt.Errorf("bad nonce length %d", len(nonce))
+	}
+	var n [24]byte
+	copy(n[:], nonce)
+	raw, ok := secretbox.Open(nil, sealed, &n, &wrapKey)
+	if !ok {
+		return out, fmt.Errorf("FS data key unwrap failed")
+	}
+	if len(raw) != 32 {
+		return out, fmt.Errorf("unwrapped data key has wrong length %d", len(raw))
+	}
+	copy(out[:], raw)
+	crypto.Zero(raw)
 	return out, nil
 }
 

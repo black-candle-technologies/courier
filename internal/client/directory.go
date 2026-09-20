@@ -100,7 +100,7 @@ func (c *Client) DirectoryRegister(handle, visibility string, caps []string, pol
 	if err := envelope.ValidateCapabilities(caps); err != nil {
 		return err
 	}
-	caps = normalizeCaps(caps)
+	caps = advertiseFSCap(normalizeCaps(caps))
 	if visibility == "" {
 		visibility = envelope.DirectoryPrivate
 	}
@@ -160,6 +160,21 @@ func normalizeCaps(caps []string) []string {
 	return out
 }
 
+// advertiseFSCap returns caps with the FS capability token added so
+// v0.11.0+ clients announce forward-secrecy support (issue #50). If the
+// user's own tokens already fill the directory's capability budget, the
+// user's tokens win and fs is left out rather than clobbering one.
+func advertiseFSCap(caps []string) []string {
+	with := withFSCap(caps)
+	if len(with) == len(caps) {
+		return caps
+	}
+	if err := envelope.ValidateCapabilities(with); err != nil {
+		return caps
+	}
+	return with
+}
+
 // DirectoryUpdate updates the agent's registered handle entry. Fields
 // left empty keep their current values (fetched via lookup).
 func (c *Client) DirectoryUpdate(visibility string, caps []string, policy string, clearCaps bool) error {
@@ -189,6 +204,11 @@ func (c *Client) DirectoryUpdate(visibility string, caps []string, policy string
 		return err
 	}
 	caps = normalizeCaps(caps)
+	// An explicit --clear-caps is honored literally: we don't re-add fs
+	// when the user just asked for an empty capability set.
+	if !(clearCaps && len(caps) == 0) {
+		caps = advertiseFSCap(caps)
+	}
 	id, err := c.cfg.Identity()
 	if err != nil {
 		return err
