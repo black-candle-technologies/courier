@@ -101,13 +101,16 @@ courier rotate
 
 ### Updates (v0.5.0+)
 
-From v0.5.0 on (now v0.6.0) you never need to reinstall manually. The client checks for
-new releases (at most once a day) and tells you; `courier update` installs
-the newest release after verifying its SHA256 checksum. To install updates
-automatically when found:
+From v0.5.0 on you never need to reinstall manually. Every time you run a
+courier command, the client checks for new releases (at most once every 12
+hours) and installs them automatically after verifying the SHA256 checksum —
+staying current matters because a stale client cannot read from an upgraded
+relay (see the v0.6.11 notes). `courier update` still works for a manual
+check-and-install any time. To opt out of automatic installs (not
+recommended):
 
 ```sh
-courier config set auto_update true
+courier config set auto_update false
 ```
 ```
 

@@ -201,8 +201,9 @@ name or a full address.
 `courier update` checks the GitHub releases API, downloads the
 `courier-<os>-<arch>` asset for the newest release, verifies its SHA256
 against the release's `SHA256SUMS`, and replaces the running binary. Every
-invocation also does a silent check at most once per 24h (stderr notice
-only); `courier config set auto_update true` installs automatically.
+invocation also does a silent check at most once per 12h and installs
+automatically (v0.6.12+ default); `courier config set auto_update false`
+opts out back to a stderr notice.
 
 ## Web dashboard (v0.6.0+)
 

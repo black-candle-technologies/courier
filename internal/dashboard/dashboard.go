@@ -34,7 +34,7 @@ import (
 )
 
 // Version of the dashboard server.
-const Version = "0.6.11"
+const Version = "0.6.12"
 
 //go:embed static/icon-192.png static/icon-512.png static/apple-touch-icon.png
 var staticFiles embed.FS

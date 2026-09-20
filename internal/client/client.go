@@ -72,7 +72,7 @@ type Config struct {
 	RelayFingerprint string            `json:"relay_fingerprint,omitempty"` // hex SHA256 of relay cert
 	Contacts         map[string]string `json:"contacts,omitempty"`          // name -> ed25519:<base64url> address
 	EncKeys          []EncKey          `json:"enc_keys,omitempty"`          // current first; lazily migrated
-	AutoUpdate       bool              `json:"auto_update,omitempty"`       // self-update when a newer release exists
+	AutoUpdate       *bool             `json:"auto_update,omitempty"`       // nil = unset: auto-install newer releases (v0.6.12+ default); false opts out
 	UpdateCheckedAt  int64             `json:"update_checked_at,omitempty"` // unix seconds of last update check
 	// v0.6.0: web dashboard account. Token is the push API token (the
 	// dashboard stores only its hash). DashboardCursor is the last
@@ -1011,14 +1011,24 @@ func (c *Client) Ping() error {
 	return nil
 }
 
-// updateCheckInterval bounds how often the client phones home to the
-// GitHub releases API: at most once per 24 hours.
-const updateCheckInterval = 24 * 3600
+// AutoUpdateEnabled reports whether the client should automatically install
+// a newer release when one is found. Since v0.6.12 auto-install is the
+// default — a stale client cannot read from an upgraded relay, so staying
+// current is a correctness requirement, not a convenience. Setting
+// auto_update=false opts back out to a manual notice.
+func (c *Config) AutoUpdateEnabled() bool {
+	return c.AutoUpdate == nil || *c.AutoUpdate
+}
 
-// MaybeUpdateCheck looks for a newer Courier release (at most once per
-// day). If one exists it either auto-installs it (AutoUpdate set) or
-// prints a notice to stderr. Network failures are silent: an unreachable
-// update server must never break messaging.
+// updateCheckInterval bounds how often the client phones home to the
+// GitHub releases API: at most once per 12 hours.
+const updateCheckInterval = 12 * 3600
+
+// MaybeUpdateCheck looks for a newer Courier release (at most once per 12
+// hours). If one exists it auto-installs it unless the operator opted out
+// (auto_update=false), in which case it prints a notice to stderr instead.
+// Network failures are silent: an unreachable update server must never
+// break messaging.
 func (c *Client) MaybeUpdateCheck(current string) {
 	now := time.Now().Unix()
 	if now-c.cfg.UpdateCheckedAt < updateCheckInterval {
@@ -1033,7 +1043,7 @@ func (c *Client) MaybeUpdateCheck(current string) {
 	if !update.NewerThan(current, rel.Tag) {
 		return
 	}
-	if c.cfg.AutoUpdate {
+	if c.cfg.AutoUpdateEnabled() {
 		if err := rel.Apply(); err != nil {
 			fmt.Fprintf(os.Stderr, "courier auto-update to %s failed: %v\n", rel.Tag, err)
 			return
