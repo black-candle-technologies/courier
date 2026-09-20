@@ -32,7 +32,10 @@ const replyPayloadVersion = 2
 
 // replyPayload is the v2 wire form of a chat message: body text plus
 // optional reply threading metadata, optional attachments, and an
-// optional disappearing-message expiry (issue #53).
+// optional disappearing-message expiry (issue #53). The optional Bridge
+// field (issue #61) carries bridge attribution for messages relayed
+// from ChatGPT web; it is additive and ignored by pre-bridge clients,
+// which render the banner-in-body per existing v2 handling.
 type replyPayload struct {
 	Version     int                           `json:"v"`
 	Body        string                        `json:"body"`
@@ -40,6 +43,7 @@ type replyPayload struct {
 	Quote       string                        `json:"quote,omitempty"`
 	Attachments []envelope.AttachmentManifest `json:"attachments,omitempty"`
 	ExpiresAt   int64                         `json:"expires_at,omitempty"`
+	Bridge      *BridgeMeta                   `json:"bridge,omitempty"`
 }
 
 // replyInfo is the threading metadata parsed out of a received message:

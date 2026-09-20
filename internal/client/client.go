@@ -155,6 +155,11 @@ type Config struct {
 	// observing a message never consumes it: a woken agent still sees
 	// it as new in `courier inbox`.
 	WakeCursor int64 `json:"wake_cursor,omitempty"`
+	// Bridge gateways (issue #61, phase 1): Courier addresses pinned as
+	// trusted ChatGPT-web bridge identities. Recipient clients flag
+	// messages from these addresses as bridged (phase 2 rendering);
+	// phase 1 only stores the pins.
+	BridgeGateways []string `json:"bridge_gateways,omitempty"`
 }
 
 // HandleCacheEntry is a cached address→handle mapping with a local

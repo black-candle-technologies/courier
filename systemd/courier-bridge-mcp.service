@@ -1,0 +1,28 @@
+# ChatGPT web → Courier bridge MCP server (issue #61, phase 1).
+#
+# NOT YET INSTALLED — phase 1 runs as foreground processes for E2E
+# verification. Install only with explicit operator approval (phase 2+).
+# Public access is via Caddy (mcp.courier.blackcandletech.com → 127.0.0.1:8472);
+# this unit binds localhost only.
+#
+# Setup (once, as root on the VPS), after the gateway unit:
+#   # /etc/courier-bridge-mcp.env (0600, root:root): COURIER_BRIDGE_TOKEN=<ingest token>
+#   # (one env file / unit instance per authorized bridge user)
+[Unit]
+Description=Courier ChatGPT-web bridge MCP server (issue #61)
+After=network.target courier-bridge-gateway.service
+
+[Service]
+Type=simple
+User=courier-bridge
+Group=courier-bridge
+WorkingDirectory=/opt/courier-bridge
+EnvironmentFile=/etc/courier-bridge-mcp.env
+ExecStart=/opt/courier-bridge/courier-bridge-mcp --addr 127.0.0.1:8472 --gateway http://127.0.0.1:8473
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
