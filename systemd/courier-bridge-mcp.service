@@ -5,20 +5,31 @@
 # Public access is via Caddy (mcp.courier.blackcandletech.com → 127.0.0.1:8472);
 # this unit binds localhost only.
 #
+# This server runs as its own unprivileged user (courier-bridge-mcp),
+# separate from the gateway's courier-bridge user (issue #86): a
+# compromise of the MCP server must not imply access to the gateway's
+# bridge identity or bridge.db.
+#
 # Setup (once, as root on the VPS), after the gateway unit:
-#   # /etc/courier-bridge-mcp.env (0600, root:root): COURIER_BRIDGE_TOKEN=<ingest token>
-#   # (one env file / unit instance per authorized bridge user)
+#   useradd -r -s /usr/sbin/nologin -d /opt/courier-bridge-mcp courier-bridge-mcp
+#   mkdir -p /opt/courier-bridge-mcp && chown courier-bridge-mcp:courier-bridge-mcp /opt/courier-bridge-mcp
+#   chmod 700 /opt/courier-bridge-mcp
+#   # /etc/courier-bridge-mcp.env (0600, root:root):
+#   #   COURIER_BRIDGE_TOKEN=<ingest token>
+#   #   COURIER_BRIDGE_MCP_AUTH_TOKEN=<256-bit caller secret, e.g. openssl rand -hex 32>
+#   # (one env file / unit instance per authorized bridge user;
+#   #  deliver the caller secret to the ChatGPT-side operator out of band)
 [Unit]
 Description=Courier ChatGPT-web bridge MCP server (issue #61)
 After=network.target courier-bridge-gateway.service
 
 [Service]
 Type=simple
-User=courier-bridge
-Group=courier-bridge
-WorkingDirectory=/opt/courier-bridge
+User=courier-bridge-mcp
+Group=courier-bridge-mcp
+WorkingDirectory=/opt/courier-bridge-mcp
 EnvironmentFile=/etc/courier-bridge-mcp.env
-ExecStart=/opt/courier-bridge/courier-bridge-mcp --addr 127.0.0.1:8472 --gateway http://127.0.0.1:8473
+ExecStart=/opt/courier-bridge-mcp/courier-bridge-mcp --addr 127.0.0.1:8472 --gateway http://127.0.0.1:8473
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

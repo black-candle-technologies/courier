@@ -3,6 +3,9 @@
 # NOT YET INSTALLED — phase 1 runs as foreground processes for E2E
 # verification. Install only with explicit operator approval (phase 2+).
 #
+# The gateway runs as its own unprivileged user (courier-bridge),
+# separate from the MCP server's courier-bridge-mcp user (issue #86).
+#
 # Setup (once, as root on the VPS):
 #   useradd -r -s /usr/sbin/nologin -d /opt/courier-bridge courier-bridge
 #   mkdir -p /opt/courier-bridge && chown courier-bridge:courier-bridge /opt/courier-bridge
