@@ -615,3 +615,52 @@ func TestIngestConcurrentSendsChainVerifies(t *testing.T) {
 		t.Fatalf("reserved=%d sent=%d, want 2 and 2", len(reserved), sent)
 	}
 }
+
+// TestConfirmTokenConcurrentConsumeSingleUse (issue #84): N concurrent
+// ingests presenting the SAME confirm token must collapse to exactly
+// one consuming send. Validation+consumption is a single atomic
+// DELETE ... RETURNING, so exactly one ingest wins the token; the rest
+// get 400 and nothing is sent twice.
+func TestConfirmTokenConcurrentConsumeSingleUse(t *testing.T) {
+	f := newGwFixture(t)
+	// 449 round-trip to mint a confirm token for body "hello".
+	rec := f.ingest(t, f.raw, ingestJSON(f.addr, "hello", ""))
+	if rec.Code != StatusConfirmationRequired {
+		t.Fatalf("first send code = %d, want 449", rec.Code)
+	}
+	var cr map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &cr)
+	ct, _ := cr["confirm_token"].(string)
+	if ct == "" {
+		t.Fatal("no confirm_token in 449")
+	}
+	const n = 16
+	codes := make([]int, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r := f.ingest(t, f.raw, ingestJSON(f.addr, "hello", ct))
+			codes[i] = r.Code
+		}(i)
+	}
+	wg.Wait()
+	var ok200, bad400 int
+	for _, c := range codes {
+		switch c {
+		case http.StatusOK:
+			ok200++
+		case http.StatusBadRequest:
+			bad400++
+		default:
+			t.Fatalf("unexpected code %d", c)
+		}
+	}
+	if ok200 != 1 || bad400 != n-1 {
+		t.Fatalf("ok200=%d bad400=%d, want 1 and %d", ok200, bad400, n-1)
+	}
+	if len(f.stub.calls) != 1 {
+		t.Fatalf("sender called %d times, want exactly 1", len(f.stub.calls))
+	}
+}
