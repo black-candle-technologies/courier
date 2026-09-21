@@ -577,7 +577,7 @@ func TestStatusAndRecipients(t *testing.T) {
 // raw discover call here exercises the same handler configuration.
 func TestDiscoverAdvertisesLatestProtocol(t *testing.T) {
 	rig := newOAuthRig(t, []string{"alice@example.com"})
-	body := `{"jsonrpc":"2.0","id":"discover-1","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`
+	body := `{"jsonrpc":"2.0","id":"discover-1","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
 	req, err := http.NewRequest(http.MethodPost, rig.mcpURL, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
