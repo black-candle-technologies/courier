@@ -464,6 +464,29 @@ operator's approval.
 The relay deletes envelopes older than 30 days (configurable). Clients
 should poll regularly; the relay is a mailbox, not an archive.
 
+### Retention and backup deletion policy (issue #113)
+
+- Relay envelopes and blobs are pruned after `--retain-days` (default
+  30 days): a daily prune plus a prune on startup. Disappearing-message
+  TTL is an *endpoint* guarantee — TTL envelopes are **not** deleted
+  early on the relay and age out under the same retention window.
+- The dashboard keeps pushed messages until they expire (`--ttl`) or
+  are deleted; a sweep on every push deletes expired rows.
+- Operators running a relay or dashboard should apply the same
+  deletion window to any backups or snapshots of relay/dashboard
+  state: backup media should rotate out on a window no longer than
+  the relay retention plus a small documented margin (30–45 days on
+  the reference deployment), so data that aged out of the live store
+  cannot be resurrected from a stale backup. Backup files must be
+  readable only by the service user (mode 0600) and stored separately
+  from the live database.
+- Client-side: expired entries in `~/.courier/sent.jsonl` and expired
+  shared-state events are pruned on read paths; per-conversation
+  forward-secrecy session keys never enter backups (issue #47).
+  A backup holds the identity seed, so anyone holding an old backup
+  can decrypt anything ever sealed to the epoch-0 encryption key —
+  rotate after restoring from an old backup (see "Key rotation").
+
 ## Security properties
 
 | Property | v1 status |
