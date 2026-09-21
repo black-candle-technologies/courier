@@ -195,6 +195,16 @@ sender's client surfaces. Buckets start full, so new senders are never
 penalized for having no history. Tunable via relay flags `--send-burst`
 and `--send-rate`.
 
+`POST /v1/blobs` (attachments) has its own byte-priced token bucket per
+uploader (defaults: 256 MiB burst, 2 MiB/sec sustained — blob bytes are
+far more expensive than message bytes), plus a durable per-uploader
+storage quota (default 1 GiB total stored blob bytes within the
+retention window), enforced atomically at upload time and released when
+retention pruning deletes expired blobs. Both reject with `429`; the
+byte bucket is checked after signature verification and before the body
+is read. Tunable via relay flags `--blob-burst-bytes`,
+`--blob-rate-bytes` and `--blob-quota-bytes`.
+
 ### Spam reports and reporter-based throttling
 
 `POST /v1/report`, JSON body:
@@ -339,7 +349,16 @@ attributed to the sender instead. `ts` must be within 300 seconds of
 relay time; the relay rejects unsigned, forged, stale, oversized
 (> 25 MiB + framing overhead), or size-mismatched uploads. Blob ids are
 client-generated random 256-bit values, so re-uploading the same blob is
-idempotent (`"duplicate": true`).
+idempotent (`"duplicate": true`). Idempotent re-uploads do not
+double-charge the quota.
+
+Uploads are also abuse-controlled (issue #100): a per-uploader
+byte-priced token bucket and a durable per-uploader storage quota (see
+"Relay-side rate limiting"). The quota counts every stored blob byte
+within the retention window; bytes return to the quota when retention
+pruning deletes expired blobs. Uploaders whose pre-quota stored bytes
+already exceed the quota reject new uploads until pruning brings them
+under — raise `--blob-quota-bytes` if that bites a real database.
 
 `GET /v1/blobs/<blob_id>?ts=<unix>&sig=<base64url>` →
 `200 application/octet-stream` (the framed ciphertext).

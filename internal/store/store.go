@@ -935,6 +935,14 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// Issue #100: the blob quota ledger lives in blobquota.go so it
+	// evolves independently of the core migrations (see #104, which is
+	// reworking migrate() on another branch). This single call creates
+	// and reconciles it.
+	if err := ensureBlobQuotaSchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("blob quota schema: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -1055,14 +1063,13 @@ func (s *Store) GetBlob(blobID string) (*Blob, error) {
 }
 
 // PruneBlobs deletes blobs received more than retainDays ago, reusing
-// the envelope retention policy. Returns the number of rows deleted.
+// the envelope retention policy, and returns the freed bytes to the
+// per-uploader quota ledger (issue #100). The quota-aware
+// implementation lives in blobquota.go next to the ledger it updates;
+// this wrapper keeps the signature stable for existing callers.
+// Returns the number of rows deleted.
 func (s *Store) PruneBlobs(retainDays int) (int64, error) {
-	cutoff := time.Now().AddDate(0, 0, -retainDays).Unix()
-	res, err := s.db.Exec(`DELETE FROM blobs WHERE received_at < ?`, cutoff)
-	if err != nil {
-		return 0, fmt.Errorf("prune blobs: %w", err)
-	}
-	return res.RowsAffected()
+	return pruneBlobsWithQuota(s.db, retainDays)
 }
 
 // KeyAnnouncement is one published encryption key for an address.
