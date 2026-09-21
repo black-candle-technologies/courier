@@ -258,19 +258,19 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 	// the same token collapse to exactly one consuming send (the
 	// atomic DELETE ... RETURNING in consumePendingConfirmation
 	// admits exactly one winner; issue #84).
+	// justConfirmed records that this ingest completed the confirmation
+	// ceremony. The recipient is marked confirmed only after the
+	// approved first send actually succeeds (fail closed, issue #83):
+	// a rate-limited or failed first send must not leave the recipient
+	// confirmed for an arbitrary later body.
+	justConfirmed := false
 	if req.ConfirmToken != "" {
 		if err := g.consumePendingConfirmation(tok.ID, req.Recipient, req.ConfirmToken, sum); err != nil {
 			g.auditFull(tok, req.Recipient, sum, int64(len(wrapped)), RejectedOutcome(RejectBadRequest), 0, "bad confirm token")
 			writeJSON(w, http.StatusBadRequest, errJSON(400, "invalid or expired confirm token"))
 			return
 		}
-		// MarkConfirmed is idempotent (INSERT OR IGNORE). NOTE (#83):
-		// this currently marks confirmed before the send; a later
-		// change moves it to after the approved first send succeeds.
-		if err := g.store.MarkConfirmed(tok.ID, req.Recipient, now.Unix()); err != nil {
-			writeJSON(w, http.StatusInternalServerError, errJSON(500, "internal error"))
-			return
-		}
+		justConfirmed = true
 	} else {
 		confirmed, err := g.store.IsConfirmed(tok.ID, req.Recipient)
 		if err != nil {
@@ -332,6 +332,17 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 		})
 		writeJSON(w, http.StatusBadGateway, errJSON(502, "send failed"))
 		return
+	}
+	if justConfirmed {
+		// The approved first send succeeded: record the confirmation
+		// (idempotent INSERT OR IGNORE). On DB error, log and continue
+		// with the 200 — the ceremony completed and the message was
+		// delivered; worst case the next send asks for confirmation
+		// again, which is the fail-closed direction.
+		if err := g.store.MarkConfirmed(tok.ID, req.Recipient, now.Unix()); err != nil {
+			log.Printf("bridge: MarkConfirmed(%s -> %s) failed after successful send: %v",
+				tok.ID, req.Recipient, err)
+		}
 	}
 	_, _ = g.store.AppendAudit(&AuditEntry{
 		Ts: now.Unix(), TokenID: tok.ID, TokenLabel: tok.Label,

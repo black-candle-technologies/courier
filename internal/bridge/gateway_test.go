@@ -664,3 +664,73 @@ func TestConfirmTokenConcurrentConsumeSingleUse(t *testing.T) {
 		t.Fatalf("sender called %d times, want exactly 1", len(f.stub.calls))
 	}
 }
+
+// confirmTokenFor mints a confirm token for (addr, body) via the 449
+// round-trip and returns it.
+func confirmTokenFor(t *testing.T, f *gwFixture, addr, body string) string {
+	t.Helper()
+	rec := f.ingest(t, f.raw, ingestJSON(addr, body, ""))
+	if rec.Code != StatusConfirmationRequired {
+		t.Fatalf("first send code = %d, want 449", rec.Code)
+	}
+	var cr map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &cr)
+	ct, _ := cr["confirm_token"].(string)
+	if ct == "" {
+		t.Fatal("no confirm_token in 449")
+	}
+	return ct
+}
+
+// TestConfirmNotMarkedWhenSendFails (issue #83): a confirmed token
+// whose approved first send FAILS must not leave the recipient
+// confirmed — fail closed. A later different body must require a fresh
+// confirmation (449), not sail through.
+func TestConfirmNotMarkedWhenSendFails(t *testing.T) {
+	f := newGwFixture(t)
+	f.stub.err = errTestSend
+	ct := confirmTokenFor(t, f, f.addr, "hello")
+	rec := f.ingest(t, f.raw, ingestJSON(f.addr, "hello", ct))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("confirmed send code = %d, want 502", rec.Code)
+	}
+	confirmed, err := f.store.IsConfirmed(f.tok.ID, f.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed {
+		t.Fatal("recipient marked confirmed although the approved first send failed")
+	}
+	// A different body still requires confirmation.
+	rec = f.ingest(t, f.raw, ingestJSON(f.addr, "different body", ""))
+	if rec.Code != StatusConfirmationRequired {
+		t.Fatalf("different body code = %d, want 449", rec.Code)
+	}
+}
+
+// TestConfirmNotMarkedWhenRateLimited (issue #83): a confirmed token
+// whose approved first send is RATE-LIMITED must not leave the
+// recipient confirmed either. Draining the minute bucket forces the
+// 429; the later different body must get 449.
+func TestConfirmNotMarkedWhenRateLimited(t *testing.T) {
+	f := newGwFixture(t)
+	for i := 0; i < RateBurst; i++ {
+		f.gw.limiter.Allow(f.tok.ID)
+	}
+	ct := confirmTokenFor(t, f, f.addr, "hello")
+	rec := f.ingest(t, f.raw, ingestJSON(f.addr, "hello", ct))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("confirmed send code = %d, want 429", rec.Code)
+	}
+	confirmed, err := f.store.IsConfirmed(f.tok.ID, f.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed {
+		t.Fatal("recipient marked confirmed although the approved first send was rate-limited")
+	}
+	rec = f.ingest(t, f.raw, ingestJSON(f.addr, "different body", ""))
+	if rec.Code != StatusConfirmationRequired {
+		t.Fatalf("different body code = %d, want 449", rec.Code)
+	}
+}
