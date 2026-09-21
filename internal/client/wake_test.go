@@ -510,3 +510,121 @@ func TestWakeLockExclusive(t *testing.T) {
 		t.Fatalf("pidfile = %q, want %d", pid, os.Getpid())
 	}
 }
+
+// TestWakeBridgedMarkedInPayload: a message from a pinned bridge
+// gateway still wakes the daemon (the bridge is the operator's own
+// channel — silently dropping the operator's own messages would break
+// the bridge), but the wake payload marks it bridged (issues #96/#97)
+// so the woken agent/harness cannot mistake it for trusted input. The
+// daemon never decrypts bodies, so the mark comes from the pin list
+// alone — the layer that needs no sender cooperation.
+func TestWakeBridgedMarkedInPayload(t *testing.T) {
+	cfg := testConfig(t)
+	bridgeAddr := "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	peerAddr := "ed25519:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+	if err := cfg.AddBridgeGateway(bridgeAddr); err != nil {
+		t.Fatal(err)
+	}
+	cl := New(cfg)
+	rec := &actionRecorder{}
+	d := testWakeDaemon(t, cl, rec, []string{"hook"})
+
+	ctx := context.Background()
+	d.handleMessages(ctx, []WakeMessage{
+		{ID: 1, From: bridgeAddr, SentAt: 1},
+		{ID: 2, From: peerAddr, SentAt: 1},
+	})
+	// Both messages are eligible: one wake action carrying both.
+	if n := rec.count(); n != 1 {
+		t.Fatalf("wake actions = %d, want 1", n)
+	}
+	rec.mu.Lock()
+	payload := append([]byte(nil), rec.calls[0].payload...)
+	rec.mu.Unlock()
+	var p struct {
+		Messages []WakeMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		t.Fatalf("bad wake payload: %v", err)
+	}
+	if len(p.Messages) != 2 {
+		t.Fatalf("payload messages = %d, want 2", len(p.Messages))
+	}
+	byID := map[int64]WakeMessage{}
+	for _, m := range p.Messages {
+		byID[m.ID] = m
+	}
+	if !byID[1].Bridged {
+		t.Error("message from pinned bridge gateway not marked bridged in wake payload")
+	}
+	if byID[2].Bridged {
+		t.Error("ordinary message wrongly marked bridged in wake payload")
+	}
+}
+
+// TestWakeSuppressBridgedActions: with SuppressBridgedActions, a
+// bridged-only batch never fires the wake command (issue #97), while a
+// mixed batch fires carrying only the non-bridged messages. The daemon
+// is the one place Courier autonomously triggers code on message
+// arrival, so this is the structural enforcement point for hooks whose
+// command does more than read-only ingestion.
+func TestWakeSuppressBridgedActions(t *testing.T) {
+	cfg := testConfig(t)
+	bridgeAddr := "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	peerAddr := "ed25519:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+	if err := cfg.AddBridgeGateway(bridgeAddr); err != nil {
+		t.Fatal(err)
+	}
+	cl := New(cfg)
+	ctx := context.Background()
+	newDaemon := func() (*WakeDaemon, *actionRecorder) {
+		rec := &actionRecorder{}
+		d := testWakeDaemon(t, cl, rec, []string{"hook"})
+		d.cfg.SuppressBridgedActions = true
+		return d, rec
+	}
+	payloadIDs := func(rec *actionRecorder) []int64 {
+		t.Helper()
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		if len(rec.calls) != 1 {
+			t.Fatalf("actions = %d, want 1", len(rec.calls))
+		}
+		var p struct {
+			Messages []WakeMessage `json:"messages"`
+		}
+		if err := json.Unmarshal(rec.calls[0].payload, &p); err != nil {
+			t.Fatalf("bad wake payload: %v", err)
+		}
+		var ids []int64
+		for _, m := range p.Messages {
+			ids = append(ids, m.ID)
+		}
+		return ids
+	}
+
+	// Bridged-only batch: the command never fires.
+	d, rec := newDaemon()
+	d.handleMessages(ctx, []WakeMessage{{ID: 1, From: bridgeAddr, SentAt: 1}})
+	if n := rec.count(); n != 0 {
+		t.Fatalf("bridged-only batch fired %d actions, want 0", n)
+	}
+
+	// Mixed batch: fires once, with the bridged message stripped.
+	d, rec = newDaemon()
+	d.handleMessages(ctx, []WakeMessage{
+		{ID: 1, From: bridgeAddr, SentAt: 1},
+		{ID: 2, From: peerAddr, SentAt: 1},
+	})
+	if ids := payloadIDs(rec); len(ids) != 1 || ids[0] != 2 {
+		t.Fatalf("suppressed payload ids = %v, want [2]", ids)
+	}
+
+	// Knob off (default): bridged messages still wake, marked bridged.
+	recDefault := &actionRecorder{}
+	dDefault := testWakeDaemon(t, cl, recDefault, []string{"hook"})
+	dDefault.handleMessages(ctx, []WakeMessage{{ID: 3, From: bridgeAddr, SentAt: 1}})
+	if ids := payloadIDs(recDefault); len(ids) != 1 || ids[0] != 3 {
+		t.Fatalf("default payload ids = %v, want [3]", ids)
+	}
+}

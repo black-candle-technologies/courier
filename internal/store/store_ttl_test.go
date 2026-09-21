@@ -28,13 +28,13 @@ func TestDashboardMessageExpiryReadFilter(t *testing.T) {
 	now := time.Now().Unix()
 
 	// One immortal, one expiring in the future, one already expired.
-	if _, err := s.SaveDashboardMessage(uid, 1, peer, self, peer, "immortal", now, now, 0, "", 0); err != nil {
+	if _, err := s.SaveDashboardMessage(uid, 1, peer, self, peer, "immortal", now, now, 0, "", 0, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SaveDashboardMessage(uid, 2, peer, self, peer, "fading", now, now, 0, "", now+3600); err != nil {
+	if _, err := s.SaveDashboardMessage(uid, 2, peer, self, peer, "fading", now, now, 0, "", now+3600, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SaveDashboardMessage(uid, 3, peer, self, peer, "gone", now, now, 0, "", now-10); err != nil {
+	if _, err := s.SaveDashboardMessage(uid, 3, peer, self, peer, "gone", now, now, 0, "", now-10, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -88,16 +88,16 @@ func TestPruneExpiredDashboardMessages(t *testing.T) {
 	self, peer := "ed25519:self", "ed25519:peer"
 	now := time.Now().Unix()
 
-	if _, err := s.SaveDashboardMessage(uid, 1, peer, self, peer, "gone1", now, now, 0, "", now-10); err != nil {
+	if _, err := s.SaveDashboardMessage(uid, 1, peer, self, peer, "gone1", now, now, 0, "", now-10, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SaveDashboardMessage(uid, 2, peer, self, peer, "gone2", now, now, 0, "", now-1); err != nil {
+	if _, err := s.SaveDashboardMessage(uid, 2, peer, self, peer, "gone2", now, now, 0, "", now-1, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SaveDashboardMessage(uid, 3, peer, self, peer, "live", now, now, 0, "", now+3600); err != nil {
+	if _, err := s.SaveDashboardMessage(uid, 3, peer, self, peer, "live", now, now, 0, "", now+3600, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SaveDashboardMessage(uid, 4, peer, self, peer, "immortal", now, now, 0, "", 0); err != nil {
+	if _, err := s.SaveDashboardMessage(uid, 4, peer, self, peer, "immortal", now, now, 0, "", 0, false); err != nil {
 		t.Fatal(err)
 	}
 

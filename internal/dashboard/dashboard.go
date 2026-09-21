@@ -278,6 +278,10 @@ type pushMessage struct {
 	// never). Expired rows are filtered from reads and deleted by the
 	// push-time sweep.
 	ExpiresAt int64 `json:"expires_at,omitempty"`
+	// Bridged marks messages the agent derived as bridged (issues
+	// #96/#97). Reported by the agent (which decrypted the envelope
+	// and holds the pin list); the dashboard only displays it.
+	Bridged bool `json:"bridged,omitempty"`
 }
 
 func bearerToken(r *http.Request) string {
@@ -396,7 +400,7 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 			recipient = m.To
 			peer = m.To
 		}
-		inserted, err := s.store.SaveDashboardMessage(user.ID, m.CourierID, m.From, recipient, peer, m.Body, m.SentAt, m.ReceivedAt, replyTo, quote, m.ExpiresAt)
+		inserted, err := s.store.SaveDashboardMessage(user.ID, m.CourierID, m.From, recipient, peer, m.Body, m.SentAt, m.ReceivedAt, replyTo, quote, m.ExpiresAt, m.Bridged)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "store failed")
 			return
@@ -529,10 +533,6 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 	type threadView struct {
 		store.DashboardThread
 		Preview string // truncated last-message preview
-		// LastBridged marks threads whose latest message arrived via a
-		// non-E2E bridge (issue #61): the body carries the bridge
-		// banner, so the thread list can flag it explicitly.
-		LastBridged bool
 	}
 	views := make([]threadView, 0, len(threads))
 	for _, th := range threads {
@@ -543,10 +543,13 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 		if len([]rune(preview)) > 120 {
 			preview = string([]rune(preview)[:120]) + "…"
 		}
+		// issues #61/#96: flag the thread from the agent-reported
+		// bridged flag OR the body banner, so threads badge even for
+		// pushes that predate the stored flag.
+		th.LastBridged = th.LastBridged || bridge.HasBanner(th.LastBody)
 		views = append(views, threadView{
 			DashboardThread: th,
 			Preview:         preview,
-			LastBridged:     bridge.HasBanner(th.LastBody),
 		})
 	}
 	render(w, appTmpl, map[string]any{"User": u.Username, "Threads": views, "Q": q, "BCTEnabled": s.bctEnabled()})
@@ -597,10 +600,6 @@ func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
 		store.DashboardMessage
 		Out bool
 		TS  int64
-		// Bridged marks messages that arrived via a non-E2E bridge
-		// (issue #61): the body carries the bridge banner, so the
-		// thread view can badge them explicitly.
-		Bridged bool
 	}
 	views := make([]msgView, 0, len(msgs))
 	for _, m := range msgs {
@@ -608,7 +607,11 @@ func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
 		if m.ReceivedAt > ts {
 			ts = m.ReceivedAt
 		}
-		views = append(views, msgView{DashboardMessage: m, Out: m.Sender == u.CourierAddress, TS: ts, Bridged: bridge.HasBanner(m.Body)})
+		// issues #61/#96: badge from the agent-reported bridged flag
+		// OR the body banner, so messages badge even for pushes that
+		// predate the stored flag.
+		m.Bridged = m.Bridged || bridge.HasBanner(m.Body)
+		views = append(views, msgView{DashboardMessage: m, Out: m.Sender == u.CourierAddress, TS: ts})
 	}
 	// issue #39: show the peer's listed handle when the agent resolved
 	// one; the dashboard never queries the directory itself.
