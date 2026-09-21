@@ -46,6 +46,13 @@ func main() {
 	dirWriteBurst := flag.Float64("dir-write-burst", 10, "per-identity directory write burst (register/update/transfer/deregister)")
 	dirLookupBurst := flag.Float64("dir-lookup-burst", 60, "per-identity directory lookup burst")
 	dirSearchBurst := flag.Float64("dir-search-burst", 10, "per-identity directory search burst")
+	// Issue #100: blob bytes are far more expensive than message bytes,
+	// so uploads get their own byte-priced bucket plus a durable
+	// per-uploader storage quota. The burst must exceed the ~25 MiB max
+	// blob size or every upload 429s.
+	blobBurstBytes := flag.Int64("blob-burst-bytes", 256<<20, "per-uploader blob upload byte-bucket burst")
+	blobRateBytes := flag.Float64("blob-rate-bytes", 2<<20, "per-uploader sustained blob upload rate, bytes per second")
+	blobQuotaBytes := flag.Int64("blob-quota-bytes", 1<<30, "per-uploader total stored blob byte quota within the retention window")
 	// Operator takedown admin mode: applies (or lifts) a transparent
 	// tombstone and exits without serving. Takedowns are public by
 	// construction — a reason is required — and must follow the
@@ -63,14 +70,17 @@ func main() {
 	defer st.Close()
 
 	dirServer := relay.NewWithConfig(st, relay.Config{
-		SendBurst:           *sendBurst,
-		SendRatePerSec:      *sendRate,
-		SpamReportThreshold: *spamThreshold,
-		SpamReportWindow:    time.Duration(*spamWindowHours * float64(time.Hour)),
-		DirWriteBurst:       *dirWriteBurst,
-		DirLookupBurst:      *dirLookupBurst,
-		DirSearchBurst:      *dirSearchBurst,
-		ReservedHandles:     splitCSV(*reservedHandles),
+		SendBurst:                 *sendBurst,
+		SendRatePerSec:            *sendRate,
+		SpamReportThreshold:       *spamThreshold,
+		SpamReportWindow:          time.Duration(*spamWindowHours * float64(time.Hour)),
+		DirWriteBurst:             *dirWriteBurst,
+		DirLookupBurst:            *dirLookupBurst,
+		DirSearchBurst:            *dirSearchBurst,
+		BlobUploadBurstBytes:      float64(*blobBurstBytes),
+		BlobUploadRateBytesPerSec: *blobRateBytes,
+		BlobQuotaBytes:            *blobQuotaBytes,
+		ReservedHandles:           splitCSV(*reservedHandles),
 	})
 
 	// Admin mode: takedown / untakedown, then exit.
@@ -118,14 +128,17 @@ func main() {
 	srv := &http.Server{
 		Addr: *addr,
 		Handler: loggingMiddleware(relay.NewWithConfig(st, relay.Config{
-			SendBurst:           *sendBurst,
-			SendRatePerSec:      *sendRate,
-			SpamReportThreshold: *spamThreshold,
-			SpamReportWindow:    time.Duration(*spamWindowHours * float64(time.Hour)),
-			DirWriteBurst:       *dirWriteBurst,
-			DirLookupBurst:      *dirLookupBurst,
-			DirSearchBurst:      *dirSearchBurst,
-			ReservedHandles:     splitCSV(*reservedHandles),
+			SendBurst:                 *sendBurst,
+			SendRatePerSec:            *sendRate,
+			SpamReportThreshold:       *spamThreshold,
+			SpamReportWindow:          time.Duration(*spamWindowHours * float64(time.Hour)),
+			DirWriteBurst:             *dirWriteBurst,
+			DirLookupBurst:            *dirLookupBurst,
+			DirSearchBurst:            *dirSearchBurst,
+			BlobUploadBurstBytes:      float64(*blobBurstBytes),
+			BlobUploadRateBytesPerSec: *blobRateBytes,
+			BlobQuotaBytes:            *blobQuotaBytes,
+			ReservedHandles:           splitCSV(*reservedHandles),
 		}).Routes()),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
