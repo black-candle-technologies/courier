@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -210,5 +211,39 @@ func TestRevokeWildcardLabelEscaped(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf(`RevokeToken("%%") revoked %d tokens, want 0`, n)
+	}
+}
+
+// errReader is an io.Reader that always fails; used to simulate
+// crypto/rand failure.
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// TestTokenIDRNGFailureFailsClosed (#86): when the randomness source
+// fails, newTokenID must return an error and IssueToken must issue
+// nothing — a predictable all-zero id must never be assigned.
+func TestTokenIDRNGFailureFailsClosed(t *testing.T) {
+	s := testStore(t)
+	old := randReader
+	randReader = errReader{err: errors.New("simulated rand failure")}
+	defer func() { randReader = old }()
+
+	if _, err := newTokenID(); err == nil {
+		t.Fatal("newTokenID: expected error on RNG failure, got nil")
+	}
+	countTokens := func() int {
+		var n int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM tokens`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	before := countTokens()
+	if _, _, err := s.IssueToken("t-rngfail", []string{testAddr(9)}, 0, "pepper"); err == nil {
+		t.Fatal("IssueToken: expected error on RNG failure, got nil")
+	}
+	if got := countTokens(); got != before {
+		t.Fatalf("IssueToken created a token on RNG failure: count %d -> %d", before, got)
 	}
 }
