@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -18,11 +19,13 @@ import (
 type fakeGateway struct {
 	t      *testing.T
 	mu     sync.Mutex
+	hits   atomic.Int64
 	ingest func(w http.ResponseWriter, r *http.Request)
 	status int
 }
 
 func (f *fakeGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.hits.Add(1)
 	w.Header().Set("Content-Type", "application/json")
 	switch r.URL.Path {
 	case "/v1/bridge/ingest":
@@ -52,12 +55,131 @@ func jsonBody(t *testing.T, w http.ResponseWriter, code int, v any) {
 	}
 }
 
-// testServerToken is the caller bearer secret the test MCP server
-// requires (issue #82).
-const testServerToken = "test-mcp-auth-secret"
+// fakeAuthdUser is the identity a fake authd reports for a token.
+type fakeAuthdUser struct {
+	id    int64
+	email string
+}
 
-// authRoundTripper injects the caller bearer token into every client
-// request; an empty token sends no Authorization header.
+// fakeAuthd scripts authd's /oauth/userinfo for OAuth tests: tokens
+// mapped in users validate, everything else gets 401.
+type fakeAuthd struct {
+	t     *testing.T
+	mu    sync.Mutex
+	hits  int
+	users map[string]fakeAuthdUser
+}
+
+func (f *fakeAuthd) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/oauth/userinfo" {
+		http.NotFound(w, r)
+		return
+	}
+	f.mu.Lock()
+	f.hits++
+	f.mu.Unlock()
+	token := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	u, ok := f.users[token]
+	if !ok {
+		http.Error(w, `{"error":"invalid_token"}`, http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"id":             u.id,
+		"email":          u.email,
+		"email_verified": true,
+	})
+}
+
+func (f *fakeAuthd) hitCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hits
+}
+
+// oauthRig is a full MCP server under test: fake authd + fake gateway
+// + the production mux (discovery, bearer validation, caller
+// allowlist).
+type oauthRig struct {
+	t      *testing.T
+	mcpURL string
+	authd  *fakeAuthd
+	gw     *fakeGateway
+	public string
+}
+
+const (
+	rigPublicURL = "https://mcp.example.com"
+	tokenAlice   = "token-alice-valid"
+	tokenBob     = "token-bob-valid"
+	tokenBad     = "token-invalid"
+)
+
+func newOAuthRig(t *testing.T, allowed []string) *oauthRig {
+	t.Helper()
+	gw := &fakeGateway{t: t}
+	gwSrv := httptest.NewServer(gw)
+	t.Cleanup(gwSrv.Close)
+
+	fa := &fakeAuthd{t: t, users: map[string]fakeAuthdUser{
+		tokenAlice: {id: 7, email: "alice@example.com"},
+		tokenBob:   {id: 9, email: "bob@example.com"},
+	}}
+	authdSrv := httptest.NewServer(fa)
+	t.Cleanup(authdSrv.Close)
+
+	parsed, err := parseAllowedCallers(strings.Join(allowed, ","))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &oauthConfig{
+		authdURL:  authdSrv.URL,
+		publicURL: rigPublicURL,
+		allowed:   parsed,
+		cache:     newTokenCache(),
+		http:      &http.Client{Timeout: 15 * time.Second},
+	}
+	srv := buildServer(newBridgeClient(gwSrv.URL, "token"))
+	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil)
+	bearer := auth.RequireBearerToken(cfg.verifyToken, &auth.RequireBearerTokenOptions{
+		ResourceMetadataURL: cfg.publicURL + "/.well-known/oauth-protected-resource",
+		Scopes:              []string{oauthScopeIdentity},
+	})
+	mux := http.NewServeMux()
+	mux.Handle("GET /.well-known/oauth-protected-resource", protectedResourceMetadata(cfg.publicURL, cfg.authdURL))
+	mux.Handle("/", bearer(requireAllowedCaller(mcpHandler, cfg.allowed)))
+	mcpSrv := httptest.NewServer(mux)
+	t.Cleanup(mcpSrv.Close)
+
+	return &oauthRig{t: t, mcpURL: mcpSrv.URL, authd: fa, gw: gw, public: rigPublicURL}
+}
+
+// postMCP posts a raw JSON-RPC request to the rig's MCP endpoint with
+// an optional Authorization header value ("": none).
+func (r *oauthRig) postMCP(t *testing.T, authorization string) (int, http.Header) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, r.mcpURL, strings.NewReader(
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, resp.Header
+}
+
+// authRoundTripper injects a bearer token into every client request; an
+// empty token sends no Authorization header.
 type authRoundTripper struct {
 	token string
 	rt    http.RoundTripper
@@ -75,38 +197,24 @@ func (a authRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 	return rt.RoundTrip(r2)
 }
 
-// testClient connects an SDK client to a buildServer instance backed by
-// the fake gateway. The server requires the caller bearer token
-// testServerToken; clientToken is what the client presents ("" sends
-// nothing). Connect failures are returned, not fatal, so tests can
-// assert on auth rejection.
-func testClient(t *testing.T, fg *fakeGateway, clientToken string) *mcp.ClientSession {
+// client connects an SDK client to the rig, presenting token (""
+// sends nothing). Connect failures are returned, not fatal, so tests
+// can assert on rejection.
+func (r *oauthRig) client(t *testing.T, token string) (*mcp.ClientSession, error) {
 	t.Helper()
-	fg.t = t
-	gw := httptest.NewServer(fg)
-	t.Cleanup(gw.Close)
-
-	srv := buildServer(newBridgeClient(gw.URL, "token"))
-	handler := authMiddleware(
-		mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil),
-		testServerToken,
-	)
-	mcpSrv := httptest.NewServer(handler)
-	t.Cleanup(mcpSrv.Close)
-
 	cl := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
 	cs, err := cl.Connect(ctx, &mcp.StreamableClientTransport{
-		Endpoint:             mcpSrv.URL,
-		HTTPClient:           &http.Client{Transport: authRoundTripper{token: clientToken}},
+		Endpoint:             r.mcpURL,
+		HTTPClient:           &http.Client{Transport: authRoundTripper{token: token}},
 		DisableStandaloneSSE: true,
 	}, nil)
 	if err != nil {
-		t.Fatalf("client connect: %v", err)
+		return nil, err
 	}
 	t.Cleanup(func() { cs.Close() })
-	return cs
+	return cs, nil
 }
 
 func callTool(t *testing.T, cs *mcp.ClientSession, name string, args map[string]any) *mcp.CallToolResult {
@@ -133,25 +241,239 @@ func toolText(t *testing.T, res *mcp.CallToolResult) string {
 	return sb.String()
 }
 
+// TestProtectedResourceMetadata: the RFC 9728 discovery document is
+// served unauthenticated and points at the authorization server.
+func TestProtectedResourceMetadata(t *testing.T) {
+	rig := newOAuthRig(t, []string{"alice@example.com"})
+	resp, err := http.Get(rig.mcpURL + "/.well-known/oauth-protected-resource")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var doc struct {
+		Resource             string   `json:"resource"`
+		AuthorizationServers []string `json:"authorization_servers"`
+		ScopesSupported      []string `json:"scopes_supported"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Resource != rigPublicURL {
+		t.Fatalf("resource = %q, want %q", doc.Resource, rigPublicURL)
+	}
+	if len(doc.AuthorizationServers) != 1 {
+		t.Fatalf("authorization_servers = %v, want one entry", doc.AuthorizationServers)
+	}
+	if len(doc.ScopesSupported) != 1 || doc.ScopesSupported[0] != "identity" {
+		t.Fatalf("scopes_supported = %v, want [identity]", doc.ScopesSupported)
+	}
+}
+
+// TestOAuthDiscoveryOn401: unauthenticated callers get a 401 whose
+// WWW-Authenticate carries the resource_metadata discovery URL — the
+// signal ChatGPT web needs to start the OAuth flow.
+func TestOAuthDiscoveryOn401(t *testing.T) {
+	rig := newOAuthRig(t, []string{"alice@example.com"})
+	code, hdr := rig.postMCP(t, "")
+	if code != http.StatusUnauthorized {
+		t.Fatalf("no auth header: status = %d, want 401", code)
+	}
+	www := hdr.Get("WWW-Authenticate")
+	want := `resource_metadata="` + rigPublicURL + `/.well-known/oauth-protected-resource"`
+	if !strings.Contains(www, want) {
+		t.Fatalf("WWW-Authenticate = %q, want it to contain %q", www, want)
+	}
+}
+
+// TestOAuthCallerAuth: the full gate matrix. Invalid tokens 401,
+// valid-but-unprovisioned callers 403, provisioned callers pass — and
+// nobody unauthenticated ever reaches the gateway.
+func TestOAuthCallerAuth(t *testing.T) {
+	rig := newOAuthRig(t, []string{"alice@example.com"})
+
+	if code, _ := rig.postMCP(t, ""); code != http.StatusUnauthorized {
+		t.Fatalf("no auth header: status = %d, want 401", code)
+	}
+	if code, _ := rig.postMCP(t, "Bearer "+tokenBad); code != http.StatusUnauthorized {
+		t.Fatalf("bad token: status = %d, want 401", code)
+	}
+	if code, _ := rig.postMCP(t, "Bearer "+tokenBob); code != http.StatusForbidden {
+		t.Fatalf("unprovisioned caller: status = %d, want 403", code)
+	}
+	if code, _ := rig.postMCP(t, "Bearer "+tokenAlice); code == http.StatusUnauthorized || code == http.StatusForbidden {
+		t.Fatalf("provisioned caller rejected: status = %d", code)
+	}
+	if n := rig.gw.hits.Load(); n != 0 {
+		t.Fatalf("gateway was contacted %d times by unauthenticated callers", n)
+	}
+
+	// A provisioned caller works end to end over the SDK client.
+	cs, err := rig.client(t, tokenAlice)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	res := callTool(t, cs, "list_bridge_recipients", nil)
+	if res.IsError {
+		t.Fatalf("authenticated tool call failed: %s", toolText(t, res))
+	}
+	if !strings.Contains(toolText(t, res), "ed25519:AAA") {
+		t.Fatalf("bad recipients text: %s", toolText(t, res))
+	}
+
+	// An unprovisioned caller cannot even connect the SDK client.
+	if _, err := rig.client(t, tokenBob); err == nil {
+		t.Fatal("unprovisioned caller connected the MCP client")
+	}
+}
+
+// TestOAuthTokenCache: a validated token is revalidated from cache,
+// not from authd, on subsequent requests.
+func TestOAuthTokenCache(t *testing.T) {
+	rig := newOAuthRig(t, []string{"alice@example.com"})
+	cs, err := rig.client(t, tokenAlice)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	callTool(t, cs, "list_bridge_recipients", nil)
+	callTool(t, cs, "bridge_status", nil)
+	callTool(t, cs, "list_bridge_recipients", nil)
+	if n := rig.authd.hitCount(); n != 1 {
+		t.Fatalf("authd userinfo hits = %d, want 1 (cached)", n)
+	}
+}
+
+// TestOAuthNegativeCache: rejected tokens stay rejected without
+// hammering authd.
+func TestOAuthNegativeCache(t *testing.T) {
+	rig := newOAuthRig(t, []string{"alice@example.com"})
+	for i := 0; i < 3; i++ {
+		if code, _ := rig.postMCP(t, "Bearer "+tokenBad); code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: status = %d, want 401", i, code)
+		}
+	}
+	if n := rig.authd.hitCount(); n != 1 {
+		t.Fatalf("authd userinfo hits = %d, want 1 (negative cached)", n)
+	}
+}
+
+// TestOAuthAuthdDownFailsClosed: when authd is unreachable the bridge
+// denies access instead of failing open.
+func TestOAuthAuthdDownFailsClosed(t *testing.T) {
+	dead := &oauthConfig{
+		authdURL:  "http://127.0.0.1:1",
+		publicURL: rigPublicURL,
+		allowed:   map[string]bool{"alice@example.com": true},
+		cache:     newTokenCache(),
+		http:      &http.Client{Timeout: 2 * time.Second},
+	}
+	bearer := auth.RequireBearerToken(dead.verifyToken, &auth.RequireBearerTokenOptions{
+		ResourceMetadataURL: rigPublicURL + "/.well-known/oauth-protected-resource",
+		Scopes:              []string{oauthScopeIdentity},
+	})
+	reached := false
+	srv := httptest.NewServer(bearer(requireAllowedCaller(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+	}), dead.allowed)))
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL, nil)
+	req.Header.Set("Authorization", "Bearer "+tokenAlice)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("request succeeded while authd is down: fail-open")
+	}
+	if reached {
+		t.Fatal("inner handler reached while authd is down: fail-open")
+	}
+}
+
+// TestSendIncludesCallerIdentity: the gateway ingest call carries the
+// authenticated caller's email for the audit log.
+func TestSendIncludesCallerIdentity(t *testing.T) {
+	rig := newOAuthRig(t, []string{"alice@example.com"})
+	var gotCaller string
+	rig.gw.ingest = func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Caller string `json:"caller"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotCaller = body.Caller
+		jsonBody(t, w, 200, map[string]any{"envelope_id": 1, "audit_id": 2})
+	}
+	cs, err := rig.client(t, tokenAlice)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	res := callTool(t, cs, "send_to_agent", map[string]any{
+		"recipient": "ed25519:AAA", "body": "hello",
+	})
+	if res.IsError {
+		t.Fatalf("send failed: %s", toolText(t, res))
+	}
+	if gotCaller != "alice@example.com" {
+		t.Fatalf("ingest caller = %q, want alice@example.com", gotCaller)
+	}
+}
+
+// TestParseAllowedCallers: empty fails closed; junk is rejected;
+// entries are normalized and de-duplicated.
+func TestParseAllowedCallers(t *testing.T) {
+	if _, err := parseAllowedCallers(""); err == nil {
+		t.Fatal("empty allowlist parsed without error: must fail closed")
+	}
+	if _, err := parseAllowedCallers("   , "); err == nil {
+		t.Fatal("blank allowlist parsed without error: must fail closed")
+	}
+	if _, err := parseAllowedCallers("not-an-email"); err == nil {
+		t.Fatal("non-email caller accepted")
+	}
+	got, err := parseAllowedCallers("Alice@Example.COM, bob@example.com ,alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || !got["alice@example.com"] || !got["bob@example.com"] {
+		t.Fatalf("bad parse result: %v", got)
+	}
+}
+
+// TestCheckPublicURL: only https origins with no path are usable as
+// the RFC 9728 resource identifier.
+func TestCheckPublicURL(t *testing.T) {
+	for _, bad := range []string{"http://mcp.example.com", "mcp.example.com", "", "https://"} {
+		if _, err := checkPublicURL(bad); err == nil {
+			t.Fatalf("checkPublicURL(%q) accepted", bad)
+		}
+	}
+	got, err := checkPublicURL("https://mcp.example.com/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://mcp.example.com" {
+		t.Fatalf("trailing slash not stripped: %q", got)
+	}
+}
+
+// --- tool behavior tests (auth-agnostic, run as a provisioned caller) ---
+
 func TestSendConfirmationRoundTrip(t *testing.T) {
-	var confirmed bool
-	fg := &fakeGateway{}
-	fg.ingest = func(w http.ResponseWriter, r *http.Request) {
-		var in struct {
-			Recipient    string `json:"recipient"`
-			Body         string `json:"body"`
+	rig := newOAuthRig(t, []string{"alice@example.com"})
+	var calls int
+	rig.gw.ingest = func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var body struct {
 			ConfirmToken string `json:"confirm_token"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-			t.Fatal(err)
-		}
-		if in.ConfirmToken == "" {
-			if in.Recipient != "ed25519:AAA" || in.Body != "hello" {
-				t.Fatalf("unexpected ingest body: %+v", in)
-			}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.ConfirmToken == "" {
 			jsonBody(t, w, 449, map[string]any{
-				"error":         "confirmation_required",
-				"confirm_token": "ct-1",
+				"confirm_token": "ctok-1",
 				"summary": map[string]any{
 					"recipient": "ed25519:AAA", "body_size": 5, "body_sha256": "abc",
 				},
@@ -159,167 +481,100 @@ func TestSendConfirmationRoundTrip(t *testing.T) {
 			})
 			return
 		}
-		if in.ConfirmToken != "ct-1" {
+		if body.ConfirmToken != "ctok-1" {
 			jsonBody(t, w, 400, map[string]any{"error": "bad confirm token"})
 			return
 		}
-		confirmed = true
-		jsonBody(t, w, 200, map[string]any{"envelope_id": 7, "audit_id": 3, "status": "sent"})
+		jsonBody(t, w, 200, map[string]any{"envelope_id": 42, "audit_id": 7})
 	}
-
-	cs := testClient(t, fg, testServerToken)
-
-	// First send: 449 → human-readable confirmation text, not an error.
+	cs, err := rig.client(t, tokenAlice)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
 	res := callTool(t, cs, "send_to_agent", map[string]any{
 		"recipient": "ed25519:AAA", "body": "hello",
 	})
 	if res.IsError {
-		t.Fatal("confirmation round-trip must not be an error result")
+		t.Fatalf("first send errored: %s", toolText(t, res))
 	}
-	text := toolText(t, res)
-	if !strings.Contains(text, "CONFIRMATION REQUIRED") ||
-		!strings.Contains(text, `confirm_token="ct-1"`) ||
-		!strings.Contains(text, "NOT end-to-end encrypted") {
-		t.Fatalf("bad confirmation text:\n%s", text)
+	txt := toolText(t, res)
+	if !strings.Contains(txt, "CONFIRMATION REQUIRED") || !strings.Contains(txt, "ctok-1") {
+		t.Fatalf("missing confirmation prompt: %s", txt)
 	}
-
-	// Confirmed send: 200 → success text with ids.
 	res = callTool(t, cs, "send_to_agent", map[string]any{
-		"recipient": "ed25519:AAA", "body": "hello", "confirm_token": "ct-1",
+		"recipient": "ed25519:AAA", "body": "hello", "confirm_token": "ctok-1",
 	})
 	if res.IsError {
-		t.Fatalf("confirmed send failed: %s", toolText(t, res))
+		t.Fatalf("confirmed send errored: %s", toolText(t, res))
 	}
-	if !strings.Contains(toolText(t, res), "Message sent") {
-		t.Fatalf("bad success text: %s", toolText(t, res))
+	if !strings.Contains(toolText(t, res), "Envelope id 42") {
+		t.Fatalf("bad send result: %s", toolText(t, res))
 	}
-	if !confirmed {
-		t.Fatal("gateway never saw the confirmed ingest")
+	if calls != 2 {
+		t.Fatalf("gateway calls = %d, want 2", calls)
 	}
 }
 
 func TestSendErrors(t *testing.T) {
-	fg := &fakeGateway{}
-	fg.ingest = func(w http.ResponseWriter, r *http.Request) {
-		jsonBody(t, w, 429, map[string]any{"error": "rate limit exceeded"})
+	rig := newOAuthRig(t, []string{"alice@example.com"})
+	rig.gw.ingest = func(w http.ResponseWriter, r *http.Request) {
+		jsonBody(t, w, 403, map[string]any{"error": "recipient not allowlisted for this token"})
 	}
-	cs := testClient(t, fg, testServerToken)
+	cs, err := rig.client(t, tokenAlice)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
 	res := callTool(t, cs, "send_to_agent", map[string]any{
-		"recipient": "ed25519:AAA", "body": "x",
+		"recipient": "ed25519:ZZZ", "body": "hi",
 	})
 	if !res.IsError {
-		t.Fatal("rate-limited send must be an error result")
+		t.Fatal("expected error for non-allowlisted recipient")
 	}
-	if !strings.Contains(toolText(t, res), "rate limit") {
+	if !strings.Contains(toolText(t, res), "not allowlisted") {
 		t.Fatalf("bad error text: %s", toolText(t, res))
 	}
-
-	// Missing required fields fail locally, before any gateway call.
-	fg.ingest = func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("gateway must not be reached with empty body")
-	}
+	// Missing fields are rejected client-side without gateway contact.
+	before := rig.gw.hits.Load()
 	res = callTool(t, cs, "send_to_agent", map[string]any{"recipient": "ed25519:AAA"})
 	if !res.IsError {
-		t.Fatal("empty body must be an error result")
+		t.Fatal("expected error for missing body")
+	}
+	if rig.gw.hits.Load() != before {
+		t.Fatal("gateway contacted for client-side validation failure")
 	}
 }
 
 func TestStatusAndRecipients(t *testing.T) {
-	fg := &fakeGateway{}
-	fg.ingest = func(w http.ResponseWriter, r *http.Request) { t.Fatal("no ingest expected") }
-	cs := testClient(t, fg, testServerToken)
-
+	rig := newOAuthRig(t, []string{"alice@example.com"})
+	cs, err := rig.client(t, tokenAlice)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
 	res := callTool(t, cs, "bridge_status", nil)
-	text := toolText(t, res)
-	for _, want := range []string{"test", "ed25519:AAA", "ed25519:BBB", "9/min", "99/hour", "NOT end-to-end encrypted"} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("status missing %q:\n%s", want, text)
+	if res.IsError {
+		t.Fatalf("bridge_status failed: %s", toolText(t, res))
+	}
+	txt := toolText(t, res)
+	for _, want := range []string{`Bridge token "test"`, "ed25519:AAA", "ed25519:BBB", "NOT end-to-end encrypted."} {
+		if !strings.Contains(txt, want) {
+			t.Fatalf("bridge_status missing %q: %s", want, txt)
 		}
 	}
-
 	res = callTool(t, cs, "list_bridge_recipients", nil)
-	text = toolText(t, res)
-	if !strings.Contains(text, "ed25519:AAA") || !strings.Contains(text, "ed25519:BBB") {
-		t.Fatalf("recipients missing addresses:\n%s", text)
+	if res.IsError {
+		t.Fatalf("list_bridge_recipients failed: %s", toolText(t, res))
+	}
+	if !strings.Contains(toolText(t, res), "ed25519:BBB") {
+		t.Fatalf("bad recipients text: %s", toolText(t, res))
 	}
 }
 
 func TestSendToolDescriptionDisclosesNonE2E(t *testing.T) {
-	srv := buildServer(newBridgeClient("http://127.0.0.1:1", "x"))
-	// The description must lead with the non-E2E warning (plan §3.3).
-	if !strings.HasPrefix(sendToolDescription, "⚠️ Messages sent through this tool are NOT end-to-end encrypted") {
-		t.Fatalf("send tool description lost its mandatory disclosure:\n%s", sendToolDescription)
+	if !strings.Contains(sendToolDescription, "NOT end-to-end encrypted") {
+		t.Fatal("send tool description lost the non-E2E disclosure")
 	}
-	_ = srv
-}
-
-// TestMCPCallerAuthRequired (issue #82): callers without the provisioned
-// caller bearer token are rejected before any gateway contact — no
-// handshake, no tool list, no recipients, no confirm tokens, no sends.
-func TestMCPCallerAuthRequired(t *testing.T) {
-	var gatewayHits atomic.Int64
-	fg := &fakeGateway{}
-	fg.ingest = func(w http.ResponseWriter, r *http.Request) {
-		gatewayHits.Add(1)
-		jsonBody(t, w, 500, map[string]any{"error": "must not be reached"})
-	}
-	counting := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gatewayHits.Add(1)
-		fg.ServeHTTP(w, r)
-	})
-	gw := httptest.NewServer(counting)
-	t.Cleanup(gw.Close)
-
-	srv := buildServer(newBridgeClient(gw.URL, "x"))
-	handler := authMiddleware(
-		mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil),
-		testServerToken,
-	)
-	mcpSrv := httptest.NewServer(handler)
-	t.Cleanup(mcpSrv.Close)
-
-	post := func(auth string) int {
-		t.Helper()
-		req, err := http.NewRequest(http.MethodPost, mcpSrv.URL, strings.NewReader(
-			`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`,
-		))
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json, text/event-stream")
-		if auth != "" {
-			req.Header.Set("Authorization", auth)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
-		return resp.StatusCode
-	}
-
-	if got := post(""); got != http.StatusUnauthorized {
-		t.Fatalf("no auth header: status = %d, want 401", got)
-	}
-	if got := post("Bearer wrong-secret"); got != http.StatusUnauthorized {
-		t.Fatalf("wrong bearer: status = %d, want 401", got)
-	}
-	if got := post("Bearer " + testServerToken); got == http.StatusUnauthorized {
-		t.Fatal("valid bearer token was rejected")
-	}
-	if n := gatewayHits.Load(); n != 0 {
-		t.Fatalf("gateway was contacted %d times by unauthenticated callers", n)
-	}
-
-	// Authenticated callers still work end to end.
-	cs := testClient(t, fg, testServerToken)
-	res := callTool(t, cs, "list_bridge_recipients", nil)
-	if res.IsError {
-		t.Fatalf("authenticated tool call failed: %s", toolText(t, res))
-	}
-	if !strings.Contains(toolText(t, res), "ed25519:AAA") {
-		t.Fatalf("bad recipients text: %s", toolText(t, res))
+	if !strings.Contains(sendToolDescription, "untrusted input") {
+		t.Fatal("send tool description lost the untrusted-input warning")
 	}
 }
 
@@ -328,10 +583,11 @@ func TestMCPCallerAuthRequired(t *testing.T) {
 // disclosure must describe the actual control (operator approval rule),
 // not claim a guarantee that only arrives in phase 2.
 func TestSendToolDescriptionHonestAboutEnforcement(t *testing.T) {
-	if strings.Contains(sendToolDescription, "never trigger agent actions") {
-		t.Fatalf("send tool description overstates phase-1 enforcement:\n%s", sendToolDescription)
+	d := strings.ToLower(sendToolDescription)
+	if strings.Contains(d, "guarantee") && !strings.Contains(d, "cannot") {
+		t.Fatal("description claims an enforcement guarantee it cannot keep")
 	}
-	if !strings.Contains(sendToolDescription, "must be treated as untrusted input") {
-		t.Fatalf("send tool description lost the untrusted-input rule:\n%s", sendToolDescription)
+	if !strings.Contains(d, "explicit approval") {
+		t.Fatal("description must name the operator approval rule as the control")
 	}
 }

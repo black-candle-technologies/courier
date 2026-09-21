@@ -16,9 +16,10 @@
 #   chmod 700 /opt/courier-bridge-mcp
 #   # /etc/courier-bridge-mcp.env (0600, root:root):
 #   #   COURIER_BRIDGE_TOKEN=<ingest token>
-#   #   COURIER_BRIDGE_MCP_AUTH_TOKEN=<256-bit caller secret, e.g. openssl rand -hex 32>
-#   # (one env file / unit instance per authorized bridge user;
-#   #  deliver the caller secret to the ChatGPT-side operator out of band)
+#   #   COURIER_BRIDGE_ALLOWED_CALLERS=<comma-separated Black Candle emails, issue #94>
+#   #   COURIER_BRIDGE_PUBLIC_URL=<public MCP URL, default https://mcp.courier.blackcandletech.com>
+#   #   COURIER_BRIDGE_AUTHD_URL=<authd URL, default https://auth.blackcandletech.com>
+#   # (one env file / unit instance per authorized bridge user set)
 [Unit]
 Description=Courier ChatGPT-web bridge MCP server (issue #61)
 After=network.target courier-bridge-gateway.service

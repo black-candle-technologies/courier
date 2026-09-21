@@ -174,11 +174,30 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": g.version})
 }
 
-// ingestRequest is the MCP server's ingest call.
+// ingestRequest is the MCP server's ingest call. Caller is the
+// OAuth-authenticated Black Candle email the MCP server asserts for
+// the human behind the request (issue #94); it is recorded in the
+// audit log. The gateway treats it as opaque asserted metadata.
 type ingestRequest struct {
 	Recipient    string `json:"recipient"`
 	Body         string `json:"body"`
 	ConfirmToken string `json:"confirm_token,omitempty"`
+	Caller       string `json:"caller,omitempty"`
+}
+
+// maxAuditCallerLen caps the caller identity stored in audit rows.
+// The value arrives asserted by our own MCP server, but metadata
+// crossing a service boundary gets a bound regardless.
+const maxAuditCallerLen = 256
+
+// sanitizeCaller normalizes the asserted caller identity for audit
+// storage.
+func sanitizeCaller(caller string) string {
+	caller = strings.TrimSpace(caller)
+	if len(caller) > maxAuditCallerLen {
+		caller = caller[:maxAuditCallerLen]
+	}
+	return caller
 }
 
 // confirmationSummary is what the ChatGPT side must present to the
@@ -211,21 +230,22 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusTooManyRequests, errJSON(429, "too many unauthenticated requests"))
 			return
 		}
-		g.audit(nil, "", nil, RejectedOutcome(RejectUnauthorized), 0, "")
+		g.audit(nil, "", "", nil, RejectedOutcome(RejectUnauthorized), 0, "")
 		writeJSON(w, http.StatusUnauthorized, errJSON(401, "unauthorized"))
 		return
 	}
 	var req ingestRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256*1024))
 	if err := dec.Decode(&req); err != nil {
-		g.audit(tok, "", nil, RejectedOutcome(RejectBadRequest), 0, "bad json")
+		g.audit(tok, "", "", nil, RejectedOutcome(RejectBadRequest), 0, "bad json")
 		writeJSON(w, http.StatusBadRequest, errJSON(400, "bad request"))
 		return
 	}
+	req.Caller = sanitizeCaller(req.Caller)
 	now := g.now()
 	bodyBytes := len([]byte(req.Body))
 	if bodyBytes > g.bodyCap {
-		g.audit(tok, req.Recipient, &req.Body, RejectedOutcome(RejectTooLarge), 0,
+		g.audit(tok, req.Caller, req.Recipient, &req.Body, RejectedOutcome(RejectTooLarge), 0,
 			fmt.Sprintf("body %d bytes > cap %d", bodyBytes, g.bodyCap))
 		writeJSON(w, http.StatusRequestEntityTooLarge, errJSON(413, "body exceeds 64 KiB"))
 		return
@@ -239,12 +259,12 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	if !allowed {
 		// 403 without disclosing the allowlist.
-		g.audit(tok, req.Recipient, &req.Body, RejectedOutcome(RejectForbidden), 0, "")
+		g.audit(tok, req.Caller, req.Recipient, &req.Body, RejectedOutcome(RejectForbidden), 0, "")
 		writeJSON(w, http.StatusForbidden, errJSON(403, "recipient not allowlisted for this token"))
 		return
 	}
 	if _, err := crypto.ParseAddress(req.Recipient); err != nil {
-		g.audit(tok, req.Recipient, &req.Body, RejectedOutcome(RejectBadRequest), 0, "bad recipient address")
+		g.audit(tok, req.Caller, req.Recipient, &req.Body, RejectedOutcome(RejectBadRequest), 0, "bad recipient address")
 		writeJSON(w, http.StatusBadRequest, errJSON(400, "bad recipient address"))
 		return
 	}
@@ -266,7 +286,7 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 	justConfirmed := false
 	if req.ConfirmToken != "" {
 		if err := g.consumePendingConfirmation(tok.ID, req.Recipient, req.ConfirmToken, sum); err != nil {
-			g.auditFull(tok, req.Recipient, sum, int64(len(wrapped)), RejectedOutcome(RejectBadRequest), 0, "bad confirm token")
+			g.auditFull(tok, req.Caller, req.Recipient, sum, int64(len(wrapped)), RejectedOutcome(RejectBadRequest), 0, "bad confirm token")
 			writeJSON(w, http.StatusBadRequest, errJSON(400, "invalid or expired confirm token"))
 			return
 		}
@@ -283,7 +303,7 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusInternalServerError, errJSON(500, "internal error"))
 				return
 			}
-			g.auditFull(tok, req.Recipient, sum, int64(len(wrapped)), OutcomeConfirmationRequired, 0, "")
+			g.auditFull(tok, req.Caller, req.Recipient, sum, int64(len(wrapped)), OutcomeConfirmationRequired, 0, "")
 			writeJSON(w, StatusConfirmationRequired, map[string]any{
 				"ok": false, "error": "confirmation_required",
 				"confirm_token": ct,
@@ -297,7 +317,7 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 	// so the 449 response does not consume quota: one logical first send
 	// costs one quota unit, not two (N5).
 	if ok, retryAfter := g.limiter.Allow(tok.ID); !ok {
-		g.audit(tok, req.Recipient, &req.Body, RejectedOutcome(RejectRateLimited), 0, "")
+		g.audit(tok, req.Caller, req.Recipient, &req.Body, RejectedOutcome(RejectRateLimited), 0, "")
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retryAfter.Seconds())))
 		writeJSON(w, http.StatusTooManyRequests, errJSON(429, "rate limit exceeded"))
 		return
@@ -310,7 +330,7 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 	reservedID, err := g.store.AppendAudit(&AuditEntry{
 		Ts: now.Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
 		Recipient: req.Recipient, BodySHA256: sum, BodySize: int64(len(wrapped)),
-		Outcome: OutcomeSendReserved,
+		Outcome: OutcomeSendReserved, Caller: req.Caller,
 	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errJSON(500, "internal error"))
@@ -328,7 +348,7 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 			Ts: now.Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
 			Recipient: req.Recipient, BodySHA256: sum, BodySize: int64(len(wrapped)),
 			Outcome: RejectedOutcome(RejectSendFailed), Reason: err.Error(),
-			SendRef: fmt.Sprint(reservedID),
+			SendRef: fmt.Sprint(reservedID), Caller: req.Caller,
 		}); aerr != nil {
 			// The send already failed (502 below); still log the
 			// audit failure with the reserved id so the gap is
@@ -354,7 +374,7 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 		Ts: now.Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
 		Recipient: req.Recipient, BodySHA256: sum, BodySize: int64(len(wrapped)),
 		Outcome: OutcomeSent, EnvelopeID: envelopeID,
-		SendRef: fmt.Sprint(reservedID),
+		SendRef: fmt.Sprint(reservedID), Caller: req.Caller,
 	}); err != nil {
 		// The message WAS delivered, but we could not record it: fail
 		// loudly (non-2xx) and log with the reserved audit id so the
@@ -374,7 +394,7 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 // audit appends a metadata-only audit row for a rejected (or
 // unauthenticated) ingest. body may be nil when unknown; only its hash
 // and size are ever stored.
-func (g *Gateway) audit(tok *Token, recipient string, body *string, outcome string, envelopeID int64, reason string) {
+func (g *Gateway) audit(tok *Token, caller, recipient string, body *string, outcome string, envelopeID int64, reason string) {
 	var tokenID, label string
 	if tok != nil {
 		tokenID, label = tok.ID, tok.Label
@@ -389,7 +409,7 @@ func (g *Gateway) audit(tok *Token, recipient string, body *string, outcome stri
 	if _, err := g.store.AppendAudit(&AuditEntry{
 		Ts: g.now().Unix(), TokenID: tokenID, TokenLabel: label,
 		Recipient: recipient, BodySHA256: sum, BodySize: size,
-		Outcome: outcome, EnvelopeID: envelopeID, Reason: reason,
+		Outcome: outcome, EnvelopeID: envelopeID, Reason: reason, Caller: caller,
 	}); err != nil {
 		// Rejection/unauthenticated audits are best-effort, but a
 		// failure must be visible in the logs, not silently dropped
@@ -400,11 +420,11 @@ func (g *Gateway) audit(tok *Token, recipient string, body *string, outcome stri
 
 // auditFull is audit with precomputed hash/size (used when the wrapped
 // body is already in hand).
-func (g *Gateway) auditFull(tok *Token, recipient, sum string, size int64, outcome string, envelopeID int64, reason string) {
+func (g *Gateway) auditFull(tok *Token, caller, recipient, sum string, size int64, outcome string, envelopeID int64, reason string) {
 	if _, err := g.store.AppendAudit(&AuditEntry{
 		Ts: g.now().Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
 		Recipient: recipient, BodySHA256: sum, BodySize: size,
-		Outcome: outcome, EnvelopeID: envelopeID, Reason: reason,
+		Outcome: outcome, EnvelopeID: envelopeID, Reason: reason, Caller: caller,
 	}); err != nil {
 		// Best-effort audit, but failures must be visible in the logs,
 		// not silently dropped (issue #85).
