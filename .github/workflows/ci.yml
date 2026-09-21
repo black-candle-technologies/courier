@@ -1,0 +1,221 @@
+# Courier CI
+#
+# Protects main with reproducible, honest gates:
+#  - gofmt check
+#  - go vet
+#  - go test ./... (full suite, fails the job on any red test)
+#  - go test -race ./...
+#  - staticcheck (pinned)
+#  - govulncheck (pinned)
+#  - multi-OS compile (linux, darwin, windows)
+#  - dependency review on pull requests
+#  - fuzz smoke: runs short -fuzz sessions for every discovered `func Fuzz`
+#    target; currently a no-op pass, wired so fuzz targets landing later are
+#    exercised automatically.
+#
+# Third-party actions are pinned by commit SHA (tag noted in comments).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege by default; jobs request what they need.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned deliberately. The govulncheck gate requires a toolchain with all
+  # known stdlib fixes (currently >= go1.26.6); bump this on purpose and
+  # re-run the suite. The go.mod `go 1.25.0` line is the minimum *language*
+  # version, not the toolchain.
+  GO_VERSION: "1.26.8"
+
+jobs:
+  gofmt:
+    name: gofmt
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v6
+      - uses: actions/setup-go@e626ada899467caf4efc6cfd0484b965da944ce8 # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Check formatting
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt clean"
+
+  vet:
+    name: go vet
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v6
+      - uses: actions/setup-go@e626ada899467caf4efc6cfd0484b965da944ce8 # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Verify module integrity
+        run: go mod verify
+      - name: go vet
+        run: go vet ./...
+
+  test:
+    name: go test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v6
+      - uses: actions/setup-go@e626ada899467caf4efc6cfd0484b965da944ce8 # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go test ./...
+        run: go test -count=1 -timeout=15m ./...
+
+  test-race:
+    name: go test -race
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v6
+      - uses: actions/setup-go@e626ada899467caf4efc6cfd0484b965da944ce8 # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go test -race ./...
+        run: go test -race -count=1 -timeout=25m ./...
+
+  staticcheck:
+    name: staticcheck
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    env:
+      # Pinned. Bump deliberately; keep in sync with the documented local dev version.
+      STATICCHECK_VERSION: "2026.2.1"
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v6
+      - uses: actions/setup-go@e626ada899467caf4efc6cfd0484b965da944ce8 # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Install staticcheck
+        run: go install "honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}"
+      - name: staticcheck
+        run: '"$(go env GOPATH)/bin/staticcheck" ./...'
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    env:
+      # Pinned. Bump deliberately; keep in sync with the documented local dev version.
+      GOVULNCHECK_VERSION: v1.8.0
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v6
+      - uses: actions/setup-go@e626ada899467caf4efc6cfd0484b965da944ce8 # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Install govulncheck
+        run: go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+      - name: govulncheck
+        run: '"$(go env GOPATH)/bin/govulncheck" ./...'
+
+  build:
+    name: build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v6
+      - uses: actions/setup-go@e626ada899467caf4efc6cfd0484b965da944ce8 # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Compile all packages and commands
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build ./...
+
+  fuzz-smoke:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v6
+      - uses: actions/setup-go@e626ada899467caf4efc6cfd0484b965da944ce8 # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Short fuzz sessions for every discovered fuzz target
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r pkg; do
+            [ -n "$pkg" ] || continue
+            while IFS= read -r target; do
+              [ -n "$target" ] || continue
+              found=1
+              echo "== fuzzing ${pkg} ${target} (-fuzztime=30s) =="
+              go test -run '^$' -fuzz "^${target}$" -fuzztime 30s "$pkg"
+            done < <(go test -list '^Fuzz' -run '^$' "$pkg" 2>/dev/null | grep '^Fuzz' || true)
+          done < <(go list -f '{{if .TestGoFiles}}{{.ImportPath}}{{end}}' ./... | grep .)
+          if [ "$found" -eq 0 ]; then
+            echo "no fuzz targets present; wired for future fuzz targets (issue #112)"
+          fi
+
+  dependency-review:
+    name: dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v6
+      - uses: actions/dependency-review-action@284c089a1c4d8e8673b7398cdb8df358a9de47ad # v4
