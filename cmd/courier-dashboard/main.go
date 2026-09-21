@@ -36,7 +36,18 @@ func main() {
 	dbPath := flag.String("db", "courier-relay.db", "sqlite database path (shared with the relay)")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate file (default: <dbdir>/tls.crt)")
 	tlsKey := flag.String("tls-key", "", "TLS key file (default: <dbdir>/tls.key)")
+	// Optional Black Candle account linking. The feature is dormant
+	// unless BOTH are set — self-hosted installs leave them empty and
+	// never see the linking UI or routes. Same binary, same release.
+	bctURL := flag.String("bct-auth-url", os.Getenv("BCT_AUTH_URL"),
+		"Black Candle auth service URL (enables optional account linking; empty disables)")
+	bctKey := flag.String("bct-auth-key", os.Getenv("BCT_AUTH_API_KEY"),
+		"API key for the Black Candle auth service (X-Api-Key)")
 	flag.Parse()
+
+	if *bctURL != "" && *bctKey == "" {
+		log.Fatalf("bct-auth-url is set but bct-auth-key is empty")
+	}
 
 	st, err := store.Open(*dbPath)
 	if err != nil {
@@ -57,9 +68,12 @@ func main() {
 
 	srv := &http.Server{
 		Addr:         *addr,
-		Handler:      loggingMiddleware(dashboard.New(st).Routes()),
+		Handler:      loggingMiddleware(dashboard.NewWithBCT(st, dashboard.BCTConfig{URL: *bctURL, APIKey: *bctKey}).Routes()),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
+	}
+	if *bctURL != "" {
+		log.Printf("Black Candle account linking enabled (auth %s)", *bctURL)
 	}
 
 	go func() {
