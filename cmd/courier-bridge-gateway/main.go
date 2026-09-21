@@ -31,9 +31,11 @@ import (
 
 	"github.com/black-candle-technologies/courier/internal/bridge"
 	"github.com/black-candle-technologies/courier/internal/client"
+	"github.com/black-candle-technologies/courier/internal/version"
 )
 
-const version = "0.11.0"
+// version.Bridge (internal/version) carries the bridge version, stamped at
+// build time via ldflags -X; see docs/versions.md.
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -48,7 +50,7 @@ func main() {
 	case "serve":
 		err = cmdServe(os.Args[2:])
 	case "version", "--version", "-v":
-		fmt.Println("courier-bridge-gateway", version)
+		fmt.Println("courier-bridge-gateway", version.Bridge)
 		return
 	default:
 		usage()
@@ -186,7 +188,7 @@ func cmdServe(args []string) error {
 	} else if n > 0 {
 		log.Printf("pruned %d audit rows older than retention", n)
 	}
-	gw := bridge.NewGateway(st, client.New(cfg), pepper, cfg.Address, id.EdPub[:], version)
+	gw := bridge.NewGateway(st, client.New(cfg), pepper, cfg.Address, id.EdPub[:], version.Bridge)
 	// COURIER_BRIDGE_BODY_CAP_BYTES optionally overrides the ingest body cap
 	// (default 64 KiB). Unset keeps the default; the value is bytes.
 	if v := strings.TrimSpace(os.Getenv("COURIER_BRIDGE_BODY_CAP_BYTES")); v != "" {
@@ -202,6 +204,6 @@ func cmdServe(args []string) error {
 		Handler:           gw.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	log.Printf("courier-bridge-gateway %s: bridge %s listening on %s", version, cfg.Address, *addr)
+	log.Printf("courier-bridge-gateway %s: bridge %s listening on %s", version.Bridge, cfg.Address, *addr)
 	return srv.ListenAndServe()
 }

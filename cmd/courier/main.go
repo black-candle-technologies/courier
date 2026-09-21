@@ -29,10 +29,12 @@ import (
 
 	"github.com/black-candle-technologies/courier/internal/client"
 	"github.com/black-candle-technologies/courier/internal/update"
+	"github.com/black-candle-technologies/courier/internal/version"
 	"github.com/mattn/go-isatty"
 )
 
-const version = "0.11.0"
+// version.Client (internal/version) carries the client version, stamped at
+// build time via ldflags -X; see docs/versions.md.
 
 func main() {
 	if len(os.Args) < 2 {
@@ -43,7 +45,7 @@ func main() {
 	// go to stderr so stdout stays machine-readable (stdio/serve).
 	if os.Args[1] != "update" && client.ConfigExists() {
 		if cfg, err := client.LoadConfig(); err == nil {
-			client.New(cfg).MaybeUpdateCheck(version)
+			client.New(cfg).MaybeUpdateCheck(version.Client)
 		}
 	}
 	var err error
@@ -99,7 +101,7 @@ func main() {
 	case "config":
 		err = cmdConfig(os.Args[2:])
 	case "version", "--version", "-v":
-		fmt.Println("courier", version)
+		fmt.Println("courier", version.Client)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
 		usage()
@@ -1321,8 +1323,8 @@ func cmdUpdate() error {
 	if err != nil {
 		return err
 	}
-	if !update.NewerThan(version, rel.Tag) {
-		fmt.Printf("already up to date (courier %s).\n", version)
+	if !update.NewerThan(version.Client, rel.Tag) {
+		fmt.Printf("already up to date (courier %s).\n", version.Client)
 		// v0.6.0+: agents that updated via an older binary never saw
 		// the dashboard setup directive, so surface it here too.
 		if cfg, err := client.LoadConfig(); err == nil && cfg.DashboardToken == "" {
@@ -1331,7 +1333,7 @@ func cmdUpdate() error {
 		}
 		return nil
 	}
-	fmt.Printf("updating courier %s -> %s...\n", version, rel.Tag)
+	fmt.Printf("updating courier %s -> %s...\n", version.Client, rel.Tag)
 	if err := rel.Apply(); err != nil {
 		return err
 	}

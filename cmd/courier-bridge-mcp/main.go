@@ -63,9 +63,12 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
+
+	"github.com/black-candle-technologies/courier/internal/version"
 )
 
-const version = "0.11.0"
+// version.Bridge (internal/version) carries the bridge version, stamped at
+// build time via ldflags -X; see docs/versions.md.
 
 // oauthScopeIdentity is the only OAuth scope this bridge needs: proving
 // which Black Candle account the caller is. authd issues exactly this
@@ -369,7 +372,7 @@ func handleRecipients(b *bridgeClient) mcp.ToolHandlerFor[struct{}, any] {
 func buildServer(b *bridgeClient, sendDesc string) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{
 		Name:    "courier-bridge",
-		Version: version,
+		Version: version.Bridge,
 		Title:   "Courier Bridge (ChatGPT web → Courier)",
 	}, nil)
 	mcp.AddTool(srv, &mcp.Tool{
@@ -697,7 +700,7 @@ func main() {
 	mux.Handle("/", bearer(requireAllowedCaller(mcpHandler, allowed)))
 	httpSrv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	log.Printf("courier-bridge-mcp %s listening on %s (gateway %s, authd %s, public %s, %d allowed callers)",
-		version, *addr, *gatewayURL, authd, public, len(allowed))
+		version.Bridge, *addr, *gatewayURL, authd, public, len(allowed))
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
