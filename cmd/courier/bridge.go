@@ -297,6 +297,9 @@ func cmdBridgeAudit(args []string) error {
 		}
 		fmt.Printf("#%-6d %s  %-16s %-24s %6dB  %s  env:%d  sha:%.12s\n",
 			r.ID, ts, r.TokenLabel, recipient, r.BodySize, r.Outcome, r.EnvelopeID, r.BodySHA256)
+		if r.Caller != "" {
+			fmt.Printf("         caller: %s\n", r.Caller)
+		}
 		if r.Reason != "" {
 			fmt.Printf("         reason: %s\n", r.Reason)
 		}
