@@ -27,16 +27,27 @@ inbound text with a non-E2E banner and must **never** trigger agent
 actions, tool calls, sends, or state changes without the receiving
 operator's explicit approval.
 
+Access control at the public MCP boundary is caller authentication,
+not URL secrecy: every incoming MCP request must carry the
+provisioned bearer secret (`COURIER_BRIDGE_MCP_AUTH_TOKEN`).
+Unauthenticated callers are rejected with `401` before any gateway
+contact.
+
 ## Components
 
 - **`courier-bridge-mcp`** — public MCP server (Streamable HTTP),
   fronted by Caddy at `mcp.courier.blackcandletech.com`. Exposes three
   tools: `send_to_agent`, `bridge_status`, `list_bridge_recipients`.
-  One server instance = one ingest token = one bridge user. The MCP
-  server is **not** a trust boundary: the gateway re-validates
-  everything. The MCP server URL itself confers send rights (the bearer
-  token lives in the server's environment, one instance per user) —
-  treat the URL as a secret.
+  One server instance = one ingest token = one bridge user. Callers of
+  the MCP server authenticate with a pre-shared high-entropy bearer
+  secret (`COURIER_BRIDGE_MCP_AUTH_TOKEN`, provisioned via the 0600
+  root-owned env file, sent as `Authorization: Bearer <token>`); every
+  incoming HTTP request is checked before any gateway contact, and
+  unauthenticated callers get `401` with no tool list, no recipients,
+  no confirm tokens, and no sends. The MCP server URL is **not** the
+  access control — URL secrecy was retired as the security story in
+  issue #82. The gateway still re-validates everything downstream.
+  OAuth/OIDC is the planned phase-2 replacement for the shared secret.
 - **`courier-bridge-gateway`** — localhost-only service on the VPS
   (`127.0.0.1:8473`). Owns the bridge identity, enforces tokens /
   allowlists / rate limits / the 64 KiB body cap, wraps the attribution
@@ -68,6 +79,36 @@ The bridge identity publishes the `bridge-chatgpt-web` contact-discovery
 capability token so clients can verify the sender out of band, and
 recipients can pin the bridge address locally with
 `courier bridge trust <addr>`.
+
+## MCP caller authentication (issue #82)
+
+The public MCP endpoint (`mcp.courier.blackcandletech.com`) requires
+callers to present the pre-shared bearer secret
+`COURIER_BRIDGE_MCP_AUTH_TOKEN` on every HTTP request
+(`Authorization: Bearer <token>`). The server rejects unauthenticated
+callers with `401` before any gateway contact — they learn nothing,
+not even the tool list.
+
+**Provisioning** (as root on the VPS, per MCP server instance):
+
+```
+# 256-bit secret, shown once — deliver to the ChatGPT-side operator
+# out of band (not over the bridge itself):
+openssl rand -hex 32
+# append to /etc/courier-bridge-mcp.env (0600, root:root):
+COURIER_BRIDGE_MCP_AUTH_TOKEN=<hex>
+systemctl restart courier-bridge-mcp
+```
+
+**Rotation:** generate a new secret, update the env file, restart the
+unit, and update the ChatGPT connector configuration on the caller
+side. There is no grace period — the old secret stops working at
+restart, so coordinate the swap. **Suspected compromise:** rotate
+immediately, and also rotate `COURIER_BRIDGE_TOKEN` if the compromise
+could have reached the server environment (the env file holds both).
+
+**Phase 2:** replace the shared secret with OAuth/OIDC at the public
+MCP boundary (per-caller credentials, auditable issuance/revocation).
 
 ## Tokens
 
@@ -115,6 +156,9 @@ on the VPS.
 
 ## Phase 2 (planned)
 
+- OAuth/OIDC caller authentication at the public MCP boundary,
+  replacing the phase-1 pre-shared bearer secret (per-caller
+  credentials, auditable issuance and revocation).
 - Dashboard admin audit view (the `courier bridge audit` equivalent in
   the UI).
 - Attribution rendering from the pinned bridge-address list
@@ -134,6 +178,11 @@ on the VPS.
   (not over the bridge itself).
 - **Rotate:** `courier bridge token rotate --name label [--grace 24h]`
   — update the MCP server's `COURIER_BRIDGE_TOKEN`, confirm a test send.
+- **Rotate the MCP caller secret:** generate a fresh 256-bit secret
+  (`openssl rand -hex 32`), replace `COURIER_BRIDGE_MCP_AUTH_TOKEN` in
+  `/etc/courier-bridge-mcp.env`, `systemctl restart courier-bridge-mcp`,
+  and update the ChatGPT connector config on the caller side. No grace
+  period — coordinate the swap.
 - **Revoke (suspected compromise):** `courier bridge token revoke --name label`
   — immediate. `--all` revokes everything (kill switch; works even if
   the gateway is down).
