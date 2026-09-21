@@ -76,9 +76,10 @@ func (s *Server) buildInboxPage(envs []store.Envelope) []inboxMsgJSON {
 	// per distinct sender across the page. "rate_limited" means the
 	// sender's send bucket is currently exhausted (actively bursting);
 	// "reported" means the sender is currently over the distinct-reporter
-	// throttle threshold. Recipients use these as machine-readable
-	// reasons when triaging message requests. They are relay-asserted,
-	// not signed — advisory signal, not authentication.
+	// throttle threshold; "bridged:<origin>" means the sender is a bridge
+	// identity registered with the relay operator (issue #98). Recipients
+	// use these as machine-readable reasons when triaging message requests.
+	// They are relay-asserted, not signed — advisory signal, not authentication.
 	senderFlags := make(map[string][]string)
 	for _, e := range envs {
 		if _, ok := senderFlags[e.From]; ok {
@@ -90,6 +91,14 @@ func (s *Server) buildInboxPage(envs []store.Envelope) []inboxMsgJSON {
 		}
 		if n, err := s.store.DistinctReporterCount(e.From, int64(s.cfg.SpamReportWindow.Seconds())); err == nil && n >= s.cfg.SpamReportThreshold {
 			flags = append(flags, "reported")
+		}
+		// issue #98: the relay operator registered this sender as a
+		// bridge identity out of band. The flag is advisory and
+		// metadata-only — computed from the sender address against the
+		// operator's config, never from message content — and purely
+		// additive: old clients ignore the unknown flag value.
+		if origin, ok := s.bridgeOrigins[e.From]; ok {
+			flags = append(flags, "bridged:"+origin)
 		}
 		senderFlags[e.From] = flags
 	}

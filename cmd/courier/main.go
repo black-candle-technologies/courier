@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/client"
+	"github.com/black-candle-technologies/courier/internal/store"
 	"github.com/black-candle-technologies/courier/internal/update"
 	"github.com/mattn/go-isatty"
 )
@@ -210,6 +211,7 @@ func usage() {
                                          create your web dashboard login
   courier dashboard push [--follow]      forward new messages to the dashboard
   courier dashboard status               show dashboard account status
+  courier dashboard set-admin USERNAME   grant dashboard admin rights (operator; bridge audit view)
   courier bridge token issue --name LABEL --allow addr,...
                                          issue a ChatGPT-web bridge token (admin)
   courier bridge token list              list bridge tokens (metadata only)
@@ -1463,7 +1465,7 @@ func cmdConfig(args []string) error {
 
 func cmdDashboard(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: courier dashboard <setup|push|status> ...")
+		return fmt.Errorf("usage: courier dashboard <setup|push|status|set-admin> ...")
 	}
 	switch args[0] {
 	case "setup":
@@ -1472,8 +1474,10 @@ func cmdDashboard(args []string) error {
 		return cmdDashboardPush(args[1:])
 	case "status":
 		return cmdDashboardStatus()
+	case "set-admin":
+		return cmdDashboardSetAdmin(args[1:])
 	default:
-		return fmt.Errorf("unknown dashboard subcommand %q (setup|push|status)", args[0])
+		return fmt.Errorf("unknown dashboard subcommand %q (setup|push|status|set-admin)", args[0])
 	}
 }
 
@@ -1576,5 +1580,49 @@ func cmdDashboardStatus() error {
 	fmt.Printf("url:      %s\n", cfg.DashboardURL)
 	fmt.Printf("cursor:   %d (last pushed courier message id)\n", cfg.DashboardCursor)
 	fmt.Printf("sent:     %d (last pushed sent message id)\n", cfg.DashboardSentCursor)
+	return nil
+}
+
+// cmdDashboardSetAdmin grants or revokes dashboard admin rights (issue
+// #95). Admins may view the bridge audit log at /admin/bridge/audit.
+// This is an operator action: it opens the dashboard database directly
+// (the relay's DB, shared with the dashboard), like `courier bridge
+// token issue` opens bridge.db. Admin rights are never self-serve —
+// there is no HTTP endpoint for this.
+func cmdDashboardSetAdmin(args []string) error {
+	fs := flag.NewFlagSet("dashboard set-admin", flag.ContinueOnError)
+	dbPath := fs.String("db", "", "dashboard database path (shared with the relay; default COURIER_RELAY_DB or courier-relay.db)")
+	revoke := fs.Bool("revoke", false, "revoke admin rights instead of granting them")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: courier dashboard set-admin [--db PATH] [--revoke] <username>")
+	}
+	db := *dbPath
+	if db == "" {
+		db = os.Getenv("COURIER_RELAY_DB")
+	}
+	if db == "" {
+		db = "courier-relay.db"
+	}
+	st, err := store.Open(db)
+	if err != nil {
+		return fmt.Errorf("open dashboard db: %w", err)
+	}
+	defer st.Close()
+	ok, err := st.SetDashboardAdmin(rest[0], !*revoke)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("no dashboard user %q", rest[0])
+	}
+	if *revoke {
+		fmt.Printf("revoked dashboard admin rights from %q\n", rest[0])
+	} else {
+		fmt.Printf("granted dashboard admin rights to %q\n", rest[0])
+	}
 	return nil
 }

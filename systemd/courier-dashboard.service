@@ -12,6 +12,13 @@ Restart=always
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
+# Optional (issue #95, bridge audit admin view): create
+# /etc/courier-dashboard.env (0600, root:root) holding
+# COURIER_BRIDGE_AUDIT_URL=<gateway base URL> and
+# COURIER_BRIDGE_AUDIT_ADMIN_TOKEN=<gateway admin token>, then add
+# EnvironmentFile=/etc/courier-dashboard.env below. Both must be
+# set; the audit view is dormant when either is empty. Grant admins
+# with `courier dashboard set-admin <username>` on the dashboard DB.
 
 [Install]
 WantedBy=multi-user.target
