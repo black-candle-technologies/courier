@@ -87,6 +87,11 @@ them — no new relay endpoint, no new signed object.
 - **Opt-out:** `courier fs off <peer>` disables FS for a peer (legacy only).
   `courier fs forget <peer>` erases the session and sets the peer to off
   (so a peer that keeps sending FS doesn't silently re-establish).
+- **Fail-closed opt-in (issue #110):** `courier fs require <peer>` sets a
+  per-contact policy under which sends **refuse** to fall back to legacy:
+  without an established FS session the send fails with an error instead
+  of going out legacy-sealed. `courier fs require <peer> off` lifts it.
+  The default stays fail-open (see §9).
 
 **Limitation, stated plainly:** peers with private handles (or no handle)
 cannot advertise `fs` through the directory. For those peers, FS starts
@@ -328,6 +333,10 @@ courier fs on <peer>         mark peer FS-capable and initiate
 courier fs off <peer>        disable FS for peer (legacy only from now on)
 courier fs rekey <peer>      force a DH rotation on next send
 courier fs forget <peer>     erase the session (implies off)
+courier fs require <peer> [on|off]
+                             fail-closed policy: refuse legacy fallback for
+                             this peer unless an FS session is established
+                             (default on; `off` lifts it back to fail-open)
 ```
 
 Handshake traffic never touches `~/.courier/sent.jsonl` (logSent=false,
@@ -347,14 +356,40 @@ chat.
   steps (erasure wins); FS for group/channel/state protocol traffic (v1
   scope); anything sealed to the seed-derived key by a holder of an old
   backup (§6b limitation).
-- **Downgrade resistance:** FS is opportunistic, not enforced — a network
-  attacker who suppresses `fs-init`/`fs-accept` keeps the conversation on
-  legacy encryption. This is the standard opportunistic-encryption
-  trade-off (cf. STARTTLS): it raises the cost of passive collection
-  without promising protection against an active attacker who controls
-  delivery. `courier fs status` shows whether a conversation is actually
-  under FS, so users can verify. Enforcement (refusing legacy) is a
-  possible future mode, not v1.
+- **Downgrade resistance:** FS is opportunistic **by default**, not
+  enforced — a network attacker who suppresses `fs-init`/`fs-accept`
+  keeps the conversation on legacy encryption. This is the standard
+  opportunistic-encryption trade-off (cf. STARTTLS): it raises the cost
+  of passive collection without promising protection against an active
+  attacker who controls delivery. `courier fs status` shows whether a
+  conversation is actually under FS, so users can verify.
+- **Downgrade detection (issue #110):** the client *pins* observed FS
+  capability per contact (`fs.json`: address → first-observed timestamp,
+  set on completed handshakes and valid inbound FS frames). A pinned
+  peer keeps receiving handshake attempts even when the relay suppresses
+  directory availability (the pin is permanent capability knowledge),
+  and a pinned peer that is suddenly reachable only via legacy — no
+  session, no current positive capability evidence, no handshake in
+  flight — is flagged: a persistent `downgrade_since` marker (visible in
+  `courier fs status` as `⚠ DOWNGRADE SUSPECTED`) plus a rate-limited
+  warning on send. The marker clears when the peer shows positive
+  capability again or a session re-establishes. Pins and policies are
+  keyed by the peer's address (the cryptographic identity), never by
+  contact name.
+- **Fail-closed mode (issue #110):** `courier fs require <peer>` makes
+  sends to that contact refuse legacy fallback — without an established
+  FS session the send fails with an error. This closes the
+  relay-suppressible downgrade for contacts that opt in. It does not
+  probe unknown peers (`fs on`/`fs start` still bootstrap capability),
+  and it deliberately wins over `fs off` if both are set (contradictory
+  configuration fails closed, loudly).
+- **The default question, still open:** the default remains **fail-open**,
+  exactly as v0.11.0 shipped — mixed-version pairs keep working with no
+  flag day. Whether `require_fs` should become the default in a future
+  release is an explicit product decision, not taken here: fail-closed
+  by default would refuse sends to every legacy/unknown peer until a
+  handshake completes, which changes the delivery-reliability contract
+  the migration story was built on.
 
 ## 10. Changes
 
@@ -362,11 +397,21 @@ chat.
   `internal/client/fs.go` (sessions, handshake, send/recv integration,
   `fs.json` store), `cmd/courier/fs.go` (CLI), this doc.
 - **Touched:** `internal/client/client.go` (send path FS branch, inbox FS
-  dispatch, attachment unwrap selection), `internal/client/attachments.go`
-  (FS data-key wrap variant), `internal/client/directory.go` (auto-add
-  `fs` capability on register/update), `internal/client/backup.go`
-  (wipe `fs.json` on restore + rotate reminder), `PROTOCOL.md`,
-  `README.md`.
+  dispatch, attachment unwrap selection, FS warning plumbing),
+  `internal/client/attachments.go` (FS data-key wrap variant),
+  `internal/client/directory.go` (auto-add `fs` capability on register/update),
+  `internal/client/backup.go` (wipe `fs.json` on restore + rotate reminder),
+  `internal/client/bridge.go` (downgrade-warning surfacing on bridged sends),
+  `PROTOCOL.md`, `README.md`.
+- **Issue #110 (fail-closed policy + downgrade detection):** new in
+  `internal/client/fs.go` — `RequireFS`/`FSPins`/`Downgrade`/
+  `DowngradeWarnedAt` in `fs.json` (additive; old files load unchanged),
+  `errFSRequired`, `fsAssessDowngrade`, `fsPinCapabilityLocked`,
+  `Client.FSSetRequireFS`/`FSRequireForPeer`/`FSPinnedAt`/
+  `FSConsumeWarning`, extended `FSSessionInfo`; new in
+  `cmd/courier/fs.go` — `courier fs require <peer> [on|off]` and the
+  `require-fs` / `capability: pinned` / `DOWNGRADE SUSPECTED` status lines.
+  Default behavior is unchanged (fail-open).
 - **Relay / dashboard: no changes.** No new endpoints, no migration, no
   redeploy. The wire is unchanged; negotiation reuses the directory's
   existing capability tokens.

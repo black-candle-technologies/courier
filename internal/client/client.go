@@ -822,11 +822,39 @@ func (c *Client) verifyKeyAnnouncement(address, x25519Pub string, epoch int64, s
 // Client talks to the relay.
 type Client struct {
 	cfg *Config
+	// fsWarnMu guards fsWarnPending: user-facing FS warnings queued by
+	// fsAssessDowngrade (issue #110) during a send, consumed once by
+	// the send path (or FSConsumeWarning) so each warning surfaces
+	// exactly once.
+	fsWarnMu      sync.Mutex
+	fsWarnPending map[string]string
 }
 
 // New returns a Client for cfg.
 func New(cfg *Config) *Client {
 	return &Client{cfg: cfg}
+}
+
+// noteFSWarning queues a user-facing FS warning for address. It is
+// consumed (and cleared) by FSConsumeWarning.
+func (c *Client) noteFSWarning(address, text string) {
+	c.fsWarnMu.Lock()
+	defer c.fsWarnMu.Unlock()
+	if c.fsWarnPending == nil {
+		c.fsWarnPending = map[string]string{}
+	}
+	c.fsWarnPending[address] = text
+}
+
+// FSConsumeWarning returns and clears any pending FS warning for
+// address (empty when none). The send path calls this after a
+// successful send to surface downgrade warnings (issue #110).
+func (c *Client) FSConsumeWarning(address string) string {
+	c.fsWarnMu.Lock()
+	defer c.fsWarnMu.Unlock()
+	w := c.fsWarnPending[address]
+	delete(c.fsWarnPending, address)
+	return w
 }
 
 // httpClient builds the transport, enforcing certificate pinning for
@@ -1118,7 +1146,16 @@ func (c *Client) send(toOrName, body string, attachPaths []string, replyTo int64
 		// fsSealMessage erases them, so disarm the deferred erase.
 		fsOut = nil
 	}
-	return c.sendSealed(address, plain, body, replyTo, quote, logSent, expiresAt)
+	id, err := c.sendSealed(address, plain, body, replyTo, quote, logSent, expiresAt)
+	if err != nil {
+		return 0, err
+	}
+	// Issue #110: surface a queued FS downgrade warning, if any, once
+	// the send succeeded.
+	if w := c.FSConsumeWarning(address); w != "" {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+	return id, nil
 }
 
 // sendSealed encrypts plain for address and posts it as a DM. sentLogBody
