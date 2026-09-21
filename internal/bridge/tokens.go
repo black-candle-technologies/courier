@@ -16,7 +16,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
+	"io"
 	"strings"
 	"time"
 
@@ -75,15 +75,21 @@ func (t *Token) Status(now int64) string {
 	}
 }
 
-// newTokenID generates a random token id (128 bits, hex).
-func newTokenID() string {
+// randReader is the randomness source for newTokenID. It defaults to
+// crypto/rand and is a package variable (not a parameter) so tests can
+// inject a failing reader and verify fail-closed behavior.
+var randReader io.Reader = rand.Reader
+
+// newTokenID generates a random token id (128 bits, hex). On RNG
+// failure it returns an error and no id is issued (fail closed): a
+// predictable all-zero id must never be assigned, since the first such
+// insert would succeed and the id is guessable.
+func newTokenID() (string, error) {
 	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// Vanishingly unlikely; log it. An all-zero id collides on the
-		// primary key and surfaces as an insert error (fail-safe).
-		log.Printf("bridge: crypto/rand failed generating token id: %v", err)
+	if _, err := io.ReadFull(randReader, b[:]); err != nil {
+		return "", fmt.Errorf("generate token id: %w", err)
 	}
-	return hex.EncodeToString(b[:])
+	return hex.EncodeToString(b[:]), nil
 }
 
 // GenerateRawToken creates a new raw token: prefix + 256 bits of
@@ -152,8 +158,12 @@ func (s *Store) IssueToken(label string, allowlist []string, ttl time.Duration, 
 	if err != nil {
 		return "", nil, err
 	}
+	id, err := newTokenID()
+	if err != nil {
+		return "", nil, err
+	}
 	tok := &Token{
-		ID:        newTokenID(),
+		ID:        id,
 		Label:     label,
 		Allowlist: allowlist,
 		CreatedAt: time.Now().Unix(),
