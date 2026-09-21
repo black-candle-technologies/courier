@@ -13,7 +13,7 @@ import (
 
 func cmdChannel(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: courier channel <create|invite|join|send|inbox|list|remove|leave> ...")
+		return fmt.Errorf("usage: courier channel <create|invite|join|send|inbox|list|remove|leave>")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {

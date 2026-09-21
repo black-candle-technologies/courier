@@ -100,13 +100,12 @@ func TestSafetyNumberRejectsBadAddresses(t *testing.T) {
 
 // verifyTestEnv wires two identities through a fake key directory.
 type verifyTestEnv struct {
-	t        *testing.T
-	alice    *Client
-	aCfg     *Config
-	bobAddr  string
-	bobID    *crypto.Identity
-	anns     map[string]fakeAnn
-	srvClose func()
+	t       *testing.T
+	alice   *Client
+	aCfg    *Config
+	bobAddr string
+	bobID   *crypto.Identity
+	anns    map[string]fakeAnn
 }
 
 func newVerifyTestEnv(t *testing.T) *verifyTestEnv {

@@ -93,13 +93,13 @@ func TestSplitSendArgs(t *testing.T) {
 
 func TestSplitBackupArgs(t *testing.T) {
 	cases := []struct {
-		name            string
-		args            []string
-		wantPos         []string
-		wantOutput      string
-		wantPassEnv     string
-		wantForce       bool
-		wantDevice      string
+		name        string
+		args        []string
+		wantPos     []string
+		wantOutput  string
+		wantPassEnv string
+		wantForce   bool
+		wantDevice  string
 	}{
 		{
 			name:        "flags after positional",

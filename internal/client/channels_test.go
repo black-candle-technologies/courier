@@ -67,7 +67,7 @@ func TestParseChannelDMPayload(t *testing.T) {
 		`not json`,
 		`{"cc":1,"t":"invite","g":"group:x"}`, // group magic, not channel
 		`{"cc":2,"t":"bogus"}`,
-		`{"cc":2}`, // no type
+		`{"cc":2}`,    // no type
 		`{"t":"msg"}`, // no magic
 	} {
 		if _, ok := parseChannelDMPayload(mk(bad)); ok {

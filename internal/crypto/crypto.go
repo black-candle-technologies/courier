@@ -121,7 +121,7 @@ func Ed25519PubToX25519(pub []byte) ([32]byte, error) {
 	_, Y, Z, _ := p.ExtendedCoordinates()
 	y := new(field.Element).Multiply(Y, new(field.Element).Invert(Z)) // affine y
 	one := new(field.Element).One()
-	num := new(field.Element).Add(one, y)                             // 1+y
+	num := new(field.Element).Add(one, y) // 1+y
 	negY := new(field.Element).Negate(y)
 	den := new(field.Element).Add(one, negY) // 1-y
 	if den.Equal(new(field.Element)) == 1 {

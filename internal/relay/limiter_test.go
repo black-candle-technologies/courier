@@ -30,7 +30,10 @@ func TestLimiterRecoversOverTime(t *testing.T) {
 	l := NewLimiter(2, 1) // burst 2, 1 token/sec
 	l.now = fc.now
 
-	if !l.Allow("alice") || !l.Allow("alice") {
+	if !l.Allow("alice") {
+		t.Fatal("initial burst denied")
+	}
+	if !l.Allow("alice") {
 		t.Fatal("initial burst denied")
 	}
 	if l.Allow("alice") {
