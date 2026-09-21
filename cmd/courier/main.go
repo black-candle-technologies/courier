@@ -124,7 +124,7 @@ func usage() {
                                          first-contact or contacts-policy handle sends
       [--attach <file>]...               attach files (E2E encrypted, 25 MiB max each)
       [--reply-to <id>]                  reply to message #id (quotes it, threads the view)
-      [--ttl <duration>]                 disappearing message: delete after duration (e.g. 10m, 2h)
+      [--ttl <duration>]                 disappearing message: local delete after duration (e.g. 10m, 2h)
   courier inbox [--all] [--limit N] [--follow [--interval 5s]] [--requests]
       [--attachments-dir <dir>]          download verified attachments into dir
                                          --requests lists held message requests instead

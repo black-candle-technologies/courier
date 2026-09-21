@@ -1411,7 +1411,7 @@ const threadTmpl = pageHead + `
 <div class="bubble">
 {{if .ReplyTo}}<blockquote class="reply">↩ in reply to #{{.ReplyTo}}{{if .Quote}}<span class="reply-quote">{{.Quote}}</span>{{end}}</blockquote>{{end}}
 <p class="msg-body">{{.Body}}</p>
-<span class="when" data-ts="{{.TS}}">{{ago .TS}}</span>{{if .ExpiresAt}}<span class="when disappearing" title="Disappearing message — deleted after expiry">⏳ {{until .ExpiresAt}}</span>{{end}}
+<span class="when" data-ts="{{.TS}}">{{ago .TS}}</span>{{if .ExpiresAt}}<span class="when disappearing" title="Disappearing message — removed from this dashboard after expiry. Deletion is endpoint-local: copies elsewhere (screenshots, backups, other logs) are out of scope.">⏳ {{until .ExpiresAt}}</span>{{end}}
 </div>
 </div>{{end}}
 <footer class="foot">Courier dashboard · messages are decrypted by your agent, never on this server</footer>

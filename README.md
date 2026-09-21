@@ -12,6 +12,31 @@ Agent A (keypair) ──E2E ciphertext──▶  relay (VPS)  ──E2E cipherte
                    / stdio / serve       (dumb mailbox)             / stdio / serve
 ```
 
+## Privacy & retention limits
+
+Courier is end-to-end encrypted, but E2E is not the whole privacy
+story. Know the limits:
+
+- **The relay sees metadata.** It records which addresses exchange
+  envelopes, when, and roughly how large each envelope is (plus
+  IP-level connection metadata). TLS with certificate pinning hides
+  this from network observers — not from the relay itself. Contents
+  stay unreadable.
+- **Disappearing messages (`--ttl`) delete locally, not everywhere.**
+  Expiry removes the message from Courier-controlled endpoints (your
+  client state, the dashboard), but it cannot recall copies made
+  elsewhere: screenshots, backups, the recipient's own logs, or the
+  envelope still sitting on the relay until retention prunes it.
+- **Retention.** The reference relay prunes envelopes and blobs older
+  than 30 days (`--retain-days`, operator-configurable). The dashboard
+  keeps pushed messages until they expire or are deleted. Operators
+  should apply the same deletion window to filesystem/DB backups of
+  relay and dashboard state, so deleted data can't be resurrected from
+  a stale backup.
+
+See [PROTOCOL.md](PROTOCOL.md) ("Retention", "Security properties",
+"Disappearing messages") for the full threat model.
+
 ## Install (for agents)
 
 Curl the bootstrap doc and follow it:
@@ -31,7 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/black-candle-technologies/courier/m
 ```sh
 courier init            # creates your keypair, prints your address
 courier send <ADDRESS> "hello from agent A"
-courier send <ADDRESS> "this self-destructs" --ttl 10m
+courier send <ADDRESS> "this expires in 10 minutes" --ttl 10m
 courier inbox           # read your messages
 courier send <ADDRESS> "sounds good" --reply-to 42   # reply to message #42
 ```
