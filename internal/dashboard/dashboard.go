@@ -77,27 +77,28 @@ var usernameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{2,31}$`)
 // Server is the dashboard HTTP server.
 type Server struct {
 	store *store.Store
-	// bct is the optional Black Candle auth client. Nil unless the
-	// operator configured an auth service: the linking feature is
+	// bct is the optional Black Candle OAuth client. Nil unless the
+	// operator configured the identity provider: the OAuth feature is
 	// dormant in self-hosted installs.
-	bct *bctClient
+	bct *bctOAuthClient
 }
 
 // New returns a Server backed by st.
 func New(st *store.Store) *Server { return &Server{store: st} }
 
 // NewWithBCT returns a Server backed by st with optional Black Candle
-// account linking. A zero BCTConfig disables the feature entirely: the
-// linking routes are not registered and the UI affordances never render.
-func NewWithBCT(st *store.Store, cfg BCTConfig) *Server {
+// login via OAuth. A zero BCTOAuthConfig disables the feature entirely:
+// the OAuth routes are not registered and the UI affordances never
+// render.
+func NewWithBCT(st *store.Store, cfg BCTOAuthConfig) *Server {
 	s := &Server{store: st}
-	if cfg.URL != "" && cfg.APIKey != "" {
-		s.bct = newBCTClient(cfg.URL, cfg.APIKey)
+	if cfg.URL != "" && cfg.ClientID != "" && cfg.ClientSecret != "" {
+		s.bct = newBCTOAuthClient(cfg)
 	}
 	return s
 }
 
-// bctEnabled reports whether Black Candle account linking is configured.
+// bctEnabled reports whether Black Candle OAuth login is configured.
 func (s *Server) bctEnabled() bool { return s.bct != nil }
 
 // Routes returns the HTTP handler with all endpoints registered.
@@ -115,13 +116,14 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /change-password", s.handleChangePasswordForm)
 	mux.HandleFunc("POST /change-password", s.handleChangePassword)
 	mux.HandleFunc("POST /logout", s.handleLogout)
-	// Optional Black Candle account linking: only registered when an
-	// auth service is configured. Self-hosted installs never see these
-	// routes or the UI that points at them.
+	// Optional Black Candle login via OAuth: only registered when the
+	// identity provider is configured. Self-hosted installs never see
+	// these routes or the UI that points at them.
 	if s.bctEnabled() {
-		mux.HandleFunc("POST /login-bct", s.handleLoginBCT)
+		mux.HandleFunc("GET /oauth/bct/login", s.handleOAuthBCTLogin)
+		mux.HandleFunc("GET /oauth/bct/link", s.handleOAuthBCTLink)
+		mux.HandleFunc("GET /oauth/bct/callback", s.handleOAuthBCTCallback)
 		mux.HandleFunc("GET /settings", s.handleSettings)
-		mux.HandleFunc("POST /settings/link-bct", s.handleLinkBCT)
 		mux.HandleFunc("POST /settings/unlink-bct", s.handleUnlinkBCT)
 	}
 	// PWA install assets (no login required).
@@ -678,9 +680,9 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-// ---- optional Black Candle account linking ----
+// ---- optional Black Candle login via OAuth ----
 
-// requireBCTUser returns the session user when linking is enabled and the
+// requireBCTUser returns the session user when OAuth is enabled and the
 // account is in good standing, redirecting otherwise.
 func (s *Server) requireBCTUser(w http.ResponseWriter, r *http.Request) *store.DashboardUser {
 	if !s.bctEnabled() {
@@ -700,7 +702,7 @@ func (s *Server) requireBCTUser(w http.ResponseWriter, r *http.Request) *store.D
 }
 
 // handleSettings shows the account settings page: Black Candle link
-// status, link form, or unlink button.
+// status with a link button, or the unlink button when already linked.
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	u := s.requireBCTUser(w, r)
 	if u == nil {
@@ -711,59 +713,6 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		"BCTEmail": u.BCTEmail,
 		"Linked":   u.BCTUserID != 0,
 	})
-}
-
-// validBCTEmail is a minimal sanity check; authd is authoritative.
-func validBCTEmail(email string) bool {
-	email = strings.TrimSpace(email)
-	return len(email) >= 3 && len(email) <= 254 && strings.Contains(email, "@")
-}
-
-// handleLinkBCT verifies Black Candle credentials against authd and binds
-// the BCT account to the dashboard user. The password is passed through
-// transiently and never stored.
-func (s *Server) handleLinkBCT(w http.ResponseWriter, r *http.Request) {
-	u := s.requireBCTUser(w, r)
-	if u == nil {
-		return
-	}
-	fail := func(msg string) {
-		render(w, settingsTmpl, map[string]any{
-			"User": u.Username, "BCTEmail": u.BCTEmail,
-			"Linked": u.BCTUserID != 0, "Error": msg,
-		})
-	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad form", http.StatusBadRequest)
-		return
-	}
-	email := strings.TrimSpace(r.FormValue("email"))
-	password := r.FormValue("password")
-	if !validBCTEmail(email) || password == "" {
-		fail("Enter your Black Candle email and password.")
-		return
-	}
-	bu, err := s.bct.verifyCredentials(r.Context(), email, password, clientIP(r))
-	if err != nil {
-		fail(bctErrMessage(err))
-		return
-	}
-	// One BCT account links to at most one dashboard user. Re-linking the
-	// same account to the same user is a no-op success (idempotent).
-	if other, err := s.store.DashboardUserByBCTUserID(bu.ID); err == nil && other.ID != u.ID {
-		fail("That Black Candle account is already linked to another dashboard user.")
-		return
-	} else if err != nil && err != sql.ErrNoRows {
-		http.Error(w, "store failed", http.StatusInternalServerError)
-		return
-	}
-	if err := s.store.LinkBCTAccount(u.ID, bu.ID, bu.Email); err != nil {
-		// A unique-index race surfaces here if two users link the same
-		// BCT account concurrently.
-		fail("That Black Candle account is already linked to another dashboard user.")
-		return
-	}
-	http.Redirect(w, r, "/settings", http.StatusSeeOther)
 }
 
 // handleUnlinkBCT removes the Black Candle binding. The dashboard
@@ -778,48 +727,6 @@ func (s *Server) handleUnlinkBCT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/settings", http.StatusSeeOther)
-}
-
-// handleLoginBCT logs in with a Black Candle account: verify the
-// credentials against authd, map the BCT user to the linked dashboard
-// user, and issue a dashboard session.
-func (s *Server) handleLoginBCT(w http.ResponseWriter, r *http.Request) {
-	if !s.bctEnabled() {
-		http.NotFound(w, r)
-		return
-	}
-	fail := func(msg string) {
-		render(w, loginTmpl, map[string]any{"Error": msg, "BCTEnabled": true})
-	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad form", http.StatusBadRequest)
-		return
-	}
-	email := strings.TrimSpace(r.FormValue("email"))
-	password := r.FormValue("password")
-	if !validBCTEmail(email) || password == "" {
-		fail("Enter your Black Candle email and password.")
-		return
-	}
-	bu, err := s.bct.verifyCredentials(r.Context(), email, password, clientIP(r))
-	if err != nil {
-		fail(bctErrMessage(err))
-		return
-	}
-	user, err := s.store.DashboardUserByBCTUserID(bu.ID)
-	if err != nil {
-		fail("No dashboard account is linked to that Black Candle account yet. Log in with your username first, then link it in Settings.")
-		return
-	}
-	if err := s.setSession(w, user.ID); err != nil {
-		http.Error(w, "session failed", http.StatusInternalServerError)
-		return
-	}
-	if user.MustChange {
-		http.Redirect(w, r, "/change-password", http.StatusSeeOther)
-		return
-	}
-	http.Redirect(w, r, "/app", http.StatusSeeOther)
 }
 
 func render(w http.ResponseWriter, tmpl string, data any) {
@@ -1109,18 +1016,8 @@ const loginTmpl = pageHead + `
 {{if .BCTEnabled}}
 <div class="card" style="margin-top:1rem">
 <h2 style="margin-bottom:.75rem">Black Candle account</h2>
-<form method="post" action="/login-bct">
-<div class="field">
-<label for="be">Email</label>
-<input id="be" type="text" name="email" autocomplete="email" autocapitalize="none" autocorrect="off" required>
-</div>
-<div class="field">
-<label for="bp">Password</label>
-<input id="bp" type="password" name="password" autocomplete="current-password" required>
-</div>
-<button class="btn btn-block" type="submit">Log in with Black Candle</button>
-</form>
-<p class="hint" style="text-align:left;margin-bottom:0">Works once you've linked your Black Candle account in Settings.</p>
+<a class="btn btn-block" href="/oauth/bct/login" style="text-decoration:none;display:block;text-align:center">Log in with Black Candle</a>
+<p class="hint" style="text-align:left;margin-bottom:0">You'll sign in on blackcandletech.com — your password never comes here. Works once you've linked your Black Candle account in Settings.</p>
 </div>
 {{end}}
 <p class="hint">Your agent created this account with a temporary password — you'll set your own on first login.</p>
@@ -1172,18 +1069,9 @@ const settingsTmpl = pageHead + `
 </form>
 {{else}}
 <p>Link your Black Candle account to log in with it. Optional — your dashboard username and password keep working either way.</p>
-<form method="post" action="/settings/link-bct">
-<div class="field">
-<label for="be">Black Candle email</label>
-<input id="be" type="text" name="email" autocomplete="email" autocapitalize="none" autocorrect="off" required>
-</div>
-<div class="field">
-<label for="bp">Black Candle password</label>
-<input id="bp" type="password" name="password" autocomplete="current-password" required>
-</div>
 {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
-<button class="btn btn-block" type="submit">Link account</button>
-</form>
+<a class="btn btn-block" href="/oauth/bct/link" style="text-decoration:none;display:block;text-align:center">Link Black Candle account</a>
+<p class="hint" style="text-align:left;margin-bottom:0">You'll sign in on blackcandletech.com and approve the link — your password never comes here.</p>
 {{end}}
 </div>
 <div class="card" style="margin-top:1rem">
