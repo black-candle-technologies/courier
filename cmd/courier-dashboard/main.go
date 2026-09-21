@@ -36,17 +36,24 @@ func main() {
 	dbPath := flag.String("db", "courier-relay.db", "sqlite database path (shared with the relay)")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate file (default: <dbdir>/tls.crt)")
 	tlsKey := flag.String("tls-key", "", "TLS key file (default: <dbdir>/tls.key)")
-	// Optional Black Candle account linking. The feature is dormant
-	// unless BOTH are set — self-hosted installs leave them empty and
-	// never see the linking UI or routes. Same binary, same release.
-	bctURL := flag.String("bct-auth-url", os.Getenv("BCT_AUTH_URL"),
-		"Black Candle auth service URL (enables optional account linking; empty disables)")
-	bctKey := flag.String("bct-auth-key", os.Getenv("BCT_AUTH_API_KEY"),
-		"API key for the Black Candle auth service (X-Api-Key)")
+	// Optional Black Candle login via OAuth 2.0. The feature is dormant
+	// unless URL, client ID, and secret are ALL set — self-hosted
+	// installs leave them empty and never see the OAuth UI or routes.
+	// Same binary, same release. The dashboard never collects Black
+	// Candle passwords: users authenticate on the provider's own site.
+	bctOAuthURL := flag.String("bct-oauth-url", os.Getenv("BCT_OAUTH_URL"),
+		"Black Candle OAuth provider base URL (enables optional OAuth login; empty disables)")
+	bctOAuthClientID := flag.String("bct-oauth-client-id", os.Getenv("BCT_OAUTH_CLIENT_ID"),
+		"OAuth client_id registered with the Black Candle provider")
+	bctOAuthClientSecret := flag.String("bct-oauth-client-secret", os.Getenv("BCT_OAUTH_CLIENT_SECRET"),
+		"OAuth client_secret for the Black Candle provider")
+	bctOAuthRedirectURI := flag.String("bct-oauth-redirect-uri", os.Getenv("BCT_OAUTH_REDIRECT_URI"),
+		"Exact OAuth redirect URI registered with the provider (default: derived from each request)")
 	flag.Parse()
 
-	if *bctURL != "" && *bctKey == "" {
-		log.Fatalf("bct-auth-url is set but bct-auth-key is empty")
+	bctOAuthSet := *bctOAuthURL != "" || *bctOAuthClientID != "" || *bctOAuthClientSecret != ""
+	if bctOAuthSet && (*bctOAuthURL == "" || *bctOAuthClientID == "" || *bctOAuthClientSecret == "") {
+		log.Fatalf("BCT OAuth is partially configured: bct-oauth-url, bct-oauth-client-id, and bct-oauth-client-secret must all be set")
 	}
 
 	st, err := store.Open(*dbPath)
@@ -67,13 +74,18 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr:         *addr,
-		Handler:      loggingMiddleware(dashboard.NewWithBCT(st, dashboard.BCTConfig{URL: *bctURL, APIKey: *bctKey}).Routes()),
+		Addr: *addr,
+		Handler: loggingMiddleware(dashboard.NewWithBCT(st, dashboard.BCTOAuthConfig{
+			URL:          *bctOAuthURL,
+			ClientID:     *bctOAuthClientID,
+			ClientSecret: *bctOAuthClientSecret,
+			RedirectURI:  *bctOAuthRedirectURI,
+		}).Routes()),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
-	if *bctURL != "" {
-		log.Printf("Black Candle account linking enabled (auth %s)", *bctURL)
+	if bctOAuthSet {
+		log.Printf("Black Candle OAuth login enabled (provider %s)", *bctOAuthURL)
 	}
 
 	go func() {
