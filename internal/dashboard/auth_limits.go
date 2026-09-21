@@ -323,10 +323,3 @@ func (l *fixedWindowLimiter) purgeLocked(now time.Time) {
 		}
 	}
 }
-
-// reset clears all buckets. Tests only.
-func (l *fixedWindowLimiter) reset() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.buckets = make(map[string]*windowCounter)
-}

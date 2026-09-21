@@ -36,8 +36,11 @@ func TestFixedWindowLimiterWindow(t *testing.T) {
 	l := newFixedWindowLimiter()
 	now := time.Now()
 	l.now = func() time.Time { return now }
-	if !l.allow("k", 2, time.Minute) || !l.allow("k", 2, time.Minute) {
-		t.Fatal("first two events in window should pass")
+	if !l.allow("k", 2, time.Minute) {
+		t.Fatal("first event in window should pass")
+	}
+	if !l.allow("k", 2, time.Minute) {
+		t.Fatal("second event in window should pass")
 	}
 	if l.allow("k", 2, time.Minute) {
 		t.Fatal("third event in window should be denied")
