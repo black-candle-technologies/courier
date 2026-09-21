@@ -588,11 +588,16 @@ func TestIngestConcurrentSendsChainVerifies(t *testing.T) {
 		t.Fatal(err)
 	}
 	reserved := map[int64]bool{}
+	for _, r := range rows {
+		if r.Outcome == OutcomeSendReserved {
+			reserved[r.ID] = true
+		}
+	}
 	var sent int
 	for _, r := range rows {
 		switch r.Outcome {
 		case OutcomeSendReserved:
-			reserved[r.ID] = true
+			// collected above
 		case OutcomeSent:
 			sent++
 			if r.EnvelopeID == 0 {
