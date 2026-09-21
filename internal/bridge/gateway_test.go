@@ -10,8 +10,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/black-candle-technologies/courier/internal/client"
 )
 
 // stubSender records bridged sends and returns incrementing ids.
@@ -24,10 +22,10 @@ type stubSender struct {
 type stubCall struct {
 	address string
 	body    string
-	meta    *client.BridgeMeta
+	meta    *BridgeMeta
 }
 
-func (s *stubSender) SendBridged(address, wrappedBody string, meta *client.BridgeMeta) (int64, error) {
+func (s *stubSender) SendBridged(address, wrappedBody string, meta *BridgeMeta) (int64, error) {
 	if s.err != nil {
 		return 0, s.err
 	}
@@ -117,7 +115,7 @@ func TestIngestFullFlow(t *testing.T) {
 	if !HasBanner(call.body) || !strings.HasSuffix(call.body, "hello") {
 		t.Fatalf("banner missing/wrong: %q", call.body)
 	}
-	if call.meta.Origin != client.BridgeOriginChatGPTWeb {
+	if call.meta.Origin != BridgeOriginChatGPTWeb {
 		t.Fatalf("meta origin = %q", call.meta.Origin)
 	}
 	if call.meta.TokenLabel != "fixture" || call.meta.AuditID == 0 {
@@ -507,7 +505,7 @@ type blockingSender struct {
 	next     int64
 }
 
-func (b *blockingSender) SendBridged(address, wrappedBody string, meta *client.BridgeMeta) (int64, error) {
+func (b *blockingSender) SendBridged(address, wrappedBody string, meta *BridgeMeta) (int64, error) {
 	b.mu.Lock()
 	b.calls++
 	n := b.calls

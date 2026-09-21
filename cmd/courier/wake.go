@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -35,6 +36,11 @@ func cmdWake(args []string) error {
 		"maximum wake actions per minute across all senders")
 	pidfile := fs.String("pidfile", client.DefaultWakePIDFile(),
 		"pidfile locked while the daemon runs (empty disables)")
+	// Issue #97: when the wake command does more than read-only
+	// ingestion, bridged (non-E2E, untrusted-input) messages can be
+	// structurally excluded from wake dispatch.
+	suppressBridged := fs.Bool("suppress-bridged-actions", false,
+		"never fire the wake command for bridged (non-E2E) messages; they stay visible via inbox/dashboard")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -50,10 +56,11 @@ func cmdWake(args []string) error {
 	}
 	cl := client.New(cfg)
 	daemon := client.NewWakeDaemon(cl, client.WakeDaemonConfig{
-		Command:             command,
-		Cooldown:            *cooldown,
-		MaxActionsPerMinute: *maxPerMin,
-		PIDFile:             *pidfile,
+		Command:                command,
+		Cooldown:               *cooldown,
+		MaxActionsPerMinute:    *maxPerMin,
+		PIDFile:                *pidfile,
+		SuppressBridgedActions: *suppressBridged,
 	}, os.Stderr)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -70,6 +77,10 @@ func cmdWakeInstall(args []string) error {
 		"minimum interval between wake actions from the same sender")
 	pidfile := fs.String("pidfile", client.DefaultWakePIDFile(),
 		"pidfile locked while the daemon runs (empty disables)")
+	// Issue #97: persisted into the generated unit so installed
+	// daemons keep the operator's bridged-dispatch choice.
+	suppressBridged := fs.Bool("suppress-bridged-actions", false,
+		"never fire the wake command for bridged (non-E2E) messages; they stay visible via inbox/dashboard")
 	force := fs.Bool("force", false, "overwrite an existing unit file")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -104,6 +115,7 @@ func cmdWakeInstall(args []string) error {
 		quoteSystemdArg(exe), "wake",
 		"--cooldown", cooldown.String(),
 		"--pidfile", quoteSystemdArg(*pidfile),
+		"--suppress-bridged-actions", strconv.FormatBool(*suppressBridged),
 		"--",
 	}, " ") + " " + strings.Join(quoted, " ")
 	unit := fmt.Sprintf(`[Unit]

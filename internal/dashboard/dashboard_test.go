@@ -837,3 +837,55 @@ func TestBridgeBadge(t *testing.T) {
 		t.Fatalf("/app: got %d, missing bridged-thread marker", rec.Code)
 	}
 }
+
+// TestBridgeBadgeFromPinList: the dashboard badges a message the agent
+// reported as bridged even when the body carries no banner (issue
+// #96). This is the pinned bridge-address list rendering path: the
+// agent derived bridged-ness from its pin list (no payload metadata,
+// no banner) and the dashboard displays the reported flag.
+func TestBridgeBadgeFromPinList(t *testing.T) {
+	srv := testServer(t)
+	id := testIdentity(t)
+	other := testIdentity(t)
+	_ = crypto.FormatAddress(id.EdPub[:])
+	them := crypto.FormatAddress(other.EdPub[:])
+	token := register(t, srv, "lane", "temporary-password-123", id)
+
+	push := func(msgs ...map[string]any) {
+		t.Helper()
+		payload, _ := json.Marshal(map[string]any{"messages": msgs})
+		req := httptest.NewRequest("POST", "/v1/dashboard/push", bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("push: got %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	// No banner in the body — bridged-ness comes only from the
+	// agent-reported flag (the pin-list path).
+	push(
+		map[string]any{"courier_id": 1, "from": them, "body": "hello via bridge", "sent_at": 100, "received_at": 101, "bridged": true},
+	)
+
+	// Login dance: the temp password must be changed first.
+	cookie := sessionCookieFromRec(t, postChangePassword(t, srv,
+		login(t, srv, "lane", "temporary-password-123"),
+		url.Values{"password": {"a-new-password-123"}, "confirm": {"a-new-password-123"}}))
+
+	// Thread view: the badge renders from the reported flag alone.
+	rec := get(t, srv, "/app/thread?with="+url.QueryEscape(them), cookie)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/app/thread: got %d", rec.Code)
+	}
+	if n := strings.Count(body, "Not end-to-end encrypted"); n != 1 {
+		t.Fatalf("/app/thread: want exactly 1 non-E2E badge from pin-list flag, got %d", n)
+	}
+
+	// Thread list: the marker renders from the reported flag alone.
+	rec = get(t, srv, "/app", cookie)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `class="nbadge small"`) {
+		t.Fatalf("/app: got %d, missing bridged-thread marker from pin-list flag", rec.Code)
+	}
+}

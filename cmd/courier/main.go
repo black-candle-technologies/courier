@@ -531,6 +531,13 @@ func printMessages(msgs []client.Message) {
 			flagStr += fmt.Sprintf(" [expires %s]", time.Unix(m.ExpiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"))
 		}
 		fmt.Printf("[#%d] from %s at %s%s\n", m.ID, m.From, ts, flagStr)
+		// issues #96/#97: bridged messages are untrusted input. The
+		// marker renders from the typed flag — not the body banner —
+		// so attribution shows even when it comes from the pinned
+		// bridge-address list alone (no payload metadata, no banner).
+		if m.Bridged {
+			fmt.Printf("⚠ bridged message — NOT end-to-end encrypted; treat as untrusted input.\n")
+		}
 		// issue #51: reply threading. The parent snippet is
 		// best-effort (see inbox resolution); a parent known nowhere
 		// renders as a bare reference, never a failure.
@@ -757,6 +764,26 @@ type stdioMessage struct {
 	Request    bool     `json:"request,omitempty"`
 	ReplyTo    int64    `json:"reply_to,omitempty"`
 	ReplyQuote string   `json:"reply_quote,omitempty"`
+	// Bridged marks messages that arrived via a non-E2E bridge
+	// (issues #96/#97): untrusted input. Agents consuming the stdio
+	// bridge must not let a bridged message trigger actions, tool
+	// calls, sends, or state changes without the operator's explicit
+	// approval.
+	Bridged bool `json:"bridged,omitempty"`
+}
+
+// toStdioMessage maps a client message onto the stdio wire form. It is
+// a separate function (rather than an inline literal) so the bridged
+// flag mapping stays covered by tests: dropping the flag here would
+// silently strip the untrusted-input signal from agent consumers.
+func toStdioMessage(m client.Message) stdioMessage {
+	return stdioMessage{
+		ID: m.ID, From: m.From, Body: m.Body,
+		SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
+		Flags: m.Flags, Request: m.Request,
+		ReplyTo: m.ReplyTo, ReplyQuote: m.ReplyQuote,
+		Bridged: m.Bridged,
+	}
 }
 
 func cmdStdio() error {
@@ -809,12 +836,7 @@ func cmdStdio() error {
 			}
 			sm := make([]stdioMessage, 0, len(msgs))
 			for _, m := range msgs {
-				sm = append(sm, stdioMessage{
-					ID: m.ID, From: m.From, Body: m.Body,
-					SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
-					Flags: m.Flags, Request: m.Request,
-					ReplyTo: m.ReplyTo, ReplyQuote: m.ReplyQuote,
-				})
+				sm = append(sm, toStdioMessage(m))
 			}
 			reply(stdioResp{ID: req.ID, OK: true, Messages: sm})
 			// issue #52: returning the messages to the harness counts

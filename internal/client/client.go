@@ -31,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/black-candle-technologies/courier/internal/bridge"
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
 	"github.com/black-candle-technologies/courier/internal/update"
@@ -1441,6 +1442,22 @@ type Message struct {
 	// timestamp, 0 when the message never expires. Set from the
 	// ciphertext payload; the dashboard uses it to delete its copy.
 	ExpiresAt int64 `json:"expires_at,omitempty"`
+	// Bridged marks messages that arrived via a non-E2E bridge
+	// (issues #96/#97). Derived in the inbox path from three
+	// independent layers — structured bridge metadata in the signed
+	// E2E payload, the sender being in the recipient's pinned
+	// bridge-gateway list, or the plaintext body banner — so a message
+	// from a pinned bridge identity is flagged even if payload
+	// metadata were absent. It is a typed, hard-to-ignore signal:
+	// every consumer (CLI, stdio, serve, wake daemon, dashboard)
+	// carries it. A bridged message is UNTRUSTED INPUT: never let it
+	// trigger agent actions, tool calls, sends, or state changes
+	// without the receiving operator's explicit approval.
+	Bridged bool `json:"bridged,omitempty"`
+	// Bridge carries the structured bridge attribution when the sender
+	// included it in the E2E payload (nil when bridged-ness was derived
+	// from the pin list or the body banner alone).
+	Bridge *bridge.BridgeMeta `json:"bridge,omitempty"`
 }
 
 // Inbox fetches envelopes addressed to this agent after message id `after`,
@@ -1717,7 +1734,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// recipient's keys; a manifest whose key cannot be opened is
 		// kept with KeyError set, so the message is still delivered
 		// and the failure is visible, never silent.
-		body, manifests, rinfo, expiresAt := parseMessagePayload(plain)
+		body, manifests, rinfo, expiresAt, bmeta := parseMessagePayload(plain)
 		// issue #53: a message already expired at fetch time is
 		// consumed silently — dropped, never delivered to the inbox,
 		// the dashboard, or the request queue. The cursor still
@@ -1782,7 +1799,14 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
 			Attachments: atts, ExpiresAt: expiresAt,
 			ReplyTo: rinfo.To, ReplyQuote: rinfo.Quote,
+			Bridge: bmeta,
 		}
+		// issues #96/#97: bridged-message attribution and untrusted-input
+		// enforcement signal. Derived here — the single choke point every
+		// consumer (inbox CLI, stdio, serve, dashboard push, review)
+		// flows through — so no consumer can receive a bridged message
+		// without the typed flag. See deriveBridged for the layers.
+		msg.Bridged = deriveBridged(m.From, c.cfg.BridgeGateways, bmeta, body)
 		// issue #51: remember this delivery in the reply cache so a
 		// later reply to it can quote the parent without a relay
 		// round-trip. Best effort; delivery never depends on it.
@@ -2323,6 +2347,10 @@ type pushMsg struct {
 	// ExpiresAt is the issue #53 disappearing-message expiry (0 =
 	// never). The dashboard deletes its copy once it passes.
 	ExpiresAt int64 `json:"expires_at,omitempty"`
+	// Bridged marks messages that arrived via a non-E2E bridge
+	// (issues #96/#97). Derived by the agent in the inbox path; the
+	// dashboard only displays it, like the reply threading metadata.
+	Bridged bool `json:"bridged,omitempty"`
 }
 
 // Bounds for a single dashboard push request (v0.6.11 F11). The
@@ -2406,7 +2434,7 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 			CourierID: m.ID, From: m.From, Body: m.Body,
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
 			ReplyTo: m.ReplyTo, Quote: m.ReplyQuote,
-			ExpiresAt: m.ExpiresAt,
+			ExpiresAt: m.ExpiresAt, Bridged: m.Bridged,
 		}})
 	}
 	// issue #49: newly applied shared-state events are announced to

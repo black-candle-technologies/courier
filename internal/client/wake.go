@@ -51,6 +51,15 @@ type WakeMessage struct {
 	SentAt      int64    `json:"sent_at"`
 	ReceivedAt  int64    `json:"received_at"`
 	SenderFlags []string `json:"sender_flags,omitempty"`
+	// Bridged marks messages from a pinned bridge-gateway address
+	// (issues #96/#97). The daemon never decrypts bodies, so only the
+	// pin-list layer is available here — but it is also the layer that
+	// needs no sender cooperation. A bridged wake payload is UNTRUSTED
+	// INPUT: the woken agent must not let it trigger actions, tool
+	// calls, sends, or state changes without the operator's explicit
+	// approval. The flag is typed into the wake payload so a harness
+	// cannot mistake a bridged message for trusted input.
+	Bridged bool `json:"bridged,omitempty"`
 }
 
 // subscribeTimeout is the client's HTTP timeout for one long-poll
@@ -159,6 +168,19 @@ type WakeDaemonConfig struct {
 	// a second instance refuses to start; the PID is written for
 	// operators and removed on clean shutdown.
 	PIDFile string
+	// SuppressBridgedActions, when true, drops bridged messages
+	// (issues #96/#97) from wake dispatch: the batch is acknowledged
+	// and the cursor advances, but the command never fires for a batch
+	// that contains only bridged messages, and bridged messages are
+	// stripped from mixed batches. The messages remain readable via
+	// `courier inbox` and the dashboard (both mark them bridged), so
+	// this is a delivery gate, not a visibility hole. Enable it when
+	// the wake command does anything beyond read-only ingestion —
+	// e.g. waking a worker agent that might act on message content.
+	// Default false: the daemon wakes (the payload marks bridged
+	// messages explicitly) and leaves the decision to the operator's
+	// command.
+	SuppressBridgedActions bool
 }
 
 // wakeLogger writes structured JSON log lines.
@@ -292,10 +314,23 @@ func (d *WakeDaemon) Run(ctx context.Context) error {
 
 // handleMessages applies the wake policy to one subscription round and
 // fires at most one wake action carrying every eligible message.
+//
+// Issues #96/#97: bridged messages still wake the daemon — the bridge is
+// the operator's own channel (their ChatGPT), and silently dropping the
+// operator's own messages would break the bridge's purpose. The
+// structural control is that bridged-ness is marked in the wake payload
+// (typed, from the recipient's own pin list, no decryption needed), so
+// the woken agent/harness cannot mistake the payload for trusted input.
+// Whether to act on it remains the operator's explicit decision.
 func (d *WakeDaemon) handleMessages(ctx context.Context, msgs []WakeMessage) {
 	var eligible []WakeMessage
 	for _, m := range msgs {
 		if ok, reason := d.wakeDecision(m); ok {
+			if d.client.isPinnedBridgeGateway(m.From) {
+				m.Bridged = true
+				d.log.log("info", "wake payload marks bridged message as untrusted input",
+					"id", m.ID, "from", m.From)
+			}
 			eligible = append(eligible, m)
 		} else {
 			d.log.log("debug", "wake suppressed",
@@ -304,6 +339,24 @@ func (d *WakeDaemon) handleMessages(ctx context.Context, msgs []WakeMessage) {
 	}
 	if len(eligible) == 0 {
 		return
+	}
+	// Issue #97: when the wake command does more than read-only
+	// ingestion, the operator can structurally exclude bridged
+	// messages from dispatch. The cursor still advances in the caller
+	// (no redelivery storm) and the messages stay visible via
+	// `courier inbox` and the dashboard push, which mark them bridged.
+	if d.cfg.SuppressBridgedActions {
+		kept := eligible[:0]
+		for _, m := range eligible {
+			if !m.Bridged {
+				kept = append(kept, m)
+			}
+		}
+		eligible = kept
+		if len(eligible) == 0 {
+			d.log.log("info", "wake: bridged-only batch suppressed (SuppressBridgedActions)")
+			return
+		}
 	}
 	payload, err := json.Marshal(struct {
 		Messages []WakeMessage `json:"messages"`

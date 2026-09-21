@@ -23,6 +23,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/black-candle-technologies/courier/internal/bridge"
 	"github.com/black-candle-technologies/courier/internal/envelope"
 )
 
@@ -43,7 +44,7 @@ type replyPayload struct {
 	Quote       string                        `json:"quote,omitempty"`
 	Attachments []envelope.AttachmentManifest `json:"attachments,omitempty"`
 	ExpiresAt   int64                         `json:"expires_at,omitempty"`
-	Bridge      *BridgeMeta                   `json:"bridge,omitempty"`
+	Bridge      *bridge.BridgeMeta            `json:"bridge,omitempty"`
 }
 
 // replyInfo is the threading metadata parsed out of a received message:
