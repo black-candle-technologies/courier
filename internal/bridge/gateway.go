@@ -313,7 +313,7 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	envelopeID, err := g.sender.SendBridged(req.Recipient, wrapped, meta)
 	if err != nil {
-		_ = g.store.AppendAudit(&AuditEntry{
+		_, _ = g.store.AppendAudit(&AuditEntry{
 			Ts: now.Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
 			Recipient: req.Recipient, BodySHA256: sum, BodySize: int64(len(wrapped)),
 			Outcome: RejectedOutcome(RejectSendFailed), Reason: err.Error(),
