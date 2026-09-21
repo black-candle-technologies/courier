@@ -209,6 +209,11 @@ courier dashboard push --follow
 Registration is signed with your Ed25519 identity key, binding the
 dashboard account to your Courier address. Passwords are bcrypt-hashed.
 
+The hosted dashboard can optionally let users link their Black Candle
+account and log in with it — see `docs/bct-account-linking.md`. It is
+config-gated (two env vars), off by default, and invisible on
+self-hosted installs.
+
 (`courier serve` also defaults to port 8471, but on your own machine's
 localhost — a different host from the VPS dashboard, so they don't clash.)
 

@@ -300,6 +300,21 @@ func migrate(db *sql.DB) error {
 		PRIMARY KEY (user_id, peer))`); err != nil {
 		return err
 	}
+	// Optional Black Candle account linking (config-gated, off unless the
+	// dashboard is started with the auth service configured). bct_user_id
+	// is the authd user id, NULL when the dashboard user is not linked.
+	// The unique index enforces one dashboard user per BCT account;
+	// SQLite treats NULLs as distinct, so any number of unlinked users
+	// is fine.
+	if err := addColumn(`ALTER TABLE dashboard_users ADD COLUMN bct_user_id INTEGER`); err != nil {
+		return err
+	}
+	if err := addColumn(`ALTER TABLE dashboard_users ADD COLUMN bct_email TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_users_bct_user_id ON dashboard_users(bct_user_id)`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -799,6 +814,11 @@ type DashboardUser struct {
 	CourierAddress string
 	APITokenHash   string
 	CreatedAt      int64
+	// BCTUserID is the linked Black Candle authd user id, 0 when the
+	// dashboard user has not linked a Black Candle account. BCTEmail is
+	// the linked account's email (display only).
+	BCTUserID int64
+	BCTEmail  string
 }
 
 // CreateDashboardUser inserts a dashboard user. The caller hashes the
@@ -820,27 +840,56 @@ func (s *Store) CreateDashboardUser(username, passwordHash, courierAddress, apiT
 func scanDashboardUser(row *sql.Row) (*DashboardUser, error) {
 	var u DashboardUser
 	var mustChange int
+	var bctUserID sql.NullInt64
 	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &mustChange,
-		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt)
+		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail)
 	if err != nil {
 		return nil, err
 	}
 	u.MustChange = mustChange != 0
+	if bctUserID.Valid {
+		u.BCTUserID = bctUserID.Int64
+	}
 	return &u, nil
 }
 
 // DashboardUserByName looks up a user by username.
 func (s *Store) DashboardUserByName(username string) (*DashboardUser, error) {
 	return scanDashboardUser(s.db.QueryRow(
-		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at
+		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email
 		 FROM dashboard_users WHERE username = ?`, username))
 }
 
 // DashboardUserByTokenHash looks up a user by the SHA256 of their API token.
 func (s *Store) DashboardUserByTokenHash(tokenHash string) (*DashboardUser, error) {
 	return scanDashboardUser(s.db.QueryRow(
-		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at
+		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email
 		 FROM dashboard_users WHERE api_token_hash = ?`, tokenHash))
+}
+
+// DashboardUserByBCTUserID looks up the dashboard user linked to a Black
+// Candle authd account, or sql.ErrNoRows when no user linked it.
+func (s *Store) DashboardUserByBCTUserID(bctUserID int64) (*DashboardUser, error) {
+	return scanDashboardUser(s.db.QueryRow(
+		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email
+		 FROM dashboard_users WHERE bct_user_id = ?`, bctUserID))
+}
+
+// LinkBCTAccount binds a dashboard user to a Black Candle authd account.
+// The caller must have verified the BCT credentials first. One BCT
+// account links to at most one dashboard user: the unique index rejects
+// a second binding.
+func (s *Store) LinkBCTAccount(userID, bctUserID int64, bctEmail string) error {
+	_, err := s.db.Exec(`UPDATE dashboard_users SET bct_user_id = ?, bct_email = ? WHERE id = ?`,
+		bctUserID, bctEmail, userID)
+	return err
+}
+
+// UnlinkBCTAccount removes the Black Candle account binding. The
+// dashboard username/password keeps working unchanged.
+func (s *Store) UnlinkBCTAccount(userID int64) error {
+	_, err := s.db.Exec(`UPDATE dashboard_users SET bct_user_id = NULL, bct_email = '' WHERE id = ?`, userID)
+	return err
 }
 
 // ChangeDashboardPassword replaces the password hash, clears must_change,
@@ -878,16 +927,20 @@ func (s *Store) CreateSession(tokenHash string, userID int64, ttl time.Duration)
 func (s *Store) SessionUser(tokenHash string) (*DashboardUser, error) {
 	var u DashboardUser
 	var mustChange int
+	var bctUserID sql.NullInt64
 	err := s.db.QueryRow(
-		`SELECT u.id, u.username, u.password_hash, u.must_change, u.courier_address, u.api_token_hash, u.created_at
+		`SELECT u.id, u.username, u.password_hash, u.must_change, u.courier_address, u.api_token_hash, u.created_at, u.bct_user_id, u.bct_email
 		 FROM dashboard_sessions s JOIN dashboard_users u ON u.id = s.user_id
 		 WHERE s.token_hash = ? AND s.expires_at > strftime('%s','now')`,
 		tokenHash).Scan(&u.ID, &u.Username, &u.PasswordHash, &mustChange,
-		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt)
+		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail)
 	if err != nil {
 		return nil, err
 	}
 	u.MustChange = mustChange != 0
+	if bctUserID.Valid {
+		u.BCTUserID = bctUserID.Int64
+	}
 	return &u, nil
 }
 
