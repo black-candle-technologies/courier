@@ -253,6 +253,8 @@ func TestSetBodyCapOverridesDefault(t *testing.T) {
 		t.Fatalf("bodyCap after non-positive SetBodyCap = %d, want 131072", f.gw.bodyCap)
 	}
 }
+
+func TestIngestBodyCap(t *testing.T) {
 	f := newGwFixture(t)
 	// Exactly 64 KiB passes the size gate (confirmation comes first).
 	big := strings.Repeat("a", DefaultBodyCap)
