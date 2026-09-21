@@ -7,11 +7,43 @@ Type=simple
 User=courier
 Group=courier
 WorkingDirectory=/var/lib/courier
+# The relay's only writable path is its state directory (relay.db and
+# blobs live here). With ProtectSystem=strict the rest of the
+# filesystem is read-only, which is fine: the binary needs read+exec
+# access only.
+StateDirectory=courier
+StateDirectoryMode=0700
 ExecStart=/opt/courier/courier-relay --addr 0.0.0.0:8470 --db /var/lib/courier/relay.db --retain-days 30
 Restart=always
 RestartSec=5
+# The relay logs to stdout (journal); it writes no log files of its own.
+
+# --- Sandboxing (issue #114) ---
+# The relay is a plain HTTPS store-and-forward server: it needs TCP
+# sockets and its state directory, nothing else.
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+# TCP/UDP only (+AF_UNIX, harmless): the relay binds 0.0.0.0:8470.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+# No capabilities needed: ports 8470+ are unprivileged.
+CapabilityBoundingSet=
+UMask=0027
+MemoryMax=512M
+TasksMax=256
 
 [Install]
 WantedBy=multi-user.target

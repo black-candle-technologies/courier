@@ -75,18 +75,28 @@ func main() {
 
 	srv := &http.Server{
 		Addr: *addr,
-		Handler: loggingMiddleware(dashboard.NewWithBCT(st, dashboard.BCTOAuthConfig{
+		Handler: loggingMiddleware(dashboard.NewWithBCTAndLimits(st, dashboard.BCTOAuthConfig{
 			URL:          *bctOAuthURL,
 			ClientID:     *bctOAuthClientID,
 			ClientSecret: *bctOAuthClientSecret,
 			RedirectURI:  *bctOAuthRedirectURI,
-		}).Routes()),
+		}, dashboard.AuthLimitsFromEnv()).Routes()),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
 	if bctOAuthSet {
 		log.Printf("Black Candle OAuth login enabled (provider %s)", *bctOAuthURL)
 	}
+	// Issue #108: layered auth rate limits, tunable via DASHBOARD_* env
+	// vars (see dashboard.AuthLimitsFromEnv). OAuth and local-auth
+	// budgets are separate.
+	lim := dashboard.AuthLimitsFromEnv()
+	log.Printf("auth limits: login %d/%s per IP, %d/%s global, backoff %s→%s; register %d/%s per IP; oauth %d/%s per IP, %d/%s global; trusted proxies: %q",
+		lim.LoginAttemptsPerIP, lim.LoginIPWindow, lim.LoginAttemptsGlobal, lim.LoginGlobalWindow,
+		lim.LoginBackoffBase, lim.LoginBackoffMax,
+		lim.RegisterAttemptsPerIP, lim.RegisterIPWindow,
+		lim.OAuthAttemptsPerIP, lim.OAuthIPWindow, lim.OAuthAttemptsGlobal, lim.OAuthGlobalWindow,
+		lim.TrustedProxies)
 
 	go func() {
 		log.Printf("courier-dashboard listening with TLS on %s (db %s)", *addr, *dbPath)

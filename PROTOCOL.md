@@ -493,6 +493,9 @@ forged, stale (`ts` outside 300 s), oversized (`> MaxBlobBytes =
 client-generated random 256-bit values, so re-uploading is idempotent
 (`"duplicate": true`).
 
+Uploads are abuse-controlled (issue #100): a per-uploader byte-priced
+token bucket plus a durable per-uploader storage quota — see §11.1.
+
 **Download:**
 
 ```
@@ -616,6 +619,16 @@ tunable via `--send-burst` / `--send-rate`). The allowance is checked
 someone else's budget. Buckets start full, so new senders are never
 penalized for having no history. Exceeding the bucket returns `429`.
 
+`POST /v1/blobs` (attachments) has its own byte-priced token bucket per
+uploader (defaults: 256 MiB burst, 2 MiB/sec sustained — blob bytes are
+far more expensive than message bytes), plus a durable per-uploader
+storage quota (default 1 GiB total stored blob bytes within the
+retention window), enforced atomically at upload time and released when
+retention pruning deletes expired blobs. Both reject with `429`; the
+byte bucket is checked after signature verification and before the body
+is read. Tunable via relay flags `--blob-burst-bytes`,
+`--blob-rate-bytes` and `--blob-quota-bytes`.
+
 ### 11.2 Spam reports and reporter-based throttling
 
 `POST /v1/report` (§9.6). When at least `--spam-threshold` (default
@@ -730,12 +743,15 @@ Cursor state, contacts, blocklist, and seen sets live in
 ### 12.3 Self-update
 
 `courier update` checks the GitHub releases API, downloads the
-`courier-<os>-<arch>` asset for the newest release, verifies its
-SHA-256 against the release's `SHA256SUMS`, and replaces the running
-binary. Every invocation also does a silent check at most once per
-12h and installs automatically (v0.6.12+ default);
-`courier config set auto_update false` opts out back to a stderr
-notice (`internal/update/update.go`).
+`courier-<os>-<arch>` asset for the newest release, verifies that the
+release's `SHA256SUMS` carries a valid Ed25519 signature from the pinned
+maintainer release-signing key (`SHA256SUMS.sig`; unsigned releases are
+refused outright — see docs/release-signing.md), verifies the binary's
+SHA256 against those authenticated checksums, and replaces the running
+binary. Every
+invocation also does a silent check at most once per 12h and installs
+automatically (v0.6.12+ default); `courier config set auto_update false`
+opts out back to a stderr notice.
 
 ## 13. DM plaintext payload versions
 
@@ -799,13 +815,7 @@ Limits: 25 MiB plaintext per attachment (`MaxAttachmentBytes`),
 256 KiB chunks (`AttachmentChunkSize`), framed blob cap 25 MiB +
 64 KiB (`MaxBlobBytes`).
 
-Upload/download authorization is in §9.7. The recipient unwraps the
-data key, downloads the blob, re-authenticates every chunk, checks
-chunk count and reassembled size, and finally the SHA-256 against the
-manifest. Verification fails closed: tampered, missing, truncated, or
-hash-mismatched data is an error, never a file
-(`internal/client/attachments.go`).
-
+Upload/download authorization is in §9.7.
 The relay never sees plaintext, filenames, MIME types, plaintext
 hashes, or data keys — only opaque ciphertext blobs addressed to a
 recipient. Blob retention follows envelope retention (§27.3).
@@ -816,7 +826,6 @@ verifies each attachment into the directory (existing filenames get a
 numeric suffix; manifest filenames cannot traverse directories).
 
 ## 15. Forward secrecy (v0.11.0+, issue #50)
-
 1:1 DMs between capable clients are protected by per-conversation
 Double-Ratchet-style sessions. The full design (negotiation,
 handshake, ratchet, erasure, migration) is in
@@ -827,7 +836,6 @@ protocol and the properties honestly, including the fail-open
 behavior.
 
 ### 15.1 What changes and what does not
-
 - The outer DM envelope is **unchanged** (crypto_box to the
   recipient's long-term key + Ed25519 signature); the relay needs no
   changes and cannot distinguish an FS message from a legacy one.
@@ -867,7 +875,6 @@ only). `courier fs forget <peer>` erases the session and sets the
 peer to off.
 
 ### 15.3 Handshake (X3DH-shaped, no prekeys)
-
 The initiator generates `rk0` (32 random bytes), an ephemeral X25519
 keypair, and a ratchet keypair, and sends `fs-init` (a protocol DM,
 sealed legacy). The responder generates its own ephemeral and ratchet
@@ -904,27 +911,7 @@ drop the message as undecryptable — self-healing without user action.
 Standard Signal-shaped, per conversation (`crypto.FSRootStep`,
 `crypto.FSChainStep`):
 
-- **Symmetric step** (every message): `chain' = HMAC(chain, 0x01)`,
-  `msgKey = HMAC(chain, 0x02)`. `msgKey` is erased immediately after
-  one encrypt/decrypt; the old chain key is overwritten (bytes zeroed
-  first).
-- **DH step** (on receiving a message whose `rpk` differs from the
-  stored peer ratchet key): fresh DH output mixes into the root via
-  `HKDF(salt=root, ikm=dhOut, info="courier-fs-root-v1")` (64 bytes →
-  new root + new chain key); the sender mints a fresh ratchet keypair.
-  Old root, old chain keys, and the old ratchet private key are
-  erased. This is the step that heals a compromise.
-- **Rotation triggers** (so DH steps actually happen): sender rotates
-  its ratchet keypair after 25 sent messages or 24h since the last
-  rotation; `courier fs rekey <peer>` forces rotation on the next
-  send; the initiator rotates on its first send after receiving
-  `fs-accept`.
-- **Out-of-order:** the header's `n`/`pn` let the receiver derive
-  skipped message keys for the previous chain, bounded to 100 keys
-  (erased on use, or dropped oldest-first past the bound). Skipped
-  keys from older chains are erased on each DH step — a message
-  delayed past two DH steps is undecryptable, by design.
-
+- **Symmetric step** (every message)
 ### 15.5 Fail-open negotiation (stated plainly)
 
 **FS is opportunistic, not enforced.** This is the standard
@@ -944,8 +931,13 @@ it without euphemism:
   legacy encryption** — the relay is in exactly the position to do
   this (issue #110). This downgrade is silent at the protocol layer;
   `courier fs status` shows whether a conversation is actually under
-  FS so users can verify. Enforcement (refusing legacy) is a possible
-  future mode, not v1.
+  FS so users can verify. Per-contact enforcement exists (issue #110): `courier fs require <peer>`
+  opts a contact into fail-closed sends — `fsPrepareSend` refuses legacy
+  unless an FS session is established. Observed FS capability is pinned
+  per contact, so handshake pressure continues even when the relay
+  suppresses directory availability; a pinned peer suddenly reachable
+  only via legacy is flagged `DOWNGRADE SUSPECTED` in
+  `courier fs status` plus a rate-limited send-time warning.
 - Protocol DMs (group/channel/state/handshake traffic) stay
   legacy-sealed by design: delivery reliability matters more for
   machine state, and the inbox pipeline decrypts FS before dispatch.
@@ -1773,12 +1765,28 @@ push also sweeps already-expired `expires_at` rows (§23).
 
 ### 26.4 Security properties
 
-Passwords: bcrypt. Tokens: shown once, stored hashed. Sessions:
-32-byte random tokens, stored hashed, 30-day expiry. Registration is
-open but signature-bound (no anonymous accounts detached from a
-Courier identity). Not yet implemented (tracked): rate limiting on
-registration/login (issue #108), CSRF tokens — SameSite=Lax only
-(issue #111). See §28.4.
+**Security properties.** Passwords: bcrypt. Tokens: shown once, stored
+hashed. Sessions: 32-byte random tokens, stored hashed, 30-day expiry.
+Registration is open but signature-bound (no anonymous accounts detached
+from a Courier identity). Not yet implemented: WebAuthn.
+
+**Auth hardening (issues #108, #111).** Layered rate limiting on the auth
+surface: per-IP fixed-window budgets on login (20/10min), registration
+(10/hour), and OAuth (60/10min, separate from local-auth budgets); a
+global login budget (200/10min) bounding total bcrypt work; and
+per-account exponential backoff on failed password logins (2s doubling
+to 15m), persisted in the database so restarts do not reset it. Unknown
+users, wrong passwords, and locked accounts all render the identical
+generic error, and unknown usernames burn the same bcrypt work as a
+wrong password, so neither message nor timing leaks account existence.
+X-Forwarded-For is only honored from trusted proxies (loopback by
+default, plus `DASHBOARD_TRUSTED_PROXIES`). All cookie-authenticated
+state-changing forms (login, change password, logout, BCT unlink) carry
+synchronizer CSRF tokens: the session's token is minted at login, stored
+on the session row, and validated in constant time; the pre-login form
+uses a double-submit cookie. Origin/Referer are validated
+defense-in-depth, and SameSite=Lax is retained. Limits are tunable via
+`DASHBOARD_*` environment variables (see `AuthLimitsFromEnv`).
 
 ## 27. Retention and deletion
 
@@ -1793,6 +1801,14 @@ registration/login (issue #108), CSRF tokens — SameSite=Lax only
   (§23); the bridge audit log retains 1 year, then pruned (§25.4).
 - Directory tombstones persist until explicitly untombstoned
   (§18.5).
+- Operators running a relay or dashboard should apply the same
+  deletion window to backups/snapshots of relay/dashboard state:
+  backup media should rotate out on a window no longer than the
+  relay retention plus a small documented margin (30–45 days on the
+  reference deployment), so data that aged out of the live store
+  cannot be resurrected from a stale backup. Backup files must be
+  readable only by the service user (mode 0600) and stored separately
+  from the live database (issue #113).
 
 ## 28. Security considerations and threat model
 

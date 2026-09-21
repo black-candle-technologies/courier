@@ -29,10 +29,12 @@ import (
 
 	"github.com/black-candle-technologies/courier/internal/client"
 	"github.com/black-candle-technologies/courier/internal/update"
+	"github.com/black-candle-technologies/courier/internal/version"
 	"github.com/mattn/go-isatty"
 )
 
-const version = "0.11.0"
+// version.Client (internal/version) carries the client version, stamped at
+// build time via ldflags -X; see docs/versions.md.
 
 func main() {
 	if len(os.Args) < 2 {
@@ -43,7 +45,7 @@ func main() {
 	// go to stderr so stdout stays machine-readable (stdio/serve).
 	if os.Args[1] != "update" && client.ConfigExists() {
 		if cfg, err := client.LoadConfig(); err == nil {
-			client.New(cfg).MaybeUpdateCheck(version)
+			client.New(cfg).MaybeUpdateCheck(version.Client)
 		}
 	}
 	var err error
@@ -99,7 +101,7 @@ func main() {
 	case "config":
 		err = cmdConfig(os.Args[2:])
 	case "version", "--version", "-v":
-		fmt.Println("courier", version)
+		fmt.Println("courier", version.Client)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
 		usage()
@@ -122,7 +124,7 @@ func usage() {
                                          first-contact or contacts-policy handle sends
       [--attach <file>]...               attach files (E2E encrypted, 25 MiB max each)
       [--reply-to <id>]                  reply to message #id (quotes it, threads the view)
-      [--ttl <duration>]                 disappearing message: delete after duration (e.g. 10m, 2h)
+      [--ttl <duration>]                 disappearing message: local delete after duration (e.g. 10m, 2h)
   courier inbox [--all] [--limit N] [--follow [--interval 5s]] [--requests]
       [--attachments-dir <dir>]          download verified attachments into dir
                                          --requests lists held message requests instead
@@ -903,7 +905,7 @@ func writeSvcJSON(w http.ResponseWriter, code int, v any) {
 
 func cmdContacts(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|receipts-on|receipts-off|remove> ...")
+		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|receipts-on|receipts-off|remove>")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
@@ -1193,7 +1195,7 @@ func cmdReportSpam(args []string) error {
 // future requests from the sender), undismiss (reverse a dismissal).
 func cmdRequest(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: courier request <list|accept|dismiss|undismiss> ...")
+		return fmt.Errorf("usage: courier request <list|accept|dismiss|undismiss>")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
@@ -1321,8 +1323,8 @@ func cmdUpdate() error {
 	if err != nil {
 		return err
 	}
-	if !update.NewerThan(version, rel.Tag) {
-		fmt.Printf("already up to date (courier %s).\n", version)
+	if !update.NewerThan(version.Client, rel.Tag) {
+		fmt.Printf("already up to date (courier %s).\n", version.Client)
 		// v0.6.0+: agents that updated via an older binary never saw
 		// the dashboard setup directive, so surface it here too.
 		if cfg, err := client.LoadConfig(); err == nil && cfg.DashboardToken == "" {
@@ -1331,7 +1333,7 @@ func cmdUpdate() error {
 		}
 		return nil
 	}
-	fmt.Printf("updating courier %s -> %s...\n", version, rel.Tag)
+	fmt.Printf("updating courier %s -> %s...\n", version.Client, rel.Tag)
 	if err := rel.Apply(); err != nil {
 		return err
 	}
@@ -1441,7 +1443,7 @@ func cmdConfig(args []string) error {
 
 func cmdDashboard(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: courier dashboard <setup|push|status> ...")
+		return fmt.Errorf("usage: courier dashboard <setup|push|status>")
 	}
 	switch args[0] {
 	case "setup":

@@ -30,11 +30,43 @@ User=courier-bridge-mcp
 Group=courier-bridge-mcp
 WorkingDirectory=/opt/courier-bridge-mcp
 EnvironmentFile=/etc/courier-bridge-mcp.env
+# /opt/courier-bridge-mcp is the MCP server's only writable path.
+# StateDirectory can't express /opt paths, so ReadWritePaths is used;
+# ProtectSystem=strict keeps the rest of the filesystem read-only
+# (/etc/courier-bridge-mcp.env needs read only).
+ReadWritePaths=/opt/courier-bridge-mcp
 ExecStart=/opt/courier-bridge-mcp/courier-bridge-mcp --addr 127.0.0.1:8472 --gateway http://127.0.0.1:8473
 Restart=always
 RestartSec=5
+# The MCP server logs to stdout (journal); it writes no log files of its own.
+
+# --- Sandboxing (issue #114) ---
+# The MCP server serves localhost HTTPS and dials the gateway
+# (127.0.0.1:8473) plus authd for OAuth client discovery.
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+# TCP/UDP only (+AF_UNIX, harmless): binds 127.0.0.1:8472, dials the
+# gateway and auth.blackcandletech.com.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+# No capabilities needed: ports 8470+ are unprivileged.
+CapabilityBoundingSet=
+UMask=0027
+MemoryMax=256M
+TasksMax=128
 
 [Install]
 WantedBy=multi-user.target

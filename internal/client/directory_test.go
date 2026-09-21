@@ -425,7 +425,7 @@ func TestResolveHandleTarget(t *testing.T) {
 	if err != nil || isHandle || addr != "" || p != nil {
 		t.Fatalf("non-handle mangled: %v %v %v %v", addr, p, isHandle, err)
 	}
-	addr, p, isHandle, err = carol.ResolveHandleTarget("somecontact")
+	_, _, isHandle, err = carol.ResolveHandleTarget("somecontact")
 	if err != nil || isHandle {
 		t.Fatalf("contact name treated as handle: %v %v", isHandle, err)
 	}

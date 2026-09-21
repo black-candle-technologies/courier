@@ -4,9 +4,14 @@
 package store
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/envelope"
@@ -85,13 +90,20 @@ CREATE TABLE IF NOT EXISTS dashboard_users (
 	must_change       INTEGER NOT NULL DEFAULT 1,
 	courier_address   TEXT NOT NULL UNIQUE,
 	api_token_hash    TEXT NOT NULL UNIQUE,
-	created_at        INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+	created_at        INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+	-- issue #108: per-account login backoff (also added via migrate()
+	-- for databases created before these columns existed).
+	failed_logins     INTEGER NOT NULL DEFAULT 0,
+	lock_until        INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS dashboard_sessions (
 	token_hash TEXT PRIMARY KEY,
 	user_id    INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
 	created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-	expires_at INTEGER NOT NULL
+	expires_at INTEGER NOT NULL,
+	-- issue #111: the session's raw synchronizer CSRF token
+	-- (also added via migrate() for pre-existing databases).
+	csrf_token TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS dashboard_messages (
 	id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,205 +135,598 @@ CREATE TABLE IF NOT EXISTS blobs (
 CREATE INDEX IF NOT EXISTS idx_blobs_recipient ON blobs(recipient);
 `
 
-// migrate adds columns introduced after the table was first created.
-// Old rows keep empty defaults; v0.2.0+ always writes sig.
-func migrate(db *sql.DB) error {
-	addColumn := func(stmt string) error {
-		_, err := db.Exec(stmt)
-		if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+// ---------------------------------------------------------------------------
+// Schema migrations (issue #104).
+//
+// The schema evolves through numbered, idempotent migrations recorded in the
+// schema_migrations ledger table. Each migration runs inside its own
+// transaction (BEGIN IMMEDIATE, via the _txlock=immediate DSN parameter, with
+// rollback on failure), so a crash can only leave a migration fully applied
+// or fully unapplied: reopening the database resumes and converges.
+//
+// Databases migrated by the pre-ledger code are adopted, never re-migrated:
+// every migration declares how to detect its own completion (complete), and
+// the runner records — without running — any migration whose effects are
+// already present. A healthy database is therefore never failed closed and
+// never has completed work re-applied.
+//
+// A ledger newer than this build (downgrade) fails closed: running against a
+// schema the binary does not understand risks silent corruption.
+//
+// Conventions for adding a migration:
+//   - append to the migrations list with the next version number;
+//   - complete must accurately detect the post-state (tables, columns,
+//     indexes, backfilled data);
+//   - up must be idempotent: guard every step with the same existence checks
+//     complete uses; never match error strings;
+//   - set destructive=true only for migrations that drop or delete data: the
+//     runner takes a VACUUM INTO backup first (see backupDatabase).
+// ---------------------------------------------------------------------------
+
+// schemaMigrationsDDL creates the ledger. It is installed by the migration
+// runner preamble — not as a numbered migration — so adoption inspection can
+// read and write it before any migration runs.
+const schemaMigrationsDDL = `
+CREATE TABLE IF NOT EXISTS schema_migrations(
+	version    INTEGER PRIMARY KEY,
+	name       TEXT NOT NULL,
+	source     TEXT NOT NULL DEFAULT 'ran', -- 'ran' | 'adopted'
+	applied_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);`
+
+// querier is satisfied by *sql.DB and *sql.Tx.
+type querier interface {
+	QueryRow(query string, args ...any) *sql.Row
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+// execer is satisfied by *sql.DB and *sql.Tx.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func tableExists(q querier, table string) (bool, error) {
+	var n int
+	if err := q.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+func columnExists(q querier, table, column string) (bool, error) {
+	rows, err := q.Query(`PRAGMA table_info(` + quoteIdent(table) + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+func indexExists(q querier, name string) (bool, error) {
+	var n int
+	if err := q.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?`, name).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// quoteIdent quotes a SQLite identifier. Table names here are internal
+// constants, but quoting keeps the PRAGMA/ALTER statements safe by
+// construction.
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// migration is one numbered schema change.
+type migration struct {
+	version     int
+	name        string
+	destructive bool
+	// complete reports whether the migration's effects are already present
+	// (fresh installs report false; databases migrated by the pre-ledger
+	// code or a partially applied migration being resumed report true).
+	complete func(q querier) (bool, error)
+	// up applies the change inside the runner's transaction. It must be
+	// idempotent: guard every step with the same existence checks complete
+	// uses. Never match error strings.
+	up func(e execer, q querier) error
+}
+
+// addColumnMigration builds a migration that adds a single column.
+// columnDef is the full column definition, e.g. "sig TEXT NOT NULL DEFAULT ”".
+func addColumnMigration(version int, name, table, column, columnDef string) migration {
+	return migration{
+		version: version,
+		name:    name,
+		complete: func(q querier) (bool, error) {
+			return columnExists(q, table, column)
+		},
+		up: func(e execer, q querier) error {
+			has, err := columnExists(q, table, column)
+			if err != nil {
+				return err
+			}
+			if has {
+				return nil
+			}
+			_, err = e.Exec(`ALTER TABLE ` + quoteIdent(table) + ` ADD COLUMN ` + columnDef)
+			return err
+		},
+	}
+}
+
+// createTablesMigration builds a migration that creates tables and indexes.
+func createTablesMigration(version int, name string, tables []string, ddls ...string) migration {
+	return migration{
+		version: version,
+		name:    name,
+		complete: func(q querier) (bool, error) {
+			for _, t := range tables {
+				ok, err := tableExists(q, t)
+				if err != nil || !ok {
+					return false, err
+				}
+			}
+			return true, nil
+		},
+		up: func(e execer, _ querier) error {
+			for _, ddl := range ddls {
+				if _, err := e.Exec(ddl); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+}
+
+// migrations is the full ordered history. v1 is the base schema (the schema
+// constant); v2+ are the incremental changes the old unversioned migrate()
+// applied, in the same order, with identical DDL.
+var migrations = []migration{
+	{
+		version: 1,
+		name:    "base schema",
+		complete: func(q querier) (bool, error) {
+			for _, t := range []string{"envelopes", "keys", "dashboard_users", "dashboard_sessions", "dashboard_messages", "blobs"} {
+				ok, err := tableExists(q, t)
+				if err != nil || !ok {
+					return false, err
+				}
+			}
+			return true, nil
+		},
+		up: func(e execer, _ querier) error {
+			_, err := e.Exec(schema)
+			return err
+		},
+	},
+	addColumnMigration(2, "envelopes.sig (v0.2.0+)", "envelopes", "sig", `sig TEXT NOT NULL DEFAULT ''`),
+	addColumnMigration(3, "dashboard_messages.recipient (v0.6.5 threads)", "dashboard_messages", "recipient", `recipient TEXT NOT NULL DEFAULT ''`),
+	addColumnMigration(4, "dashboard_messages.peer (v0.6.5 threads)", "dashboard_messages", "peer", `peer TEXT NOT NULL DEFAULT ''`),
+	addColumnMigration(5, "dashboard_messages.reply_to (issue #51)", "dashboard_messages", "reply_to", `reply_to INTEGER NOT NULL DEFAULT 0`),
+	addColumnMigration(6, "dashboard_messages.quote (issue #51)", "dashboard_messages", "quote", `quote TEXT NOT NULL DEFAULT ''`),
+	addColumnMigration(7, "dashboard_messages.expires_at (issue #53)", "dashboard_messages", "expires_at", `expires_at INTEGER NOT NULL DEFAULT 0`),
+	addColumnMigration(8, "keys.signature (v0.6.11 F1)", "keys", "signature", `signature TEXT NOT NULL DEFAULT ''`),
+	{
+		// v0.6.11 (F3): replay dedup. env_hash covers every
+		// sender-controlled envelope field; the UNIQUE index makes
+		// re-POSTed envelopes idempotent instead of duplicating delivery.
+		version: 9,
+		name:    "envelopes.env_hash replay-dedup (v0.6.11 F3)",
+		complete: func(q querier) (bool, error) {
+			has, err := columnExists(q, "envelopes", "env_hash")
+			if err != nil || !has {
+				return false, err
+			}
+			idx, err := indexExists(q, "idx_envelopes_env_hash")
+			if err != nil || !idx {
+				return false, err
+			}
+			var n int
+			if err := q.QueryRow(`SELECT COUNT(*) FROM envelopes WHERE env_hash IS NULL`).Scan(&n); err != nil {
+				return false, err
+			}
+			return n == 0, nil
+		},
+		up: func(e execer, q querier) error {
+			has, err := columnExists(q, "envelopes", "env_hash")
+			if err != nil {
+				return err
+			}
+			if !has {
+				if _, err := e.Exec(`ALTER TABLE "envelopes" ADD COLUMN env_hash TEXT`); err != nil {
+					return err
+				}
+			}
+			if err := backfillEnvelopeHashes(e, q); err != nil {
+				return err
+			}
+			// A pre-existing true duplicate (the identical envelope stored
+			// twice before F3) fails here. That is intentional: the old
+			// code failed the same way, and silently dropping delivered
+			// messages would be worse than a loud, actionable error.
+			_, err = e.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_envelopes_env_hash ON envelopes(env_hash)`)
+			return err
+		},
+	},
+	addColumnMigration(10, "envelopes.kind (issue #32 groups)", "envelopes", "kind", `kind TEXT NOT NULL DEFAULT ''`),
+	addColumnMigration(11, "envelopes.key_epoch (issue #32 groups)", "envelopes", "key_epoch", `key_epoch INTEGER NOT NULL DEFAULT 0`),
+	createTablesMigration(12, "group messaging tables (issue #32)", []string{"groups", "group_members", "group_controls"},
+		`CREATE TABLE IF NOT EXISTS groups(
+			group_id     TEXT PRIMARY KEY,
+			name         TEXT NOT NULL DEFAULT '',
+			admin        TEXT NOT NULL,
+			member_epoch INTEGER NOT NULL DEFAULT 1,
+			created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')))`,
+		`CREATE TABLE IF NOT EXISTS group_members(
+			group_id TEXT NOT NULL,
+			member   TEXT NOT NULL,
+			PRIMARY KEY (group_id, member))`,
+		`CREATE TABLE IF NOT EXISTS group_controls(
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			group_id   TEXT NOT NULL,
+			action     TEXT NOT NULL,
+			target     TEXT NOT NULL DEFAULT '',
+			admin      TEXT NOT NULL,
+			epoch      INTEGER NOT NULL,
+			sig        TEXT NOT NULL,
+			created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+			UNIQUE(group_id, epoch))`,
+	),
+	createTablesMigration(13, "dashboard_seen per-thread read state (v0.6.9)", []string{"dashboard_seen"},
+		`CREATE TABLE IF NOT EXISTS dashboard_seen(
+			user_id      INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
+			peer         TEXT NOT NULL,
+			last_seen_id INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (user_id, peer))`,
+	),
+	{
+		version: 14,
+		name:    "spam_reports abuse metadata",
+		complete: func(q querier) (bool, error) {
+			ok, err := tableExists(q, "spam_reports")
+			if err != nil || !ok {
+				return false, err
+			}
+			return indexExists(q, "idx_spam_reports_sender")
+		},
+		up: func(e execer, _ querier) error {
+			// Spam/abuse reports (metadata-only filtering). One row per
+			// (sender, reporter) pair: only distinct reporters count toward
+			// the throttle threshold, and re-reports are idempotent.
+			// reported_at implements decay: only reports inside the
+			// throttle window count.
+			if _, err := e.Exec(`CREATE TABLE IF NOT EXISTS spam_reports(
+				sender      TEXT NOT NULL,
+				reporter    TEXT NOT NULL,
+				envelope_id INTEGER NOT NULL,
+				reported_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+				PRIMARY KEY (sender, reporter))`); err != nil {
+				return err
+			}
+			_, err := e.Exec(`CREATE INDEX IF NOT EXISTS idx_spam_reports_sender
+				ON spam_reports(sender, reported_at)`)
+			return err
+		},
+	},
+	{
+		version: 15,
+		name:    "directory contact-discovery (issue #39)",
+		complete: func(q querier) (bool, error) {
+			ok, err := tableExists(q, "directory")
+			if err != nil || !ok {
+				return false, err
+			}
+			return indexExists(q, "idx_directory_address")
+		},
+		up: func(e execer, _ querier) error {
+			// Contact-discovery directory. One row per handle (handle is
+			// the primary key: first-come-first-served). capabilities are
+			// 0x00-joined tokens. tombstone marks an operator takedown: the
+			// row stays so the handle cannot be re-registered and the
+			// removal is visible (transparent takedown).
+			if _, err := e.Exec(`CREATE TABLE IF NOT EXISTS directory(
+				handle           TEXT PRIMARY KEY,
+				address          TEXT NOT NULL,
+				capabilities     TEXT NOT NULL DEFAULT '',
+				contact_policy   TEXT NOT NULL DEFAULT 'open',
+				visibility       TEXT NOT NULL DEFAULT 'private',
+				epoch            INTEGER NOT NULL,
+				signature        TEXT NOT NULL DEFAULT '',
+				transfer_from    TEXT NOT NULL DEFAULT '',
+				tombstone        INTEGER NOT NULL DEFAULT 0,
+				tombstone_reason TEXT NOT NULL DEFAULT '',
+				registered_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+				updated_at       INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+			)`); err != nil {
+				return err
+			}
+			_, err := e.Exec(`CREATE INDEX IF NOT EXISTS idx_directory_address
+				ON directory(address)`)
+			return err
+		},
+	},
+	// v0.8.0 (issue #39): transfer proof. When a handle is transferred, the
+	// stored signature is the previous holder's transfer signature (not a
+	// registration signature by the new owner), so the previous holder's
+	// address is kept alongside it.
+	addColumnMigration(16, "directory.transfer_from (v0.8.0, issue #39)", "directory", "transfer_from", `transfer_from TEXT NOT NULL DEFAULT ''`),
+	createTablesMigration(17, "dashboard_peer_handles (issue #39)", []string{"dashboard_peer_handles"},
+		`CREATE TABLE IF NOT EXISTS dashboard_peer_handles(
+			user_id    INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
+			peer       TEXT NOT NULL,
+			handle     TEXT NOT NULL,
+			updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+			PRIMARY KEY (user_id, peer))`,
+	),
+	createTablesMigration(18, "dashboard_peer_verified (issue #48)", []string{"dashboard_peer_verified"},
+		`CREATE TABLE IF NOT EXISTS dashboard_peer_verified(
+			user_id    INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
+			peer       TEXT NOT NULL,
+			status     TEXT NOT NULL,
+			updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+			PRIMARY KEY (user_id, peer))`,
+	),
+	{
+		// Optional Black Candle account linking (config-gated, off unless
+		// the dashboard is started with the auth service configured).
+		// bct_user_id is the authd user id, NULL when the dashboard user is
+		// not linked. The unique index enforces one dashboard user per BCT
+		// account; SQLite treats NULLs as distinct, so any number of
+		// unlinked users is fine.
+		version: 19,
+		name:    "dashboard_users Black Candle account linking",
+		complete: func(q querier) (bool, error) {
+			for _, c := range []string{"bct_user_id", "bct_email"} {
+				ok, err := columnExists(q, "dashboard_users", c)
+				if err != nil || !ok {
+					return false, err
+				}
+			}
+			return indexExists(q, "idx_dashboard_users_bct_user_id")
+		},
+		up: func(e execer, q querier) error {
+			for _, cc := range []struct{ column, def string }{
+				{"bct_user_id", `bct_user_id INTEGER`},
+				{"bct_email", `bct_email TEXT NOT NULL DEFAULT ''`},
+			} {
+				has, err := columnExists(q, "dashboard_users", cc.column)
+				if err != nil {
+					return err
+				}
+				if !has {
+					if _, err := e.Exec(`ALTER TABLE "dashboard_users" ADD COLUMN ` + cc.def); err != nil {
+						return err
+					}
+				}
+			}
+			_, err := e.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_users_bct_user_id ON dashboard_users(bct_user_id)`)
+			return err
+		},
+	},
+	{
+		version: 20,
+		name:    "dashboard login backoff columns and session CSRF token",
+		complete: func(q querier) (bool, error) {
+			for _, cc := range []struct{ table, column string }{
+				{"dashboard_users", "failed_logins"},
+				{"dashboard_users", "lock_until"},
+				{"dashboard_sessions", "csrf_token"},
+			} {
+				ok, err := columnExists(q, cc.table, cc.column)
+				if err != nil || !ok {
+					return false, err
+				}
+			}
+			return true, nil
+		},
+		up: func(e execer, q querier) error {
+			for _, cc := range []struct{ table, column, def string }{
+				{"dashboard_users", "failed_logins", `failed_logins INTEGER NOT NULL DEFAULT 0`},
+				{"dashboard_users", "lock_until", `lock_until INTEGER NOT NULL DEFAULT 0`},
+				{"dashboard_sessions", "csrf_token", `csrf_token TEXT NOT NULL DEFAULT ''`},
+			} {
+				has, err := columnExists(q, cc.table, cc.column)
+				if err != nil {
+					return err
+				}
+				if !has {
+					if _, err := e.Exec(`ALTER TABLE "` + cc.table + `" ADD COLUMN ` + cc.def); err != nil {
+						return err
+					}
+				}
+			}
+			// An early unreleased draft stored a SHA-256 digest in
+			// csrf_hash; drop it best-effort if some dev database
+			// still has it. Table/column are internal constants.
+			if has, err := columnExists(q, "dashboard_sessions", "csrf_hash"); err != nil {
+				return err
+			} else if has {
+				_, _ = e.Exec(`ALTER TABLE "dashboard_sessions" DROP COLUMN csrf_hash`)
+			}
+			return nil
+		},
+	},
+}
+
+// latestSchemaVersion is the newest migration version this build knows.
+func latestSchemaVersion() int {
+	return migrations[len(migrations)-1].version
+}
+
+// readLedger returns the set of migration versions recorded as applied.
+func readLedger(db *sql.DB) (map[int]bool, error) {
+	rows, err := db.Query(`SELECT version FROM schema_migrations`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	applied := map[int]bool{}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		applied[v] = true
+	}
+	return applied, rows.Err()
+}
+
+// testCrashAfterMigration is a test seam (cf. bridge.appendAuditFail): when
+// non-zero, applyMigration aborts with errTestCrash after executing that
+// migration's statements but before recording and committing it —
+// simulating a kill mid-migration. Production code never sets it.
+var testCrashAfterMigration int
+
+var errTestCrash = errors.New("test seam: simulated crash mid-migration")
+
+// runMigrations brings the database at path to the latest schema version.
+// path is used for pre-destructive-migration backups.
+func runMigrations(db *sql.DB, path string) error {
+	return runMigrationsWith(db, path, migrations)
+}
+
+// runMigrationsWith applies migs in order. It takes the migration list so
+// tests can exercise the runner (backups, interruption) with synthetic
+// migrations; production always passes the global migrations list.
+func runMigrationsWith(db *sql.DB, path string, migs []migration) error {
+	if _, err := db.Exec(schemaMigrationsDDL); err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+	applied, err := readLedger(db)
+	if err != nil {
+		return fmt.Errorf("read schema_migrations: %w", err)
+	}
+	latest := migs[len(migs)-1].version
+	for v := range applied {
+		if v > latest {
+			return fmt.Errorf("database schema version %d is newer than this build supports (%d): refusing to open (downgrade is not supported)", v, latest)
+		}
+	}
+	ranAny := false
+	for i := range migs {
+		m := &migs[i]
+		if applied[m.version] {
+			continue
+		}
+		done, err := m.complete(db)
+		if err != nil {
+			return fmt.Errorf("migration %d (%s) completion check: %w", m.version, m.name, err)
+		}
+		if m.destructive && !done {
+			if err := backupDatabase(db, path); err != nil {
+				return fmt.Errorf("migration %d (%s): %w", m.version, m.name, err)
+			}
+		}
+		if err := applyMigration(db, m, done); err != nil {
 			return err
 		}
-		return nil
+		ranAny = true
 	}
-	if err := addColumn(`ALTER TABLE envelopes ADD COLUMN sig TEXT NOT NULL DEFAULT ''`); err != nil {
-		return err
-	}
-	// v0.6.5: thread support. recipient is the other side of an outbound
-	// message ('' for inbound); peer is the counterparty address, computed
-	// at insert. Old rows predate peer, so queries fall back to sender.
-	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN recipient TEXT NOT NULL DEFAULT ''`); err != nil {
-		return err
-	}
-	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN peer TEXT NOT NULL DEFAULT ''`); err != nil {
-		return err
-	}
-	// issue #51: reply threading. reply_to is the parent relay envelope
-	// id (0 when not a reply); quote is the agent-provided parent
-	// snippet for display. The dashboard never decrypts: the agent
-	// reports, the dashboard displays (same trust model as handles).
-	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN reply_to INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return err
-	}
-	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN quote TEXT NOT NULL DEFAULT ''`); err != nil {
-		return err
-	}
-	// issue #53: disappearing messages. expires_at is 0 for messages
-	// that never expire; the dashboard filters expired rows from reads
-	// and deletes them on push.
-	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return err
-	}
-	// v0.6.11: key announcements now carry their Ed25519 signature so
-	// senders can authenticate the directory response (F1).
-	if err := addColumn(`ALTER TABLE keys ADD COLUMN signature TEXT NOT NULL DEFAULT ''`); err != nil {
-		return err
-	}
-	// v0.6.11 (F3): replay dedup. env_hash covers every sender-controlled
-	// envelope field; the UNIQUE index makes re-POSTed envelopes
-	// idempotent instead of duplicating delivery.
-	if err := addColumn(`ALTER TABLE envelopes ADD COLUMN env_hash TEXT`); err != nil {
-		return err
-	}
-	if err := backfillEnvelopeHashes(db); err != nil {
-		return err
-	}
-	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_envelopes_env_hash ON envelopes(env_hash)`); err != nil {
-		return err
-	}
-	// issue #32: envelope kind ("" or "dm" for direct messages, "group"
-	// for group messages). Empty for pre-group envelopes.
-	if err := addColumn(`ALTER TABLE envelopes ADD COLUMN kind TEXT NOT NULL DEFAULT ''`); err != nil {
-		return err
-	}
-	// issue #32: sender-key epoch for group messages (0 for direct
-	// messages). Covered by the group envelope signature; tells the
-	// reader which sender key sealed the body.
-	if err := addColumn(`ALTER TABLE envelopes ADD COLUMN key_epoch INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return err
-	}
-	// issue #32: group messaging tables.
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS groups(
-		group_id     TEXT PRIMARY KEY,
-		name         TEXT NOT NULL DEFAULT '',
-		admin        TEXT NOT NULL,
-		member_epoch INTEGER NOT NULL DEFAULT 1,
-		created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')))`); err != nil {
-		return err
-	}
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS group_members(
-		group_id TEXT NOT NULL,
-		member   TEXT NOT NULL,
-		PRIMARY KEY (group_id, member))`); err != nil {
-		return err
-	}
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS group_controls(
-		id         INTEGER PRIMARY KEY AUTOINCREMENT,
-		group_id   TEXT NOT NULL,
-		action     TEXT NOT NULL,
-		target     TEXT NOT NULL DEFAULT '',
-		admin      TEXT NOT NULL,
-		epoch      INTEGER NOT NULL,
-		sig        TEXT NOT NULL,
-		created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-		UNIQUE(group_id, epoch))`); err != nil {
-		return err
-	}
-	// v0.6.9: per-thread read state for unread badges.
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS dashboard_seen(
-		user_id      INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
-		peer         TEXT NOT NULL,
-		last_seen_id INTEGER NOT NULL DEFAULT 0,
-		PRIMARY KEY (user_id, peer))`); err != nil {
-		return err
-	}
-	// Spam/abuse reports (metadata-only filtering). One row per
-	// (sender, reporter) pair: only distinct reporters count toward the
-	// throttle threshold, and re-reports are idempotent. reported_at
-	// implements decay: only reports inside the throttle window count.
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS spam_reports(
-		sender      TEXT NOT NULL,
-		reporter    TEXT NOT NULL,
-		envelope_id INTEGER NOT NULL,
-		reported_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-		PRIMARY KEY (sender, reporter))`); err != nil {
-		return err
-	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_spam_reports_sender
-		ON spam_reports(sender, reported_at)`); err != nil {
-		return err
-	}
-	// issue #39: contact-discovery directory. One row per handle
-	// (handle is the primary key: first-come-first-served, §11 Q2).
-	// capabilities are 0x00-joined tokens. tombstone marks an operator
-	// takedown: the row stays so the handle cannot be re-registered and
-	// the removal is visible (transparent takedown, §11 Q3).
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS directory(
-		handle           TEXT PRIMARY KEY,
-		address          TEXT NOT NULL,
-		capabilities     TEXT NOT NULL DEFAULT '',
-		contact_policy   TEXT NOT NULL DEFAULT 'open',
-		visibility       TEXT NOT NULL DEFAULT 'private',
-		epoch            INTEGER NOT NULL,
-		signature        TEXT NOT NULL DEFAULT '',
-		transfer_from    TEXT NOT NULL DEFAULT '',
-		tombstone        INTEGER NOT NULL DEFAULT 0,
-		tombstone_reason TEXT NOT NULL DEFAULT '',
-		registered_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-		updated_at       INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-	)`); err != nil {
-		return err
-	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_directory_address
-		ON directory(address)`); err != nil {
-		return err
-	}
-	// v0.8.0 (issue #39): transfer proof. When a handle is transferred,
-	// the stored signature is the previous holder's transfer signature
-	// (not a registration signature by the new owner), so the previous
-	// holder's address is kept alongside it. Clients verify the binding
-	// as: register-sig by the profile address, or transfer-sig by
-	// transfer_from over (handle, new address, epoch).
-	if err := addColumn(`ALTER TABLE directory ADD COLUMN transfer_from TEXT NOT NULL DEFAULT ''`); err != nil {
-		return err
-	}
-	// issue #39: per-user peer handle labels for the dashboard. The
-	// agent resolves listed handles via the signed directory reverse
-	// endpoint and pushes them with its messages; the dashboard only
-	// displays what the agent tells it — it never queries the directory
-	// itself (it holds no identity key). Stale on purpose: rows older
-	// than the display TTL are ignored so unregistered handles fade.
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS dashboard_peer_handles(
-		user_id    INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
-		peer       TEXT NOT NULL,
-		handle     TEXT NOT NULL,
-		updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-		PRIMARY KEY (user_id, peer))`); err != nil {
-		return err
-	}
-	// issue #48: per-user peer verification states for the dashboard.
-	// The agent pushes them with its peer labels; the dashboard only
-	// displays what the agent reports — it never verifies identities
-	// itself. Rows older than the display TTL are ignored.
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS dashboard_peer_verified(
-		user_id    INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
-		peer       TEXT NOT NULL,
-		status     TEXT NOT NULL,
-		updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-		PRIMARY KEY (user_id, peer))`); err != nil {
-		return err
-	}
-	// Optional Black Candle account linking (config-gated, off unless the
-	// dashboard is started with the auth service configured). bct_user_id
-	// is the authd user id, NULL when the dashboard user is not linked.
-	// The unique index enforces one dashboard user per BCT account;
-	// SQLite treats NULLs as distinct, so any number of unlinked users
-	// is fine.
-	if err := addColumn(`ALTER TABLE dashboard_users ADD COLUMN bct_user_id INTEGER`); err != nil {
-		return err
-	}
-	if err := addColumn(`ALTER TABLE dashboard_users ADD COLUMN bct_email TEXT NOT NULL DEFAULT ''`); err != nil {
-		return err
-	}
-	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_users_bct_user_id ON dashboard_users(bct_user_id)`); err != nil {
-		return err
+	// Integrity check after migrations changed something (issue #104).
+	// PRAGMA quick_check validates b-tree structure without a full scan.
+	if ranAny {
+		if err := checkIntegrity(db); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// backfillEnvelopeHashes computes env_hash for envelopes stored before
-// the v0.6.11 (F3) replay-dedup migration, so old messages are covered too.
-func backfillEnvelopeHashes(db *sql.DB) error {
-	rows, err := db.Query(`SELECT id, recipient, sender, eph, nonce, ct, sent_at, sig
+// applyMigration runs one migration inside its own transaction (BEGIN
+// IMMEDIATE via the _txlock=immediate DSN parameter; rollback on failure).
+// alreadyDone comes from the pre-transaction completion check and lets the
+// runner adopt a migration without re-running it; the check is repeated
+// inside the transaction so a concurrent migrator cannot cause a duplicate
+// apply. The ledger row commits atomically with the migration, so a crash
+// can only leave a migration fully applied or fully unapplied.
+func applyMigration(db *sql.DB, m *migration, alreadyDone bool) error {
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("migration %d (%s) begin: %w", m.version, m.name, err)
+	}
+	defer tx.Rollback() // no-op after Commit
+	done := alreadyDone
+	if !done {
+		done, err = m.complete(tx)
+		if err != nil {
+			return fmt.Errorf("migration %d (%s) completion check: %w", m.version, m.name, err)
+		}
+	}
+	source := "adopted"
+	if !done {
+		source = "ran"
+		if err := m.up(tx, tx); err != nil {
+			return fmt.Errorf("migration %d (%s): %w", m.version, m.name, err)
+		}
+		if testCrashAfterMigration == m.version {
+			return fmt.Errorf("migration %d (%s): %w", m.version, m.name, errTestCrash)
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO schema_migrations(version, name, source) VALUES(?,?,?)`,
+		m.version, m.name, source); err != nil {
+		return fmt.Errorf("migration %d (%s) ledger: %w", m.version, m.name, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("migration %d (%s) commit: %w", m.version, m.name, err)
+	}
+	return nil
+}
+
+// backupDatabase writes a consistent snapshot of the database with VACUUM
+// INTO (safe under WAL, requires no open transaction) before a destructive
+// migration runs. The backup holds the same secrets as the live database:
+// it is chmodded 0600 and covered by the same backup-permissions discipline
+// as the live file (see enforceFilePerms). Backups are never deleted
+// automatically; operators rotate them.
+func backupDatabase(db *sql.DB, path string) error {
+	backupPath := fmt.Sprintf("%s.bak-%d", path, time.Now().UnixNano())
+	literal := "'" + strings.ReplaceAll(backupPath, "'", "''") + "'"
+	if _, err := db.Exec(`VACUUM INTO ` + literal); err != nil {
+		return fmt.Errorf("backup to %s: %w", backupPath, err)
+	}
+	if err := os.Chmod(backupPath, 0o600); err != nil {
+		return fmt.Errorf("chmod backup %s: %w", backupPath, err)
+	}
+	return nil
+}
+
+// checkIntegrity fails closed unless PRAGMA quick_check reports a clean
+// database.
+func checkIntegrity(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA quick_check`)
+	if err != nil {
+		return fmt.Errorf("integrity check: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var msg string
+		if err := rows.Scan(&msg); err != nil {
+			return fmt.Errorf("integrity check: %w", err)
+		}
+		if msg != "ok" {
+			return fmt.Errorf("integrity check failed: %s", msg)
+		}
+	}
+	return rows.Err()
+}
+
+// backfillEnvelopeHashes computes env_hash for envelopes stored before the
+// v0.6.11 (F3) replay-dedup migration, so old messages are covered too.
+func backfillEnvelopeHashes(e execer, q querier) error {
+	rows, err := q.Query(`SELECT id, recipient, sender, eph, nonce, ct, sent_at, sig
 		FROM envelopes WHERE env_hash IS NULL`)
 	if err != nil {
 		return err
@@ -346,27 +751,247 @@ func backfillEnvelopeHashes(db *sql.DB) error {
 	}
 	rows.Close()
 	for _, u := range updates {
-		if _, err := db.Exec(`UPDATE envelopes SET env_hash = ? WHERE id = ?`, u.hash, u.id); err != nil {
+		if _, err := e.Exec(`UPDATE envelopes SET env_hash = ? WHERE id = ?`, u.hash, u.id); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// File permissions (issue #103).
+//
+// The database holds dashboard password hashes, sessions, routing metadata
+// and ciphertext blobs. It must never be readable by other local users:
+//   - the parent directory is created (and kept) at 0700;
+//   - the database file (and WAL sidecars) are kept at 0600;
+//   - ownership is verified: a non-root process refuses a database owned by
+//     someone else, since it could neither tighten its permissions nor trust
+//     its current mode;
+//   - anything that cannot be enforced fails closed with an actionable error
+//     instead of running insecurely.
+//
+// Directory enforcement is deliberately conservative: a pre-existing
+// directory with broad permissions fails closed rather than being chmodded
+// unless every file in it belongs to this database (the file itself, its WAL
+// sidecars, or its backups) — a shared directory may hold other users' files
+// that a chmod would silently break. Keep the database in a dedicated
+// directory (the relay and dashboard defaults do).
+// The file itself is always tightened: it is unambiguously ours.
+// ---------------------------------------------------------------------------
+
+// prepareDatabaseDir creates the parent directory of path with 0700 and
+// enforces the directory permissions policy. It runs before the database is
+// opened so nothing sensitive is ever touched while reachable by others.
+func prepareDatabaseDir(path string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create db dir %s: %w", dir, err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("stat db dir %s: %w", dir, err)
+	}
+	if !ownedByProcess(fi) {
+		return fmt.Errorf("db dir %s is not owned by the current user: refusing to open (issue #103)", dir)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		onlyOurs, err := dirHoldsOnlyDatabaseFiles(dir, filepath.Base(path))
+		if err != nil {
+			return fmt.Errorf("stat db dir %s: %w", dir, err)
+		}
+		if !onlyOurs {
+			return fmt.Errorf("db dir %s has overly broad permissions (%o): refusing to open — chmod it to 0700 or move the database to a dedicated directory (issue #103)", dir, fi.Mode().Perm())
+		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("db dir %s has overly broad permissions and chmod failed: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// precreateDatabaseFile creates an empty database file with 0600 before
+// SQLite first touches it, so a permissive umask can never leave even a
+// momentary world-readable window. Existing files are left alone:
+// enforceFilePerms tightens them after open.
+func precreateDatabaseFile(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		return fmt.Errorf("create db file %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("create db file %s: %w", path, err)
+	}
+	return nil
+}
+
+// enforceFilePerms tightens the database file and any WAL sidecars to 0600
+// after migrations, and verifies ownership. It runs after migrations so
+// files SQLite creates along the way are covered too.
+func enforceFilePerms(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat db file %s: %w", path, err)
+	}
+	if !ownedByProcess(fi) {
+		return fmt.Errorf("db file %s is not owned by the current user: refusing to open (issue #103)", path)
+	}
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := tightenFile(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func tightenFile(p string) error {
+	fi, err := os.Stat(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat %s: %w", p, err)
+	}
+	if fi.Mode().Perm()&0o077 == 0 {
+		return nil
+	}
+	if err := os.Chmod(p, 0o600); err != nil {
+		return fmt.Errorf("%s has overly broad permissions and chmod failed: %w", p, err)
+	}
+	return nil
+}
+
+// ownedByProcess reports whether the process may enforce permissions on fi.
+// Root may enforce anything; otherwise the file must belong to the euid —
+// otherwise we could neither tighten it nor trust its current mode.
+func ownedByProcess(fi os.FileInfo) bool {
+	if os.Geteuid() == 0 {
+		return true
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return st.Uid == uint32(os.Geteuid())
+}
+
+// dirHoldsOnlyDatabaseFiles reports whether every entry in dir belongs to
+// the database named base: the file itself, its WAL sidecars, or its
+// pre-migration backups.
+func dirHoldsOnlyDatabaseFiles(dir, base string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		n := e.Name()
+		if n == base || n == base+"-wal" || n == base+"-shm" || strings.HasPrefix(n, base+".bak-") {
+			continue
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+// ---------------------------------------------------------------------------
+// Connection pragmas (issue #105).
+//
+// The relay and the dashboard are separate processes sharing one database
+// file. WAL mode lets dashboard reads proceed while the relay writes (and
+// vice versa); busy_timeout makes lock contention wait up to 5s instead of
+// failing fast. Both are set on the DSN (like internal/bridge.OpenStore) and
+// validated after open: running without them would silently reintroduce the
+// database-locked stalls this fixes, so validation fails closed.
+//
+// Transactions are BEGIN IMMEDIATE (via _txlock) and kept short: every
+// migration is its own transaction, and all statement paths are single
+// statements or short read-modify-write sequences.
+//
+// Deeper work — isolating dashboard plaintext and moving blobs out of the
+// hot database file (object storage), plus a PostgreSQL/sharded path — is
+// tracked as follow-up in issue #105 and intentionally not built here.
+// ---------------------------------------------------------------------------
+
+// dsnFor builds the SQLite DSN for path: WAL journal mode, a 5s busy
+// timeout, and immediate transaction locking.
+func dsnFor(path string) string {
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate"
+}
+
+// validatePragmas fails closed unless WAL mode and the busy timeout actually
+// took effect on the live connection.
+func validatePragmas(db *sql.DB) error {
+	var journalMode string
+	if err := db.QueryRow(`PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+		return fmt.Errorf("read journal_mode: %w", err)
+	}
+	if !strings.EqualFold(journalMode, "wal") {
+		return fmt.Errorf("journal_mode is %q, want \"wal\": refusing to open (issue #105)", journalMode)
+	}
+	var busyTimeout int
+	if err := db.QueryRow(`PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+		return fmt.Errorf("read busy_timeout: %w", err)
+	}
+	if busyTimeout != 5000 {
+		return fmt.Errorf("busy_timeout is %d, want 5000: refusing to open (issue #105)", busyTimeout)
+	}
+	return nil
+}
+
 // Open opens (creating if needed) the SQLite database at path.
+//
+//   - #103: the parent directory is created/enforced at 0700 and the
+//     database file (plus WAL sidecars) at 0600; ownership is verified and
+//     anything unenforceable fails closed. Keep the database in a dedicated
+//     directory.
+//   - #104: the schema is brought current by numbered, idempotent,
+//     transactional migrations recorded in schema_migrations. Databases
+//     migrated by the pre-ledger code are adopted via schema inspection —
+//     never re-migrated, never failed closed for being healthy.
+//   - #105: the connection runs in WAL mode with a 5s busy timeout (both
+//     validated); transactions are BEGIN IMMEDIATE and kept short.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve db path: %w", err)
+	}
+	if err := prepareDatabaseDir(abs); err != nil {
+		return nil, err
+	}
+	if err := precreateDatabaseFile(abs); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dsnFor(abs))
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema); err != nil {
+	if err := runMigrations(db, abs); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("schema: %w", err)
+		return nil, fmt.Errorf("migrations: %w", err)
 	}
-	if err := migrate(db); err != nil {
+	if err := enforceFilePerms(abs); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("migrate: %w", err)
+		return nil, err
+	}
+	if err := validatePragmas(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// Issue #100: the blob quota ledger lives in blobquota.go so it
+	// evolves independently of the core migrations (see #104, which is
+	// reworking migrate() on another branch). This single call creates
+	// and reconciles it.
+	if err := ensureBlobQuotaSchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("blob quota schema: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -488,14 +1113,13 @@ func (s *Store) GetBlob(blobID string) (*Blob, error) {
 }
 
 // PruneBlobs deletes blobs received more than retainDays ago, reusing
-// the envelope retention policy. Returns the number of rows deleted.
+// the envelope retention policy, and returns the freed bytes to the
+// per-uploader quota ledger (issue #100). The quota-aware
+// implementation lives in blobquota.go next to the ledger it updates;
+// this wrapper keeps the signature stable for existing callers.
+// Returns the number of rows deleted.
 func (s *Store) PruneBlobs(retainDays int) (int64, error) {
-	cutoff := time.Now().AddDate(0, 0, -retainDays).Unix()
-	res, err := s.db.Exec(`DELETE FROM blobs WHERE received_at < ?`, cutoff)
-	if err != nil {
-		return 0, fmt.Errorf("prune blobs: %w", err)
-	}
-	return res.RowsAffected()
+	return pruneBlobsWithQuota(s.db, retainDays)
 }
 
 // KeyAnnouncement is one published encryption key for an address.
@@ -819,6 +1443,11 @@ type DashboardUser struct {
 	// the linked account's email (display only).
 	BCTUserID int64
 	BCTEmail  string
+	// FailedLogins counts consecutive failed password logins; LockUntil
+	// is the unix time until which password login is rejected (issue
+	// #108 per-account exponential backoff).
+	FailedLogins int
+	LockUntil    int64
 }
 
 // CreateDashboardUser inserts a dashboard user. The caller hashes the
@@ -842,7 +1471,8 @@ func scanDashboardUser(row *sql.Row) (*DashboardUser, error) {
 	var mustChange int
 	var bctUserID sql.NullInt64
 	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &mustChange,
-		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail)
+		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail,
+		&u.FailedLogins, &u.LockUntil)
 	if err != nil {
 		return nil, err
 	}
@@ -853,26 +1483,27 @@ func scanDashboardUser(row *sql.Row) (*DashboardUser, error) {
 	return &u, nil
 }
 
+// dashboardUserColumns is the SELECT list for dashboard_users, kept in
+// the scanDashboardUser order.
+const dashboardUserColumns = `id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email, failed_logins, lock_until`
+
 // DashboardUserByName looks up a user by username.
 func (s *Store) DashboardUserByName(username string) (*DashboardUser, error) {
 	return scanDashboardUser(s.db.QueryRow(
-		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email
-		 FROM dashboard_users WHERE username = ?`, username))
+		`SELECT `+dashboardUserColumns+` FROM dashboard_users WHERE username = ?`, username))
 }
 
 // DashboardUserByTokenHash looks up a user by the SHA256 of their API token.
 func (s *Store) DashboardUserByTokenHash(tokenHash string) (*DashboardUser, error) {
 	return scanDashboardUser(s.db.QueryRow(
-		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email
-		 FROM dashboard_users WHERE api_token_hash = ?`, tokenHash))
+		`SELECT `+dashboardUserColumns+` FROM dashboard_users WHERE api_token_hash = ?`, tokenHash))
 }
 
 // DashboardUserByBCTUserID looks up the dashboard user linked to a Black
 // Candle authd account, or sql.ErrNoRows when no user linked it.
 func (s *Store) DashboardUserByBCTUserID(bctUserID int64) (*DashboardUser, error) {
 	return scanDashboardUser(s.db.QueryRow(
-		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email
-		 FROM dashboard_users WHERE bct_user_id = ?`, bctUserID))
+		`SELECT `+dashboardUserColumns+` FROM dashboard_users WHERE bct_user_id = ?`, bctUserID))
 }
 
 // LinkBCTAccount binds a dashboard user to a Black Candle authd account.
@@ -914,12 +1545,82 @@ func (s *Store) ChangeDashboardPassword(userID int64, passwordHash string) error
 	return tx.Commit()
 }
 
-// CreateSession stores a login session token (by its SHA256 hash).
-func (s *Store) CreateSession(tokenHash string, userID int64, ttl time.Duration) error {
+// CreateSession stores a login session token (by its SHA256 hash) along
+// with the raw synchronizer CSRF token issued for it (issue #111).
+func (s *Store) CreateSession(tokenHash string, userID int64, ttl time.Duration, csrfToken string) error {
 	_, err := s.db.Exec(
-		`INSERT INTO dashboard_sessions (token_hash, user_id, expires_at)
-		 VALUES (?, ?, strftime('%s','now') + ?)`,
-		tokenHash, userID, int64(ttl.Seconds()))
+		`INSERT INTO dashboard_sessions (token_hash, user_id, expires_at, csrf_token)
+		 VALUES (?, ?, strftime('%s','now') + ?, ?)`,
+		tokenHash, userID, int64(ttl.Seconds()), csrfToken)
+	return err
+}
+
+// SessionCSRFToken returns the raw synchronizer CSRF token stored on a
+// session, or sql.ErrNoRows when the session does not exist. Empty when
+// the session predates CSRF tokens.
+func (s *Store) SessionCSRFToken(tokenHash string) (string, error) {
+	var t string
+	err := s.db.QueryRow(`SELECT csrf_token FROM dashboard_sessions WHERE token_hash = ?`,
+		tokenHash).Scan(&t)
+	return t, err
+}
+
+// LoginBackoff returns the account lockout after n consecutive failed
+// logins: base * 2^(n-1), capped at max. Pure function, unit-tested via
+// the dashboard package.
+func LoginBackoff(n int, base, max time.Duration) time.Duration {
+	if n < 1 {
+		n = 1
+	}
+	d := base
+	for i := 1; i < n; i++ {
+		d *= 2
+		if d >= max {
+			return max
+		}
+	}
+	if d > max {
+		return max
+	}
+	return d
+}
+
+// NoteLoginFailure records one failed password login for username: the
+// consecutive-failure counter grows by one and the account locks for
+// the exponential backoff (issue #108). The read-modify-write runs in
+// one transaction so concurrent failures cannot clobber each other's
+// counters. Unknown usernames are a no-op — the row simply does not
+// exist.
+func (s *Store) NoteLoginFailure(username string, base, max time.Duration) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var failures int
+	err = tx.QueryRow(`SELECT failed_logins FROM dashboard_users WHERE username = ?`,
+		username).Scan(&failures)
+	if err == sql.ErrNoRows {
+		return nil // unknown username: no-op
+	}
+	if err != nil {
+		return err
+	}
+	failures++
+	lockUntil := time.Now().Add(LoginBackoff(failures, base, max)).Unix()
+	if _, err := tx.Exec(`UPDATE dashboard_users SET failed_logins = ?, lock_until = ?
+		WHERE username = ?`, failures, lockUntil, username); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ClearLoginFailures resets the backoff counters after a successful
+// login.
+func (s *Store) ClearLoginFailures(userID int64) error {
+	_, err := s.db.Exec(
+		`UPDATE dashboard_users SET failed_logins = 0, lock_until = 0 WHERE id = ?`,
+		userID)
 	return err
 }
 
@@ -929,11 +1630,12 @@ func (s *Store) SessionUser(tokenHash string) (*DashboardUser, error) {
 	var mustChange int
 	var bctUserID sql.NullInt64
 	err := s.db.QueryRow(
-		`SELECT u.id, u.username, u.password_hash, u.must_change, u.courier_address, u.api_token_hash, u.created_at, u.bct_user_id, u.bct_email
+		`SELECT u.id, u.username, u.password_hash, u.must_change, u.courier_address, u.api_token_hash, u.created_at, u.bct_user_id, u.bct_email, u.failed_logins, u.lock_until
 		 FROM dashboard_sessions s JOIN dashboard_users u ON u.id = s.user_id
 		 WHERE s.token_hash = ? AND s.expires_at > strftime('%s','now')`,
 		tokenHash).Scan(&u.ID, &u.Username, &u.PasswordHash, &mustChange,
-		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail)
+		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail,
+		&u.FailedLogins, &u.LockUntil)
 	if err != nil {
 		return nil, err
 	}
