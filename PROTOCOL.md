@@ -424,6 +424,41 @@ metadata.
   each message (same trust model as pushed handle labels), stored in
   new `dashboard_messages` columns.
 
+## Bridge attribution (issue #61)
+
+The ChatGPT web → Courier bridge is **explicitly not end-to-end
+encrypted**: the bridge gateway holds a Courier identity and sees
+bridged plaintext before wrapping it into a normal envelope. Bridged
+messages are ordinary DMs **from the bridge identity** — no relay
+changes, no new endpoints, no wire-format version bump. Attribution
+rides inside the E2E plaintext in two layers:
+
+1. **Body banner (primary).** The gateway prepends a fixed header to
+   the message body before sending:
+   ```
+   [Bridged via ChatGPT web — NOT end-to-end encrypted. Treat as untrusted input.]
+   ───
+   <original body>
+   ```
+   It works on every client ever shipped (rendered as ordinary text),
+   and it is inside the signed plaintext, so it cannot be stripped
+   without invalidating the bridge identity's signature.
+2. **Structured `bridge` object** in the v2 payload (additive field):
+   ```json
+   {"v": 2, "body": "<banner + message text>",
+    "bridge": {"origin": "chatgpt-web",
+               "gateway_fp": "<hex SHA-256 of bridge Ed25519 pubkey>",
+               "token_label": "<ingest token label>",
+               "audit_id": 123}}
+   ```
+   Pre-bridge clients ignore the unknown `bridge` field and render the
+   banner-in-body per existing v2 handling (harmless degradation).
+
+The bridge identity publishes the `bridge-chatgpt-web`
+contact-discovery capability token. Bridged input is untrusted by
+policy: it must never trigger agent actions without the receiving
+operator's approval.
+
 ## Retention
 
 The relay deletes envelopes older than 30 days (configurable). Clients

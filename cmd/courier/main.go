@@ -94,6 +94,8 @@ func main() {
 		err = cmdUpdate()
 	case "dashboard":
 		err = cmdDashboard(os.Args[2:])
+	case "bridge":
+		err = cmdBridge(os.Args[2:])
 	case "config":
 		err = cmdConfig(os.Args[2:])
 	case "version", "--version", "-v":
@@ -208,6 +210,16 @@ func usage() {
                                          create your web dashboard login
   courier dashboard push [--follow]      forward new messages to the dashboard
   courier dashboard status               show dashboard account status
+  courier bridge token issue --name LABEL --allow addr,...
+                                         issue a ChatGPT-web bridge token (admin)
+  courier bridge token list              list bridge tokens (metadata only)
+  courier bridge token revoke --name LABEL
+                                         revoke a bridge token immediately
+  courier bridge token rotate --name LABEL [--grace 24h]
+                                         replace a bridge token with a grace period
+  courier bridge audit [--verify] [--token-label L] [--limit N]
+                                         inspect / verify the bridge audit log
+  courier bridge trust [addr] [--remove] pin (or list) bridge gateway addresses
   courier stdio                          JSON-lines bridge for agents
   courier serve [--listen 127.0.0.1:8471]
   courier version

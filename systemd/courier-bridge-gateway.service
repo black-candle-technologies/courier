@@ -1,0 +1,34 @@
+# ChatGPT web → Courier bridge gateway (issue #61, phase 1).
+#
+# NOT YET INSTALLED — phase 1 runs as foreground processes for E2E
+# verification. Install only with explicit operator approval (phase 2+).
+#
+# The gateway runs as its own unprivileged user (courier-bridge),
+# separate from the MCP server's courier-bridge-mcp user (issue #86).
+#
+# Setup (once, as root on the VPS):
+#   useradd -r -s /usr/sbin/nologin -d /opt/courier-bridge courier-bridge
+#   mkdir -p /opt/courier-bridge && chown courier-bridge:courier-bridge /opt/courier-bridge
+#   chmod 700 /opt/courier-bridge
+#   # /etc/courier-bridge.env (0600, root:root): COURIER_BRIDGE_PEPPER=<random>
+#   sudo -u courier-bridge courier-bridge-gateway --home /opt/courier-bridge init
+[Unit]
+Description=Courier ChatGPT-web bridge gateway (issue #61)
+After=network.target
+
+[Service]
+Type=simple
+User=courier-bridge
+Group=courier-bridge
+WorkingDirectory=/opt/courier-bridge
+EnvironmentFile=/etc/courier-bridge.env
+ExecStart=/opt/courier-bridge/courier-bridge-gateway serve --home /opt/courier-bridge --addr 127.0.0.1:8473
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+# The gateway must stay localhost-only: the MCP server (and only the
+# MCP server) reaches it there. Never widen the bind address.
+
+[Install]
+WantedBy=multi-user.target
