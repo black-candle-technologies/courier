@@ -324,12 +324,18 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	envelopeID, err := g.sender.SendBridged(req.Recipient, wrapped, meta)
 	if err != nil {
-		_, _ = g.store.AppendAudit(&AuditEntry{
+		if _, aerr := g.store.AppendAudit(&AuditEntry{
 			Ts: now.Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
 			Recipient: req.Recipient, BodySHA256: sum, BodySize: int64(len(wrapped)),
 			Outcome: RejectedOutcome(RejectSendFailed), Reason: err.Error(),
 			SendRef: fmt.Sprint(reservedID),
-		})
+		}); aerr != nil {
+			// The send already failed (502 below); still log the
+			// audit failure with the reserved id so the gap is
+			// visible (issue #85).
+			log.Printf("bridge: audit append failed for failed send (reserved_audit_id=%d): %v",
+				reservedID, aerr)
+		}
 		writeJSON(w, http.StatusBadGateway, errJSON(502, "send failed"))
 		return
 	}
@@ -344,12 +350,21 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 				tok.ID, req.Recipient, err)
 		}
 	}
-	_, _ = g.store.AppendAudit(&AuditEntry{
+	if _, err := g.store.AppendAudit(&AuditEntry{
 		Ts: now.Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
 		Recipient: req.Recipient, BodySHA256: sum, BodySize: int64(len(wrapped)),
 		Outcome: OutcomeSent, EnvelopeID: envelopeID,
 		SendRef: fmt.Sprint(reservedID),
-	})
+	}); err != nil {
+		// The message WAS delivered, but we could not record it: fail
+		// loudly (non-2xx) and log with the reserved audit id so the
+		// gap is visible (issue #85). Callers must not blindly retry
+		// an audit_failed response — the send already happened.
+		log.Printf("bridge: audit append failed for sent message (reserved_audit_id=%d envelope=%d): %v",
+			reservedID, envelopeID, err)
+		writeJSON(w, http.StatusInternalServerError, errJSON(500, "audit_failed"))
+		return
+	}
 	_ = g.store.RecordUse(tok.ID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "envelope_id": envelopeID, "audit_id": reservedID,
@@ -371,21 +386,30 @@ func (g *Gateway) audit(tok *Token, recipient string, body *string, outcome stri
 		sum = SHA256Hex([]byte(wrapped))
 		size = int64(len(wrapped))
 	}
-	_, _ = g.store.AppendAudit(&AuditEntry{
+	if _, err := g.store.AppendAudit(&AuditEntry{
 		Ts: g.now().Unix(), TokenID: tokenID, TokenLabel: label,
 		Recipient: recipient, BodySHA256: sum, BodySize: size,
 		Outcome: outcome, EnvelopeID: envelopeID, Reason: reason,
-	})
+	}); err != nil {
+		// Rejection/unauthenticated audits are best-effort, but a
+		// failure must be visible in the logs, not silently dropped
+		// (issue #85).
+		log.Printf("bridge: audit append failed (outcome=%s recipient=%s): %v", outcome, recipient, err)
+	}
 }
 
 // auditFull is audit with precomputed hash/size (used when the wrapped
 // body is already in hand).
 func (g *Gateway) auditFull(tok *Token, recipient, sum string, size int64, outcome string, envelopeID int64, reason string) {
-	_, _ = g.store.AppendAudit(&AuditEntry{
+	if _, err := g.store.AppendAudit(&AuditEntry{
 		Ts: g.now().Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
 		Recipient: recipient, BodySHA256: sum, BodySize: size,
 		Outcome: outcome, EnvelopeID: envelopeID, Reason: reason,
-	})
+	}); err != nil {
+		// Best-effort audit, but failures must be visible in the logs,
+		// not silently dropped (issue #85).
+		log.Printf("bridge: audit append failed (outcome=%s recipient=%s): %v", outcome, recipient, err)
+	}
 }
 
 // newPendingConfirmation creates a single-use confirm token bound to
