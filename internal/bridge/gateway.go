@@ -322,7 +322,7 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, errJSON(502, "send failed"))
 		return
 	}
-	_ = g.store.AppendAudit(&AuditEntry{
+	_, _ = g.store.AppendAudit(&AuditEntry{
 		Ts: now.Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
 		Recipient: req.Recipient, BodySHA256: sum, BodySize: int64(len(wrapped)),
 		Outcome: OutcomeSent, EnvelopeID: envelopeID,
