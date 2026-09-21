@@ -150,7 +150,7 @@ type channelInvite struct {
 // channelStore is the whole channels.json document.
 type channelStore struct {
 	Channels map[string]*channelState  `json:"channels"`
-	Invites  map[string]*channelInvite `json:"invites"` // keyed by base64url join secret
+	Invites  map[string]*channelInvite `json:"invites"`                 // keyed by base64url join secret
 	Pending  map[string]int64          `json:"pending_joins,omitempty"` // inviter address -> unix ts
 }
 

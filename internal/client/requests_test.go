@@ -8,15 +8,6 @@ import (
 	"github.com/black-candle-technologies/courier/internal/crypto"
 )
 
-func hasFlag(msgs []Message, id int64, flag string) bool {
-	for _, m := range msgs {
-		if m.ID == id {
-			return slices.Contains(m.Flags, flag)
-		}
-	}
-	return false
-}
-
 // TestFirstContactFlagOnDelivered: in the default open policy, a
 // message from an unknown sender is still delivered — but it carries
 // the machine-readable first_contact flag.

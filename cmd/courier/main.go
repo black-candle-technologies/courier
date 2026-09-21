@@ -903,7 +903,7 @@ func writeSvcJSON(w http.ResponseWriter, code int, v any) {
 
 func cmdContacts(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|receipts-on|receipts-off|remove> ...")
+		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|receipts-on|receipts-off|remove>")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
@@ -1193,7 +1193,7 @@ func cmdReportSpam(args []string) error {
 // future requests from the sender), undismiss (reverse a dismissal).
 func cmdRequest(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: courier request <list|accept|dismiss|undismiss> ...")
+		return fmt.Errorf("usage: courier request <list|accept|dismiss|undismiss>")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
@@ -1441,7 +1441,7 @@ func cmdConfig(args []string) error {
 
 func cmdDashboard(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: courier dashboard <setup|push|status> ...")
+		return fmt.Errorf("usage: courier dashboard <setup|push|status>")
 	}
 	switch args[0] {
 	case "setup":

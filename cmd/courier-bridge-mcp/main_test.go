@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -22,7 +23,6 @@ type fakeGateway struct {
 	mu     sync.Mutex
 	hits   atomic.Int64
 	ingest func(w http.ResponseWriter, r *http.Request)
-	status int
 }
 
 func (f *fakeGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -676,5 +676,27 @@ func TestFetchBodyCapFallback(t *testing.T) {
 	b := newBridgeClient("http://127.0.0.1:1", "token") // nothing listens here
 	if got := fetchBodyCap(b); got != defaultBodyCapBytes {
 		t.Fatalf("fetchBodyCap unreachable = %d, want %d", got, defaultBodyCapBytes)
+	}
+}
+
+// TestCapCaller: short identities pass through untouched; over-long ones
+// are truncated to maxCallerLen on rune boundaries (valid UTF-8 preserved).
+func TestCapCaller(t *testing.T) {
+	short := "alice@example.com"
+	if got := capCaller(short); got != short {
+		t.Fatalf("capCaller(%q) = %q, want unchanged", short, got)
+	}
+	long := strings.Repeat("a", maxCallerLen+10)
+	if got := capCaller(long); len(got) != maxCallerLen {
+		t.Fatalf("capCaller(len %d) = len %d, want %d", len(long), len(got), maxCallerLen)
+	}
+	// Multi-byte runes must not be split: the result stays valid UTF-8.
+	longRune := strings.Repeat("é", maxCallerLen+10) // 2 bytes each
+	got := capCaller(longRune)
+	if n := len([]rune(got)); n != maxCallerLen {
+		t.Fatalf("capCaller rune count = %d, want %d", n, maxCallerLen)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatal("capCaller produced invalid UTF-8")
 	}
 }

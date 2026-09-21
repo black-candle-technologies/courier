@@ -98,6 +98,19 @@ const userinfoTimeout = 10 * time.Second
 // depth applies to asserted metadata crossing a service boundary.
 const maxCallerLen = 256
 
+// capCaller enforces maxCallerLen on the caller identity recorded in the
+// gateway audit log. The identity comes from validated authd userinfo, so
+// this is defense in depth for asserted metadata crossing a service
+// boundary. Truncation is on rune boundaries so the stored value stays
+// valid UTF-8.
+func capCaller(caller string) string {
+	if len(caller) <= maxCallerLen {
+		return caller
+	}
+	runes := []rune(caller)
+	return string(runes[:maxCallerLen])
+}
+
 // sendToolDisclosure is the mandatory user-facing disclosure (plan
 // §2.1, §3.3): it begins the send_to_agent description so the warning
 // surfaces inside ChatGPT's own tool UI. The body cap line is appended
@@ -244,7 +257,7 @@ func handleSend(b *bridgeClient) mcp.ToolHandlerFor[sendInput, any] {
 		}
 		code, data, err := b.do(http.MethodPost, "/v1/bridge/ingest", map[string]string{
 			"recipient": in.Recipient, "body": in.Body, "confirm_token": in.ConfirmToken,
-			"caller": caller,
+			"caller": capCaller(caller),
 		})
 		if err != nil {
 			return textResult(err.Error(), true)
