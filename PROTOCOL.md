@@ -553,8 +553,12 @@ name or a full address.
 ## Self-update (v0.5.0+)
 
 `courier update` checks the GitHub releases API, downloads the
-`courier-<os>-<arch>` asset for the newest release, verifies its SHA256
-against the release's `SHA256SUMS`, and replaces the running binary. Every
+`courier-<os>-<arch>` asset for the newest release, verifies that the
+release's `SHA256SUMS` carries a valid Ed25519 signature from the pinned
+maintainer release-signing key (`SHA256SUMS.sig`; unsigned releases are
+refused outright — see docs/release-signing.md), verifies the binary's
+SHA256 against those authenticated checksums, and replaces the running
+binary. Every
 invocation also does a silent check at most once per 12h and installs
 automatically (v0.6.12+ default); `courier config set auto_update false`
 opts out back to a stderr notice.

@@ -1,14 +1,36 @@
 // Package update implements Courier's self-update (v0.5.0+): the client
 // checks the GitHub releases API for a newer version and can replace its
-// own binary in place. Downloads are verified against the SHA256SUMS asset
-// published with each release before the binary is swapped.
+// own binary in place.
 //
-// Trust note: the checksum file comes from the same release as the binary,
-// so this verifies integrity of the download, not the release itself. If
-// you don't trust the release channel, build from source instead.
+// Trust model (two independent layers, #102):
+//
+//  1. Release authenticity: every release must publish a SHA256SUMS.sig
+//     asset — a raw 64-byte Ed25519 signature over the exact bytes of the
+//     SHA256SUMS file, made with the Courier release-signing key whose
+//     public half is pinned below. The updater verifies this signature
+//     BEFORE it trusts anything from the release, including the checksums
+//     themselves.
+//  2. Download integrity: the downloaded binary's SHA-256 must match the
+//     (now authenticated) checksums entry for it.
+//
+// Fail closed: releases published before signing was adopted carry no
+// SHA256SUMS.sig and are rejected outright — the updater will not trust
+// their checksums. The first signed release bootstraps trust for every
+// release after it.
+//
+// What this does NOT cover: a compromised release pipeline could still
+// ship a legitimately-signed malicious binary — the signature proves the
+// release came from the maintainer's signing key, not that the code is
+// bug-free. A signing-key rotation requires a client release pinning the
+// new public key, so rotations are announced and auditable in git history.
+// If you don't trust the maintainer at all, build from source instead.
+//
+// Release-signing procedure (key custody, asset format, rotation): see
+// docs/release-signing.md.
 package update
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -29,6 +51,48 @@ const Repo = "black-candle-technologies/courier"
 // SumsAsset is the per-release asset carrying SHA256 checksums.
 const SumsAsset = "SHA256SUMS"
 
+// SumsSigAsset is the per-release asset carrying the raw 64-byte Ed25519
+// signature over the exact bytes of the SHA256SUMS file.
+const SumsSigAsset = "SHA256SUMS.sig"
+
+// releaseSigningPubKeyHex pins the public half of the Courier
+// release-signing Ed25519 keypair. The private half is held by the
+// maintainer offline (see docs/release-signing.md) and must never appear
+// in this repository.
+const releaseSigningPubKeyHex = "4d687198d5f666491b8215c58f58681c6d7745e869b8a27798540d0bf7d395d4"
+
+// releaseSigningPubKey is the parsed pinned public key, validated once at
+// package init. A bad constant is a build-time-class bug: panic loudly
+// rather than run with a broken trust root.
+var releaseSigningPubKey = mustParseSigningKey()
+
+func mustParseSigningKey() ed25519.PublicKey {
+	raw, err := hex.DecodeString(releaseSigningPubKeyHex)
+	if err != nil || len(raw) != ed25519.PublicKeySize {
+		panic("update: invalid pinned release-signing public key")
+	}
+	return ed25519.PublicKey(raw)
+}
+
+// verifyChecksumsSignature authenticates the SHA256SUMS file bytes against
+// the release's SHA256SUMS.sig, using the given Ed25519 public key. The
+// pinned releaseSigningPubKey is passed on the production path; tests pass
+// freshly generated keys.
+func verifyChecksumsSignature(sums, sig []byte, pub ed25519.PublicKey) error {
+	if len(pub) != ed25519.PublicKeySize {
+		return fmt.Errorf("release signing key has wrong size %d (want %d)",
+			len(pub), ed25519.PublicKeySize)
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("release signature has wrong size %d (want %d): %s is not a valid Ed25519 signature",
+			len(sig), ed25519.SignatureSize, SumsSigAsset)
+	}
+	if !ed25519.Verify(pub, sums, sig) {
+		return fmt.Errorf("invalid release signature: %s does not match the maintainer's signature; the release may be forged or tampered with", SumsAsset)
+	}
+	return nil
+}
+
 // maxDownloadBytes caps a single downloaded asset at 64 MiB.
 const maxDownloadBytes = 64 << 20
 
@@ -36,7 +100,12 @@ const maxDownloadBytes = 64 << 20
 type Release struct {
 	Tag    string            // e.g. "v0.5.0"
 	Assets map[string]string // asset name -> download URL
-	Sums   map[string]string // asset name -> hex SHA256 from SHA256SUMS
+	// Sums is the asset name -> hex SHA256 map from SHA256SUMS. It is only
+	// populated after SHA256SUMS.sig verifies against the pinned
+	// release-signing key, so a Release returned by Latest carries
+	// authenticated checksums (trust layer 1). Apply enforces trust
+	// layer 2 (binary hash must match the authenticated checksums).
+	Sums map[string]string
 }
 
 func getJSON(url string, v any) error {
@@ -54,6 +123,13 @@ func getJSON(url string, v any) error {
 
 // Latest queries the GitHub API for the newest Courier release.
 func Latest() (*Release, error) {
+	return latestFrom("https://api.github.com", releaseSigningPubKey)
+}
+
+// latestFrom is Latest parameterized by API base URL and signing key, so
+// tests can exercise the full fetch-verify-parse path against a local
+// server with a throwaway key.
+func latestFrom(apiBase string, pub ed25519.PublicKey) (*Release, error) {
 	var gh struct {
 		TagName string `json:"tag_name"`
 		Assets  []struct {
@@ -61,7 +137,7 @@ func Latest() (*Release, error) {
 			URL  string `json:"browser_download_url"`
 		} `json:"assets"`
 	}
-	if err := getJSON("https://api.github.com/repos/"+Repo+"/releases/latest", &gh); err != nil {
+	if err := getJSON(apiBase+"/repos/"+Repo+"/releases/latest", &gh); err != nil {
 		return nil, fmt.Errorf("release check: %w", err)
 	}
 	if gh.TagName == "" {
@@ -72,12 +148,30 @@ func Latest() (*Release, error) {
 		rel.Assets[a.Name] = a.URL
 	}
 	if sumsURL, ok := rel.Assets[SumsAsset]; ok {
-		if raw, err := download(sumsURL); err == nil {
-			for _, line := range strings.Split(string(raw), "\n") {
-				f := strings.Fields(line)
-				if len(f) == 2 {
-					rel.Sums[f[1]] = f[0]
-				}
+		raw, err := download(sumsURL)
+		if err != nil {
+			return nil, fmt.Errorf("release check: download %s: %w", SumsAsset, err)
+		}
+		// Layer 1 (authenticity): the checksums must carry a valid
+		// maintainer signature before anything is trusted. Fail closed:
+		// releases published before signing was adopted have no
+		// SHA256SUMS.sig and are rejected outright.
+		sigURL, ok := rel.Assets[SumsSigAsset]
+		if !ok {
+			return nil, fmt.Errorf("release check: release %s is not signed (no %s asset); refusing to trust unsigned release checksums — see docs/release-signing.md", rel.Tag, SumsSigAsset)
+		}
+		sig, err := download(sigURL)
+		if err != nil {
+			return nil, fmt.Errorf("release check: download %s: %w", SumsSigAsset, err)
+		}
+		if err := verifyChecksumsSignature(raw, sig, pub); err != nil {
+			return nil, fmt.Errorf("release check: %w", err)
+		}
+		// Only parse the checksums after the signature has verified.
+		for _, line := range strings.Split(string(raw), "\n") {
+			f := strings.Fields(line)
+			if len(f) == 2 {
+				rel.Sums[f[1]] = f[0]
 			}
 		}
 	}
@@ -147,9 +241,11 @@ func binaryName() string {
 	return fmt.Sprintf("courier-%s-%s", runtime.GOOS, runtime.GOARCH)
 }
 
-// Apply downloads this release's binary for the current platform,
-// verifies its SHA256 against the release's SHA256SUMS, and atomically
-// replaces the running executable.
+// Apply downloads this release's binary for the current platform and
+// atomically replaces the running executable. Two checks gate the swap:
+// the release's SHA256SUMS must already be signature-authenticated (layer
+// 1, enforced when the Release was built by Latest), and the downloaded
+// binary's SHA-256 must match its entry in those checksums (layer 2).
 func (r *Release) Apply() error {
 	name := binaryName()
 	dlURL, ok := r.Assets[name]
