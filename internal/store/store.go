@@ -85,13 +85,20 @@ CREATE TABLE IF NOT EXISTS dashboard_users (
 	must_change       INTEGER NOT NULL DEFAULT 1,
 	courier_address   TEXT NOT NULL UNIQUE,
 	api_token_hash    TEXT NOT NULL UNIQUE,
-	created_at        INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+	created_at        INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+	-- issue #108: per-account login backoff (also added via migrate()
+	-- for databases created before these columns existed).
+	failed_logins     INTEGER NOT NULL DEFAULT 0,
+	lock_until        INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS dashboard_sessions (
 	token_hash TEXT PRIMARY KEY,
 	user_id    INTEGER NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
 	created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-	expires_at INTEGER NOT NULL
+	expires_at INTEGER NOT NULL,
+	-- issue #111: the session's raw synchronizer CSRF token
+	-- (also added via migrate() for pre-existing databases).
+	csrf_token TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS dashboard_messages (
 	id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,6 +129,14 @@ CREATE TABLE IF NOT EXISTS blobs (
 );
 CREATE INDEX IF NOT EXISTS idx_blobs_recipient ON blobs(recipient);
 `
+
+// dropColumn drops a column best-effort. Only used to remove columns
+// from unreleased drafts; errors are ignored because the column may
+// not exist or the build may predate DROP COLUMN support. Table and
+// column are always internal constants, never user input.
+func dropColumn(db *sql.DB, table, column string) {
+	_, _ = db.Exec(fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", table, column))
+}
 
 // migrate adds columns introduced after the table was first created.
 // Old rows keep empty defaults; v0.2.0+ always writes sig.
@@ -315,6 +330,29 @@ func migrate(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_users_bct_user_id ON dashboard_users(bct_user_id)`); err != nil {
 		return err
 	}
+	// Issue #108: per-account exponential backoff on failed logins.
+	// failed_logins counts consecutive failures; lock_until is the unix
+	// time until which password login is rejected. Additive columns with
+	// safe defaults: existing databases adopt them without any data
+	// migration or loss.
+	if err := addColumn(`ALTER TABLE dashboard_users ADD COLUMN failed_logins INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := addColumn(`ALTER TABLE dashboard_users ADD COLUMN lock_until INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	// Issue #111: synchronizer CSRF tokens. csrf_token holds the raw
+	// random token issued with the session; it is the single source of
+	// truth for rendering and validating the hidden form field, so no
+	// second cookie is needed. Sessions created before this column
+	// existed have an empty token: reads keep working, state-changing
+	// POSTs fail closed until the user logs in again and gets a token.
+	if err := addColumn(`ALTER TABLE dashboard_sessions ADD COLUMN csrf_token TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	// An early unreleased draft stored a SHA-256 digest in csrf_hash;
+	// drop it best-effort if some dev database still has it.
+	dropColumn(db, "dashboard_sessions", "csrf_hash")
 	return nil
 }
 
@@ -819,6 +857,11 @@ type DashboardUser struct {
 	// the linked account's email (display only).
 	BCTUserID int64
 	BCTEmail  string
+	// FailedLogins counts consecutive failed password logins; LockUntil
+	// is the unix time until which password login is rejected (issue
+	// #108 per-account exponential backoff).
+	FailedLogins int
+	LockUntil    int64
 }
 
 // CreateDashboardUser inserts a dashboard user. The caller hashes the
@@ -842,7 +885,8 @@ func scanDashboardUser(row *sql.Row) (*DashboardUser, error) {
 	var mustChange int
 	var bctUserID sql.NullInt64
 	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &mustChange,
-		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail)
+		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail,
+		&u.FailedLogins, &u.LockUntil)
 	if err != nil {
 		return nil, err
 	}
@@ -853,26 +897,27 @@ func scanDashboardUser(row *sql.Row) (*DashboardUser, error) {
 	return &u, nil
 }
 
+// dashboardUserColumns is the SELECT list for dashboard_users, kept in
+// the scanDashboardUser order.
+const dashboardUserColumns = `id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email, failed_logins, lock_until`
+
 // DashboardUserByName looks up a user by username.
 func (s *Store) DashboardUserByName(username string) (*DashboardUser, error) {
 	return scanDashboardUser(s.db.QueryRow(
-		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email
-		 FROM dashboard_users WHERE username = ?`, username))
+		`SELECT `+dashboardUserColumns+` FROM dashboard_users WHERE username = ?`, username))
 }
 
 // DashboardUserByTokenHash looks up a user by the SHA256 of their API token.
 func (s *Store) DashboardUserByTokenHash(tokenHash string) (*DashboardUser, error) {
 	return scanDashboardUser(s.db.QueryRow(
-		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email
-		 FROM dashboard_users WHERE api_token_hash = ?`, tokenHash))
+		`SELECT `+dashboardUserColumns+` FROM dashboard_users WHERE api_token_hash = ?`, tokenHash))
 }
 
 // DashboardUserByBCTUserID looks up the dashboard user linked to a Black
 // Candle authd account, or sql.ErrNoRows when no user linked it.
 func (s *Store) DashboardUserByBCTUserID(bctUserID int64) (*DashboardUser, error) {
 	return scanDashboardUser(s.db.QueryRow(
-		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email
-		 FROM dashboard_users WHERE bct_user_id = ?`, bctUserID))
+		`SELECT `+dashboardUserColumns+` FROM dashboard_users WHERE bct_user_id = ?`, bctUserID))
 }
 
 // LinkBCTAccount binds a dashboard user to a Black Candle authd account.
@@ -914,12 +959,82 @@ func (s *Store) ChangeDashboardPassword(userID int64, passwordHash string) error
 	return tx.Commit()
 }
 
-// CreateSession stores a login session token (by its SHA256 hash).
-func (s *Store) CreateSession(tokenHash string, userID int64, ttl time.Duration) error {
+// CreateSession stores a login session token (by its SHA256 hash) along
+// with the raw synchronizer CSRF token issued for it (issue #111).
+func (s *Store) CreateSession(tokenHash string, userID int64, ttl time.Duration, csrfToken string) error {
 	_, err := s.db.Exec(
-		`INSERT INTO dashboard_sessions (token_hash, user_id, expires_at)
-		 VALUES (?, ?, strftime('%s','now') + ?)`,
-		tokenHash, userID, int64(ttl.Seconds()))
+		`INSERT INTO dashboard_sessions (token_hash, user_id, expires_at, csrf_token)
+		 VALUES (?, ?, strftime('%s','now') + ?, ?)`,
+		tokenHash, userID, int64(ttl.Seconds()), csrfToken)
+	return err
+}
+
+// SessionCSRFToken returns the raw synchronizer CSRF token stored on a
+// session, or sql.ErrNoRows when the session does not exist. Empty when
+// the session predates CSRF tokens.
+func (s *Store) SessionCSRFToken(tokenHash string) (string, error) {
+	var t string
+	err := s.db.QueryRow(`SELECT csrf_token FROM dashboard_sessions WHERE token_hash = ?`,
+		tokenHash).Scan(&t)
+	return t, err
+}
+
+// LoginBackoff returns the account lockout after n consecutive failed
+// logins: base * 2^(n-1), capped at max. Pure function, unit-tested via
+// the dashboard package.
+func LoginBackoff(n int, base, max time.Duration) time.Duration {
+	if n < 1 {
+		n = 1
+	}
+	d := base
+	for i := 1; i < n; i++ {
+		d *= 2
+		if d >= max {
+			return max
+		}
+	}
+	if d > max {
+		return max
+	}
+	return d
+}
+
+// NoteLoginFailure records one failed password login for username: the
+// consecutive-failure counter grows by one and the account locks for
+// the exponential backoff (issue #108). The read-modify-write runs in
+// one transaction so concurrent failures cannot clobber each other's
+// counters. Unknown usernames are a no-op — the row simply does not
+// exist.
+func (s *Store) NoteLoginFailure(username string, base, max time.Duration) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var failures int
+	err = tx.QueryRow(`SELECT failed_logins FROM dashboard_users WHERE username = ?`,
+		username).Scan(&failures)
+	if err == sql.ErrNoRows {
+		return nil // unknown username: no-op
+	}
+	if err != nil {
+		return err
+	}
+	failures++
+	lockUntil := time.Now().Add(LoginBackoff(failures, base, max)).Unix()
+	if _, err := tx.Exec(`UPDATE dashboard_users SET failed_logins = ?, lock_until = ?
+		WHERE username = ?`, failures, lockUntil, username); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ClearLoginFailures resets the backoff counters after a successful
+// login.
+func (s *Store) ClearLoginFailures(userID int64) error {
+	_, err := s.db.Exec(
+		`UPDATE dashboard_users SET failed_logins = 0, lock_until = 0 WHERE id = ?`,
+		userID)
 	return err
 }
 
@@ -929,11 +1044,12 @@ func (s *Store) SessionUser(tokenHash string) (*DashboardUser, error) {
 	var mustChange int
 	var bctUserID sql.NullInt64
 	err := s.db.QueryRow(
-		`SELECT u.id, u.username, u.password_hash, u.must_change, u.courier_address, u.api_token_hash, u.created_at, u.bct_user_id, u.bct_email
+		`SELECT u.id, u.username, u.password_hash, u.must_change, u.courier_address, u.api_token_hash, u.created_at, u.bct_user_id, u.bct_email, u.failed_logins, u.lock_until
 		 FROM dashboard_sessions s JOIN dashboard_users u ON u.id = s.user_id
 		 WHERE s.token_hash = ? AND s.expires_at > strftime('%s','now')`,
 		tokenHash).Scan(&u.ID, &u.Username, &u.PasswordHash, &mustChange,
-		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail)
+		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail,
+		&u.FailedLogins, &u.LockUntil)
 	if err != nil {
 		return nil, err
 	}

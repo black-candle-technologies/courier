@@ -72,19 +72,15 @@ func TestPushReplyThreading(t *testing.T) {
 	}
 
 	// The thread view renders the quote block (HTML-escaped).
-	cookie := login(t, srv, "lane", "temporary-password-123")
+	creds := login(t, srv, "lane", "temporary-password-123")
 	// Password must be changed first; do it, then re-login.
 	form := url.Values{"password": {"a-new-password-123"}, "confirm": {"a-new-password-123"}}
-	req = httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(cookie)
-	rec = httptest.NewRecorder()
-	srv.Routes().ServeHTTP(rec, req)
+	rec = postChangePassword(t, srv, creds, form)
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("change-password: <redacted>: %s", rec.Body.String())
 	}
-	cookie = login(t, srv, "lane", "a-new-password-123")
-	trec := get(t, srv, "/app/thread?with="+url.QueryEscape(peer), cookie)
+	creds = login(t, srv, "lane", "a-new-password-123")
+	trec := get(t, srv, "/app/thread?with="+url.QueryEscape(peer), creds.session)
 	if trec.Code != http.StatusOK {
 		t.Fatalf("thread view: got %d", trec.Code)
 	}

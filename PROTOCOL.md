@@ -576,8 +576,25 @@ agent advances its local cursor past every attempted push.
 **Security properties.** Passwords: bcrypt. Tokens: shown once, stored
 hashed. Sessions: 32-byte random tokens, stored hashed, 30-day expiry.
 Registration is open but signature-bound (no anonymous accounts detached
-from a Courier identity). Not yet implemented: rate limiting on
-registration/login, CSRF tokens (SameSite=Lax only), WebAuthn.
+from a Courier identity). Not yet implemented: WebAuthn.
+
+**Auth hardening (issues #108, #111).** Layered rate limiting on the auth
+surface: per-IP fixed-window budgets on login (20/10min), registration
+(10/hour), and OAuth (60/10min, separate from local-auth budgets); a
+global login budget (200/10min) bounding total bcrypt work; and
+per-account exponential backoff on failed password logins (2s doubling
+to 15m), persisted in the database so restarts do not reset it. Unknown
+users, wrong passwords, and locked accounts all render the identical
+generic error, and unknown usernames burn the same bcrypt work as a
+wrong password, so neither message nor timing leaks account existence.
+X-Forwarded-For is only honored from trusted proxies (loopback by
+default, plus `DASHBOARD_TRUSTED_PROXIES`). All cookie-authenticated
+state-changing forms (login, change password, logout, BCT unlink) carry
+synchronizer CSRF tokens: the session's token is minted at login, stored
+on the session row, and validated in constant time; the pre-login form
+uses a double-submit cookie. Origin/Referer are validated
+defense-in-depth, and SameSite=Lax is retained. Limits are tunable via
+`DASHBOARD_*` environment variables (see `AuthLimitsFromEnv`).
 
 ## Group messaging (issue #32)
 

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/black-candle-technologies/courier/internal/envelope"
 	_ "modernc.org/sqlite"
@@ -434,5 +435,115 @@ func TestDashboardMessageReplyThreading(t *testing.T) {
 	}
 	if msgs[1].ReplyTo != 1 || msgs[1].Quote != "parent" {
 		t.Fatalf("reply metadata lost: %+v", msgs[1])
+	}
+}
+
+// TestMigrateAdoptsPreHardeningSchema builds a database with the
+// pre-#108/#111 schema (no failed_logins, lock_until, csrf_token) and
+// verifies Open adopts it: the additive migrations add the columns with
+// safe defaults and the new methods work on the old rows.
+func TestMigrateAdoptsPreHardeningSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE dashboard_users (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username TEXT NOT NULL UNIQUE,
+		password_hash TEXT NOT NULL,
+		must_change INTEGER NOT NULL DEFAULT 1,
+		courier_address TEXT NOT NULL UNIQUE,
+		api_token_hash TEXT NOT NULL UNIQUE,
+		created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+		bct_user_id INTEGER,
+		bct_email TEXT NOT NULL DEFAULT '')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE dashboard_sessions (
+		token_hash TEXT PRIMARY KEY,
+		user_id INTEGER NOT NULL,
+		created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+		expires_at INTEGER NOT NULL)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO dashboard_users (username, password_hash, courier_address, api_token_hash)
+		VALUES ('olduser', 'h', 'ed25519:old', 'tok')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO dashboard_sessions (token_hash, user_id, expires_at)
+		VALUES ('sesshash', 1, 9999999999)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on pre-hardening DB: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	u, err := s.DashboardUserByName("olduser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.FailedLogins != 0 || u.LockUntil != 0 {
+		t.Fatalf("adopted defaults: %+v", u)
+	}
+	// The backoff machinery works on the adopted row.
+	before := time.Now().Unix()
+	if err := s.NoteLoginFailure("olduser", time.Second, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	u, err = s.DashboardUserByName("olduser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.FailedLogins != 1 {
+		t.Fatalf("FailedLogins = %d, want 1", u.FailedLogins)
+	}
+	if u.LockUntil < before+1 || u.LockUntil > before+5 {
+		t.Fatalf("LockUntil = %d, want ~1s in the future", u.LockUntil)
+	}
+	// Unknown usernames are a no-op, not an error.
+	if err := s.NoteLoginFailure("nobody", time.Second, time.Hour); err != nil {
+		t.Fatalf("unknown user: %v", err)
+	}
+	// The pre-CSRF session has no token: fail closed.
+	tok, err := s.SessionCSRFToken("sesshash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "" {
+		t.Fatalf("pre-CSRF session token = %q, want empty", tok)
+	}
+	// New sessions get a token.
+	if err := s.CreateSession("newsess", u.ID, time.Hour, "raw-token-123"); err != nil {
+		t.Fatal(err)
+	}
+	tok, err = s.SessionCSRFToken("newsess")
+	if err != nil || tok != "raw-token-123" {
+		t.Fatalf("SessionCSRFToken = %q, %v; want raw-token-123", tok, err)
+	}
+}
+
+// TestLoginBackoffGrowth verifies the exponential schedule and the cap.
+func TestLoginBackoffGrowth(t *testing.T) {
+	base, max := 2*time.Second, 15*time.Minute
+	cases := map[int]time.Duration{
+		1:   base,
+		2:   2 * base,
+		3:   4 * base,
+		10:  max,
+		100: max,
+	}
+	for n, want := range cases {
+		if got := LoginBackoff(n, base, max); got != want {
+			t.Errorf("LoginBackoff(%d) = %v, want %v", n, got, want)
+		}
 	}
 }
