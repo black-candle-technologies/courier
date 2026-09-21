@@ -63,7 +63,7 @@ func TestPushDisappearingMessages(t *testing.T) {
 	// pushes) is filtered from reads, then deleted by the next push's
 	// sweep. SaveDashboardMessage itself does not filter — only the
 	// push handler and read paths do.
-	if _, err := srv.store.SaveDashboardMessage(u.ID, 9, addr, "", addr, "doomed", now-100, now-100, 0, "", now-10); err != nil {
+	if _, err := srv.store.SaveDashboardMessage(u.ID, 9, addr, "", addr, "doomed", now-100, now-100, 0, "", now-10, false); err != nil {
 		t.Fatal(err)
 	}
 	msgs, err = srv.store.DashboardThreadMessages(u.ID, addr, 100)

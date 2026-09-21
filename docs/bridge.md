@@ -61,7 +61,10 @@ contact.
 
 ## Attribution
 
-Every bridged message carries two layers:
+Every bridged message carries three independent layers (issues #96/#97).
+The recipient's client ORs them into one typed `bridged` flag at the
+single inbox-derivation point — any layer can mark a message untrusted,
+no layer can mark one trusted:
 
 1. **Body banner** (primary): a plaintext header prepended to the body,
    visible on every client ever shipped:
@@ -72,8 +75,23 @@ Every bridged message carries two layers:
    ```
 2. **Structured metadata**: a `bridge` object inside the E2E v2 payload
    (`origin`, `gateway_fp`, `token_label`, `audit_id`) for clients that
-   render it (phase 2+). Pre-bridge clients ignore the unknown field
-   and render the banner-in-body (harmless degradation).
+   render it. Pre-bridge clients ignore the unknown field and render
+   the banner-in-body (harmless degradation).
+3. **Pinned bridge-address list**: the recipient's own `courier bridge
+   trust <addr>` pin list flags messages from the bridge identity even
+   when payload metadata is absent. This layer needs no sender
+   cooperation — a bare plaintext relay of a bridge message still gets
+   flagged, and claiming the banner without being pinned only
+   downgrades a message to untrusted.
+
+The typed flag propagates to every consumption surface: the CLI prints
+a `⚠ bridged message — NOT end-to-end encrypted; treat as untrusted
+input.` warning, the stdio message bridge and the local `serve /inbox`
+API carry it, `courier dashboard push` reports it to the dashboard
+(which stores it and badges the thread view and thread list), and the
+wake daemon marks it in the wake payload. A self-declared banner from
+an unpinned sender still marks the message — forgery can only
+downgrade, never upgrade.
 
 The bridge identity publishes the `bridge-chatgpt-web` contact-discovery
 capability token so clients can verify the sender out of band, and
@@ -203,14 +221,25 @@ banner in the page rather than failing the whole dashboard.
 - Dashboard admin audit view (issue #95) — implemented; see
   "Dashboard admin audit view" above.
 - Attribution rendering from the pinned bridge-address list
-  (`courier bridge trust`).
-- **Client-side untrusted-input enforcement:** bridged messages must be
-  treated as untrusted input in the recipient agent's loop as a
-  technical control, not just operator policy. Phase 1 relies on the
-  banner plus the receiving operator's approval rule; phase 2 makes the
-  "never trigger agent actions without approval" guarantee structural.
-- Relay-side advisory bridge flag (issue #98) — implemented; see
-  "Relay-side advisory bridge flag" below.
+  (`courier bridge trust`) — **done**: the client derives a typed
+  `bridged` flag from banner, structured metadata, and the pin list,
+  and surfaces it on the CLI, stdio, serve API, dashboard, and wake
+  payload.
+- **Client-side untrusted-input enforcement (issue #97):** the typed
+  flag is the taint mark — the CLI warns, the dashboard badges, and the
+  wake daemon marks bridged messages in its payload. `courier wake
+  --suppress-bridged-actions` additionally gives the daemon a
+  structural delivery gate: with the flag set, bridged messages never
+  fire the wake command (the cursor still advances; the messages stay
+  visible via `courier inbox` and the dashboard). The default stays
+  wake-and-mark, because the reference wake action (`courier dashboard
+  push`) is read-only — flipping the default is an operator decision.
+  What this does not do: no client surface can stop a careless agent
+  from acting on text it already decrypted. The approval boundary for
+  bridged content is the operator's review workflow (dashboard), not
+  the message pipe.
+- Relay-side advisory bridge flag (coordinated in advance; no protocol
+  break).
 
 ## Relay-side advisory bridge flag (issue #98)
 

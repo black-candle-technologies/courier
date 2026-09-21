@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"path/filepath"
 
+	"github.com/black-candle-technologies/courier/internal/bridge"
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
 	"golang.org/x/crypto/nacl/secretbox"
@@ -57,29 +58,29 @@ type messagePayload struct {
 // text. v2 adds optional reply_to/quote alongside optional
 // attachments and an optional expiry; reply metadata on a v1 payload
 // is ignored (v1 semantics are frozen).
-func parseMessagePayload(plain []byte) (string, []envelope.AttachmentManifest, replyInfo, int64) {
+func parseMessagePayload(plain []byte) (string, []envelope.AttachmentManifest, replyInfo, int64, *bridge.BridgeMeta) {
 	var p messagePayload
 	if err := json.Unmarshal(plain, &p); err != nil {
-		return string(plain), nil, replyInfo{}, 0
+		return string(plain), nil, replyInfo{}, 0, nil
 	}
 	switch p.Version {
 	case 1:
 		if len(p.Attachments) == 0 && p.ExpiresAt == 0 {
-			return string(plain), nil, replyInfo{}, 0
+			return string(plain), nil, replyInfo{}, 0, nil
 		}
-		return p.Body, p.Attachments, replyInfo{}, p.ExpiresAt
+		return p.Body, p.Attachments, replyInfo{}, p.ExpiresAt, nil
 	case replyPayloadVersion:
 		rp, ok := parseReplyPayload(plain)
 		if !ok {
-			return string(plain), nil, replyInfo{}, 0
+			return string(plain), nil, replyInfo{}, 0, nil
 		}
 		var r replyInfo
 		if rp.ReplyTo > 0 {
 			r = replyInfo{To: rp.ReplyTo, Quote: rp.Quote}
 		}
-		return rp.Body, rp.Attachments, r, rp.ExpiresAt
+		return rp.Body, rp.Attachments, r, rp.ExpiresAt, rp.Bridge
 	default:
-		return string(plain), nil, replyInfo{}, 0
+		return string(plain), nil, replyInfo{}, 0, nil
 	}
 }
 

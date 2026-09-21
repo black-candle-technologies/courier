@@ -41,7 +41,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/black-candle-technologies/courier/internal/client"
 	"github.com/black-candle-technologies/courier/internal/crypto"
 )
 
@@ -77,7 +76,7 @@ const BridgeCapability = "bridge-chatgpt-web"
 // Sender delivers a bridge-attributed message. The production
 // implementation is *client.Client.SendBridged; tests stub it.
 type Sender interface {
-	SendBridged(address, wrappedBody string, meta *client.BridgeMeta) (int64, error)
+	SendBridged(address, wrappedBody string, meta *BridgeMeta) (int64, error)
 }
 
 // Gateway is the bridge ingest service.
@@ -325,8 +324,8 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errJSON(500, "internal error"))
 		return
 	}
-	meta := &client.BridgeMeta{
-		Origin:     client.BridgeOriginChatGPTWeb,
+	meta := &BridgeMeta{
+		Origin:     BridgeOriginChatGPTWeb,
 		GatewayFP:  g.gatewayFP,
 		TokenLabel: tok.Label,
 		AuditID:    reservedID,

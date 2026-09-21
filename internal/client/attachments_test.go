@@ -214,7 +214,7 @@ func TestMessagePayloadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, manifests, rinfo, exp := parseMessagePayload(mustMarshal(t, messagePayload{Version: 1, Body: "hi", Attachments: []envelope.AttachmentManifest{m}}))
+	body, manifests, rinfo, exp, _ := parseMessagePayload(mustMarshal(t, messagePayload{Version: 1, Body: "hi", Attachments: []envelope.AttachmentManifest{m}}))
 	if body != "hi" || len(manifests) != 1 || manifests[0].Filename != "f.txt" || exp != 0 {
 		t.Fatalf("payload not parsed: %q %+v exp=%d", body, manifests, exp)
 	}
@@ -223,19 +223,19 @@ func TestMessagePayloadRoundTrip(t *testing.T) {
 	}
 	// Legacy raw text is untouched, even if it looks vaguely like JSON.
 	for _, raw := range []string{"hello world", `{"v":1}`, `{"v":1,"body":"x"}`, "\x00\x01 binary"} {
-		b, ms, r, exp := parseMessagePayload([]byte(raw))
+		b, ms, r, exp, _ := parseMessagePayload([]byte(raw))
 		if b != raw || len(ms) != 0 || r.To != 0 || exp != 0 {
 			t.Fatalf("raw text %q misparsed", raw)
 		}
 	}
 	// issue #53: a TTL-only payload (no attachments) parses the body
 	// and expiry; old clients see this as raw JSON (message preserved).
-	ttlBody, ttlMs, _, ttlExp := parseMessagePayload(mustMarshal(t, messagePayload{Version: 1, Body: "vanish", ExpiresAt: 1893456000}))
+	ttlBody, ttlMs, _, ttlExp, _ := parseMessagePayload(mustMarshal(t, messagePayload{Version: 1, Body: "vanish", ExpiresAt: 1893456000}))
 	if ttlBody != "vanish" || len(ttlMs) != 0 || ttlExp != 1893456000 {
 		t.Fatalf("ttl payload not parsed: %q %+v exp=%d", ttlBody, ttlMs, ttlExp)
 	}
 	// TTL composes with attachments.
-	attBody, attMs, _, attExp := parseMessagePayload(mustMarshal(t, messagePayload{Version: 1, Body: "hi", Attachments: []envelope.AttachmentManifest{m}, ExpiresAt: 42}))
+	attBody, attMs, _, attExp, _ := parseMessagePayload(mustMarshal(t, messagePayload{Version: 1, Body: "hi", Attachments: []envelope.AttachmentManifest{m}, ExpiresAt: 42}))
 	if attBody != "hi" || len(attMs) != 1 || attExp != 42 {
 		t.Fatalf("ttl+attachment payload not parsed: %q %+v exp=%d", attBody, attMs, attExp)
 	}
