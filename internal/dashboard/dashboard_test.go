@@ -302,16 +302,6 @@ func get(t *testing.T, srv *Server, path string, cookie *http.Cookie) *httptest.
 	return rec
 }
 
-// getAuthed performs a GET with the session cookie.
-func getAuthed(t *testing.T, srv *Server, path string, creds testLogin) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest("GET", path, nil)
-	req.AddCookie(creds.session)
-	rec := httptest.NewRecorder()
-	srv.Routes().ServeHTTP(rec, req)
-	return rec
-}
-
 // sessionCSRFToken reads the session's synchronizer CSRF token from the
 // DB, like the server does when rendering a form.
 func sessionCSRFToken(t *testing.T, srv *Server, session *http.Cookie) string {

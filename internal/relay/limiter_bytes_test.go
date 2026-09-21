@@ -93,8 +93,11 @@ func TestLimiterAllowUnchangedAfterRefactor(t *testing.T) {
 	l := NewLimiter(2, 0)
 	l.now = fc.now
 
-	if !l.Allow("a") || !l.Allow("a") {
-		t.Fatal("burst denied")
+	if !l.Allow("a") {
+		t.Fatal("first burst action denied")
+	}
+	if !l.Allow("a") {
+		t.Fatal("second burst action denied")
 	}
 	if l.Allow("a") {
 		t.Fatal("over-burst action allowed")
