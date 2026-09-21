@@ -123,6 +123,11 @@ func (s *Store) lastHash() (string, error) {
 func (s *Store) AppendAudit(e *AuditEntry) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.appendAuditFail != nil {
+		if err := s.appendAuditFail(e); err != nil {
+			return 0, err
+		}
+	}
 	prev, err := s.lastHash()
 	if err != nil {
 		return 0, fmt.Errorf("audit chain head: %w", err)

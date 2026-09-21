@@ -31,6 +31,7 @@ package bridge
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -251,13 +252,32 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 	wrapped := WrapBody(req.Body)
 	sum := SHA256Hex([]byte(wrapped))
 	// First-send-per-(token, recipient) confirmation round-trip.
-	confirmed, err := g.store.IsConfirmed(tok.ID, req.Recipient)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errJSON(500, "internal error"))
-		return
-	}
-	if !confirmed {
-		if req.ConfirmToken == "" {
+	// A presented confirm token is ALWAYS validated and consumed —
+	// even when the recipient is already confirmed — so a token can
+	// never be silently ignored, and N concurrent ingests presenting
+	// the same token collapse to exactly one consuming send (the
+	// atomic DELETE ... RETURNING in consumePendingConfirmation
+	// admits exactly one winner; issue #84).
+	// justConfirmed records that this ingest completed the confirmation
+	// ceremony. The recipient is marked confirmed only after the
+	// approved first send actually succeeds (fail closed, issue #83):
+	// a rate-limited or failed first send must not leave the recipient
+	// confirmed for an arbitrary later body.
+	justConfirmed := false
+	if req.ConfirmToken != "" {
+		if err := g.consumePendingConfirmation(tok.ID, req.Recipient, req.ConfirmToken, sum); err != nil {
+			g.auditFull(tok, req.Recipient, sum, int64(len(wrapped)), RejectedOutcome(RejectBadRequest), 0, "bad confirm token")
+			writeJSON(w, http.StatusBadRequest, errJSON(400, "invalid or expired confirm token"))
+			return
+		}
+		justConfirmed = true
+	} else {
+		confirmed, err := g.store.IsConfirmed(tok.ID, req.Recipient)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, errJSON(500, "internal error"))
+			return
+		}
+		if !confirmed {
 			ct, err := g.newPendingConfirmation(tok.ID, req.Recipient, sum)
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, errJSON(500, "internal error"))
@@ -270,15 +290,6 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 				"summary":       confirmationSummary{Recipient: req.Recipient, BodySize: int64(len(wrapped)), BodySHA256: sum},
 				"disclosure":    DisclosureText,
 			})
-			return
-		}
-		if err := g.consumePendingConfirmation(tok.ID, req.Recipient, req.ConfirmToken, sum); err != nil {
-			g.auditFull(tok, req.Recipient, sum, int64(len(wrapped)), RejectedOutcome(RejectBadRequest), 0, "bad confirm token")
-			writeJSON(w, http.StatusBadRequest, errJSON(400, "invalid or expired confirm token"))
-			return
-		}
-		if err := g.store.MarkConfirmed(tok.ID, req.Recipient, now.Unix()); err != nil {
-			writeJSON(w, http.StatusInternalServerError, errJSON(500, "internal error"))
 			return
 		}
 	}
@@ -313,21 +324,47 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	envelopeID, err := g.sender.SendBridged(req.Recipient, wrapped, meta)
 	if err != nil {
-		_, _ = g.store.AppendAudit(&AuditEntry{
+		if _, aerr := g.store.AppendAudit(&AuditEntry{
 			Ts: now.Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
 			Recipient: req.Recipient, BodySHA256: sum, BodySize: int64(len(wrapped)),
 			Outcome: RejectedOutcome(RejectSendFailed), Reason: err.Error(),
 			SendRef: fmt.Sprint(reservedID),
-		})
+		}); aerr != nil {
+			// The send already failed (502 below); still log the
+			// audit failure with the reserved id so the gap is
+			// visible (issue #85).
+			log.Printf("bridge: audit append failed for failed send (reserved_audit_id=%d): %v",
+				reservedID, aerr)
+		}
 		writeJSON(w, http.StatusBadGateway, errJSON(502, "send failed"))
 		return
 	}
-	_, _ = g.store.AppendAudit(&AuditEntry{
+	if justConfirmed {
+		// The approved first send succeeded: record the confirmation
+		// (idempotent INSERT OR IGNORE). On DB error, log and continue
+		// with the 200 — the ceremony completed and the message was
+		// delivered; worst case the next send asks for confirmation
+		// again, which is the fail-closed direction.
+		if err := g.store.MarkConfirmed(tok.ID, req.Recipient, now.Unix()); err != nil {
+			log.Printf("bridge: MarkConfirmed(%s -> %s) failed after successful send: %v",
+				tok.ID, req.Recipient, err)
+		}
+	}
+	if _, err := g.store.AppendAudit(&AuditEntry{
 		Ts: now.Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
 		Recipient: req.Recipient, BodySHA256: sum, BodySize: int64(len(wrapped)),
 		Outcome: OutcomeSent, EnvelopeID: envelopeID,
 		SendRef: fmt.Sprint(reservedID),
-	})
+	}); err != nil {
+		// The message WAS delivered, but we could not record it: fail
+		// loudly (non-2xx) and log with the reserved audit id so the
+		// gap is visible (issue #85). Callers must not blindly retry
+		// an audit_failed response — the send already happened.
+		log.Printf("bridge: audit append failed for sent message (reserved_audit_id=%d envelope=%d): %v",
+			reservedID, envelopeID, err)
+		writeJSON(w, http.StatusInternalServerError, errJSON(500, "audit_failed"))
+		return
+	}
 	_ = g.store.RecordUse(tok.ID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "envelope_id": envelopeID, "audit_id": reservedID,
@@ -349,21 +386,30 @@ func (g *Gateway) audit(tok *Token, recipient string, body *string, outcome stri
 		sum = SHA256Hex([]byte(wrapped))
 		size = int64(len(wrapped))
 	}
-	_, _ = g.store.AppendAudit(&AuditEntry{
+	if _, err := g.store.AppendAudit(&AuditEntry{
 		Ts: g.now().Unix(), TokenID: tokenID, TokenLabel: label,
 		Recipient: recipient, BodySHA256: sum, BodySize: size,
 		Outcome: outcome, EnvelopeID: envelopeID, Reason: reason,
-	})
+	}); err != nil {
+		// Rejection/unauthenticated audits are best-effort, but a
+		// failure must be visible in the logs, not silently dropped
+		// (issue #85).
+		log.Printf("bridge: audit append failed (outcome=%s recipient=%s): %v", outcome, recipient, err)
+	}
 }
 
 // auditFull is audit with precomputed hash/size (used when the wrapped
 // body is already in hand).
 func (g *Gateway) auditFull(tok *Token, recipient, sum string, size int64, outcome string, envelopeID int64, reason string) {
-	_, _ = g.store.AppendAudit(&AuditEntry{
+	if _, err := g.store.AppendAudit(&AuditEntry{
 		Ts: g.now().Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
 		Recipient: recipient, BodySHA256: sum, BodySize: size,
 		Outcome: outcome, EnvelopeID: envelopeID, Reason: reason,
-	})
+	}); err != nil {
+		// Best-effort audit, but failures must be visible in the logs,
+		// not silently dropped (issue #85).
+		log.Printf("bridge: audit append failed (outcome=%s recipient=%s): %v", outcome, recipient, err)
+	}
 }
 
 // newPendingConfirmation creates a single-use confirm token bound to
@@ -398,24 +444,33 @@ func (g *Gateway) newPendingConfirmation(tokenID, recipient, bodySHA string) (st
 // token approved for one message could be replayed for a different
 // message, defeating the first-send human-approval control (F1).
 // On success the caller marks the recipient confirmed.
+//
+// Validation and consumption are ATOMIC: a single DELETE ... RETURNING
+// statement both checks the token's existence and removes it, so two
+// concurrent ingests presenting the same token cannot both consume it
+// (issue #84). A presented-but-unknown token is an error, never a
+// silent pass.
 func (g *Gateway) consumePendingConfirmation(tokenID, recipient, raw, bodySHA string) error {
 	sum := sha256.Sum256([]byte(raw))
+	tokHex := hex.EncodeToString(sum[:])
 	var dbTokenID, dbRecipient, dbBodySHA string
 	var expiresAt int64
 	err := g.store.db.QueryRow(
-		`SELECT token_id,recipient,body_sha256,expires_at FROM pending_confirmations WHERE token=?`,
-		hex.EncodeToString(sum[:]),
+		`DELETE FROM pending_confirmations WHERE token=? RETURNING token_id,recipient,body_sha256,expires_at`,
+		tokHex,
 	).Scan(&dbTokenID, &dbRecipient, &dbBodySHA, &expiresAt)
-	if err != nil {
+	if err == sql.ErrNoRows {
 		return fmt.Errorf("unknown confirm token")
 	}
-	now := g.now().Unix()
-	// Single-use: delete regardless of outcome.
-	_, _ = g.store.db.Exec(`DELETE FROM pending_confirmations WHERE token=?`, hex.EncodeToString(sum[:]))
+	if err != nil {
+		return fmt.Errorf("consume confirm token: %w", err)
+	}
+	// Single-use: the row is already deleted by the statement above,
+	// regardless of whether the binding checks below pass.
 	if dbTokenID != tokenID || dbRecipient != recipient || dbBodySHA != bodySHA {
 		return fmt.Errorf("confirm token does not match")
 	}
-	if now > expiresAt {
+	if g.now().Unix() > expiresAt {
 		return fmt.Errorf("confirm token expired")
 	}
 	return nil

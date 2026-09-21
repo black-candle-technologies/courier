@@ -615,3 +615,167 @@ func TestIngestConcurrentSendsChainVerifies(t *testing.T) {
 		t.Fatalf("reserved=%d sent=%d, want 2 and 2", len(reserved), sent)
 	}
 }
+
+// TestConfirmTokenConcurrentConsumeSingleUse (issue #84): N concurrent
+// ingests presenting the SAME confirm token must collapse to exactly
+// one consuming send. Validation+consumption is a single atomic
+// DELETE ... RETURNING, so exactly one ingest wins the token; the rest
+// get 400 and nothing is sent twice.
+func TestConfirmTokenConcurrentConsumeSingleUse(t *testing.T) {
+	f := newGwFixture(t)
+	// 449 round-trip to mint a confirm token for body "hello".
+	rec := f.ingest(t, f.raw, ingestJSON(f.addr, "hello", ""))
+	if rec.Code != StatusConfirmationRequired {
+		t.Fatalf("first send code = %d, want 449", rec.Code)
+	}
+	var cr map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &cr)
+	ct, _ := cr["confirm_token"].(string)
+	if ct == "" {
+		t.Fatal("no confirm_token in 449")
+	}
+	const n = 16
+	codes := make([]int, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r := f.ingest(t, f.raw, ingestJSON(f.addr, "hello", ct))
+			codes[i] = r.Code
+		}(i)
+	}
+	wg.Wait()
+	var ok200, bad400 int
+	for _, c := range codes {
+		switch c {
+		case http.StatusOK:
+			ok200++
+		case http.StatusBadRequest:
+			bad400++
+		default:
+			t.Fatalf("unexpected code %d", c)
+		}
+	}
+	if ok200 != 1 || bad400 != n-1 {
+		t.Fatalf("ok200=%d bad400=%d, want 1 and %d", ok200, bad400, n-1)
+	}
+	if len(f.stub.calls) != 1 {
+		t.Fatalf("sender called %d times, want exactly 1", len(f.stub.calls))
+	}
+}
+
+// confirmTokenFor mints a confirm token for (addr, body) via the 449
+// round-trip and returns it.
+func confirmTokenFor(t *testing.T, f *gwFixture, addr, body string) string {
+	t.Helper()
+	rec := f.ingest(t, f.raw, ingestJSON(addr, body, ""))
+	if rec.Code != StatusConfirmationRequired {
+		t.Fatalf("first send code = %d, want 449", rec.Code)
+	}
+	var cr map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &cr)
+	ct, _ := cr["confirm_token"].(string)
+	if ct == "" {
+		t.Fatal("no confirm_token in 449")
+	}
+	return ct
+}
+
+// TestConfirmNotMarkedWhenSendFails (issue #83): a confirmed token
+// whose approved first send FAILS must not leave the recipient
+// confirmed — fail closed. A later different body must require a fresh
+// confirmation (449), not sail through.
+func TestConfirmNotMarkedWhenSendFails(t *testing.T) {
+	f := newGwFixture(t)
+	f.stub.err = errTestSend
+	ct := confirmTokenFor(t, f, f.addr, "hello")
+	rec := f.ingest(t, f.raw, ingestJSON(f.addr, "hello", ct))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("confirmed send code = %d, want 502", rec.Code)
+	}
+	confirmed, err := f.store.IsConfirmed(f.tok.ID, f.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed {
+		t.Fatal("recipient marked confirmed although the approved first send failed")
+	}
+	// A different body still requires confirmation.
+	rec = f.ingest(t, f.raw, ingestJSON(f.addr, "different body", ""))
+	if rec.Code != StatusConfirmationRequired {
+		t.Fatalf("different body code = %d, want 449", rec.Code)
+	}
+}
+
+// TestConfirmNotMarkedWhenRateLimited (issue #83): a confirmed token
+// whose approved first send is RATE-LIMITED must not leave the
+// recipient confirmed either. Draining the minute bucket forces the
+// 429; the later different body must get 449.
+func TestConfirmNotMarkedWhenRateLimited(t *testing.T) {
+	f := newGwFixture(t)
+	for i := 0; i < RateBurst; i++ {
+		f.gw.limiter.Allow(f.tok.ID)
+	}
+	ct := confirmTokenFor(t, f, f.addr, "hello")
+	rec := f.ingest(t, f.raw, ingestJSON(f.addr, "hello", ct))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("confirmed send code = %d, want 429", rec.Code)
+	}
+	confirmed, err := f.store.IsConfirmed(f.tok.ID, f.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed {
+		t.Fatal("recipient marked confirmed although the approved first send was rate-limited")
+	}
+	rec = f.ingest(t, f.raw, ingestJSON(f.addr, "different body", ""))
+	if rec.Code != StatusConfirmationRequired {
+		t.Fatalf("different body code = %d, want 449", rec.Code)
+	}
+}
+
+const errTestAudit = testErr("audit boom")
+
+// TestSendAuditFailureSurfaced (issue #85): if the send-completion
+// audit event cannot be appended, the failure must surface as a
+// non-2xx (not a silent 200), and the failure is logged with the
+// reserved audit id. The message WAS delivered — the sender stub must
+// show exactly one call.
+func TestSendAuditFailureSurfaced(t *testing.T) {
+	f := newGwFixture(t)
+	ct := confirmTokenFor(t, f, f.addr, "hello")
+	f.store.appendAuditFail = func(e *AuditEntry) error {
+		if e.Outcome == OutcomeSent {
+			return errTestAudit
+		}
+		return nil
+	}
+	rec := f.ingest(t, f.raw, ingestJSON(f.addr, "hello", ct))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500 on audit failure", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "audit_failed") {
+		t.Fatalf("body %q missing audit_failed", rec.Body.String())
+	}
+	if len(f.stub.calls) != 1 {
+		t.Fatalf("sender called %d times, want 1 (message was delivered)", len(f.stub.calls))
+	}
+	// The rows that did land still form a valid chain.
+	if ok, _, _, err := f.store.VerifyAudit(); err != nil || !ok {
+		t.Fatalf("audit verify: %v %v", err, ok)
+	}
+}
+
+// TestAuditHelperFailureDoesNotBreakResponse (issue #85): the audit()
+// helper is best-effort, but its failures must be logged rather than
+// silently discarded — and must not change the HTTP response. With
+// every append failing, an unauthenticated ingest still gets its 401.
+func TestAuditHelperFailureDoesNotBreakResponse(t *testing.T) {
+	f := newGwFixture(t)
+	f.store.appendAuditFail = func(e *AuditEntry) error { return errTestAudit }
+	rec := f.ingest(t, "bogus", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401", rec.Code)
+	}
+}
