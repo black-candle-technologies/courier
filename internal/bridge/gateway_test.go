@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/black-candle-technologies/courier/internal/client"
 )
@@ -486,5 +489,129 @@ func TestDisclosureMentionsAllPlaintextHops(t *testing.T) {
 		if !strings.Contains(DisclosureText, hop) {
 			t.Errorf("DisclosureText missing plaintext hop %q", hop)
 		}
+	}
+}
+
+// blockingSender is a Sender whose first two SendBridged calls block
+// until both are in flight. That forces the exact interleaving that
+// used to fork the audit chain under the old reserve-then-rewrite
+// design: reserve A -> append B -> finalize A (issue #81).
+type blockingSender struct {
+	firstIn  chan struct{}
+	secondIn chan struct{}
+	release  chan struct{}
+	once1    sync.Once
+	once2    sync.Once
+	mu       sync.Mutex
+	calls    int
+	next     int64
+}
+
+func (b *blockingSender) SendBridged(address, wrappedBody string, meta *client.BridgeMeta) (int64, error) {
+	b.mu.Lock()
+	b.calls++
+	n := b.calls
+	b.mu.Unlock()
+	if n == 1 {
+		b.once1.Do(func() { close(b.firstIn) })
+	} else {
+		b.once2.Do(func() { close(b.secondIn) })
+	}
+	<-b.release
+	b.mu.Lock()
+	b.next++
+	id := b.next
+	b.mu.Unlock()
+	return id, nil
+}
+
+// TestIngestConcurrentSendsChainVerifies (issue #81): two concurrent
+// confirmed sends interleave as reserve A -> reserve B -> finalize A ->
+// finalize B in some order. The audit chain must still verify, and
+// every send_reserved event must pair with exactly one completion
+// event linked via SendRef.
+func TestIngestConcurrentSendsChainVerifies(t *testing.T) {
+	s := testStore(t)
+	addr1, addr2 := testAddr(101), testAddr(102)
+	raw, tok, err := s.IssueToken("fixture", []string{addr1, addr2}, 0, "test-pepper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs := &blockingSender{
+		firstIn:  make(chan struct{}),
+		secondIn: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	gw := NewGateway(s, bs, "test-pepper", "ed25519:bridge", bytes.Repeat([]byte{7}, 32), "test")
+	// Pre-confirm both recipients so the concurrent ingests go straight
+	// to the send path (confirmation is orthogonal to this test).
+	now := time.Now().Unix()
+	for _, addr := range []string{addr1, addr2} {
+		if err := s.MarkConfirmed(tok.ID, addr, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recs := make([]*httptest.ResponseRecorder, 2)
+	var wg sync.WaitGroup
+	for i, addr := range []string{addr1, addr2} {
+		wg.Add(1)
+		go func(i int, addr string) {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPost, "/v1/bridge/ingest",
+				bytes.NewReader([]byte(ingestJSON(addr, "hello", ""))))
+			req.Header.Set("Authorization", "Bearer "+raw)
+			rec := httptest.NewRecorder()
+			gw.Routes().ServeHTTP(rec, req)
+			recs[i] = rec
+		}(i, addr)
+	}
+	// Both sends are now in flight, which means both send_reserved rows
+	// are appended. Release them so the completion events interleave.
+	<-bs.firstIn
+	<-bs.secondIn
+	close(bs.release)
+	wg.Wait()
+	for i, rec := range recs {
+		if rec == nil || rec.Code != http.StatusOK {
+			t.Fatalf("ingest %d: code = %v, want 200", i, rec)
+		}
+	}
+	ok, _, _, err := s.VerifyAudit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("audit chain forked under concurrent sends")
+	}
+	rows, err := s.ListAudit(AuditFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserved := map[int64]bool{}
+	for _, r := range rows {
+		if r.Outcome == OutcomeSendReserved {
+			reserved[r.ID] = true
+		}
+	}
+	var sent int
+	for _, r := range rows {
+		switch r.Outcome {
+		case OutcomeSendReserved:
+			// collected above
+		case OutcomeSent:
+			sent++
+			if r.EnvelopeID == 0 {
+				t.Fatal("sent row missing envelope id")
+			}
+			id, err := strconv.ParseInt(r.SendRef, 10, 64)
+			if err != nil || !reserved[id] {
+				t.Fatalf("sent row references unknown reserved row %q", r.SendRef)
+			}
+		default:
+			t.Fatalf("unexpected outcome %q", r.Outcome)
+		}
+	}
+	if len(reserved) != 2 || sent != 2 {
+		t.Fatalf("reserved=%d sent=%d, want 2 and 2", len(reserved), sent)
 	}
 }

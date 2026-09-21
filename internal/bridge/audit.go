@@ -1,9 +1,22 @@
 // Hash-chained audit log for the bridge gateway (issue #61).
 //
-// Every ingest — sent or rejected — appends one metadata-only row:
-// who (token label), what (recipient, body SHA-256, size), when, and
-// the outcome. Message bodies are NEVER logged; the log is a metadata
-// record, not a message archive.
+// Every ingest — sent or rejected — appends one or more metadata-only
+// rows: who (token label), what (recipient, body SHA-256, size), when,
+// and the outcome. Message bodies are NEVER logged; the log is a
+// metadata record, not a message archive.
+//
+// Rows are IMMUTABLE once appended: the chain writer (AppendAudit) is
+// the only mutator, and it only ever inserts. A send is recorded as a
+// pair of chained events — send_reserved (appended before the relay
+// round-trip so the wire metadata can reference its row id) and then
+// sent or rejected:send_failed (appended after, linked to the reserved
+// row via send_ref). Immutability is what keeps the chain correct
+// under concurrency: the old reserve-then-rewrite design let a
+// concurrent append link prev_hash to a reserved row_hash that
+// finalization then rewrote, forking the chain (issue #81). Mutable
+// operational state (in-flight sends) lives outside the chained
+// record entirely — in memory in the gateway, never in the audit
+// table.
 //
 // Each row stores prev_hash (the previous row's hash) and row_hash =
 // SHA-256 over the full row content, so `courier bridge audit --verify`
@@ -33,6 +46,12 @@ import (
 const (
 	OutcomeSent                 = "sent"
 	OutcomeConfirmationRequired = "confirmation_requested"
+	// OutcomeSendReserved is the immutable event appended before the
+	// relay round-trip. The wire message's BridgeMeta.AuditID references
+	// this row. After the round-trip the gateway appends a second
+	// immutable event (OutcomeSent, or rejected:send_failed) linked to
+	// this one via SendRef.
+	OutcomeSendReserved = "send_reserved"
 )
 
 // RejectedOutcome builds the outcome string for a rejected ingest.
@@ -51,7 +70,11 @@ const (
 // DefaultAuditRetention is the user-confirmed 1-year retention.
 const DefaultAuditRetention = 365 * 24 * time.Hour
 
-// AuditEntry is one audit row.
+// AuditEntry is one audit row. Rows are immutable once appended:
+// AppendAudit is the only writer and it only inserts. SendRef links a
+// send's completion event (sent / rejected:send_failed) back to its
+// send_reserved row; it is operational metadata and is deliberately
+// NOT part of row_hash, so linking never affects chain verification.
 type AuditEntry struct {
 	ID         int64
 	Ts         int64
@@ -63,6 +86,7 @@ type AuditEntry struct {
 	Outcome    string
 	EnvelopeID int64
 	Reason     string
+	SendRef    string
 	PrevHash   string
 	RowHash    string
 }
@@ -89,10 +113,13 @@ func (s *Store) lastHash() (string, error) {
 	return h, err
 }
 
-// AppendAudit appends one audit row, chaining its hash to the previous
-// row. Appends and finalizes are serialized on the store mutex so two
-// concurrent ingests cannot read the same chain head and fork the
-// chain (F2). It returns the new row id.
+// AppendAudit appends one IMMUTABLE audit row, chaining its hash to
+// the previous row. It is the only writer of the audit table. Appends
+// are serialized on the store mutex so two concurrent ingests cannot
+// read the same chain head and fork the chain (F2). Because rows are
+// never updated after insert, no interleaving of appends — however the
+// gateway interleaves reserves, sends, and completion events — can
+// break VerifyAudit (issue #81). It returns the new row id.
 func (s *Store) AppendAudit(e *AuditEntry) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -103,40 +130,15 @@ func (s *Store) AppendAudit(e *AuditEntry) (int64, error) {
 	e.PrevHash = prev
 	e.RowHash = hashRow(prev, e)
 	res, err := s.db.Exec(
-		`INSERT INTO audit(ts,token_id,token_label,recipient,body_sha256,body_size,outcome,envelope_id,reason,prev_hash,row_hash)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO audit(ts,token_id,token_label,recipient,body_sha256,body_size,outcome,envelope_id,reason,send_ref,prev_hash,row_hash)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
 		e.Ts, e.TokenID, e.TokenLabel, e.Recipient, e.BodySHA256, e.BodySize,
-		e.Outcome, e.EnvelopeID, e.Reason, e.PrevHash, e.RowHash,
+		e.Outcome, e.EnvelopeID, e.Reason, e.SendRef, e.PrevHash, e.RowHash,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("append audit: %w", err)
 	}
 	return res.LastInsertId()
-}
-
-// FinalizeAudit updates the outcome/envelope of a previously appended
-// row (the send → audit ordering means the row is reserved before the
-// relay round-trip) and re-chains its hash over the final content.
-// It takes the store mutex: finalizing rewrites a row_hash, so it must
-// not interleave with an append that is reading the chain head (F2).
-func (s *Store) FinalizeAudit(id int64, outcome string, envelopeID int64, reason string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var e AuditEntry
-	err := s.db.QueryRow(
-		`SELECT id,ts,token_id,token_label,recipient,body_sha256,body_size,prev_hash
-		 FROM audit WHERE id=?`, id,
-	).Scan(&e.ID, &e.Ts, &e.TokenID, &e.TokenLabel, &e.Recipient, &e.BodySHA256, &e.BodySize, &e.PrevHash)
-	if err != nil {
-		return fmt.Errorf("read audit row: %w", err)
-	}
-	e.Outcome = outcome
-	e.EnvelopeID = envelopeID
-	e.Reason = reason
-	e.RowHash = hashRow(e.PrevHash, &e)
-	_, err = s.db.Exec(`UPDATE audit SET outcome=?, envelope_id=?, reason=?, row_hash=? WHERE id=?`,
-		outcome, envelopeID, reason, e.RowHash, id)
-	return err
 }
 
 // VerifyAudit walks the whole chain and reports whether every row's
@@ -146,7 +148,7 @@ func (s *Store) FinalizeAudit(id int64, outcome string, envelopeID int64, reason
 // pruned, which is expected, not tampering).
 func (s *Store) VerifyAudit() (ok bool, checked int64, firstID int64, err error) {
 	rows, err := s.db.Query(
-		`SELECT id,ts,token_id,token_label,recipient,body_sha256,body_size,outcome,envelope_id,reason,prev_hash,row_hash
+		`SELECT id,ts,token_id,token_label,recipient,body_sha256,body_size,outcome,envelope_id,reason,send_ref,prev_hash,row_hash
 		 FROM audit ORDER BY id ASC`,
 	)
 	if err != nil {
@@ -157,7 +159,7 @@ func (s *Store) VerifyAudit() (ok bool, checked int64, firstID int64, err error)
 	for rows.Next() {
 		var e AuditEntry
 		if err := rows.Scan(&e.ID, &e.Ts, &e.TokenID, &e.TokenLabel, &e.Recipient, &e.BodySHA256,
-			&e.BodySize, &e.Outcome, &e.EnvelopeID, &e.Reason, &e.PrevHash, &e.RowHash); err != nil {
+			&e.BodySize, &e.Outcome, &e.EnvelopeID, &e.Reason, &e.SendRef, &e.PrevHash, &e.RowHash); err != nil {
 			return false, checked, firstID, fmt.Errorf("scan audit: %w", err)
 		}
 		if checked == 0 {
@@ -198,7 +200,7 @@ type AuditFilter struct {
 
 // ListAudit returns audit rows, newest first, honoring the filter.
 func (s *Store) ListAudit(f AuditFilter) ([]*AuditEntry, error) {
-	q := `SELECT id,ts,token_id,token_label,recipient,body_sha256,body_size,outcome,envelope_id,reason,prev_hash,row_hash
+	q := `SELECT id,ts,token_id,token_label,recipient,body_sha256,body_size,outcome,envelope_id,reason,send_ref,prev_hash,row_hash
 	      FROM audit WHERE 1=1`
 	var args []any
 	if f.TokenLabel != "" {
@@ -223,7 +225,7 @@ func (s *Store) ListAudit(f AuditFilter) ([]*AuditEntry, error) {
 	for rows.Next() {
 		var e AuditEntry
 		if err := rows.Scan(&e.ID, &e.Ts, &e.TokenID, &e.TokenLabel, &e.Recipient, &e.BodySHA256,
-			&e.BodySize, &e.Outcome, &e.EnvelopeID, &e.Reason, &e.PrevHash, &e.RowHash); err != nil {
+			&e.BodySize, &e.Outcome, &e.EnvelopeID, &e.Reason, &e.SendRef, &e.PrevHash, &e.RowHash); err != nil {
 			return nil, fmt.Errorf("scan audit: %w", err)
 		}
 		out = append(out, &e)
