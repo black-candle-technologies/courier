@@ -11,6 +11,7 @@
 #   mkdir -p /opt/courier-bridge && chown courier-bridge:courier-bridge /opt/courier-bridge
 #   chmod 700 /opt/courier-bridge
 #   # /etc/courier-bridge.env (0600, root:root): COURIER_BRIDGE_PEPPER=<random>
+#   # Optional (issue #95, read-only admin audit API): COURIER_BRIDGE_ADMIN_TOKEN=<random>
 #   sudo -u courier-bridge courier-bridge-gateway --home /opt/courier-bridge init
 [Unit]
 Description=Courier ChatGPT-web bridge gateway (issue #61)

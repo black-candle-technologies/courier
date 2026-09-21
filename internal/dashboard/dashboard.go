@@ -82,6 +82,10 @@ type Server struct {
 	// operator configured the identity provider: the OAuth feature is
 	// dormant in self-hosted installs.
 	bct *bctOAuthClient
+	// bridgeAudit is the optional bridge-gateway audit API client
+	// (issue #95). Nil unless the operator configured the gateway URL
+	// and admin token: the audit view is dormant otherwise.
+	bridgeAudit *bridgeAuditClient
 }
 
 // New returns a Server backed by st.
@@ -92,15 +96,30 @@ func New(st *store.Store) *Server { return &Server{store: st} }
 // the OAuth routes are not registered and the UI affordances never
 // render.
 func NewWithBCT(st *store.Store, cfg BCTOAuthConfig) *Server {
+	return NewFull(st, cfg, BridgeAuditConfig{})
+}
+
+// NewFull returns a Server backed by st with optional Black Candle
+// OAuth login and the optional bridge audit admin view. Zero configs
+// disable their features entirely: unconfigured routes are not
+// registered and their UI affordances never render.
+func NewFull(st *store.Store, bct BCTOAuthConfig, audit BridgeAuditConfig) *Server {
 	s := &Server{store: st}
-	if cfg.URL != "" && cfg.ClientID != "" && cfg.ClientSecret != "" {
-		s.bct = newBCTOAuthClient(cfg)
+	if bct.URL != "" && bct.ClientID != "" && bct.ClientSecret != "" {
+		s.bct = newBCTOAuthClient(bct)
+	}
+	if audit.enabled() {
+		s.bridgeAudit = newBridgeAuditClient(audit)
 	}
 	return s
 }
 
 // bctEnabled reports whether Black Candle OAuth login is configured.
 func (s *Server) bctEnabled() bool { return s.bct != nil }
+
+// bridgeAuditEnabled reports whether the bridge audit admin view is
+// configured.
+func (s *Server) bridgeAuditEnabled() bool { return s.bridgeAudit != nil }
 
 // Routes returns the HTTP handler with all endpoints registered.
 func (s *Server) Routes() http.Handler {
@@ -126,6 +145,12 @@ func (s *Server) Routes() http.Handler {
 		mux.HandleFunc("GET /oauth/bct/callback", s.handleOAuthBCTCallback)
 		mux.HandleFunc("GET /settings", s.handleSettings)
 		mux.HandleFunc("POST /settings/unlink-bct", s.handleUnlinkBCT)
+	}
+	// Bridge audit admin view (issue #95): only registered when the
+	// gateway URL and admin token are configured, and only reachable
+	// by dashboard admins (checked in the handler).
+	if s.bridgeAuditEnabled() {
+		mux.HandleFunc("GET /admin/bridge/audit", s.handleBridgeAudit)
 	}
 	// PWA install assets (no login required).
 	mux.HandleFunc("GET /manifest.webmanifest", handleManifest)
@@ -549,7 +574,10 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 			LastBridged:     bridge.HasBanner(th.LastBody),
 		})
 	}
-	render(w, appTmpl, map[string]any{"User": u.Username, "Threads": views, "Q": q, "BCTEnabled": s.bctEnabled()})
+	render(w, appTmpl, map[string]any{"User": u.Username, "Threads": views, "Q": q, "BCTEnabled": s.bctEnabled(),
+		// issue #95: the Bridge audit link renders only for admins,
+		// and only when the audit view is configured.
+		"IsAdmin": u.IsAdmin, "BridgeAuditEnabled": s.bridgeAuditEnabled()})
 }
 
 // handleThread shows one conversation: every message exchanged with a
@@ -1068,6 +1096,38 @@ input::placeholder{color:var(--ink-3)}
 .empty{text-align:center;padding:3rem 1.5rem;color:var(--ink-2)}
 .empty-mark{font-size:2.5rem;margin-bottom:.5rem}
 .empty h2{color:var(--ink);margin-bottom:.4rem}
+/* issue #95: bridge audit admin view */
+.wrap.wide{--maxw:72rem}
+.afilters{display:flex;gap:.75rem;align-items:flex-end;flex-wrap:wrap;
+  margin:0 0 1rem;background:var(--surface);border:1px solid var(--line);
+  border-radius:var(--radius-sm);padding:.85rem 1rem}
+.afilters label{display:flex;flex-direction:column;gap:.3rem;font-weight:600;
+  font-size:13px;color:var(--ink-2)}
+.afilters input{min-width:10rem;font-family:inherit;font-size:14px;color:var(--ink);
+  background:var(--surface);border:1px solid var(--line-strong);
+  border-radius:var(--radius-sm);padding:.5rem .75rem}
+.afilters input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.twrap{overflow-x:auto;border:1px solid var(--line);border-radius:var(--radius-sm);
+  background:var(--surface)}
+.tbl{width:100%;border-collapse:collapse;font-size:.82rem;min-width:56rem}
+.tbl th{text-align:left;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--ink-3);padding:.6rem .7rem;border-bottom:1px solid var(--line-strong);
+  white-space:nowrap}
+.tbl td{padding:.55rem .7rem;border-bottom:1px solid var(--line);vertical-align:top}
+.tbl tbody tr:last-child td{border-bottom:none}
+.tbl .mono{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:.76rem}
+.tbl .num{text-align:right;white-space:nowrap}
+.tbl .detail{max-width:16rem;color:var(--ink-2)}
+.obadge{display:inline-block;padding:.1rem .55rem;border-radius:999px;font-size:.72rem;
+  font-weight:700;white-space:nowrap;border:1px solid transparent}
+.obadge.ok{background:rgba(47,158,68,.12);border-color:rgba(47,158,68,.4);color:#2f9e44}
+.obadge.err{background:var(--error-bg);border-color:var(--error-line);color:var(--error)}
+.obadge.neutral{background:rgba(0,0,0,.05);border-color:var(--line-strong);color:var(--ink-2)}
+@media (prefers-color-scheme:dark){.obadge.neutral{background:rgba(255,255,255,.06)}}
+.vbanner{border-radius:var(--radius-sm);padding:.75rem 1rem;margin:0 0 1rem;
+  font-size:.88rem;border:1px solid transparent}
+.vbanner.ok{background:rgba(47,158,68,.1);border-color:rgba(47,158,68,.35);color:#2f9e44}
+.vbanner.err{background:var(--error-bg);border-color:var(--error-line);color:var(--error)}
 .foot{margin-top:2.5rem;color:var(--ink-3);font-size:.78rem;text-align:center}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{transition:none!important;animation:none!important}
@@ -1169,6 +1229,7 @@ const appTmpl = pageHead + `
 <h1>Messages</h1>
 <button class="installbtn" id="installBtn" hidden>Install app</button>
 <span class="user" title="{{.User}}">{{.User}}</span>
+{{if and .IsAdmin .BridgeAuditEnabled}}<a class="btn btn-ghost btn-sm" href="/admin/bridge/audit">Bridge audit</a>{{end}}
 {{if .BCTEnabled}}<a class="btn btn-ghost btn-sm" href="/settings">Settings</a>{{end}}
 <form method="post" action="/logout"><button class="btn btn-ghost btn-sm" type="submit">Log out</button></form>
 </div></header>

@@ -235,6 +235,20 @@ content-derived:
 |---|---|
 | `rate_limited` | the sender's relay send bucket is currently exhausted (they are sending too fast) |
 | `reported` | at least `--spam-threshold` distinct recipients recently reported the sender |
+| `bridged:<origin>` | the sender is a bridge identity registered with the relay operator (issue #98); `origin` names the bridge (e.g. `chatgpt-web`). The relay never inspects content — this flag is computed from the sender address against the operator's registered list. |
+
+The `bridged:<origin>` flag is the relay-side advisory mark for bridged
+traffic (issue #98). It is **metadata-only and purely additive**: the
+relay operator registers bridge sender identities out of band with
+`courier-relay --bridge-origins "ed25519:<base64url>=chatgpt-web,..."`
+("coordinated in advance"); the wire format gains no new required
+fields, so there is **no protocol break** — old clients ignore the
+unknown flag value and old relays simply never emit it. Flagging is
+computed at read time from the operator's config, so registering or
+removing a bridge identity takes effect on subsequent inbox reads
+without any stored state or migration. Clients should treat a
+`bridged:` flag as an advisory hint (e.g. hold for review or badge as
+non-E2E on the first leg), never as authentication.
 
 Recipients use these flags to triage (see "Message requests" below).
 

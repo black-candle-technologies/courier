@@ -315,6 +315,12 @@ func migrate(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_users_bct_user_id ON dashboard_users(bct_user_id)`); err != nil {
 		return err
 	}
+	// issue #95: dashboard admins may view the bridge audit log. The
+	// column defaults to 0 (non-admin); the operator grants admin with
+	// `courier dashboard set-admin <username>`.
+	if err := addColumn(`ALTER TABLE dashboard_users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -819,6 +825,10 @@ type DashboardUser struct {
 	// the linked account's email (display only).
 	BCTUserID int64
 	BCTEmail  string
+	// IsAdmin marks dashboard admins (issue #95). Admins may view the
+	// bridge audit log at /admin/bridge/audit. Granted by the operator
+	// with `courier dashboard set-admin <username>`; never self-serve.
+	IsAdmin bool
 }
 
 // CreateDashboardUser inserts a dashboard user. The caller hashes the
@@ -840,13 +850,15 @@ func (s *Store) CreateDashboardUser(username, passwordHash, courierAddress, apiT
 func scanDashboardUser(row *sql.Row) (*DashboardUser, error) {
 	var u DashboardUser
 	var mustChange int
+	var isAdmin int
 	var bctUserID sql.NullInt64
 	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &mustChange,
-		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail)
+		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail, &isAdmin)
 	if err != nil {
 		return nil, err
 	}
 	u.MustChange = mustChange != 0
+	u.IsAdmin = isAdmin != 0
 	if bctUserID.Valid {
 		u.BCTUserID = bctUserID.Int64
 	}
@@ -856,14 +868,14 @@ func scanDashboardUser(row *sql.Row) (*DashboardUser, error) {
 // DashboardUserByName looks up a user by username.
 func (s *Store) DashboardUserByName(username string) (*DashboardUser, error) {
 	return scanDashboardUser(s.db.QueryRow(
-		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email
+		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email, is_admin
 		 FROM dashboard_users WHERE username = ?`, username))
 }
 
 // DashboardUserByTokenHash looks up a user by the SHA256 of their API token.
 func (s *Store) DashboardUserByTokenHash(tokenHash string) (*DashboardUser, error) {
 	return scanDashboardUser(s.db.QueryRow(
-		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email
+		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email, is_admin
 		 FROM dashboard_users WHERE api_token_hash = ?`, tokenHash))
 }
 
@@ -871,7 +883,7 @@ func (s *Store) DashboardUserByTokenHash(tokenHash string) (*DashboardUser, erro
 // Candle authd account, or sql.ErrNoRows when no user linked it.
 func (s *Store) DashboardUserByBCTUserID(bctUserID int64) (*DashboardUser, error) {
 	return scanDashboardUser(s.db.QueryRow(
-		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email
+		`SELECT id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email, is_admin
 		 FROM dashboard_users WHERE bct_user_id = ?`, bctUserID))
 }
 
@@ -890,6 +902,26 @@ func (s *Store) LinkBCTAccount(userID, bctUserID int64, bctEmail string) error {
 func (s *Store) UnlinkBCTAccount(userID int64) error {
 	_, err := s.db.Exec(`UPDATE dashboard_users SET bct_user_id = NULL, bct_email = '' WHERE id = ?`, userID)
 	return err
+}
+
+// SetDashboardAdmin grants or revokes dashboard admin rights (issue
+// #95). Admins may view the bridge audit log. Admin rights are never
+// self-serve: only the operator (via `courier dashboard set-admin`)
+// can grant them. It returns false when no user has that username.
+func (s *Store) SetDashboardAdmin(username string, admin bool) (bool, error) {
+	v := 0
+	if admin {
+		v = 1
+	}
+	res, err := s.db.Exec(`UPDATE dashboard_users SET is_admin = ? WHERE username = ?`, v, username)
+	if err != nil {
+		return false, fmt.Errorf("set admin: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("set admin: %w", err)
+	}
+	return n > 0, nil
 }
 
 // ChangeDashboardPassword replaces the password hash, clears must_change,
@@ -927,17 +959,19 @@ func (s *Store) CreateSession(tokenHash string, userID int64, ttl time.Duration)
 func (s *Store) SessionUser(tokenHash string) (*DashboardUser, error) {
 	var u DashboardUser
 	var mustChange int
+	var isAdmin int
 	var bctUserID sql.NullInt64
 	err := s.db.QueryRow(
-		`SELECT u.id, u.username, u.password_hash, u.must_change, u.courier_address, u.api_token_hash, u.created_at, u.bct_user_id, u.bct_email
+		`SELECT u.id, u.username, u.password_hash, u.must_change, u.courier_address, u.api_token_hash, u.created_at, u.bct_user_id, u.bct_email, u.is_admin
 		 FROM dashboard_sessions s JOIN dashboard_users u ON u.id = s.user_id
 		 WHERE s.token_hash = ? AND s.expires_at > strftime('%s','now')`,
 		tokenHash).Scan(&u.ID, &u.Username, &u.PasswordHash, &mustChange,
-		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail)
+		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail, &isAdmin)
 	if err != nil {
 		return nil, err
 	}
 	u.MustChange = mustChange != 0
+	u.IsAdmin = isAdmin != 0
 	if bctUserID.Valid {
 		u.BCTUserID = bctUserID.Int64
 	}

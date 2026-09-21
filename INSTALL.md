@@ -157,6 +157,18 @@ distinct-reporter throttle via `courier-relay` flags (`--send-burst`,
 `--send-rate`, `--spam-threshold`, `--spam-window-hours`); see
 PROTOCOL.md for defaults and the full design.
 
+Relay operators can also register bridge identities (issue #98) so the
+relay marks their envelopes with the advisory, metadata-only
+`bridged:<origin>` sender flag — purely additive, no protocol break:
+
+```sh
+courier-relay --bridge-origins "ed25519:<base64url-of-bridge-identity>=chatgpt-web"
+```
+
+The flag is coordinated out of band with the bridge operator: only
+senders listed here are flagged, and the relay never inspects message
+content to decide.
+
 ### Key rotation (v0.5.0+)
 
 Your address never changes, but your encryption key should. `courier rotate`
