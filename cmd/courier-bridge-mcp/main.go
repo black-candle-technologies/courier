@@ -629,7 +629,13 @@ func main() {
 		http:      &http.Client{Timeout: userinfoTimeout + 5*time.Second},
 	}
 	srv := buildServer(newBridgeClient(*gatewayURL, token))
-	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil)
+	// Stateless mode: every MCP request is independent (all three tools are
+	// plain request/response calls; the send confirmation round-trip is two
+	// separate tool calls, so no MCP session state is needed). Stateless is
+	// also the SDK's requirement for serving the 2026-07-28 protocol
+	// version, which ChatGPT's client (openai-mcp) requires: without it,
+	// server/discover omits 2026-07-28 and ChatGPT aborts setup.
+	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{Stateless: true})
 	bearer := auth.RequireBearerToken(cfg.verifyToken, &auth.RequireBearerTokenOptions{
 		ResourceMetadataURL: public + "/.well-known/oauth-protected-resource",
 		Scopes:              []string{oauthScopeIdentity},

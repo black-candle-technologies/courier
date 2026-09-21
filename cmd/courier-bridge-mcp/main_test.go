@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -141,7 +142,7 @@ func newOAuthRig(t *testing.T, allowed []string) *oauthRig {
 		http:      &http.Client{Timeout: 15 * time.Second},
 	}
 	srv := buildServer(newBridgeClient(gwSrv.URL, "token"))
-	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil)
+	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{Stateless: true})
 	bearer := auth.RequireBearerToken(cfg.verifyToken, &auth.RequireBearerTokenOptions{
 		ResourceMetadataURL: cfg.publicURL + "/.well-known/oauth-protected-resource",
 		Scopes:              []string{oauthScopeIdentity},
@@ -566,6 +567,59 @@ func TestStatusAndRecipients(t *testing.T) {
 	}
 	if !strings.Contains(toolText(t, res), "ed25519:BBB") {
 		t.Fatalf("bad recipients text: %s", toolText(t, res))
+	}
+}
+
+// TestDiscoverAdvertisesLatestProtocol pins the ChatGPT-connector fix:
+// the MCP handler must run stateless so server/discover advertises
+// protocol 2026-07-28 (ChatGPT's openai-mcp client requires it and aborts
+// connector setup when it is missing). The rig mirrors production, so a
+// raw discover call here exercises the same handler configuration.
+func TestDiscoverAdvertisesLatestProtocol(t *testing.T) {
+	rig := newOAuthRig(t, []string{"alice@example.com"})
+	body := `{"jsonrpc":"2.0","id":"discover-1","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`
+	req, err := http.NewRequest(http.MethodPost, rig.mcpURL, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer "+tokenAlice)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("discover status = %d, body = %s", resp.StatusCode, raw)
+	}
+	var got struct {
+		Result struct {
+			SupportedVersions []string `json:"supportedVersions"`
+		} `json:"result"`
+	}
+	// The response is SSE-framed; extract the data: payload.
+	line := ""
+	for _, l := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(l, "data:") {
+			line = strings.TrimPrefix(l, "data:")
+		}
+	}
+	if line == "" {
+		t.Fatalf("no SSE data in discover response: %s", raw)
+	}
+	if err := json.Unmarshal([]byte(line), &got); err != nil {
+		t.Fatalf("bad discover JSON: %v (%s)", err, line)
+	}
+	found := false
+	for _, v := range got.Result.SupportedVersions {
+		if v == "2026-07-28" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("server/discover missing 2026-07-28, got %v", got.Result.SupportedVersions)
 	}
 }
 
