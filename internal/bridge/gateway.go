@@ -188,10 +188,6 @@ type confirmationSummary struct {
 	BodySHA256 string `json:"body_sha256"`
 }
 
-// auditReserved is the outcome for an audit row reserved before the
-// relay round-trip; FinalizeAudit moves it to its final state.
-const auditReserved = "sending"
-
 // handleIngest validates, confirms, sends, and audits one bridged
 // message.
 func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
@@ -295,11 +291,15 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusTooManyRequests, errJSON(429, "rate limit exceeded"))
 		return
 	}
-	// Reserve the audit row so the wire metadata can reference it.
-	auditID, err := g.store.AppendAudit(&AuditEntry{
+	// Reserve the audit row immutably: the row is appended once and never
+	// mutated afterward, so concurrent appends can never link to a
+	// row_hash that a later finalization would rewrite (issue #81). The
+	// wire metadata references this reserved row's id; the completion
+	// event appended below links back to it via SendRef.
+	reservedID, err := g.store.AppendAudit(&AuditEntry{
 		Ts: now.Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
 		Recipient: req.Recipient, BodySHA256: sum, BodySize: int64(len(wrapped)),
-		Outcome: auditReserved,
+		Outcome: OutcomeSendReserved,
 	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errJSON(500, "internal error"))
@@ -309,18 +309,28 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 		Origin:     client.BridgeOriginChatGPTWeb,
 		GatewayFP:  g.gatewayFP,
 		TokenLabel: tok.Label,
-		AuditID:    auditID,
+		AuditID:    reservedID,
 	}
 	envelopeID, err := g.sender.SendBridged(req.Recipient, wrapped, meta)
 	if err != nil {
-		_ = g.store.FinalizeAudit(auditID, RejectedOutcome(RejectSendFailed), 0, err.Error())
+		_ = g.store.AppendAudit(&AuditEntry{
+			Ts: now.Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
+			Recipient: req.Recipient, BodySHA256: sum, BodySize: int64(len(wrapped)),
+			Outcome: RejectedOutcome(RejectSendFailed), Reason: err.Error(),
+			SendRef: fmt.Sprint(reservedID),
+		})
 		writeJSON(w, http.StatusBadGateway, errJSON(502, "send failed"))
 		return
 	}
-	_ = g.store.FinalizeAudit(auditID, OutcomeSent, envelopeID, "")
+	_ = g.store.AppendAudit(&AuditEntry{
+		Ts: now.Unix(), TokenID: tok.ID, TokenLabel: tok.Label,
+		Recipient: req.Recipient, BodySHA256: sum, BodySize: int64(len(wrapped)),
+		Outcome: OutcomeSent, EnvelopeID: envelopeID,
+		SendRef: fmt.Sprint(reservedID),
+	})
 	_ = g.store.RecordUse(tok.ID)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "envelope_id": envelopeID, "audit_id": auditID,
+		"ok": true, "envelope_id": envelopeID, "audit_id": reservedID,
 	})
 }
 

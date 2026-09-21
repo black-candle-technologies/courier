@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -46,9 +47,10 @@ CREATE TABLE IF NOT EXISTS audit(
   recipient   TEXT NOT NULL,
   body_sha256 TEXT NOT NULL,
   body_size   INTEGER NOT NULL,
-  outcome     TEXT NOT NULL,           -- sent | rejected:<reason> | confirmation_requested
+  outcome     TEXT NOT NULL,           -- sent | send_reserved | rejected:<reason> | confirmation_requested
   envelope_id INTEGER NOT NULL DEFAULT 0,
   reason      TEXT NOT NULL DEFAULT '',
+  send_ref    TEXT NOT NULL DEFAULT '', -- links a send's completion event to its send_reserved row id
   prev_hash   TEXT NOT NULL,
   row_hash    TEXT NOT NULL
 );
@@ -93,6 +95,15 @@ func OpenStore(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init bridge schema: %w", err)
+	}
+	// Migration for audit.send_ref on pre-existing bridge.db files
+	// (bridge phase 1 is unmerged, so this only affects local dev
+	// databases): ADD COLUMN is a no-op-able change, and send_ref is
+	// deliberately excluded from row_hash, so old rows keep verifying.
+	if _, err := db.Exec(`ALTER TABLE audit ADD COLUMN send_ref TEXT NOT NULL DEFAULT ''`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		db.Close()
+		return nil, fmt.Errorf("migrate audit.send_ref: %w", err)
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		db.Close()
