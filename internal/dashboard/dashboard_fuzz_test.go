@@ -2,6 +2,8 @@ package dashboard
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,12 +13,19 @@ import (
 )
 
 // FuzzLoginForm feeds arbitrary request bodies to the dashboard login
-// form parser (POST /login -> handleLogin: r.ParseForm, username /
-// password extraction, user lookup, failed-login render). The login
-// form is the dashboard's most exposed unauthenticated surface.
-// Invariants: never panic; the handler always answers 200 (login page
-// re-render) or 400 (unparseable form) — never a bare 500 or an empty
-// reply — and handling is deterministic for the same body.
+// form parser (POST /login -> handleLogin: r.ParseForm, CSRF/Origin
+// gate, username / password extraction, user lookup, failed-login
+// render). The login form is the dashboard's most exposed
+// unauthenticated surface.
+// Invariants: never panic; the handler always answers with a
+// well-formed, non-empty response — 200 (login page re-render), 400
+// (unparseable form), 403 (CSRF/Origin rejection, issue #111), or 429
+// (rate limit, issue #108) — never a bare 500 or an empty reply — and
+// handling is deterministic for the same body.
+//
+// Each request carries a valid double-submit CSRF pair (issue #111)
+// so the fuzzer reaches the form parsing and credential-lookup paths
+// instead of stopping at the CSRF gate.
 //
 // Note: with no registered users the lookup fails before bcrypt runs,
 // so this stays fast; the bcrypt comparison path itself is covered by
@@ -38,15 +47,33 @@ func FuzzLoginForm(f *testing.F) {
 		}
 		defer st.Close()
 		srv := &Server{store: st}
+		// Valid double-submit CSRF pair for this iteration: the form
+		// field and the cookie must match (constant-time compare in
+		// the handler). base64url is form-safe, so it can be appended
+		// to any body.
+		var rb [32]byte
+		if _, err := rand.Read(rb[:]); err != nil {
+			t.Fatal(err)
+		}
+		csrf := base64.RawURLEncoding.EncodeToString(rb[:])
 		doPost := func(b []byte) *httptest.ResponseRecorder {
-			req := httptest.NewRequest(http.MethodPost, "/login", bytes.NewReader(b))
+			full := make([]byte, 0, len(b)+len(csrf)+16)
+			full = append(full, b...)
+			full = append(full, '&')
+			full = append(full, csrfField...)
+			full = append(full, '=')
+			full = append(full, csrf...)
+			req := httptest.NewRequest(http.MethodPost, "/login", bytes.NewReader(full))
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.AddCookie(&http.Cookie{Name: loginCSRFCookie, Value: csrf})
 			rec := httptest.NewRecorder()
 			srv.handleLogin(rec, req)
 			return rec
 		}
 		rec := doPost(body)
-		if rec.Code != http.StatusOK && rec.Code != http.StatusBadRequest {
+		switch rec.Code {
+		case http.StatusOK, http.StatusBadRequest, http.StatusForbidden, http.StatusTooManyRequests:
+		default:
 			t.Fatalf("handleLogin(%q): unexpected status %d", body, rec.Code)
 		}
 		if rec.Body.Len() == 0 {
