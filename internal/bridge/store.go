@@ -78,6 +78,10 @@ type Store struct {
 	// All Store users live in one process (the gateway; the CLI never
 	// appends), so a process-local mutex is sufficient.
 	mu sync.Mutex
+	// appendAuditFail is a test seam (issue #85): when non-nil,
+	// AppendAudit fails with its return value instead of writing to
+	// the database. Production code never sets it.
+	appendAuditFail func(*AuditEntry) error
 }
 
 // OpenStore opens (creating if needed) the bridge database at path.

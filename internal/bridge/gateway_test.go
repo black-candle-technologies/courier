@@ -734,3 +734,48 @@ func TestConfirmNotMarkedWhenRateLimited(t *testing.T) {
 		t.Fatalf("different body code = %d, want 449", rec.Code)
 	}
 }
+
+const errTestAudit = testErr("audit boom")
+
+// TestSendAuditFailureSurfaced (issue #85): if the send-completion
+// audit event cannot be appended, the failure must surface as a
+// non-2xx (not a silent 200), and the failure is logged with the
+// reserved audit id. The message WAS delivered — the sender stub must
+// show exactly one call.
+func TestSendAuditFailureSurfaced(t *testing.T) {
+	f := newGwFixture(t)
+	ct := confirmTokenFor(t, f, f.addr, "hello")
+	f.store.appendAuditFail = func(e *AuditEntry) error {
+		if e.Outcome == OutcomeSent {
+			return errTestAudit
+		}
+		return nil
+	}
+	rec := f.ingest(t, f.raw, ingestJSON(f.addr, "hello", ct))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500 on audit failure", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "audit_failed") {
+		t.Fatalf("body %q missing audit_failed", rec.Body.String())
+	}
+	if len(f.stub.calls) != 1 {
+		t.Fatalf("sender called %d times, want 1 (message was delivered)", len(f.stub.calls))
+	}
+	// The rows that did land still form a valid chain.
+	if ok, _, _, err := f.store.VerifyAudit(); err != nil || !ok {
+		t.Fatalf("audit verify: %v %v", err, ok)
+	}
+}
+
+// TestAuditHelperFailureDoesNotBreakResponse (issue #85): the audit()
+// helper is best-effort, but its failures must be logged rather than
+// silently discarded — and must not change the HTTP response. With
+// every append failing, an unauthenticated ingest still gets its 401.
+func TestAuditHelperFailureDoesNotBreakResponse(t *testing.T) {
+	f := newGwFixture(t)
+	f.store.appendAuditFail = func(e *AuditEntry) error { return errTestAudit }
+	rec := f.ingest(t, "bogus", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401", rec.Code)
+	}
+}
