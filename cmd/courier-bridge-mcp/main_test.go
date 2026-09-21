@@ -585,6 +585,7 @@ func TestDiscoverAdvertisesLatestProtocol(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Mcp-Protocol-Version", "2026-07-28")
+	req.Header.Set("Mcp-Method", "server/discover")
 	req.Header.Set("Authorization", "Bearer "+tokenAlice)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
