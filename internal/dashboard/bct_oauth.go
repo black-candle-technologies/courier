@@ -180,11 +180,11 @@ func (c *bctOAuthClient) authorizeURL(state, verifier, redirectURI string) strin
 
 var (
 	// errOAuthExchange means the code/token exchange with the provider failed.
-	errOAuthExchange = errors.New("Black Candle sign-in failed — try again")
+	errOAuthExchange = errors.New("sign-in with Black Candle failed — try again")
 	// errOAuthUnverified means the Black Candle email is not confirmed.
 	errOAuthUnverified = errors.New("confirm your Black Candle email first, then try again")
 	// errOAuthUnavailable means the provider could not be reached.
-	errOAuthUnavailable = errors.New("Black Candle sign-in is temporarily unavailable")
+	errOAuthUnavailable = errors.New("the Black Candle sign-in service is temporarily unavailable")
 )
 
 // exchangeCode trades an authorization code for an access token.

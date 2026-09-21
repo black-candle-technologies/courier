@@ -12,7 +12,7 @@ import (
 
 func cmdDirectory(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: courier directory <register|update|unregister|transfer|lookup|search|reverse|request|introductions|forward|accept|dismiss> ...")
+		return fmt.Errorf("usage: courier directory <register|update|unregister|transfer|lookup|search|reverse|request|introductions|forward|accept|dismiss>")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
