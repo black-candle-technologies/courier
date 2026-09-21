@@ -25,6 +25,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/bridge"
@@ -185,6 +187,16 @@ func cmdServe(args []string) error {
 		log.Printf("pruned %d audit rows older than retention", n)
 	}
 	gw := bridge.NewGateway(st, client.New(cfg), pepper, cfg.Address, id.EdPub[:], version)
+	// COURIER_BRIDGE_BODY_CAP_BYTES optionally overrides the ingest body cap
+	// (default 64 KiB). Unset keeps the default; the value is bytes.
+	if v := strings.TrimSpace(os.Getenv("COURIER_BRIDGE_BODY_CAP_BYTES")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("bad COURIER_BRIDGE_BODY_CAP_BYTES %q: must be a positive integer (bytes)", v)
+		}
+		gw.SetBodyCap(n)
+		log.Printf("body cap overridden: %d bytes", n)
+	}
 	srv := &http.Server{
 		Addr:              *addr,
 		Handler:           gw.Routes(),

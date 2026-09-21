@@ -141,7 +141,7 @@ func newOAuthRig(t *testing.T, allowed []string) *oauthRig {
 		cache:     newTokenCache(),
 		http:      &http.Client{Timeout: 15 * time.Second},
 	}
-	srv := buildServer(newBridgeClient(gwSrv.URL, "token"))
+	srv := buildServer(newBridgeClient(gwSrv.URL, "token"), sendToolDescriptionFor(defaultBodyCapBytes))
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{Stateless: true})
 	bearer := auth.RequireBearerToken(cfg.verifyToken, &auth.RequireBearerTokenOptions{
 		ResourceMetadataURL: cfg.publicURL + "/.well-known/oauth-protected-resource",
@@ -626,10 +626,10 @@ func TestDiscoverAdvertisesLatestProtocol(t *testing.T) {
 }
 
 func TestSendToolDescriptionDisclosesNonE2E(t *testing.T) {
-	if !strings.Contains(sendToolDescription, "NOT end-to-end encrypted") {
+	if !strings.Contains(sendToolDisclosure, "NOT end-to-end encrypted") {
 		t.Fatal("send tool description lost the non-E2E disclosure")
 	}
-	if !strings.Contains(sendToolDescription, "untrusted input") {
+	if !strings.Contains(sendToolDisclosure, "untrusted input") {
 		t.Fatal("send tool description lost the untrusted-input warning")
 	}
 }
@@ -639,11 +639,42 @@ func TestSendToolDescriptionDisclosesNonE2E(t *testing.T) {
 // disclosure must describe the actual control (operator approval rule),
 // not claim a guarantee that only arrives in phase 2.
 func TestSendToolDescriptionHonestAboutEnforcement(t *testing.T) {
-	d := strings.ToLower(sendToolDescription)
+	d := strings.ToLower(sendToolDisclosure)
 	if strings.Contains(d, "guarantee") && !strings.Contains(d, "cannot") {
 		t.Fatal("description claims an enforcement guarantee it cannot keep")
 	}
 	if !strings.Contains(d, "explicit approval") {
 		t.Fatal("description must name the operator approval rule as the control")
+	}
+}
+
+// TestSendToolDescriptionForCap pins the advertised body cap to the given
+// value so the tool description stays truthful when the gateway cap is
+// raised via COURIER_BRIDGE_BODY_CAP_BYTES.
+func TestSendToolDescriptionForCap(t *testing.T) {
+	d := sendToolDescriptionFor(defaultBodyCapBytes)
+	if !strings.Contains(d, "64 KiB (65536 bytes)") {
+		t.Fatalf("default cap not advertised, got: %s", d)
+	}
+	if !strings.Contains(d, "NOT end-to-end encrypted") {
+		t.Fatal("cap description lost the non-E2E disclosure")
+	}
+	d = sendToolDescriptionFor(256 * 1024)
+	if !strings.Contains(d, "256 KiB (262144 bytes)") {
+		t.Fatalf("raised cap not advertised, got: %s", d)
+	}
+	// Non-positive falls back to the default rather than advertising nonsense.
+	d = sendToolDescriptionFor(0)
+	if !strings.Contains(d, "64 KiB (65536 bytes)") {
+		t.Fatalf("zero cap did not fall back to default, got: %s", d)
+	}
+}
+
+// TestFetchBodyCapFallback: when the gateway is unreachable at startup,
+// the advertised cap falls back to the default instead of failing.
+func TestFetchBodyCapFallback(t *testing.T) {
+	b := newBridgeClient("http://127.0.0.1:1", "token") // nothing listens here
+	if got := fetchBodyCap(b); got != defaultBodyCapBytes {
+		t.Fatalf("fetchBodyCap unreachable = %d, want %d", got, defaultBodyCapBytes)
 	}
 }

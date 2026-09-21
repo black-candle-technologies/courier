@@ -113,6 +113,14 @@ func NewGateway(store *Store, sender Sender, pepper, address string, edPub []byt
 	}
 }
 
+// SetBodyCap overrides the ingest body cap (default DefaultBodyCap).
+// Non-positive values are ignored, keeping the default.
+func (g *Gateway) SetBodyCap(n int) {
+	if n > 0 {
+		g.bodyCap = n
+	}
+}
+
 // Routes wires the gateway's HTTP endpoints.
 func (g *Gateway) Routes() *http.ServeMux {
 	mux := http.NewServeMux()

@@ -220,7 +220,39 @@ func TestIngestAllowlist(t *testing.T) {
 	}
 }
 
-func TestIngestBodyCap(t *testing.T) {
+func TestSetBodyCapOverridesDefault(t *testing.T) {
+	f := newGwFixture(t)
+	if f.gw.bodyCap != DefaultBodyCap {
+		t.Fatalf("default bodyCap = %d, want %d", f.gw.bodyCap, DefaultBodyCap)
+	}
+	f.gw.SetBodyCap(128 * 1024)
+	// A 96 KiB body now passes the size gate (confirmation comes first).
+	big := strings.Repeat("a", 96*1024)
+	rec := f.ingest(t, f.raw, ingestJSON(f.addr, big, ""))
+	if rec.Code != StatusConfirmationRequired {
+		t.Fatalf("96KiB body with raised cap: code = %d, want 449", rec.Code)
+	}
+	// Status reports the overridden cap.
+	req := httptest.NewRequest(http.MethodGet, "/v1/bridge/status", nil)
+	req.Header.Set("Authorization", "Bearer "+f.raw)
+	srec := httptest.NewRecorder()
+	f.gw.Routes().ServeHTTP(srec, req)
+	var st struct {
+		BodyCapBytes int `json:"body_cap_bytes"`
+	}
+	if err := json.Unmarshal(srec.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.BodyCapBytes != 128*1024 {
+		t.Fatalf("status body_cap_bytes = %d, want %d", st.BodyCapBytes, 128*1024)
+	}
+	// Non-positive values keep the existing cap.
+	f.gw.SetBodyCap(0)
+	f.gw.SetBodyCap(-5)
+	if f.gw.bodyCap != 128*1024 {
+		t.Fatalf("bodyCap after non-positive SetBodyCap = %d, want 131072", f.gw.bodyCap)
+	}
+}
 	f := newGwFixture(t)
 	// Exactly 64 KiB passes the size gate (confirmation comes first).
 	big := strings.Repeat("a", DefaultBodyCap)
