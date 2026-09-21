@@ -497,6 +497,12 @@ ratchet, erasure, migration) is in `docs/forward-secrecy.md`.
 - Negotiation: the `fs` directory capability token, prior handshake
   memory, `courier fs on`, or an inbound valid init. Unknown/legacy
   peers keep legacy encryption — never probed.
+- Default is **fail-open** (issue #110): without an FS session, DMs go
+  out under legacy encryption. `courier fs require <peer>` opts a
+  contact into fail-closed sends (refuse legacy unless an FS session is
+  established). Observed FS capability is pinned per contact; a pinned
+  peer that suddenly offers only legacy is flagged with a `DOWNGRADE
+  SUSPECTED` marker (`courier fs status`) and a send-time warning.
 - Session state lives in `~/.courier/fs.json` (0600) and is excluded
   from backups/sync; `backup restore` erases it (restored identity = new
   device).

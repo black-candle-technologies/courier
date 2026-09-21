@@ -110,6 +110,11 @@ var (
 	errFSGapTooLarge = errors.New("fs: message gap exceeds skipped-key window")
 	errFSIgnored     = errors.New("fs: handshake ignored")
 	errFSProcessed   = errors.New("fs: handshake already processed")
+	// errFSRequired is returned by fsPrepareSend when the per-contact
+	// require_fs policy (issue #110) is set and no FS session is
+	// established: the send fails closed instead of silently falling
+	// back to legacy encryption.
+	errFSRequired = errors.New("fs: forward secrecy is required for this peer but no session is established (the handshake may be suppressed; run `courier fs start <peer>` or `courier fs on <peer>` to retry it)")
 )
 
 // ---- tunables ----
@@ -137,6 +142,13 @@ const (
 	fsNegCapCacheTTL = 600
 	// maxFSProcessedInits bounds remembered handshake ids (replay guard).
 	maxFSProcessedInits = 50
+	// fsDowngradeWarnCooldownSeconds: minimum interval between
+	// downgrade warnings surfaced for the same peer (issue #110). The
+	// persistent marker (visible in `courier fs status`) is set on the
+	// first detection and cleared on recovery; the user-facing warning
+	// is rate-limited so an actively-suppressed peer doesn't spam every
+	// send.
+	fsDowngradeWarnCooldownSeconds = 3600
 )
 
 // peer FS modes.
@@ -200,6 +212,26 @@ type fsFile struct {
 	NegCapCache    map[string]int64      `json:"neg_cap_cache,omitempty"`
 	ProcessedInits []string              `json:"processed_inits,omitempty"`
 	LastInitAt     map[string]int64      `json:"last_init_at,omitempty"`
+	// RequireFS (issue #110) is the per-contact fail-closed policy:
+	// when set for an address, sends to it refuse to fall back to
+	// legacy encryption unless an FS session is established. Default
+	// (absent) is fail-open, matching pre-#110 behavior.
+	RequireFS map[string]bool `json:"require_fs,omitempty"`
+	// FSPins (issue #110) pins observed FS capability: address ->
+	// unix timestamp of first proof the peer speaks FS (completed
+	// handshake or valid inbound FS frame). Pins are permanent: once
+	// a peer has proven FS support, a later absence of capability
+	// evidence is treated as a possible downgrade, not as proof the
+	// peer is legacy-only. Pins also keep handshake pressure on
+	// (fsShouldInit) when the relay suppresses directory availability.
+	FSPins map[string]int64 `json:"fs_pins,omitempty"`
+	// Downgrade (issue #110): address -> unix timestamp when a
+	// pinned peer was first observed falling back to legacy with no
+	// current positive capability evidence. Cleared when the peer
+	// shows positive capability again or a session re-establishes.
+	Downgrade map[string]int64 `json:"downgrade_since,omitempty"`
+	// DowngradeWarnedAt rate-limits the user-facing warning per peer.
+	DowngradeWarnedAt map[string]int64 `json:"downgrade_warned_at,omitempty"`
 }
 
 func fsFilePath() (string, error) {
@@ -219,11 +251,15 @@ func (ff *fsFile) session(peer string) *fsSession {
 
 func newFSFile() *fsFile {
 	return &fsFile{
-		Sessions:    map[string]*fsSession{},
-		PeerModes:   map[string]string{},
-		CapCache:    map[string]fsCapEntry{},
-		NegCapCache: map[string]int64{},
-		LastInitAt:  map[string]int64{},
+		Sessions:          map[string]*fsSession{},
+		PeerModes:         map[string]string{},
+		CapCache:          map[string]fsCapEntry{},
+		NegCapCache:       map[string]int64{},
+		LastInitAt:        map[string]int64{},
+		RequireFS:         map[string]bool{},
+		FSPins:            map[string]int64{},
+		Downgrade:         map[string]int64{},
+		DowngradeWarnedAt: map[string]int64{},
 	}
 }
 
@@ -258,6 +294,18 @@ func loadFSLocked() (*fsFile, error) {
 	}
 	if ff.LastInitAt == nil {
 		ff.LastInitAt = map[string]int64{}
+	}
+	if ff.RequireFS == nil {
+		ff.RequireFS = map[string]bool{}
+	}
+	if ff.FSPins == nil {
+		ff.FSPins = map[string]int64{}
+	}
+	if ff.Downgrade == nil {
+		ff.Downgrade = map[string]int64{}
+	}
+	if ff.DowngradeWarnedAt == nil {
+		ff.DowngradeWarnedAt = map[string]int64{}
 	}
 	return ff, nil
 }
@@ -394,6 +442,21 @@ func fsInitDue(ff *fsFile, peer string, cooldown int64) bool {
 	return time.Now().Unix()-last >= cooldown
 }
 
+// fsPinCapabilityLocked records first-observed FS capability for peer
+// (issue #110). Pins are permanent: once a peer has proven FS support —
+// a completed handshake or a valid inbound FS frame — later absence of
+// capability evidence is treated as a possible downgrade, never as
+// proof the peer is legacy-only. First-observed-wins: re-pinning never
+// moves the timestamp.
+func fsPinCapabilityLocked(ff *fsFile, peer string, now int64) {
+	if ff.FSPins == nil {
+		ff.FSPins = map[string]int64{}
+	}
+	if _, ok := ff.FSPins[peer]; !ok {
+		ff.FSPins[peer] = now
+	}
+}
+
 // ---- send path ----
 
 // fsSendOutput carries one message's derived keys from the session
@@ -522,29 +585,46 @@ func fsSealMessage(out *fsSendOutput, plain []byte) ([]byte, error) {
 // fs-init (best-effort protocol DM) and the message still goes legacy —
 // the session upgrades from the next message (docs/forward-secrecy.md
 // §4.5).
+//
+// Issue #110: when the per-contact require_fs policy is set for
+// address, there is no silent legacy fallback — fsPrepareSend returns
+// errFSRequired unless an FS session is established, and the send fails
+// closed. On the legacy-fallback path it also runs downgrade detection
+// for pinned peers (fsAssessDowngrade).
 func (c *Client) fsPrepareSend(address string) (*fsSendOutput, error) {
 	if address == c.cfg.Address {
 		return nil, nil
 	}
 	var out *fsSendOutput
 	err := updateFS(func(ff *fsFile) error {
-		if ff.PeerModes[address] == fsModeOff {
+		if ff.PeerModes[address] == fsModeOff && !ff.RequireFS[address] {
 			return nil
 		}
 		sess := ff.session(address)
-		if sess == nil || !sess.Established {
+		if sess != nil && sess.Established {
+			o, err := fsAdvanceSendLocked(sess)
+			if err != nil {
+				return err
+			}
+			out = o
 			return nil
 		}
-		o, err := fsAdvanceSendLocked(sess)
-		if err != nil {
-			return err
+		// No usable session. Fail closed when the peer requires FS —
+		// never silently fall back to legacy (issue #110). Note this
+		// deliberately wins over mode "off": "off" + "require" is a
+		// contradictory configuration, and refusing to send is the
+		// only safe reading of it.
+		if ff.RequireFS[address] {
+			return errFSRequired
 		}
-		out = o
 		return nil
 	})
 	if err != nil || out != nil {
 		return out, err
 	}
+	// Legacy-fallback path: downgrade detection for pinned peers, then
+	// the usual opportunistic handshake.
+	c.fsAssessDowngrade(address)
 	if c.fsShouldInit(address) {
 		var due bool
 		_ = updateFS(func(ff *fsFile) error {
@@ -564,6 +644,99 @@ func (c *Client) fsPrepareSend(address string) (*fsSendOutput, error) {
 		}
 	}
 	return nil, nil
+}
+
+// fsAssessDowngrade implements issue #110's downgrade detection. It
+// runs on the legacy-fallback path (no established session, sends not
+// fail-closed): a peer whose FS capability was previously observed
+// (pinned) but for which no *current* positive capability evidence
+// exists is downgrade-suspected — the relay may be suppressing
+// directory availability or handshake traffic. It records a persistent
+// marker (surfaced by `courier fs status`) and queues a rate-limited
+// user-facing warning (consumed via FSConsumeWarning, printed by the
+// send path).
+//
+// A handshake already in flight suppresses the warning: a slow
+// round-trip is not a downgrade. Explicit `fs off` peers are exempt —
+// the user chose legacy.
+func (c *Client) fsAssessDowngrade(address string) {
+	now := time.Now().Unix()
+	ff, err := loadFS()
+	if err != nil {
+		return
+	}
+	if ff.PeerModes[address] == fsModeOff {
+		return
+	}
+	if _, pinned := ff.FSPins[address]; !pinned {
+		return
+	}
+	// Current positive evidence, excluding the pin itself: the point
+	// is the peer "suddenly only offers legacy".
+	positive := ff.PeerModes[address] == fsModeOn
+	if !positive {
+		if e, ok := ff.CapCache[address]; ok && e.Capable &&
+			now-e.At < fsCapCacheTTL {
+			positive = true
+		}
+	}
+	if !positive {
+		if at, ok := ff.NegCapCache[address]; ok && now-at < fsNegCapCacheTTL {
+			// Fresh negative result: don't hit the directory again.
+		} else if c.fsDirectoryCapable(address) {
+			positive = true
+			_ = updateFS(func(ff *fsFile) error {
+				if ff.CapCache == nil {
+					ff.CapCache = map[string]fsCapEntry{}
+				}
+				ff.CapCache[address] = fsCapEntry{Capable: true, At: now}
+				delete(ff.NegCapCache, address)
+				return nil
+			})
+		} else {
+			_ = updateFS(func(ff *fsFile) error {
+				if ff.NegCapCache == nil {
+					ff.NegCapCache = map[string]int64{}
+				}
+				ff.NegCapCache[address] = now
+				return nil
+			})
+		}
+	}
+	if !positive {
+		if now-ff.LastInitAt[address] < fsInitRefreshSeconds {
+			return
+		}
+		var warnDue bool
+		_ = updateFS(func(ff *fsFile) error {
+			if ff.Downgrade == nil {
+				ff.Downgrade = map[string]int64{}
+			}
+			if _, ok := ff.Downgrade[address]; !ok {
+				ff.Downgrade[address] = now
+			}
+			if ff.DowngradeWarnedAt == nil {
+				ff.DowngradeWarnedAt = map[string]int64{}
+			}
+			if now-ff.DowngradeWarnedAt[address] >= fsDowngradeWarnCooldownSeconds {
+				ff.DowngradeWarnedAt[address] = now
+				warnDue = true
+			}
+			return nil
+		})
+		if warnDue {
+			peer := shortPeer(address)
+			c.noteFSWarning(address, fmt.Sprintf(
+				"DOWNGRADE WARNING: %s previously negotiated forward secrecy but is currently reachable only via legacy encryption — the relay may be suppressing FS directory or handshake traffic. Run `courier fs start %s` to retry the handshake, or `courier fs require %s` to refuse legacy sends.",
+				peer, peer, peer))
+		}
+		return
+	}
+	// Positive evidence again: clear any downgrade marker.
+	_ = updateFS(func(ff *fsFile) error {
+		delete(ff.Downgrade, address)
+		return nil
+	})
 }
 
 // fsShouldInit reports whether to send an fs-init to address: the peer
@@ -586,6 +759,12 @@ func (c *Client) fsShouldInit(address string) bool {
 		}
 	}
 	if ff.PeerModes[address] == fsModeOn {
+		return true
+	}
+	// Issue #110: a pinned peer has proven FS support before. The pin
+	// is permanent capability knowledge, so handshake pressure
+	// continues even when the relay suppresses directory availability.
+	if _, pinned := ff.FSPins[address]; pinned {
 		return true
 	}
 	now := time.Now().Unix()
@@ -800,6 +979,11 @@ func (c *Client) handleFSInit(from string, p fsPayload) {
 			ff.CapCache = map[string]fsCapEntry{}
 		}
 		ff.CapCache[from] = fsCapEntry{Capable: true, At: now}
+		// Issue #110: adopting their init is proof the peer speaks FS —
+		// pin the capability, and clear any downgrade marker: the peer
+		// is demonstrably back on FS.
+		fsPinCapabilityLocked(ff, from, now)
+		delete(ff.Downgrade, from)
 		acc := fsPayload{
 			Magic: fsMagic, Type: fsTypeAccept, Version: fsPayloadVersion,
 			SID: p.SID, InitID: p.InitID,
@@ -882,6 +1066,10 @@ func (c *Client) handleFSAccept(from string, p fsPayload) {
 			ff.CapCache = map[string]fsCapEntry{}
 		}
 		ff.CapCache[from] = fsCapEntry{Capable: true, At: now}
+		// Issue #110: a completed handshake pins the peer's FS
+		// capability and clears any downgrade marker.
+		fsPinCapabilityLocked(ff, from, now)
+		delete(ff.Downgrade, from)
 		return nil
 	})
 }
@@ -1108,6 +1296,8 @@ func (c *Client) fsDecryptMessage(from string, p fsPayload) (plain []byte, wrapK
 				ff.CapCache = map[string]fsCapEntry{}
 			}
 			ff.CapCache[from] = fsCapEntry{Capable: true, At: time.Now().Unix()}
+			// Issue #110: inbound FS proof also pins the capability.
+			fsPinCapabilityLocked(ff, from, time.Now().Unix())
 			if fsInitDue(ff, from, fsInitCooldownSeconds) {
 				if ff.LastInitAt == nil {
 					ff.LastInitAt = map[string]int64{}
@@ -1201,6 +1391,11 @@ type FSSessionInfo struct {
 	MsgsRecvd      int64
 	LastRotateAt   int64
 	SinceHandshake int64
+	// Issue #110: fail-closed policy, capability pin, downgrade state.
+	RequireFS          bool
+	Pinned             bool
+	DowngradeSuspected bool
+	DowngradeSince     int64
 }
 
 // FSStatus lists FS sessions (one peer, or all).
@@ -1226,11 +1421,15 @@ func (c *Client) FSStatus(peer string) ([]FSSessionInfo, error) {
 		if mode == "" {
 			mode = fsModeAuto
 		}
+		_, pinned := ff.FSPins[addr]
+		downgradeSince, downgrade := ff.Downgrade[addr]
 		out = append(out, FSSessionInfo{
 			Peer: addr, Established: sess.Established,
 			Initiator: sess.Initiator, Mode: mode,
 			MsgsSent: sess.MsgsSent, MsgsRecvd: sess.MsgsRecvd,
 			LastRotateAt: sess.LastRotateAt, SinceHandshake: sess.CreatedAt,
+			RequireFS: ff.RequireFS[addr], Pinned: pinned,
+			DowngradeSuspected: downgrade, DowngradeSince: downgradeSince,
 		})
 	}
 	return out, nil
@@ -1291,6 +1490,10 @@ func (c *Client) FSSetPeerMode(peer, mode string) error {
 		if mode == fsModeOff {
 			// Erasure: disabling FS drops the session's keys now.
 			delete(ff.Sessions, address)
+			// Explicit user action, not a downgrade: clear markers.
+			// (The capability pin is a historical fact and is kept.)
+			delete(ff.Downgrade, address)
+			delete(ff.DowngradeWarnedAt, address)
 		}
 		if ff.PeerModes == nil {
 			ff.PeerModes = map[string]string{}
@@ -1309,6 +1512,60 @@ func (c *Client) FSSetPeerMode(peer, mode string) error {
 		return c.sendFSInit(address)
 	}
 	return nil
+}
+
+// FSSetRequireFS sets (or clears) the per-contact fail-closed policy
+// (issue #110): when set, sends to peer fail closed with errFSRequired
+// unless an FS session is established — they never silently fall back
+// to legacy encryption. The default is fail-open (policy absent),
+// matching pre-#110 behavior. Setting the policy does not initiate a
+// handshake; use `courier fs on <peer>` or `courier fs start <peer>`
+// to establish a session first, otherwise sends will fail until one
+// exists.
+func (c *Client) FSSetRequireFS(peer string, require bool) error {
+	address, err := c.cfg.ResolveRecipient(peer)
+	if err != nil {
+		return err
+	}
+	return updateFS(func(ff *fsFile) error {
+		if ff.RequireFS == nil {
+			ff.RequireFS = map[string]bool{}
+		}
+		if require {
+			ff.RequireFS[address] = true
+		} else {
+			delete(ff.RequireFS, address)
+		}
+		return nil
+	})
+}
+
+// FSRequireForPeer reports whether the fail-closed require_fs policy
+// (issue #110) is set for peer.
+func (c *Client) FSRequireForPeer(peer string) (bool, error) {
+	address, err := c.cfg.ResolveRecipient(peer)
+	if err != nil {
+		return false, err
+	}
+	ff, err := loadFS()
+	if err != nil {
+		return false, err
+	}
+	return ff.RequireFS[address], nil
+}
+
+// FSPinnedAt returns the unix timestamp when FS capability was first
+// observed for the peer's address (issue #110), or 0 if never pinned.
+func (c *Client) FSPinnedAt(peer string) (int64, error) {
+	address, err := c.cfg.ResolveRecipient(peer)
+	if err != nil {
+		return 0, err
+	}
+	ff, err := loadFS()
+	if err != nil {
+		return 0, err
+	}
+	return ff.FSPins[address], nil
 }
 
 // FSRekey forces a DH rotation on the next send to peer.
@@ -1340,6 +1597,9 @@ func (c *Client) FSForget(peer string) error {
 			ff.PeerModes = map[string]string{}
 		}
 		ff.PeerModes[address] = fsModeOff
+		// Explicit user action, not a downgrade: clear markers.
+		delete(ff.Downgrade, address)
+		delete(ff.DowngradeWarnedAt, address)
 		return nil
 	})
 }
