@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/black-candle-technologies/courier/internal/bridge"
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
 	"github.com/black-candle-technologies/courier/internal/store"
@@ -771,5 +772,68 @@ func TestThreadSeenWatermark(t *testing.T) {
 	}
 	if len(threads) != 1 || threads[0].Unread != 0 {
 		t.Fatalf("unread after open = %+v, want 0", threads)
+	}
+}
+
+// TestBridgeBadge verifies that messages which arrived via a non-E2E
+// bridge (issue #61) are explicitly marked in the dashboard: a badge in
+// the thread view and a marker in the thread list. Ordinary E2E
+// messages get no badge.
+func TestBridgeBadge(t *testing.T) {
+	srv := testServer(t)
+	id := testIdentity(t)
+	other := testIdentity(t)
+	me := crypto.FormatAddress(id.EdPub[:])
+	them := crypto.FormatAddress(other.EdPub[:])
+	_ = me
+	token := register(t, srv, "lane", "temporary-password-123", id)
+
+	push := func(msgs ...map[string]any) {
+		t.Helper()
+		payload, _ := json.Marshal(map[string]any{"messages": msgs})
+		req := httptest.NewRequest("POST", "/v1/dashboard/push", bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("push: got %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	// One ordinary E2E message and one bridged (non-E2E) message.
+	push(
+		map[string]any{"courier_id": 1, "from": them, "body": "hey", "sent_at": 100, "received_at": 101},
+		map[string]any{"courier_id": 2, "from": them, "body": bridge.WrapBody("hello from chatgpt"), "sent_at": 102, "received_at": 103},
+	)
+
+	// Login dance: the temp password must be changed first.
+	cookie := login(t, srv, "lane", "temporary-password-123")
+	form := url.Values{"password": {"a-new-password-123"}, "confirm": {"a-new-password-123"}}
+	req := httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("change-password: got %d", rec.Code)
+	}
+	cookie = login(t, srv, "lane", "a-new-password-123")
+
+	// Thread view: exactly one badge — on the bridged message only.
+	rec = get(t, srv, "/app/thread?with="+url.QueryEscape(them), cookie)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/app/thread: got %d", rec.Code)
+	}
+	if n := strings.Count(body, "Not end-to-end encrypted"); n != 1 {
+		t.Fatalf("/app/thread: want exactly 1 non-E2E badge, got %d", n)
+	}
+	if !strings.Contains(body, bridge.BridgeBannerHeader) {
+		t.Fatal("/app/thread: bridge banner text missing from body")
+	}
+
+	// Thread list: the thread whose latest message is bridged is flagged.
+	rec = get(t, srv, "/app", cookie)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `class="nbadge small"`) {
+		t.Fatalf("/app: got %d, missing bridged-thread marker", rec.Code)
 	}
 }

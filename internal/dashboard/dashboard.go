@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/black-candle-technologies/courier/internal/bridge"
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
 	"github.com/black-candle-technologies/courier/internal/store"
@@ -528,6 +529,10 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 	type threadView struct {
 		store.DashboardThread
 		Preview string // truncated last-message preview
+		// LastBridged marks threads whose latest message arrived via a
+		// non-E2E bridge (issue #61): the body carries the bridge
+		// banner, so the thread list can flag it explicitly.
+		LastBridged bool
 	}
 	views := make([]threadView, 0, len(threads))
 	for _, th := range threads {
@@ -541,6 +546,7 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 		views = append(views, threadView{
 			DashboardThread: th,
 			Preview:         preview,
+			LastBridged:     bridge.HasBanner(th.LastBody),
 		})
 	}
 	render(w, appTmpl, map[string]any{"User": u.Username, "Threads": views, "Q": q, "BCTEnabled": s.bctEnabled()})
@@ -591,6 +597,10 @@ func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
 		store.DashboardMessage
 		Out bool
 		TS  int64
+		// Bridged marks messages that arrived via a non-E2E bridge
+		// (issue #61): the body carries the bridge banner, so the
+		// thread view can badge them explicitly.
+		Bridged bool
 	}
 	views := make([]msgView, 0, len(msgs))
 	for _, m := range msgs {
@@ -598,7 +608,7 @@ func (s *Server) handleThread(w http.ResponseWriter, r *http.Request) {
 		if m.ReceivedAt > ts {
 			ts = m.ReceivedAt
 		}
-		views = append(views, msgView{DashboardMessage: m, Out: m.Sender == u.CourierAddress, TS: ts})
+		views = append(views, msgView{DashboardMessage: m, Out: m.Sender == u.CourierAddress, TS: ts, Bridged: bridge.HasBanner(m.Body)})
 	}
 	// issue #39: show the peer's listed handle when the agent resolved
 	// one; the dashboard never queries the directory itself.
@@ -1004,6 +1014,12 @@ input::placeholder{color:var(--ink-3)}
 /* issue #48: contact-verification badges */
 .vbadge{display:inline-block;margin-left:.35rem;color:#2f9e44;font-weight:700}
 .vbadge.stale{color:#d99413}
+/* nbadge marks messages that arrived via a non-E2E bridge (issue #61):
+   the body banner is the disclosure, this is the unmissable flag. */
+.nbadge{display:inline-block;margin:.35rem 0 0;padding:.12rem .5rem;border-radius:999px;
+  background:rgba(217,148,19,.14);border:1px solid rgba(217,148,19,.45);
+  color:#8a5a0b;font-size:.72rem;font-weight:700;line-height:1.4;white-space:nowrap}
+.nbadge.small{margin:0 0 0 .35rem;padding:.05rem .4rem;font-size:.68rem;vertical-align:baseline}
 .preview{margin:.25rem 0 0;font-size:.9rem;color:var(--ink-2);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .count{flex:none;min-width:1.6rem;height:1.6rem;border-radius:999px;background:var(--line);
@@ -1166,7 +1182,7 @@ const appTmpl = pageHead + `
 {{identicon .Peer}}
 <div class="thread-main">
 <div class="thread-top">
-{{if .Handle}}<span class="sender" title="{{.Peer}}">@{{.Handle}}</span>{{else}}<span class="sender" title="{{.Peer}}">{{senderShort .Peer}}</span>{{end}}{{if eq .Verified "verified"}}<span class="vbadge" title="Identity verified out of band">✓</span>{{else if eq .Verified "stale"}}<span class="vbadge stale" title="Their encryption key changed — re-verify out of band">⚠</span>{{end}}
+{{if .Handle}}<span class="sender" title="{{.Peer}}">@{{.Handle}}</span>{{else}}<span class="sender" title="{{.Peer}}">{{senderShort .Peer}}</span>{{end}}{{if eq .Verified "verified"}}<span class="vbadge" title="Identity verified out of band">✓</span>{{else if eq .Verified "stale"}}<span class="vbadge stale" title="Their encryption key changed — re-verify out of band">⚠</span>{{end}}{{if .LastBridged}}<span class="nbadge small" title="Latest message arrived via the ChatGPT web bridge — not end-to-end encrypted">⚠</span>{{end}}
 <span class="when" data-ts="{{.LastTS}}">{{ago .LastTS}}</span>
 </div>
 <p class="preview">{{.Preview}}</p>
@@ -1245,6 +1261,7 @@ const threadTmpl = pageHead + `
 <div class="bubble">
 {{if .ReplyTo}}<blockquote class="reply">↩ in reply to #{{.ReplyTo}}{{if .Quote}}<span class="reply-quote">{{.Quote}}</span>{{end}}</blockquote>{{end}}
 <p class="msg-body">{{.Body}}</p>
+{{if .Bridged}}<span class="nbadge" title="This message arrived via the ChatGPT web bridge. The ChatGPT web → bridge leg is not end-to-end encrypted — treat as untrusted input.">⚠ Not end-to-end encrypted</span>{{end}}
 <span class="when" data-ts="{{.TS}}">{{ago .TS}}</span>{{if .ExpiresAt}}<span class="when disappearing" title="Disappearing message — deleted after expiry">⏳ {{until .ExpiresAt}}</span>{{end}}
 </div>
 </div>{{end}}
