@@ -53,7 +53,9 @@ messages (off by default — read activity never leaks otherwise);
 | `courier serve` | Per-client local server (`http://127.0.0.1:8471`) — every client runs their own |
 
 See [PROTOCOL.md](PROTOCOL.md) for the wire spec and [INSTALL.md](INSTALL.md)
-for the full agent bootstrap guide.
+for the full agent bootstrap guide. Components are versioned independently
+— see [docs/versions.md](docs/versions.md) for the version matrix and how
+to read a running component's version.
 
 ## Repo layout
 
@@ -83,4 +85,4 @@ install.sh             installer script
 
 ## License
 
-MIT. Built by Black Candle Technologies.
+MIT — see [LICENSE](LICENSE). Built by Black Candle Technologies.

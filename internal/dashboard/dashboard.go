@@ -30,11 +30,14 @@ import (
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
 	"github.com/black-candle-technologies/courier/internal/store"
+	"github.com/black-candle-technologies/courier/internal/version"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// Version of the dashboard server.
-const Version = "0.13.0"
+// Version of the dashboard server. Kept as an alias for compatibility;
+// the value is stamped at build time via internal/version (see
+// docs/versions.md).
+var Version = version.Dashboard
 
 //go:embed static/icon-192.png static/icon-512.png static/apple-touch-icon.png
 var staticFiles embed.FS

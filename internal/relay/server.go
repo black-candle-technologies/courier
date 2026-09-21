@@ -18,6 +18,7 @@ import (
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
 	"github.com/black-candle-technologies/courier/internal/store"
+	"github.com/black-candle-technologies/courier/internal/version"
 )
 
 // MaxCiphertextBytes caps a single message at 256 KiB.
@@ -226,7 +227,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"ok":        true,
 		"time":      time.Now().UTC().Format(time.RFC3339),
 		"envelopes": n,
-		"version":   "0.9.0",
+		"version":   version.Relay,
 	})
 }
 
