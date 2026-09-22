@@ -1497,6 +1497,147 @@ type Message struct {
 	Bridge *bridge.BridgeMeta `json:"bridge,omitempty"`
 }
 
+// inboxEnvelope is one row of the relay's /v1/inbox page: the encrypted
+// envelope plus its metadata. The relay never sees inside the
+// ciphertext; every field here is routing/authentication metadata.
+type inboxEnvelope struct {
+	ID          int64    `json:"id"`
+	From        string   `json:"from"`
+	Eph         string   `json:"eph"`
+	Nonce       string   `json:"nonce"`
+	Ct          string   `json:"ct"`
+	SentAt      int64    `json:"sent_at"`
+	ReceivedAt  int64    `json:"received_at"`
+	Sig         string   `json:"sig"`
+	SenderFlags []string `json:"sender_flags"`
+	Kind        string   `json:"kind"`
+}
+
+// fetchEnvelopePage requests one raw page of envelopes from the relay.
+// The request is recipient-signed, so the relay serves ciphertext only
+// to the address owner; after and limit are covered by the signature to
+// prevent cursor tampering (v0.6.11 F10).
+func (c *Client) fetchEnvelopePage(after int64, limit int) ([]inboxEnvelope, error) {
+	hc, err := c.httpClient()
+	if err != nil {
+		return nil, err
+	}
+	id, err := c.cfg.Identity()
+	if err != nil {
+		return nil, err
+	}
+	toEd, err := crypto.ParseAddress(c.cfg.Address)
+	if err != nil {
+		return nil, fmt.Errorf("bad address: %w", err)
+	}
+	ts := time.Now().Unix()
+	sig := id.Sign(envelope.InboxRequest(toEd[:], after, int64(limit), ts))
+	url := fmt.Sprintf("%s/v1/inbox?to=%s&after=%d&limit=%d&ts=%d&sig=%s",
+		c.cfg.RelayURL, c.cfg.Address, after, limit, ts,
+		base64.RawURLEncoding.EncodeToString(sig))
+	resp, err := hc.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("relay unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, relayErr(data)
+	}
+	var in struct {
+		Messages []inboxEnvelope `json:"messages"`
+	}
+	if err := json.Unmarshal(data, &in); err != nil {
+		return nil, fmt.Errorf("bad relay response: %w", err)
+	}
+	return in.Messages, nil
+}
+
+// openEnvelope verifies the sender signature on one envelope and
+// trial-decrypts it across this client's retained encryption keys —
+// messages sealed before a rotation still open with the retired key. A
+// forged, corrupted, or undecryptable envelope is an error, never a
+// message.
+func (c *Client) openEnvelope(m inboxEnvelope) ([]byte, error) {
+	fromEd, err := crypto.ParseAddress(m.From)
+	if err != nil {
+		return nil, fmt.Errorf("bad sender address: %w", err)
+	}
+	eph, err1 := base64.RawURLEncoding.DecodeString(m.Eph)
+	nonce, err2 := base64.RawURLEncoding.DecodeString(m.Nonce)
+	ct, err3 := base64.RawURLEncoding.DecodeString(m.Ct)
+	sig, err4 := base64.RawURLEncoding.DecodeString(m.Sig)
+	if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+		return nil, errors.New("bad envelope encoding")
+	}
+	toEd, err := crypto.ParseAddress(c.cfg.Address)
+	if err != nil {
+		return nil, fmt.Errorf("bad address: %w", err)
+	}
+	canon := envelope.Canonical(toEd[:], fromEd[:], eph, nonce, m.SentAt, ct)
+	if !crypto.Verify(fromEd[:], canon, sig) {
+		return nil, errors.New("sender signature verification failed")
+	}
+	for _, xp := range c.cfg.encryptionPrivKeys() {
+		if p, err := crypto.Open(xp[:], eph, nonce, ct); err == nil {
+			return p, nil
+		}
+	}
+	return nil, errors.New("decryption failed")
+}
+
+// unwrapAttachmentKeys validates each manifest and unwraps its data key
+// for this recipient. A manifest whose key cannot be opened is kept with
+// KeyError set, so the message is still delivered and the failure is
+// visible, never silent. fsWrapKey carries the message-derived wrap key
+// for forward-secret messages (issue #50); it is nil for legacy
+// messages.
+func (c *Client) unwrapAttachmentKeys(manifests []envelope.AttachmentManifest, fsWrapKey *[32]byte) []IncomingAttachment {
+	var atts []IncomingAttachment
+	for _, mf := range manifests {
+		ia := IncomingAttachment{Manifest: mf}
+		if err := envelope.ValidateManifest(&mf); err != nil {
+			ia.KeyError = fmt.Errorf("bad manifest: %w", err)
+		} else {
+			var wk *envelope.WrappedKey
+			for i := range mf.Keys {
+				if mf.Keys[i].Recipient == c.cfg.Address {
+					wk = &mf.Keys[i]
+					break
+				}
+			}
+			if wk == nil {
+				ia.KeyError = errors.New("no wrapped data key for this recipient")
+			} else if fsWrapKey != nil {
+				// issue #50: FS messages wrap attachment data keys
+				// under the message-derived key.
+				if dk, err := UnwrapDataKeyFS(*wk, *fsWrapKey); err == nil {
+					ia.DataKey = dk
+				} else {
+					ia.KeyError = err
+				}
+			} else {
+				var uerr error
+				opened := false
+				for _, xp := range c.cfg.encryptionPrivKeys() {
+					if dk, err := UnwrapDataKey(*wk, xp); err == nil {
+						ia.DataKey = dk
+						opened = true
+						break
+					} else {
+						uerr = err
+					}
+				}
+				if !opened {
+					ia.KeyError = uerr
+				}
+			}
+		}
+		atts = append(atts, ia)
+	}
+	return atts
+}
+
 // Inbox fetches envelopes addressed to this agent after message id `after`,
 // verifies each sender signature, and decrypts. Envelopes that fail
 // verification or decryption are skipped and counted, never fatal.
@@ -1539,51 +1680,12 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, int, erro
 // depends on them staying silent. The three are reported separately so
 // routine delivery mechanics never look like an attack.
 func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsumer) ([]Message, int64, int, int, []string, []appliedStateEvent, error) {
-	hc, err := c.httpClient()
-	if err != nil {
-		return nil, after, 0, 0, nil, nil, err
-	}
-	id, err := c.cfg.Identity()
-	if err != nil {
-		return nil, after, 0, 0, nil, nil, err
-	}
-	toEd, err := crypto.ParseAddress(c.cfg.Address)
-	if err != nil {
-		return nil, after, 0, 0, nil, nil, fmt.Errorf("bad address: %w", err)
-	}
 	// v0.6.11 (F10): the inbox request is signed by the recipient, so
 	// the relay serves ciphertext only to the address owner. after and
 	// limit are covered by the signature to prevent cursor tampering.
-	ts := time.Now().Unix()
-	sig := id.Sign(envelope.InboxRequest(toEd[:], after, int64(limit), ts))
-	url := fmt.Sprintf("%s/v1/inbox?to=%s&after=%d&limit=%d&ts=%d&sig=%s",
-		c.cfg.RelayURL, c.cfg.Address, after, limit, ts,
-		base64.RawURLEncoding.EncodeToString(sig))
-	resp, err := hc.Get(url)
+	inboxEnvs, err := c.fetchEnvelopePage(after, limit)
 	if err != nil {
-		return nil, after, 0, 0, nil, nil, fmt.Errorf("relay unreachable: %w", err)
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if resp.StatusCode != http.StatusOK {
-		return nil, after, 0, 0, nil, nil, relayErr(data)
-	}
-	var in struct {
-		Messages []struct {
-			ID          int64    `json:"id"`
-			From        string   `json:"from"`
-			Eph         string   `json:"eph"`
-			Nonce       string   `json:"nonce"`
-			Ct          string   `json:"ct"`
-			SentAt      int64    `json:"sent_at"`
-			ReceivedAt  int64    `json:"received_at"`
-			Sig         string   `json:"sig"`
-			SenderFlags []string `json:"sender_flags"`
-			Kind        string   `json:"kind"`
-		} `json:"messages"`
-	}
-	if err := json.Unmarshal(data, &in); err != nil {
-		return nil, after, 0, 0, nil, nil, fmt.Errorf("bad relay response: %w", err)
+		return nil, after, 0, 0, nil, nil, err
 	}
 	var out []Message
 	skipped := 0
@@ -1597,7 +1699,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 	// flushed once after the loop.
 	var cacheEntries []replyCacheEntry
 	seen := c.seenSet(consumer)
-	for _, m := range in.Messages {
+	for _, m := range inboxEnvs {
 		// Track the highest inspected envelope id regardless of
 		// outcome: the cursor must advance past undecryptable and
 		// replayed messages too (v0.6.11 F4).
@@ -1623,11 +1725,6 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		if seen[h] {
 			continue
 		}
-		fromEd, err := crypto.ParseAddress(m.From)
-		if err != nil {
-			skipped++
-			continue
-		}
 		// Blocklist and dismissed requests: messages from these senders
 		// are dropped at read time, before any decryption work. The
 		// cursor still advances past them (F4) and they are never marked
@@ -1638,35 +1735,9 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			filtered++
 			continue
 		}
-		eph, err1 := base64.RawURLEncoding.DecodeString(m.Eph)
-		nonce, err2 := base64.RawURLEncoding.DecodeString(m.Nonce)
-		ct, err3 := base64.RawURLEncoding.DecodeString(m.Ct)
-		sig, err4 := base64.RawURLEncoding.DecodeString(m.Sig)
-		if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
-			skipped++
-			continue
-		}
-		toEd, err := crypto.ParseAddress(c.cfg.Address)
+		plain, err := c.openEnvelope(m)
 		if err != nil {
-			skipped++
-			continue
-		}
-		canon := envelope.Canonical(toEd[:], fromEd[:], eph, nonce, m.SentAt, ct)
-		if !crypto.Verify(fromEd[:], canon, sig) {
-			skipped++ // forged or corrupted: drop
-			continue
-		}
-		// Trial-decrypt across retained keys: messages sealed before a
-		// rotation still open with the retired key.
-		var plain []byte
-		for _, xp := range c.cfg.encryptionPrivKeys() {
-			if p, err := crypto.Open(xp[:], eph, nonce, ct); err == nil {
-				plain = p
-				break
-			}
-		}
-		if plain == nil {
-			skipped++
+			skipped++ // forged, corrupted, or undecryptable: drop
 			continue
 		}
 
@@ -1782,49 +1853,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			newHashes = append(newHashes, h)
 			continue
 		}
-		var atts []IncomingAttachment
-		for _, mf := range manifests {
-			ia := IncomingAttachment{Manifest: mf}
-			if err := envelope.ValidateManifest(&mf); err != nil {
-				ia.KeyError = fmt.Errorf("bad manifest: %w", err)
-			} else {
-				var wk *envelope.WrappedKey
-				for i := range mf.Keys {
-					if mf.Keys[i].Recipient == c.cfg.Address {
-						wk = &mf.Keys[i]
-						break
-					}
-				}
-				if wk == nil {
-					ia.KeyError = errors.New("no wrapped data key for this recipient")
-				} else if fsWrapKey != nil {
-					// issue #50: FS messages wrap attachment data
-					// keys under the message-derived key.
-					if dk, err := UnwrapDataKeyFS(*wk, *fsWrapKey); err == nil {
-						ia.DataKey = dk
-					} else {
-						ia.KeyError = err
-					}
-				} else {
-					var uerr error
-					opened := false
-					for _, xp := range c.cfg.encryptionPrivKeys() {
-						if dk, err := UnwrapDataKey(*wk, xp); err == nil {
-							ia.DataKey = dk
-							opened = true
-							break
-						} else {
-							uerr = err
-						}
-					}
-					if !opened {
-						ia.KeyError = uerr
-					}
-				}
-			}
-			atts = append(atts, ia)
-
-		}
+		atts := c.unwrapAttachmentKeys(manifests, fsWrapKey)
 		// The FS wrap key exists only for this message's manifests;
 		// erase it now that the data keys are extracted.
 		if fsWrapKey != nil {

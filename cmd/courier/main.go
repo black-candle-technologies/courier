@@ -7,6 +7,7 @@
 //	courier address                      print your address (public key)
 //	courier send <address> <message|-> [--attach file]... [--reply-to id] [--ttl 10m]
 //	courier inbox [--all] [--limit N] [--follow] [--attachments-dir dir]
+//	courier attachments fetch --message <id> --attachments-dir <dir>
 //	courier backup create|restore|export-sync|import-sync
 //	courier stdio                        JSON-lines bridge for agents
 //	courier serve [--listen 127.0.0.1:8471]
@@ -59,6 +60,8 @@ func main() {
 		err = cmdSend(os.Args[2:])
 	case "inbox":
 		err = cmdInbox(os.Args[2:])
+	case "attachments":
+		err = cmdAttachments(os.Args[2:])
 	case "wake":
 		err = cmdWake(os.Args[2:])
 	case "stdio":
@@ -129,6 +132,9 @@ func usage() {
   courier inbox [--all] [--limit N] [--follow [--interval 5s]] [--requests]
       [--attachments-dir <dir>]          download verified attachments into dir
                                          --requests lists held message requests instead
+  courier attachments fetch --message <id> --attachments-dir <dir>
+                                         re-download attachments from an already-read
+                                         message (issue #136)
   courier wake [--cooldown 5m] [--max-per-minute 12] -- <command> [args...]
                                          instant wake daemon: runs <command> (no shell)
                                          with new-message JSON on stdin, seconds after
