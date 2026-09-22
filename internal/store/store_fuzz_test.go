@@ -50,8 +50,9 @@ func splitFuzzOldRows(data []byte) []fuzzOldRow {
 // with fuzzed envelope rows, then runs the production migration path via
 // Open. Invariants: migration never fails and never panics on arbitrary
 // row bytes; every row gets env_hash == DedupHash(...) backfilled;
-// migration is idempotent (a second Open is a fixed point); no rows are
-// lost.
+// migration is idempotent (a second Open is a fixed point); no distinct
+// envelope is lost — exact replays (identical rows) collapse to a single
+// row, mirroring Save's ON CONFLICT(env_hash) DO NOTHING.
 func FuzzMigrateOldSchemaDB(f *testing.F) {
 	f.Add([]byte("hello")) // one row of short fields
 	f.Add([]byte{})        // one row of empty fields
@@ -114,9 +115,16 @@ func FuzzMigrateOldSchemaDB(f *testing.F) {
 			s.Close()
 			t.Fatal(err)
 		}
-		if count != len(rows) {
+		// Exact replays collapse to one row (see migration 9), so the
+		// expected row count is the number of distinct envelope hashes.
+		distinct := make(map[string]struct{})
+		for _, r := range rows {
+			distinct[envelope.DedupHash(r.to, r.from, r.eph, r.nonce, r.sentAt, r.ct, r.sig)] = struct{}{}
+		}
+		if count != len(distinct) {
 			s.Close()
-			t.Fatalf("migration lost rows: have %d, want %d", count, len(rows))
+			t.Fatalf("migration lost distinct envelopes: have %d, want %d (from %d rows)",
+				count, len(distinct), len(rows))
 		}
 		s.Close()
 

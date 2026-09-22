@@ -352,10 +352,19 @@ var migrations = []migration{
 			if err := backfillEnvelopeHashes(e, q); err != nil {
 				return err
 			}
-			// A pre-existing true duplicate (the identical envelope stored
-			// twice before F3) fails here. That is intentional: the old
-			// code failed the same way, and silently dropping delivered
-			// messages would be worse than a loud, actionable error.
+			// Collapse pre-existing true duplicates (the identical envelope
+			// stored twice before F3, e.g. a retried POST) before the UNIQUE
+			// index goes on. Two rows with the same env_hash are the same
+			// envelope — DedupHash covers every sender-controlled field, and
+			// eph/nonce are random per message, so distinct messages cannot
+			// share a hash short of breaking SHA-256. Keep the earliest copy
+			// and drop the replay, exactly what Save's ON CONFLICT(env_hash)
+			// DO NOTHING would have done had F3 existed at insert time. No
+			// distinct message is lost. Failing here instead would brick the
+			// upgrade: the migration rolls back and Open refuses to start.
+			if err := dedupEnvelopeHashes(e); err != nil {
+				return err
+			}
 			_, err = e.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_envelopes_env_hash ON envelopes(env_hash)`)
 			return err
 		},
@@ -731,6 +740,25 @@ func checkIntegrity(db *sql.DB) error {
 		}
 	}
 	return rows.Err()
+}
+
+// dedupEnvelopeHashes drops replayed envelope copies ahead of the v0.6.11
+// (F3) UNIQUE index: for each env_hash keep the earliest row (MIN(id)).
+// A duplicate env_hash means a bit-identical envelope — DedupHash covers
+// every sender-controlled field, and eph/nonce are random per message, so
+// distinct messages cannot share a hash short of breaking SHA-256. The
+// surviving row is the message; the dropped rows are replay copies the
+// dedup feature would have refused at insert time. Idempotent: after one
+// run no duplicates remain.
+func dedupEnvelopeHashes(e execer) error {
+	_, err := e.Exec(`DELETE FROM envelopes
+		WHERE env_hash IS NOT NULL
+		  AND id NOT IN (
+		      SELECT MIN(id) FROM envelopes
+		      WHERE env_hash IS NOT NULL
+		      GROUP BY env_hash
+		  )`)
+	return err
 }
 
 // backfillEnvelopeHashes computes env_hash for envelopes stored before the
