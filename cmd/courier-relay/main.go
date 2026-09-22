@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/relay"
 	"github.com/black-candle-technologies/courier/internal/store"
 	"github.com/black-candle-technologies/courier/internal/tlscert"
@@ -53,6 +54,12 @@ func main() {
 	blobBurstBytes := flag.Int64("blob-burst-bytes", 256<<20, "per-uploader blob upload byte-bucket burst")
 	blobRateBytes := flag.Float64("blob-rate-bytes", 2<<20, "per-uploader sustained blob upload rate, bytes per second")
 	blobQuotaBytes := flag.Int64("blob-quota-bytes", 1<<30, "per-uploader total stored blob byte quota within the retention window")
+	// Bridge identity registration (issue #98): the relay operator
+	// registers bridge sender identities out of band, and the relay
+	// marks their envelopes with the advisory, metadata-only
+	// `bridged:<origin>` sender flag. Purely additive — no wire or
+	// protocol change; old clients ignore the unknown flag.
+	bridgeOrigins := flag.String("bridge-origins", "", `registered bridge identities as addr=origin pairs, comma-separated (e.g. "ed25519:<base64url>=chatgpt-web")`)
 	// Operator takedown admin mode: applies (or lifts) a transparent
 	// tombstone and exits without serving. Takedowns are public by
 	// construction — a reason is required — and must follow the
@@ -62,6 +69,13 @@ func main() {
 	takedownReason := flag.String("takedown-reason", "", "public reason for the takedown (required with -takedown)")
 	untakedown := flag.String("untakedown", "", "lift a directory handle tombstone (admin mode: applies and exits)")
 	flag.Parse()
+
+	// Parse the operator-registered bridge identities (issue #98)
+	// before building the relay config.
+	bridgeOriginMap, err := parseBridgeOrigins(*bridgeOrigins)
+	if err != nil {
+		log.Fatalf("bridge-origins: %v", err)
+	}
 
 	st, err := store.Open(*dbPath)
 	if err != nil {
@@ -81,6 +95,7 @@ func main() {
 		BlobUploadRateBytesPerSec: *blobRateBytes,
 		BlobQuotaBytes:            *blobQuotaBytes,
 		ReservedHandles:           splitCSV(*reservedHandles),
+		BridgeOrigins:             bridgeOriginMap,
 	})
 
 	// Admin mode: takedown / untakedown, then exit.
@@ -139,6 +154,7 @@ func main() {
 			BlobUploadRateBytesPerSec: *blobRateBytes,
 			BlobQuotaBytes:            *blobQuotaBytes,
 			ReservedHandles:           splitCSV(*reservedHandles),
+			BridgeOrigins:             bridgeOriginMap,
 		}).Routes()),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
@@ -203,4 +219,31 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+// parseBridgeOrigins parses --bridge-origins (issue #98): comma-separated
+// addr=origin pairs mapping bridge sender addresses to their origin
+// label, e.g. "ed25519:<base64url>=chatgpt-web". Empty input yields an
+// empty (non-nil) map. Malformed entries — bad address or unsafe
+// origin label — are a fatal config error, unlike the runtime
+// validation in relay.NewWithConfig, which drops invalid entries
+// leniently: a broken flag should fail loudly at startup so the
+// operator notices the misconfiguration.
+func parseBridgeOrigins(s string) (map[string]string, error) {
+	out := make(map[string]string)
+	for _, part := range splitCSV(s) {
+		addr, origin, ok := strings.Cut(part, "=")
+		addr, origin = strings.TrimSpace(addr), strings.TrimSpace(origin)
+		if !ok || addr == "" || origin == "" {
+			return nil, fmt.Errorf("bad entry %q: want addr=origin", part)
+		}
+		if _, err := crypto.ParseAddress(addr); err != nil {
+			return nil, fmt.Errorf("bad entry %q: %v", part, err)
+		}
+		if !relay.ValidBridgeOriginLabel(origin) {
+			return nil, fmt.Errorf("bad entry %q: origin label must be a lowercase flag-safe token (1-32 chars: a-z, 0-9, -, _)", part)
+		}
+		out[addr] = origin
+	}
+	return out, nil
 }

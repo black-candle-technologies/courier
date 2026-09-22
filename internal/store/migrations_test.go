@@ -509,6 +509,15 @@ func legacyMigrate(db *sql.DB) error {
 	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
+	// issues #96/#97: bridged-message attribution. bridged is 1 when
+	// the pushing agent derived the message as bridged in its inbox
+	// path (pin list, payload metadata, or body banner); the dashboard
+	// only displays it, like the other agent-reported fields. Old rows
+	// default to 0; the dashboard view ORs the stored flag with the
+	// body banner so pre-change pushes keep their badge.
+	if err := addColumn(`ALTER TABLE dashboard_messages ADD COLUMN bridged INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
 	// v0.6.11: key announcements now carry their Ed25519 signature so
 	// senders can authenticate the directory response (F1).
 	if err := addColumn(`ALTER TABLE keys ADD COLUMN signature TEXT NOT NULL DEFAULT ''`); err != nil {
@@ -661,6 +670,12 @@ func legacyMigrate(db *sql.DB) error {
 		return err
 	}
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_users_bct_user_id ON dashboard_users(bct_user_id)`); err != nil {
+		return err
+	}
+	// issue #95: dashboard admins may view the bridge audit log. The
+	// column defaults to 0 (non-admin); the operator grants admin with
+	// `courier dashboard set-admin <username>`.
+	if err := addColumn(`ALTER TABLE dashboard_users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
 	return nil

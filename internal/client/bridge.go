@@ -1,4 +1,5 @@
-// Bridge messaging (issue #61, phase 1): sending bridge-attributed DMs.
+// Bridge messaging (issue #61, phase 1): sending bridge-attributed DMs,
+// plus client-side bridged-message detection (phase 2, issues #96/#97).
 //
 // The ChatGPT web → Courier bridge is explicitly NOT end-to-end
 // encrypted: the bridge gateway holds a Courier identity and sees every
@@ -15,34 +16,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 
+	"github.com/black-candle-technologies/courier/internal/bridge"
 	"github.com/black-candle-technologies/courier/internal/crypto"
 )
-
-// BridgeOriginChatGPTWeb identifies the ChatGPT web bridge origin in
-// bridge metadata.
-const BridgeOriginChatGPTWeb = "chatgpt-web"
-
-// BridgeMeta is the structured bridge attribution riding inside the
-// E2E-encrypted v2 payload. It is additive: pre-bridge clients ignore
-// the unknown field and render the banner-in-body per existing v2
-// handling (harmless degradation).
-type BridgeMeta struct {
-	// Origin is the bridge source, e.g. "chatgpt-web".
-	Origin string `json:"origin"`
-	// GatewayFP is the hex SHA-256 of the bridge identity's Ed25519
-	// public key, so recipients can pin the expected gateway.
-	GatewayFP string `json:"gateway_fp"`
-	// TokenLabel is the ingest token label that submitted the message.
-	TokenLabel string `json:"token_label,omitempty"`
-	// AuditID is the gateway audit-log row for this send.
-	AuditID int64 `json:"audit_id,omitempty"`
-}
 
 // encodeBridgedBody builds the v2 plaintext for a bridged message:
 // banner-wrapped body plus bridge metadata. The v2 form is used even
 // though no reply threading is involved, so the metadata has a home.
-func encodeBridgedBody(wrappedBody string, meta *BridgeMeta) ([]byte, error) {
+func encodeBridgedBody(wrappedBody string, meta *bridge.BridgeMeta) ([]byte, error) {
 	return json.Marshal(replyPayload{
 		Version: replyPayloadVersion,
 		Body:    wrappedBody,
@@ -53,14 +36,14 @@ func encodeBridgedBody(wrappedBody string, meta *BridgeMeta) ([]byte, error) {
 // SendBridged sends a bridge-attributed DM to address, which must be a
 // full ed25519:... address (no contact-name resolution — the gateway
 // works purely in allowlisted addresses). wrappedBody must already
-// carry the attribution banner (see internal/bridge.WrapBody); meta
-// must be non-nil.
+// carry the attribution banner (see bridge.WrapBody); meta must be
+// non-nil.
 //
 // The send follows the normal human-send crypto path: an established
 // forward-secrecy session is used when one exists, otherwise the
 // standard sealed box. It is recorded in the local sent log like any
 // DM so the dashboard threads it.
-func (c *Client) SendBridged(address, wrappedBody string, meta *BridgeMeta) (int64, error) {
+func (c *Client) SendBridged(address, wrappedBody string, meta *bridge.BridgeMeta) (int64, error) {
 	if _, err := crypto.ParseAddress(address); err != nil {
 		return 0, fmt.Errorf("bad recipient address: %w", err)
 	}
@@ -132,4 +115,34 @@ func (c *Config) RemoveBridgeGateway(addr string) error {
 	}
 	c.BridgeGateways = kept
 	return c.Save()
+}
+
+// isPinnedBridgeGateway reports whether addr is in this client's pinned
+// bridge-gateway list (issue #96). The pin list is the recipient's own
+// trust decision, independent of anything the sender claims.
+func (c *Client) isPinnedBridgeGateway(addr string) bool {
+	return slices.Contains(c.cfg.BridgeGateways, addr)
+}
+
+// deriveBridged reports whether an inbound message from `from` is
+// bridged (issues #96/#97): it arrived via a non-E2E bridge and must be
+// treated as untrusted input. Three independent layers are OR'd, in
+// order of trustworthiness:
+//
+//  1. Structured bridge metadata in the signed E2E payload — the
+//     gateway's own attestation, unforgeable by third parties.
+//  2. The sender address being in the recipient's pinned bridge-gateway
+//     list — the recipient's own trust decision. This flags messages
+//     from the bridge identity even if payload metadata were absent.
+//  3. The plaintext body banner — the gateway's visible attestation,
+//     inside the signed plaintext. This also catches bridged messages
+//     for recipients who never pinned the bridge address.
+//
+// Any single layer marks the message bridged. The direction of error
+// is deliberate: a false positive marks a message untrusted (safe),
+// while no layer can turn a genuinely bridged message trusted — the
+// banner cannot be stripped without invalidating the bridge identity's
+// signature, and pinning needs no sender cooperation at all.
+func deriveBridged(from string, pins []string, meta *bridge.BridgeMeta, body string) bool {
+	return meta != nil || slices.Contains(pins, from) || bridge.HasBanner(body)
 }

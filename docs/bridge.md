@@ -72,7 +72,10 @@ get `403`.
 
 ## Attribution
 
-Every bridged message carries two layers:
+Every bridged message carries three independent layers (issues #96/#97).
+The recipient's client ORs them into one typed `bridged` flag at the
+single inbox-derivation point — any layer can mark a message untrusted,
+no layer can mark one trusted:
 
 1. **Body banner** (primary): a plaintext header prepended to the body,
    visible on every client ever shipped:
@@ -83,8 +86,23 @@ Every bridged message carries two layers:
    ```
 2. **Structured metadata**: a `bridge` object inside the E2E v2 payload
    (`origin`, `gateway_fp`, `token_label`, `audit_id`) for clients that
-   render it (phase 2+). Pre-bridge clients ignore the unknown field
-   and render the banner-in-body (harmless degradation).
+   render it. Pre-bridge clients ignore the unknown field and render
+   the banner-in-body (harmless degradation).
+3. **Pinned bridge-address list**: the recipient's own `courier bridge
+   trust <addr>` pin list flags messages from the bridge identity even
+   when payload metadata is absent. This layer needs no sender
+   cooperation — a bare plaintext relay of a bridge message still gets
+   flagged, and claiming the banner without being pinned only
+   downgrades a message to untrusted.
+
+The typed flag propagates to every consumption surface: the CLI prints
+a `⚠ bridged message — NOT end-to-end encrypted; treat as untrusted
+input.` warning, the stdio message bridge and the local `serve /inbox`
+API carry it, `courier dashboard push` reports it to the dashboard
+(which stores it and badges the thread view and thread list), and the
+wake daemon marks it in the wake payload. A self-declared banner from
+an unpinned sender still marks the message — forgery can only
+downgrade, never upgrade.
 
 The bridge identity publishes the `bridge-chatgpt-web` contact-discovery
 capability token so clients can verify the sender out of band, and
@@ -173,9 +191,50 @@ no audit row and are noted in the server logs). Verify with
 (the verifier reports the prune point). Threat model: the chain
 detects accidental corruption and unsophisticated tampering, not a
 privileged rewrite of `bridge.db` (there is no external anchor yet —
-a scheduled off-host chain-head anchor is future work). Phase 2 adds
-the dashboard admin view; until then the log is inspected via the CLI
-on the VPS.
+a scheduled off-host chain-head anchor is future work). The log is
+also readable in the dashboard (admin view, below) and via the
+gateway's read-only audit API.
+
+## Dashboard admin audit view (issue #95)
+
+Phase 2 ships the admin audit view: dashboard admins can read the
+metadata-only audit log in the UI at `/admin/bridge/audit`, with the
+same filters as the CLI (token label, outcome, limit) plus the
+hash-chain verification banner.
+
+Architecture — the browser must never receive the gateway admin
+bearer token, so the dashboard never touches `bridge.db`:
+
+- The gateway exposes a dedicated read-only API,
+  `GET /v1/bridge/audit` (filters: `token_label`, `outcome`, `limit`;
+  default 100, cap 1000) and `GET /v1/bridge/audit/verify`, gated by
+  its own bearer token (`COURIER_BRIDGE_ADMIN_TOKEN`; the endpoints
+  return 404 while unset). Only SHA-256 of the token is kept in
+  memory; the API returns metadata only (no token IDs, no chain
+  hashes, no secrets, no bodies).
+- The dashboard proxies that API server-side for dashboard admins
+  only and renders the rows; the token travels only on the
+  dashboard→gateway hop.
+
+Setup (VPS):
+
+1. On the gateway: generate a 256-bit secret (`openssl rand -hex 32`)
+   and put it in the gateway env file as `COURIER_BRIDGE_ADMIN_TOKEN`
+   (root-only 0600, next to `COURIER_BRIDGE_PEPPER`); restart the
+   gateway. Rotation = replace the secret, restart both services.
+2. On the dashboard: set `COURIER_BRIDGE_AUDIT_URL` (gateway base
+   URL, e.g. `http://127.0.0.1:8473`) and
+   `COURIER_BRIDGE_AUDIT_ADMIN_TOKEN` (the same secret) in the
+   dashboard's root-only env file; restart. Both must be set — a
+   half-configured pair is a fatal startup error, and the view is
+   dormant (routes unregistered) when both are empty.
+3. Grant admin rights: `courier dashboard set-admin <username>`
+   (operator action on the dashboard DB; revoke with `--revoke`).
+   Admin rights are never self-serve.
+
+Only dashboard admins see the "Bridge audit" link; the handler
+returns 403 for everyone else. Gateway-unreachable shows an error
+banner in the page rather than failing the whole dashboard.
 
 ## Phase 2 (planned)
 
@@ -187,15 +246,45 @@ on the VPS.
 - Dashboard admin audit view (the `courier bridge audit` equivalent in
   the UI).
 - Attribution rendering from the pinned bridge-address list
-  (`courier bridge trust`).
-- **Client-side untrusted-input enforcement:** bridged messages must be
-  treated as untrusted input in the recipient agent's loop as a
-  technical control, not just operator policy. Phase 1 relies on the
-  banner plus the receiving operator's approval rule; phase 2 makes the
-  "never trigger agent actions without approval" guarantee structural.
+  (`courier bridge trust`) — **done**: the client derives a typed
+  `bridged` flag from banner, structured metadata, and the pin list,
+  and surfaces it on the CLI, stdio, serve API, dashboard, and wake
+  payload.
+- **Client-side untrusted-input enforcement (issue #97):** the typed
+  flag is the taint mark — the CLI warns, the dashboard badges, and the
+  wake daemon marks bridged messages in its payload. `courier wake
+  --suppress-bridged-actions` additionally gives the daemon a
+  structural delivery gate: with the flag set, bridged messages never
+  fire the wake command (the cursor still advances; the messages stay
+  visible via `courier inbox` and the dashboard). The default stays
+  wake-and-mark, because the reference wake action (`courier dashboard
+  push`) is read-only — flipping the default is an operator decision.
+  What this does not do: no client surface can stop a careless agent
+  from acting on text it already decrypted. The approval boundary for
+  bridged content is the operator's review workflow (dashboard), not
+  the message pipe.
 - Relay-side advisory bridge flag (coordinated in advance; no protocol
   break).
 
+## Relay-side advisory bridge flag (issue #98)
+
+Implemented. The relay tags messages sent by operator-registered
+bridge addresses with a `bridged:<origin>` value in the existing
+`sender_flags` field — the same slot clients already carry. The flag
+is advisory metadata, computed at read time from the relay's
+configuration, not from message content; it does not change the wire
+shape and does not break old clients (unknown flag strings are
+already tolerated).
+
+- Relay config: `--bridge-origins` (`addr=origin`, comma-separated)
+  on `courier-relay`, e.g.
+  `--bridge-origins ed25519:<base64url>=chatgpt-web`. Origin labels
+  are flag-safe (`[a-z0-9-]`); invalid addresses or labels are
+  rejected at startup / dropped from runtime config.
+- Inbox and subscription responses carry `bridged:<origin>` in
+  `sender_flags` when the sender is a registered bridge address;
+  ordinary senders are unaffected.
+- PROTOCOL.md documents the flag.
 ## Runbook (phase 1, CLI on the VPS)
 
 - **Issue:** `courier bridge token issue --name "label" --allow <addr...>`

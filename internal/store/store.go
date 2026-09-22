@@ -558,6 +558,17 @@ var migrations = []migration{
 			return nil
 		},
 	},
+	// issues #96/#97: bridged-message attribution. bridged is 1 when
+	// the pushing agent derived the message as bridged in its inbox
+	// path (pin list, payload metadata, or body banner); the dashboard
+	// only displays it, like the other agent-reported fields. Old rows
+	// default to 0; the dashboard view ORs the stored flag with the
+	// body banner so pre-change pushes keep their badge.
+	addColumnMigration(21, "dashboard_messages.bridged (issues #96/#97)", "dashboard_messages", "bridged", `bridged INTEGER NOT NULL DEFAULT 0`),
+	// issue #95: dashboard admins may view the bridge audit log. The
+	// column defaults to 0 (non-admin); the operator grants admin with
+	// `courier dashboard set-admin <username>`.
+	addColumnMigration(22, "dashboard_users.is_admin (issue #95)", "dashboard_users", "is_admin", `is_admin INTEGER NOT NULL DEFAULT 0`),
 }
 
 // latestSchemaVersion is the newest migration version this build knows.
@@ -1433,6 +1444,10 @@ type DashboardUser struct {
 	// #108 per-account exponential backoff).
 	FailedLogins int
 	LockUntil    int64
+	// IsAdmin marks dashboard admins (issue #95). Admins may view the
+	// bridge audit log at /admin/bridge/audit. Granted by the operator
+	// with `courier dashboard set-admin <username>`; never self-serve.
+	IsAdmin bool
 }
 
 // CreateDashboardUser inserts a dashboard user. The caller hashes the
@@ -1454,14 +1469,16 @@ func (s *Store) CreateDashboardUser(username, passwordHash, courierAddress, apiT
 func scanDashboardUser(row *sql.Row) (*DashboardUser, error) {
 	var u DashboardUser
 	var mustChange int
+	var isAdmin int
 	var bctUserID sql.NullInt64
 	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &mustChange,
 		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail,
-		&u.FailedLogins, &u.LockUntil)
+		&u.FailedLogins, &u.LockUntil, &isAdmin)
 	if err != nil {
 		return nil, err
 	}
 	u.MustChange = mustChange != 0
+	u.IsAdmin = isAdmin != 0
 	if bctUserID.Valid {
 		u.BCTUserID = bctUserID.Int64
 	}
@@ -1470,7 +1487,7 @@ func scanDashboardUser(row *sql.Row) (*DashboardUser, error) {
 
 // dashboardUserColumns is the SELECT list for dashboard_users, kept in
 // the scanDashboardUser order.
-const dashboardUserColumns = `id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email, failed_logins, lock_until`
+const dashboardUserColumns = `id, username, password_hash, must_change, courier_address, api_token_hash, created_at, bct_user_id, bct_email, failed_logins, lock_until, is_admin`
 
 // DashboardUserByName looks up a user by username.
 func (s *Store) DashboardUserByName(username string) (*DashboardUser, error) {
@@ -1506,6 +1523,26 @@ func (s *Store) LinkBCTAccount(userID, bctUserID int64, bctEmail string) error {
 func (s *Store) UnlinkBCTAccount(userID int64) error {
 	_, err := s.db.Exec(`UPDATE dashboard_users SET bct_user_id = NULL, bct_email = '' WHERE id = ?`, userID)
 	return err
+}
+
+// SetDashboardAdmin grants or revokes dashboard admin rights (issue
+// #95). Admins may view the bridge audit log. Admin rights are never
+// self-serve: only the operator (via `courier dashboard set-admin`)
+// can grant them. It returns false when no user has that username.
+func (s *Store) SetDashboardAdmin(username string, admin bool) (bool, error) {
+	v := 0
+	if admin {
+		v = 1
+	}
+	res, err := s.db.Exec(`UPDATE dashboard_users SET is_admin = ? WHERE username = ?`, v, username)
+	if err != nil {
+		return false, fmt.Errorf("set admin: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("set admin: %w", err)
+	}
+	return n > 0, nil
 }
 
 // ChangeDashboardPassword replaces the password hash, clears must_change,
@@ -1613,18 +1650,20 @@ func (s *Store) ClearLoginFailures(userID int64) error {
 func (s *Store) SessionUser(tokenHash string) (*DashboardUser, error) {
 	var u DashboardUser
 	var mustChange int
+	var isAdmin int
 	var bctUserID sql.NullInt64
 	err := s.db.QueryRow(
-		`SELECT u.id, u.username, u.password_hash, u.must_change, u.courier_address, u.api_token_hash, u.created_at, u.bct_user_id, u.bct_email, u.failed_logins, u.lock_until
+		`SELECT u.id, u.username, u.password_hash, u.must_change, u.courier_address, u.api_token_hash, u.created_at, u.bct_user_id, u.bct_email, u.failed_logins, u.lock_until, u.is_admin
 		 FROM dashboard_sessions s JOIN dashboard_users u ON u.id = s.user_id
 		 WHERE s.token_hash = ? AND s.expires_at > strftime('%s','now')`,
 		tokenHash).Scan(&u.ID, &u.Username, &u.PasswordHash, &mustChange,
 		&u.CourierAddress, &u.APITokenHash, &u.CreatedAt, &bctUserID, &u.BCTEmail,
-		&u.FailedLogins, &u.LockUntil)
+		&u.FailedLogins, &u.LockUntil, &isAdmin)
 	if err != nil {
 		return nil, err
 	}
 	u.MustChange = mustChange != 0
+	u.IsAdmin = isAdmin != 0
 	if bctUserID.Valid {
 		u.BCTUserID = bctUserID.Int64
 	}
@@ -1655,6 +1694,10 @@ type DashboardMessage struct {
 	// never). Read paths filter expired rows; the push sweep deletes
 	// them.
 	ExpiresAt int64
+	// Bridged marks messages the pushing agent derived as bridged
+	// (issues #96/#97): arrived via a non-E2E bridge, untrusted input.
+	// Stored at push time; read paths surface it for the badge.
+	Bridged bool
 }
 
 // SaveDashboardMessage stores a pushed message; duplicates (same user +
@@ -1662,13 +1705,15 @@ type DashboardMessage struct {
 // inserted. peer is the counterparty address: the sender for inbound
 // messages, the recipient for outbound ones. replyTo/quote carry
 // reply threading metadata (issue #51); expiresAt is the issue #53
-// disappearing-message expiry, 0 for messages that never expire.
-func (s *Store) SaveDashboardMessage(userID, courierID int64, sender, recipient, peer, body string, sentAt, receivedAt, replyTo int64, quote string, expiresAt int64) (bool, error) {
+// disappearing-message expiry, 0 for messages that never expire;
+// bridged marks messages the agent derived as bridged (issues #96/#97)
+// — the dashboard displays it, never derives it.
+func (s *Store) SaveDashboardMessage(userID, courierID int64, sender, recipient, peer, body string, sentAt, receivedAt, replyTo int64, quote string, expiresAt int64, bridged bool) (bool, error) {
 	res, err := s.db.Exec(
 		`INSERT OR IGNORE INTO dashboard_messages
-		 (user_id, courier_id, sender, recipient, peer, body, sent_at, received_at, reply_to, quote, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		userID, courierID, sender, recipient, peer, body, sentAt, receivedAt, replyTo, quote, expiresAt)
+		 (user_id, courier_id, sender, recipient, peer, body, sent_at, received_at, reply_to, quote, expires_at, bridged)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		userID, courierID, sender, recipient, peer, body, sentAt, receivedAt, replyTo, quote, expiresAt, bridged)
 	if err != nil {
 		return false, err
 	}
@@ -1721,6 +1766,10 @@ type DashboardThread struct {
 	LastBody string
 	LastOut  bool  // the latest message was sent by the user
 	Unread   int64 // inbound messages newer than the user's last visit
+	// LastBridged marks threads whose latest message arrived via a
+	// non-E2E bridge (issues #96/#97), as reported by the pushing
+	// agent. The dashboard view ORs it with the body banner.
+	LastBridged bool
 }
 
 // DashboardThreads returns the user's threads, most recently active first.
@@ -1775,10 +1824,11 @@ func (s *Store) DashboardThreads(userID int64, userAddr string, limit int) ([]Da
 	// Latest message per peer.
 	const tpeer = `COALESCE(NULLIF(t.peer,''), t.sender)`
 	lrows, err := s.db.Query(
-		`SELECT p, body, sender, cnt, ts FROM (
+		`SELECT p, body, sender, cnt, ts, bridged FROM (
 		   SELECT `+tpeer+` AS p, t.body AS body, t.sender AS sender,
 		          COUNT(*) OVER (PARTITION BY `+tpeer+`) AS cnt,
 		          COALESCE(t.sent_at, t.received_at) AS ts,
+		          t.bridged AS bridged,
 		          ROW_NUMBER() OVER (PARTITION BY `+tpeer+`
 		                             ORDER BY COALESCE(t.sent_at, t.received_at) DESC, t.id DESC) AS rn
 		   FROM dashboard_messages t WHERE t.user_id = ?
@@ -1793,9 +1843,11 @@ func (s *Store) DashboardThreads(userID int64, userAddr string, limit int) ([]Da
 	for lrows.Next() {
 		var th DashboardThread
 		var sender string
-		if err := lrows.Scan(&th.Peer, &th.LastBody, &sender, &th.Count, &th.LastTS); err != nil {
+		var bridged int64
+		if err := lrows.Scan(&th.Peer, &th.LastBody, &sender, &th.Count, &th.LastTS, &bridged); err != nil {
 			return nil, err
 		}
+		th.LastBridged = bridged != 0
 		th.LastOut = sender == userAddr
 		th.Unread = unreadByPeer[th.Peer]
 		th.Handle = handles[th.Peer]
@@ -1963,7 +2015,7 @@ func (s *Store) SearchThreadPeers(userID int64, q string) ([]string, error) {
 // shows recent history instead of the oldest 500 messages.
 func (s *Store) DashboardThreadMessages(userID int64, peer string, limit int) ([]DashboardMessage, error) {
 	rows, err := s.db.Query(
-		`SELECT id, courier_id, sender, recipient, body, sent_at, received_at, reply_to, quote, expires_at
+		`SELECT id, courier_id, sender, recipient, body, sent_at, received_at, reply_to, quote, expires_at, bridged
 		 FROM dashboard_messages
 		 WHERE user_id = ? AND `+peerExpr+` = ?
 		   AND `+liveMessageExpr("")+`
@@ -1976,9 +2028,11 @@ func (s *Store) DashboardThreadMessages(userID int64, peer string, limit int) ([
 	var out []DashboardMessage
 	for rows.Next() {
 		var m DashboardMessage
-		if err := rows.Scan(&m.ID, &m.CourierID, &m.Sender, &m.Recipient, &m.Body, &m.SentAt, &m.ReceivedAt, &m.ReplyTo, &m.Quote, &m.ExpiresAt); err != nil {
+		var bridged int64
+		if err := rows.Scan(&m.ID, &m.CourierID, &m.Sender, &m.Recipient, &m.Body, &m.SentAt, &m.ReceivedAt, &m.ReplyTo, &m.Quote, &m.ExpiresAt, &bridged); err != nil {
 			return nil, err
 		}
+		m.Bridged = bridged != 0
 		out = append(out, m)
 	}
 	if err := rows.Err(); err != nil {

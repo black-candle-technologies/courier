@@ -33,7 +33,7 @@ func TestReplyPayloadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, manifests, r, _ := parseMessagePayload(raw)
+	body, manifests, r, _, _ := parseMessagePayload(raw)
 	if body != "yes, 3 works" {
 		t.Fatalf("body = %q", body)
 	}
@@ -55,7 +55,7 @@ func TestReplyPayloadWithAttachments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, manifests, r, _ := parseMessagePayload(raw)
+	body, manifests, r, _, _ := parseMessagePayload(raw)
 	if body != "see attached" || len(manifests) != 1 || manifests[0].Filename != "f.txt" {
 		t.Fatalf("body/manifests not parsed: %q %+v", body, manifests)
 	}
@@ -67,18 +67,18 @@ func TestReplyPayloadWithAttachments(t *testing.T) {
 func TestReplyPayloadValidation(t *testing.T) {
 	// Negative reply_to normalizes to "not a reply", never an error.
 	raw, _ := encodeReplyPayload("hi", -3, "x", nil, 0)
-	if _, _, r, _ := parseMessagePayload(raw); r.To != 0 {
+	if _, _, r, _, _ := parseMessagePayload(raw); r.To != 0 {
 		t.Fatalf("negative reply_to not normalized: %+v", r)
 	}
 	// Unknown versions fall back to raw text.
 	for _, v := range []string{`{"v":99,"body":"hi","reply_to":1}`, `{"v":0}`, `not json`} {
-		b, ms, r, _ := parseMessagePayload([]byte(v))
+		b, ms, r, _, _ := parseMessagePayload([]byte(v))
 		if b != v || len(ms) != 0 || r.To != 0 {
 			t.Fatalf("payload %q misparsed: %q %+v %+v", v, b, ms, r)
 		}
 	}
 	// v1 with a foreign reply_to field: v1 semantics frozen, ignored.
-	b, ms, r, _ := parseMessagePayload([]byte(`{"v":1,"body":"hi","reply_to":9,"attachments":[]}`))
+	b, ms, r, _, _ := parseMessagePayload([]byte(`{"v":1,"body":"hi","reply_to":9,"attachments":[]}`))
 	if b != `{"v":1,"body":"hi","reply_to":9,"attachments":[]}` || len(ms) != 0 || r.To != 0 {
 		t.Fatalf("v1+reply_to not treated as raw text: %q %+v %+v", b, ms, r)
 	}
@@ -145,7 +145,7 @@ func TestEncodeMessageBodyWireChoice(t *testing.T) {
 	if err := json.Unmarshal(raw, &v); err != nil || v.Version != 2 {
 		t.Fatalf("reply+attachments must be v2: %s", raw)
 	}
-	body, ms, r, _ := parseMessagePayload(raw)
+	body, ms, r, _, _ := parseMessagePayload(raw)
 	if body != "re: docs" || len(ms) != 1 || r.To != 42 || r.Quote != "send docs" {
 		t.Fatalf("v2 reply+attachments misparsed: %q %+v %+v", body, ms, r)
 	}

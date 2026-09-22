@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
+
+	"github.com/black-candle-technologies/courier/internal/client"
 )
 
 func TestSplitSendArgs(t *testing.T) {
@@ -152,5 +155,45 @@ func TestSplitBackupArgs(t *testing.T) {
 				t.Errorf("force = %v, want %v", force, tc.wantForce)
 			}
 		})
+	}
+}
+
+// TestToStdioMessageBridged: the stdio bridge (the agent integration
+// surface) must carry the bridged flag (issues #96/#97) — dropping it
+// here would silently strip the untrusted-input signal from agent
+// consumers.
+func TestToStdioMessageBridged(t *testing.T) {
+	bridged := toStdioMessage(client.Message{
+		ID: 7, From: "ed25519:bridge", Body: "hi", Bridged: true,
+	})
+	if !bridged.Bridged {
+		t.Error("bridged flag lost in stdio mapping")
+	}
+	plain := toStdioMessage(client.Message{
+		ID: 8, From: "ed25519:peer", Body: "hi",
+	})
+	if plain.Bridged {
+		t.Error("ordinary message mapped as bridged")
+	}
+	// The flag is serialized (omitempty): a careless agent parsing the
+	// JSON still sees bridged:true, and sees nothing for the rest.
+	raw, err := json.Marshal(bridged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire["bridged"] != true {
+		t.Errorf("bridged not serialized: %s", raw)
+	}
+	raw, _ = json.Marshal(plain)
+	wire = nil
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := wire["bridged"]; ok {
+		t.Error("non-bridged message must omit the bridged field")
 	}
 }

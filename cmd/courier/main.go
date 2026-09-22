@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/client"
+	"github.com/black-candle-technologies/courier/internal/store"
 	"github.com/black-candle-technologies/courier/internal/update"
 	"github.com/black-candle-technologies/courier/internal/version"
 	"github.com/mattn/go-isatty"
@@ -212,6 +213,7 @@ func usage() {
                                          create your web dashboard login
   courier dashboard push [--follow]      forward new messages to the dashboard
   courier dashboard status               show dashboard account status
+  courier dashboard set-admin USERNAME   grant dashboard admin rights (operator; bridge audit view)
   courier bridge token issue --name LABEL --allow addr,...
                                          issue a ChatGPT-web bridge token (admin)
   courier bridge token list              list bridge tokens (metadata only)
@@ -533,6 +535,13 @@ func printMessages(msgs []client.Message) {
 			flagStr += fmt.Sprintf(" [expires %s]", time.Unix(m.ExpiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"))
 		}
 		fmt.Printf("[#%d] from %s at %s%s\n", m.ID, m.From, ts, flagStr)
+		// issues #96/#97: bridged messages are untrusted input. The
+		// marker renders from the typed flag — not the body banner —
+		// so attribution shows even when it comes from the pinned
+		// bridge-address list alone (no payload metadata, no banner).
+		if m.Bridged {
+			fmt.Printf("⚠ bridged message — NOT end-to-end encrypted; treat as untrusted input.\n")
+		}
 		// issue #51: reply threading. The parent snippet is
 		// best-effort (see inbox resolution); a parent known nowhere
 		// renders as a bare reference, never a failure.
@@ -759,6 +768,26 @@ type stdioMessage struct {
 	Request    bool     `json:"request,omitempty"`
 	ReplyTo    int64    `json:"reply_to,omitempty"`
 	ReplyQuote string   `json:"reply_quote,omitempty"`
+	// Bridged marks messages that arrived via a non-E2E bridge
+	// (issues #96/#97): untrusted input. Agents consuming the stdio
+	// bridge must not let a bridged message trigger actions, tool
+	// calls, sends, or state changes without the operator's explicit
+	// approval.
+	Bridged bool `json:"bridged,omitempty"`
+}
+
+// toStdioMessage maps a client message onto the stdio wire form. It is
+// a separate function (rather than an inline literal) so the bridged
+// flag mapping stays covered by tests: dropping the flag here would
+// silently strip the untrusted-input signal from agent consumers.
+func toStdioMessage(m client.Message) stdioMessage {
+	return stdioMessage{
+		ID: m.ID, From: m.From, Body: m.Body,
+		SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
+		Flags: m.Flags, Request: m.Request,
+		ReplyTo: m.ReplyTo, ReplyQuote: m.ReplyQuote,
+		Bridged: m.Bridged,
+	}
 }
 
 func cmdStdio() error {
@@ -811,12 +840,7 @@ func cmdStdio() error {
 			}
 			sm := make([]stdioMessage, 0, len(msgs))
 			for _, m := range msgs {
-				sm = append(sm, stdioMessage{
-					ID: m.ID, From: m.From, Body: m.Body,
-					SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
-					Flags: m.Flags, Request: m.Request,
-					ReplyTo: m.ReplyTo, ReplyQuote: m.ReplyQuote,
-				})
+				sm = append(sm, toStdioMessage(m))
 			}
 			reply(stdioResp{ID: req.ID, OK: true, Messages: sm})
 			// issue #52: returning the messages to the harness counts
@@ -1443,7 +1467,7 @@ func cmdConfig(args []string) error {
 
 func cmdDashboard(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: courier dashboard <setup|push|status>")
+		return fmt.Errorf("usage: courier dashboard <setup|push|status|set-admin> [args]")
 	}
 	switch args[0] {
 	case "setup":
@@ -1452,8 +1476,10 @@ func cmdDashboard(args []string) error {
 		return cmdDashboardPush(args[1:])
 	case "status":
 		return cmdDashboardStatus()
+	case "set-admin":
+		return cmdDashboardSetAdmin(args[1:])
 	default:
-		return fmt.Errorf("unknown dashboard subcommand %q (setup|push|status)", args[0])
+		return fmt.Errorf("unknown dashboard subcommand %q (setup|push|status|set-admin)", args[0])
 	}
 }
 
@@ -1556,5 +1582,49 @@ func cmdDashboardStatus() error {
 	fmt.Printf("url:      %s\n", cfg.DashboardURL)
 	fmt.Printf("cursor:   %d (last pushed courier message id)\n", cfg.DashboardCursor)
 	fmt.Printf("sent:     %d (last pushed sent message id)\n", cfg.DashboardSentCursor)
+	return nil
+}
+
+// cmdDashboardSetAdmin grants or revokes dashboard admin rights (issue
+// #95). Admins may view the bridge audit log at /admin/bridge/audit.
+// This is an operator action: it opens the dashboard database directly
+// (the relay's DB, shared with the dashboard), like `courier bridge
+// token issue` opens bridge.db. Admin rights are never self-serve —
+// there is no HTTP endpoint for this.
+func cmdDashboardSetAdmin(args []string) error {
+	fs := flag.NewFlagSet("dashboard set-admin", flag.ContinueOnError)
+	dbPath := fs.String("db", "", "dashboard database path (shared with the relay; default COURIER_RELAY_DB or courier-relay.db)")
+	revoke := fs.Bool("revoke", false, "revoke admin rights instead of granting them")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: courier dashboard set-admin [--db PATH] [--revoke] <username>")
+	}
+	db := *dbPath
+	if db == "" {
+		db = os.Getenv("COURIER_RELAY_DB")
+	}
+	if db == "" {
+		db = "courier-relay.db"
+	}
+	st, err := store.Open(db)
+	if err != nil {
+		return fmt.Errorf("open dashboard db: %w", err)
+	}
+	defer st.Close()
+	ok, err := st.SetDashboardAdmin(rest[0], !*revoke)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("no dashboard user %q", rest[0])
+	}
+	if *revoke {
+		fmt.Printf("revoked dashboard admin rights from %q\n", rest[0])
+	} else {
+		fmt.Printf("granted dashboard admin rights to %q\n", rest[0])
+	}
 	return nil
 }

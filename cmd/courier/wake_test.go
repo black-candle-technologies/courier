@@ -65,6 +65,11 @@ func TestWakeInstallWritesUnit(t *testing.T) {
 	if !strings.Contains(execStart, "/opt/hooks/wake.sh") {
 		t.Errorf("ExecStart missing wake command: %q", execStart)
 	}
+	// Issue #97: the install path persists the daemon flags so the
+	// installed unit keeps the operator's bridged-dispatch choice.
+	if !strings.Contains(execStart, "--suppress-bridged-actions false") {
+		t.Errorf("ExecStart missing persisted --suppress-bridged-actions: %q", execStart)
+	}
 	if strings.Contains(execStart, "sh -c") || strings.Contains(execStart, "/bin/sh") {
 		t.Errorf("ExecStart must not involve a shell: %q", execStart)
 	}
@@ -80,5 +85,13 @@ func TestWakeInstallWritesUnit(t *testing.T) {
 	raw, _ = os.ReadFile(unitPath)
 	if !strings.Contains(string(raw), "/other/hook") {
 		t.Error("forced install did not overwrite the unit")
+	}
+	// --suppress-bridged-actions persists as true when requested.
+	if err := cmdWakeInstall([]string{"--force", "--suppress-bridged-actions", "--", "/other/hook"}); err != nil {
+		t.Fatalf("install --suppress-bridged-actions: %v", err)
+	}
+	raw, _ = os.ReadFile(unitPath)
+	if !strings.Contains(string(raw), "--suppress-bridged-actions true") {
+		t.Errorf("unit missing persisted --suppress-bridged-actions true:\n%s", raw)
 	}
 }

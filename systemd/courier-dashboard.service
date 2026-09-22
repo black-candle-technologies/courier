@@ -37,8 +37,6 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictNamespaces=true
-# TCP/UDP only (+AF_UNIX, harmless): the dashboard binds 0.0.0.0:8471
-# and dials authd over HTTPS for Black Candle OAuth (issue #94).
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallFilter=@system-service
 SystemCallArchitectures=native
@@ -47,6 +45,13 @@ CapabilityBoundingSet=
 UMask=0027
 MemoryMax=512M
 TasksMax=256
+# Optional (issue #95, bridge audit admin view): create
+# /etc/courier-dashboard.env (0600, root:root) holding
+# COURIER_BRIDGE_AUDIT_URL=<gateway base URL> and
+# COURIER_BRIDGE_AUDIT_ADMIN_TOKEN=<gateway admin token>, then add
+# EnvironmentFile=/etc/courier-dashboard.env below. Both must be
+# set; the audit view is dormant when either is empty. Grant admins
+# with `courier dashboard set-admin <username>` on the dashboard DB.
 
 [Install]
 WantedBy=multi-user.target

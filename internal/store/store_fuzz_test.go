@@ -175,7 +175,7 @@ func fuzzSearchUser(s *Store, t *testing.T) int64 {
 	bodies := []string{"hello world", "100% legit", "under_score test", `back\slash`, "prefix hello suffix"}
 	for i, b := range bodies {
 		if _, err := s.SaveDashboardMessage(u.ID, int64(i+1), "ed25519:sender", "", "ed25519:peer",
-			b, 1780000000, 1780000000, 0, "", 0); err != nil {
+			b, 1780000000, 1780000000, 0, "", 0, false); err != nil {
 			t.Fatal(err)
 		}
 	}

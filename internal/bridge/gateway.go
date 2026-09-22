@@ -41,7 +41,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/black-candle-technologies/courier/internal/client"
 	"github.com/black-candle-technologies/courier/internal/crypto"
 )
 
@@ -77,7 +76,7 @@ const BridgeCapability = "bridge-chatgpt-web"
 // Sender delivers a bridge-attributed message. The production
 // implementation is *client.Client.SendBridged; tests stub it.
 type Sender interface {
-	SendBridged(address, wrappedBody string, meta *client.BridgeMeta) (int64, error)
+	SendBridged(address, wrappedBody string, meta *BridgeMeta) (int64, error)
 }
 
 // Gateway is the bridge ingest service.
@@ -92,6 +91,11 @@ type Gateway struct {
 	bodyCap   int
 	version   string
 	now       func() time.Time // overridable in tests
+	// adminHash/adminEnabled gate the read-only audit API (issue #95):
+	// SHA-256 of the provisioned COURIER_BRIDGE_ADMIN_TOKEN. The API
+	// is dormant (404) until SetAdminToken is called.
+	adminHash    [32]byte
+	adminEnabled bool
 }
 
 // NewGateway builds a gateway. address is the bridge identity's
@@ -127,6 +131,10 @@ func (g *Gateway) Routes() *http.ServeMux {
 	mux.HandleFunc("/v1/bridge/health", g.handleHealth)
 	mux.HandleFunc("/v1/bridge/ingest", g.handleIngest)
 	mux.HandleFunc("/v1/bridge/status", g.handleStatus)
+	// issue #95: read-only admin audit API. Dormant (404) until
+	// SetAdminToken provisions the admin bearer token.
+	mux.HandleFunc("/v1/bridge/audit", g.handleAuditList)
+	mux.HandleFunc("/v1/bridge/audit/verify", g.handleAuditVerify)
 	return mux
 }
 
@@ -344,8 +352,8 @@ func (g *Gateway) handleIngest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errJSON(500, "internal error"))
 		return
 	}
-	meta := &client.BridgeMeta{
-		Origin:     client.BridgeOriginChatGPTWeb,
+	meta := &BridgeMeta{
+		Origin:     BridgeOriginChatGPTWeb,
 		GatewayFP:  g.gatewayFP,
 		TokenLabel: tok.Label,
 		AuditID:    reservedID,

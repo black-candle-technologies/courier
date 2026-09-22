@@ -193,7 +193,7 @@ func TestDashboardThreadsUnreadCounts(t *testing.T) {
 
 	push := func(courierID int64, sender, peer, body string, ts int64) {
 		t.Helper()
-		if _, err := s.SaveDashboardMessage(uid, courierID, sender, self, peer, body, ts, ts, 0, "", 0); err != nil {
+		if _, err := s.SaveDashboardMessage(uid, courierID, sender, self, peer, body, ts, ts, 0, "", 0, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -285,7 +285,7 @@ func TestDashboardThreadMessagesNewest500(t *testing.T) {
 	peer := "ed25519:peer"
 	for i := int64(1); i <= 600; i++ {
 		body := "msg-" + strconv.FormatInt(i, 10)
-		if _, err := s.SaveDashboardMessage(uid, i, peer, self, peer, body, i, i, 0, "", 0); err != nil {
+		if _, err := s.SaveDashboardMessage(uid, i, peer, self, peer, body, i, i, 0, "", 0, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -417,10 +417,10 @@ func TestDashboardMessageReplyThreading(t *testing.T) {
 	uid := int64(1)
 	self := "ed25519:self"
 	peer := "ed25519:peer"
-	if _, err := s.SaveDashboardMessage(uid, 1, peer, "", peer, "parent", 100, 100, 0, "", 0); err != nil {
+	if _, err := s.SaveDashboardMessage(uid, 1, peer, "", peer, "parent", 100, 100, 0, "", 0, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SaveDashboardMessage(uid, 2, self, peer, peer, "reply", 101, 101, 1, "parent", 0); err != nil {
+	if _, err := s.SaveDashboardMessage(uid, 2, self, peer, peer, "reply", 101, 101, 1, "parent", 0, false); err != nil {
 		t.Fatal(err)
 	}
 	msgs, err := s.DashboardThreadMessages(uid, peer, 500)
@@ -545,5 +545,92 @@ func TestLoginBackoffGrowth(t *testing.T) {
 		if got := LoginBackoff(n, base, max); got != want {
 			t.Errorf("LoginBackoff(%d) = %v, want %v", n, got, want)
 		}
+	}
+}
+
+// TestDashboardMessageBridgedRoundTrip: the bridged flag (issues
+// #96/#97) survives the dashboard push store round trip — both the
+// per-message read path and the thread-list latest-message query — so
+// the dashboard can badge pin-list-derived attribution it never
+// derived itself.
+func TestDashboardMessageBridgedRoundTrip(t *testing.T) {
+	s := testStore(t)
+	self := "ed25519:self"
+	peer := "ed25519:peer"
+	uid := int64(1)
+	if _, err := s.SaveDashboardMessage(uid, 1, peer, "", peer, "plain", 100, 100, 0, "", 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SaveDashboardMessage(uid, 2, peer, "", peer, "via bridge", 101, 101, 0, "", 0, true); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := s.DashboardThreadMessages(uid, peer, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %d, want 2", len(msgs))
+	}
+	if msgs[0].Bridged {
+		t.Error("ordinary message read back as bridged")
+	}
+	if !msgs[1].Bridged {
+		t.Error("bridged message lost its flag on read")
+	}
+	threads, err := s.DashboardThreads(uid, self, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(threads) != 1 {
+		t.Fatalf("threads = %d, want 1", len(threads))
+	}
+	if !threads[0].LastBridged {
+		t.Error("thread list lost the latest message's bridged flag")
+	}
+}
+
+// TestDashboardMessageBridgedMigration: a pre-change dashboard DB
+// (rows written before the bridged column existed) still opens and
+// reads — the migration backfills bridged=0 and the badge falls back
+// to the body banner (issues #96/#97, never fail closed on a healthy
+// DB).
+func TestDashboardMessageBridgedMigration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "old.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a pre-change schema: drop the column the migration
+	// added and remove its ledger row, then re-open so the migration
+	// re-runs and re-adds it.
+	if _, err := s.db.Exec(`ALTER TABLE dashboard_messages DROP COLUMN bridged`); err != nil {
+		s.Close()
+		t.Skipf("sqlite cannot drop column: %v", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM schema_migrations WHERE version = 21`); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO dashboard_messages
+		 (user_id, courier_id, sender, recipient, peer, body, sent_at, received_at, reply_to, quote, expires_at)
+		 VALUES (1, 1, 'ed25519:peer', '', 'ed25519:peer', 'old row', 100, 100, 0, '', 0)`); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	s.Close()
+	// Re-open: the migration must adopt the old DB, not fail on it.
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("re-open after migration: %v", err)
+	}
+	defer s2.Close()
+	msgs, err := s2.DashboardThreadMessages(1, "ed25519:peer", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].Bridged {
+		t.Fatalf("old row misread: %+v", msgs)
 	}
 }

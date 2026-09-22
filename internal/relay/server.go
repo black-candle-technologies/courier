@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -90,6 +91,17 @@ type Config struct {
 	// (e.g. "courier", "admin", "support"): they can never be
 	// registered by anyone. Normalized to lowercase.
 	ReservedHandles []string
+	// BridgeOrigins maps registered bridge sender addresses to their
+	// origin label (issue #98), e.g.
+	// {"ed25519:<base64url>": "chatgpt-web"}. The relay operator
+	// configures the bridge identities out of band — "coordinated in
+	// advance" — and the relay marks envelopes from those senders with
+	// the advisory `bridged:<origin>` sender flag in inbox responses.
+	// The flag is metadata-only (computed from the sender address at
+	// read time, never from content) and purely additive: no wire
+	// change, no protocol break. Old clients ignore the unknown flag
+	// value and old relays simply never emit it.
+	BridgeOrigins map[string]string
 }
 
 // DefaultConfig returns the standard abuse-control tuning: generous
@@ -135,6 +147,9 @@ type Server struct {
 	blobUploadLimiter *Limiter
 	// reserved holds operator-reserved handles (lowercase).
 	reserved map[string]bool
+	// bridgeOrigins holds validated bridge sender addresses mapped to
+	// their origin label (issue #98), copied from Config.BridgeOrigins.
+	bridgeOrigins map[string]string
 	// subs tracks held /v1/inbox/subscribe long-poll requests
 	// (issue #42), keyed by recipient address. Guarded by subMu.
 	subMu sync.Mutex
@@ -186,6 +201,21 @@ func NewWithConfig(st *store.Store, cfg Config) *Server {
 			reserved[n] = true
 		}
 	}
+	// Validate the operator-registered bridge identities (issue #98):
+	// keys must parse as Courier addresses and origin labels must be
+	// safe flag tokens. Invalid entries are dropped, never fatal — a
+	// typo in the operator config must not stop the relay, it just
+	// means that sender is not flagged.
+	bridgeOrigins := make(map[string]string, len(cfg.BridgeOrigins))
+	for addr, origin := range cfg.BridgeOrigins {
+		if _, err := crypto.ParseAddress(addr); err != nil {
+			continue
+		}
+		if !ValidBridgeOriginLabel(origin) {
+			continue
+		}
+		bridgeOrigins[addr] = origin
+	}
 	return &Server{
 		store:            st,
 		cfg:              cfg,
@@ -196,9 +226,22 @@ func NewWithConfig(st *store.Store, cfg Config) *Server {
 		// Issue #100: byte-priced bucket, separate from the send limiter.
 		blobUploadLimiter: NewLimiter(cfg.BlobUploadBurstBytes, cfg.BlobUploadRateBytesPerSec),
 		reserved:          reserved,
+		bridgeOrigins:     bridgeOrigins,
 		subs:              make(map[string]map[*subscriber]struct{}),
 	}
 }
+
+// bridgeOriginRe constrains operator-configured bridge origin labels
+// (issue #98): they ride inside the `bridged:<origin>` sender flag, so
+// they must be lowercase flag-safe tokens (1-32 chars).
+var bridgeOriginRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+
+// ValidBridgeOriginLabel reports whether origin is a safe token for
+// the `bridged:<origin>` sender flag (issue #98): lowercase, 1-32
+// chars, letters/digits/dashes/underscores. The relay CLI validates
+// with this and fails loudly; NewWithConfig applies the same rule
+// leniently (dropping invalid entries) for programmatic callers.
+func ValidBridgeOriginLabel(origin string) bool { return bridgeOriginRe.MatchString(origin) }
 
 // Routes returns the HTTP handler with all endpoints registered.
 func (s *Server) Routes() http.Handler {

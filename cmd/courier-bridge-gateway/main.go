@@ -70,7 +70,10 @@ func usage() {
       Run the ingest gateway (localhost-only unless --allow-remote).
   courier-bridge-gateway version
 
-  env: COURIER_BRIDGE_PEPPER (required for serve: token-hash pepper)`)
+  env: COURIER_BRIDGE_PEPPER (required for serve: token-hash pepper)
+       COURIER_BRIDGE_ADMIN_TOKEN (optional: enables the read-only admin
+       audit API at /v1/bridge/audit; generate with "openssl rand -hex 32"
+       and keep it in the root-only env file — see docs/bridge.md)`)
 }
 
 func cmdInit(args []string) error {
@@ -189,6 +192,15 @@ func cmdServe(args []string) error {
 		log.Printf("pruned %d audit rows older than retention", n)
 	}
 	gw := bridge.NewGateway(st, client.New(cfg), pepper, cfg.Address, id.EdPub[:], version.Bridge)
+	// issue #95: provision the admin bearer token for the read-only
+	// audit API. The raw secret never leaves this process's memory;
+	// only its SHA-256 is kept (see bridge.SetAdminToken).
+	if adminToken := os.Getenv("COURIER_BRIDGE_ADMIN_TOKEN"); adminToken != "" {
+		gw.SetAdminToken(adminToken)
+		log.Printf("bridge admin audit API enabled at /v1/bridge/audit")
+	} else {
+		log.Printf("bridge admin audit API disabled (COURIER_BRIDGE_ADMIN_TOKEN not set)")
+	}
 	// COURIER_BRIDGE_BODY_CAP_BYTES optionally overrides the ingest body cap
 	// (default 64 KiB). Unset keeps the default; the value is bytes.
 	if v := strings.TrimSpace(os.Getenv("COURIER_BRIDGE_BODY_CAP_BYTES")); v != "" {

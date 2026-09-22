@@ -10,9 +10,16 @@
 //
 //	courier-dashboard [--addr :8471] [--db courier-relay.db]
 //	                   [--tls-cert tls.crt] [--tls-key tls.key]
+//	                   [--bridge-audit-url URL --bridge-audit-admin-token TOKEN]
 //
 // TLS uses the same self-signed certificate as the relay (generated on
 // first run next to the database if missing).
+//
+// The bridge audit admin view (issue #95) is config-gated: pass the
+// gateway base URL and the gateway's admin bearer token (or the
+// COURIER_BRIDGE_AUDIT_URL / COURIER_BRIDGE_AUDIT_ADMIN_TOKEN env
+// vars) to enable /admin/bridge/audit for dashboard admins. Both must
+// be set; the feature is dormant otherwise.
 package main
 
 import (
@@ -49,11 +56,25 @@ func main() {
 		"OAuth client_secret for the Black Candle provider")
 	bctOAuthRedirectURI := flag.String("bct-oauth-redirect-uri", os.Getenv("BCT_OAUTH_REDIRECT_URI"),
 		"Exact OAuth redirect URI registered with the provider (default: derived from each request)")
+	// Bridge audit admin view (issue #95): the dashboard fetches the
+	// gateway's read-only audit API and renders it for dashboard admins
+	// only. Both must be set; either alone is a fatal config error.
+	// The feature is dormant when both are empty. The admin token is a
+	// secret: keep it in the root-only env file, never in the shell
+	// history (prefer the env var over the flag).
+	bridgeAuditURL := flag.String("bridge-audit-url", os.Getenv("COURIER_BRIDGE_AUDIT_URL"),
+		"bridge gateway base URL for the admin audit view (e.g. http://127.0.0.1:8473; empty disables)")
+	bridgeAuditToken := flag.String("bridge-audit-admin-token", os.Getenv("COURIER_BRIDGE_AUDIT_ADMIN_TOKEN"),
+		"admin bearer token for the bridge gateway audit API (COURIER_BRIDGE_ADMIN_TOKEN on the gateway side)")
 	flag.Parse()
 
 	bctOAuthSet := *bctOAuthURL != "" || *bctOAuthClientID != "" || *bctOAuthClientSecret != ""
 	if bctOAuthSet && (*bctOAuthURL == "" || *bctOAuthClientID == "" || *bctOAuthClientSecret == "") {
 		log.Fatalf("BCT OAuth is partially configured: bct-oauth-url, bct-oauth-client-id, and bct-oauth-client-secret must all be set")
+	}
+	bridgeAuditSet := *bridgeAuditURL != "" || *bridgeAuditToken != ""
+	if bridgeAuditSet && (*bridgeAuditURL == "" || *bridgeAuditToken == "") {
+		log.Fatalf("bridge audit view is partially configured: bridge-audit-url and bridge-audit-admin-token must both be set")
 	}
 
 	st, err := store.Open(*dbPath)
@@ -75,12 +96,15 @@ func main() {
 
 	srv := &http.Server{
 		Addr: *addr,
-		Handler: loggingMiddleware(dashboard.NewWithBCTAndLimits(st, dashboard.BCTOAuthConfig{
+		Handler: loggingMiddleware(dashboard.NewFull(st, dashboard.BCTOAuthConfig{
 			URL:          *bctOAuthURL,
 			ClientID:     *bctOAuthClientID,
 			ClientSecret: *bctOAuthClientSecret,
 			RedirectURI:  *bctOAuthRedirectURI,
-		}, dashboard.AuthLimitsFromEnv()).Routes()),
+		}, dashboard.AuthLimitsFromEnv(), dashboard.BridgeAuditConfig{
+			URL:        *bridgeAuditURL,
+			AdminToken: *bridgeAuditToken,
+		}).Routes()),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
@@ -97,6 +121,9 @@ func main() {
 		lim.RegisterAttemptsPerIP, lim.RegisterIPWindow,
 		lim.OAuthAttemptsPerIP, lim.OAuthIPWindow, lim.OAuthAttemptsGlobal, lim.OAuthGlobalWindow,
 		lim.TrustedProxies)
+	if bridgeAuditSet {
+		log.Printf("bridge audit admin view enabled (gateway %s)", *bridgeAuditURL)
+	}
 
 	go func() {
 		log.Printf("courier-dashboard listening with TLS on %s (db %s)", *addr, *dbPath)
