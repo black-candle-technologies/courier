@@ -29,15 +29,11 @@ func pushWithToken(t *testing.T, srv *Server, username string, payload map[strin
 		t.Fatalf("push: got %d: %s", rec.Code, rec.Body.String())
 	}
 	// Log in (forced password change first).
-	cookie := login(t, srv, username, "temporary-password-123")
+	creds := login(t, srv, username, "temporary-password-123")
 	form := url.Values{"password": {"a-new-password-123"}, "confirm": {"a-new-password-123"}}
-	req2 := httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
-	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req2.AddCookie(cookie)
-	rec2 := httptest.NewRecorder()
-	srv.Routes().ServeHTTP(rec2, req2)
+	rec2 := postChangePassword(t, srv, creds, form)
 	if rec2.Code != 303 {
-		t.Fatalf("change-password: got %d", rec2.Code)
+		t.Fatalf("change-password: got %d: %s", rec2.Code, rec2.Body.String())
 	}
 	for _, c := range rec2.Result().Cookies() {
 		if c.Name == sessionCookie {

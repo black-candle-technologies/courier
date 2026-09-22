@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -274,9 +275,23 @@ func oauthTestUser(t *testing.T, rg *oauthTestRig, username string) (*store.Dash
 	if err != nil {
 		t.Fatal(err)
 	}
-	form := url.Values{"username": {username}, "password": {"dashboard-password-1"}}
+	// Issue #111: the login form requires the pre-login double-submit
+	// CSRF token. Fetch it from the login page first.
+	getResp := rg.get(t, rg.dash.URL+"/", "")
+	var loginCSRF string
+	for _, c := range getResp.Cookies() {
+		if c.Name == loginCSRFCookie {
+			loginCSRF = c.Value
+		}
+	}
+	_ = getResp.Body.Close()
+	if loginCSRF == "" {
+		t.Fatal("login: no pre-login CSRF cookie")
+	}
+	form := url.Values{"username": {username}, "password": {"dashboard-password-1"}, csrfField: {loginCSRF}}
 	req, _ := http.NewRequest("POST", rg.dash.URL+"/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: loginCSRFCookie, Value: loginCSRF})
 	resp, err := rg.client.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -285,16 +300,33 @@ func oauthTestUser(t *testing.T, rg *oauthTestRig, username string) (*store.Dash
 	if resp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("login: got %d", resp.StatusCode)
 	}
-	cookie := ""
+	// The login sets the session cookie; the session's CSRF token
+	// (issue #111) lives in the session DB row, not a second cookie.
+	var cookie string
 	for _, c := range resp.Cookies() {
 		if c.Name == sessionCookie {
 			cookie = c.Name + "=" + c.Value
 		}
 	}
 	if cookie == "" {
-		t.Fatal("login: no session cookie")
+		t.Fatalf("login: no session cookie, got %v", resp.Cookies())
 	}
 	return u, cookie
+}
+
+// settingsCSRFToken fetches /settings and extracts the hidden CSRF
+// token, like a browser rendering the unlink form.
+var csrfHiddenRe = regexp.MustCompile(`name="csrf_token" value="([^"]+)"`)
+
+func settingsCSRFToken(t *testing.T, rg *oauthTestRig, cookie string) string {
+	t.Helper()
+	resp := rg.get(t, rg.dash.URL+"/settings", cookie)
+	body := readBody(t, resp)
+	m := csrfHiddenRe.FindStringSubmatch(body)
+	if m == nil {
+		t.Fatalf("no CSRF token in /settings page")
+	}
+	return m[1]
 }
 
 func readBody(t *testing.T, resp *http.Response) string {
@@ -445,7 +477,12 @@ func TestOAuthUnlinkStillWorks(t *testing.T) {
 	if err := rg.srv.store.LinkBCTAccount(u.ID, rg.provider.account.id, rg.provider.account.email); err != nil {
 		t.Fatal(err)
 	}
-	req, _ := http.NewRequest("POST", rg.dash.URL+"/settings/unlink-bct", nil)
+	// Issue #111: unlink requires the session's synchronizer CSRF token;
+	// pull it from the settings page like a browser would.
+	csrf := settingsCSRFToken(t, rg, cookie)
+	form := url.Values{csrfField: {csrf}}
+	req, _ := http.NewRequest("POST", rg.dash.URL+"/settings/unlink-bct", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Cookie", cookie)
 	resp, err := rg.client.Do(req)
 	if err != nil {

@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
 	"github.com/black-candle-technologies/courier/internal/store"
+	"github.com/black-candle-technologies/courier/internal/version"
 )
 
 // MaxCiphertextBytes caps a single message at 256 KiB.
@@ -70,6 +72,21 @@ type Config struct {
 	// endpoint, so its budget is deliberately tight.
 	DirSearchBurst      float64
 	DirSearchRatePerSec float64
+	// BlobUploadBurstBytes / BlobUploadRateBytesPerSec bound blob
+	// uploads per uploader with a byte-priced token bucket (issue
+	// #100), separate from the send limiter: blob bytes are far more
+	// expensive than message bytes. The burst must exceed
+	// envelope.MaxBlobBytes or every upload is rejected.
+	BlobUploadBurstBytes      float64
+	BlobUploadRateBytesPerSec float64
+	// BlobQuotaBytes caps the total stored blob bytes per uploader
+	// identity within the retention window (issue #100). It is enforced
+	// atomically at upload time; freed bytes return to the quota when
+	// retention pruning deletes the blobs. Uploaders whose pre-quota
+	// stored bytes already exceed this reject new uploads until pruning
+	// brings them under — raise the flag rather than the code if that
+	// bites a real database.
+	BlobQuotaBytes int64
 	// ReservedHandles are operator-reserved administrative handles
 	// (e.g. "courier", "admin", "support"): they can never be
 	// registered by anyone. Normalized to lowercase.
@@ -104,6 +121,14 @@ func DefaultConfig() Config {
 		DirLookupRatePerSec: 1,
 		DirSearchBurst:      10,
 		DirSearchRatePerSec: 10.0 / 60,
+		// Issue #100: blob uploads get their own byte-priced bucket and
+		// a durable per-uploader quota. A 256 MiB burst (~10 max-size
+		// uploads) with 2 MiB/sec sustained is invisible to legitimate
+		// attachment traffic and blunts disk-fill floods; 1 GiB per
+		// uploader within the retention window bounds total storage.
+		BlobUploadBurstBytes:      256 << 20,
+		BlobUploadRateBytesPerSec: 2 << 20,
+		BlobQuotaBytes:            1 << 30,
 	}
 }
 
@@ -117,6 +142,9 @@ type Server struct {
 	dirWriteLimiter  *Limiter
 	dirLookupLimiter *Limiter
 	dirSearchLimiter *Limiter
+	// blobUploadLimiter is separate from the send limiter: blob bytes
+	// are far more expensive than message bytes (issue #100).
+	blobUploadLimiter *Limiter
 	// reserved holds operator-reserved handles (lowercase).
 	reserved map[string]bool
 	// bridgeOrigins holds validated bridge sender addresses mapped to
@@ -158,6 +186,15 @@ func NewWithConfig(st *store.Store, cfg Config) *Server {
 	if cfg.DirSearchRatePerSec <= 0 {
 		cfg.DirSearchRatePerSec = def.DirSearchRatePerSec
 	}
+	if cfg.BlobUploadBurstBytes <= 0 {
+		cfg.BlobUploadBurstBytes = def.BlobUploadBurstBytes
+	}
+	if cfg.BlobUploadRateBytesPerSec <= 0 {
+		cfg.BlobUploadRateBytesPerSec = def.BlobUploadRateBytesPerSec
+	}
+	if cfg.BlobQuotaBytes <= 0 {
+		cfg.BlobQuotaBytes = def.BlobQuotaBytes
+	}
 	reserved := make(map[string]bool, len(cfg.ReservedHandles))
 	for _, h := range cfg.ReservedHandles {
 		if n, err := envelope.NormalizeHandle(strings.ToLower(h)); err == nil {
@@ -186,9 +223,11 @@ func NewWithConfig(st *store.Store, cfg Config) *Server {
 		dirWriteLimiter:  NewLimiter(cfg.DirWriteBurst, cfg.DirWriteRatePerSec),
 		dirLookupLimiter: NewLimiter(cfg.DirLookupBurst, cfg.DirLookupRatePerSec),
 		dirSearchLimiter: NewLimiter(cfg.DirSearchBurst, cfg.DirSearchRatePerSec),
-		reserved:         reserved,
-		bridgeOrigins:    bridgeOrigins,
-		subs:             make(map[string]map[*subscriber]struct{}),
+		// Issue #100: byte-priced bucket, separate from the send limiter.
+		blobUploadLimiter: NewLimiter(cfg.BlobUploadBurstBytes, cfg.BlobUploadRateBytesPerSec),
+		reserved:          reserved,
+		bridgeOrigins:     bridgeOrigins,
+		subs:              make(map[string]map[*subscriber]struct{}),
 	}
 }
 
@@ -269,7 +308,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"ok":        true,
 		"time":      time.Now().UTC().Format(time.RFC3339),
 		"envelopes": n,
-		"version":   "0.9.0",
+		"version":   version.Relay,
 	})
 }
 
@@ -654,6 +693,15 @@ func (s *Server) handleBlobUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "blob upload signature verification failed")
 		return
 	}
+	// Issue #100: blob uploads are metered with their own byte-priced
+	// bucket, checked after signature verification (so spoofed requests
+	// cannot burn someone else's budget) and before the body is read
+	// (so a throttled client gets a fast 429 instead of streaming up to
+	// 25 MiB into the void).
+	if !s.blobUploadLimiter.AllowBytes("blob:"+q.Get("from"), size) {
+		writeErr(w, http.StatusTooManyRequests, "blob rate limit exceeded: slow down")
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, MaxBlobUploadBytes+1))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "failed to read blob body")
@@ -663,13 +711,21 @@ func (s *Server) handleBlobUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "body size does not match the declared size")
 		return
 	}
-	stored, err := s.store.SaveBlob(&store.Blob{
+	// Issue #100: the quota check and the insert are one atomic
+	// transaction inside SaveBlobWithQuota, so concurrent uploads cannot
+	// overdraw. A full quota is an explicit 429, never a silent drop.
+	stored, err := s.store.SaveBlobWithQuota(&store.Blob{
 		BlobID:    q.Get("blob_id"),
 		Recipient: q.Get("to"),
 		Uploader:  q.Get("from"),
 		Size:      size,
 		Data:      body,
-	})
+	}, s.cfg.BlobQuotaBytes)
+	if errors.Is(err, store.ErrBlobQuotaExceeded) {
+		writeErr(w, http.StatusTooManyRequests,
+			"blob storage quota exceeded: the uploader's stored bytes are over quota; bytes free up as retention pruning deletes expired blobs")
+		return
+	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "store failed")
 		return

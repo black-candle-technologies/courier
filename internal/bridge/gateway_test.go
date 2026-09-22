@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -214,6 +215,40 @@ func TestIngestAllowlist(t *testing.T) {
 	rows, _ := f.store.ListAudit(AuditFilter{Outcome: RejectedOutcome(RejectForbidden)})
 	if len(rows) != 1 {
 		t.Fatalf("rejection not audited: %d rows", len(rows))
+	}
+}
+
+func TestSetBodyCapOverridesDefault(t *testing.T) {
+	f := newGwFixture(t)
+	if f.gw.bodyCap != DefaultBodyCap {
+		t.Fatalf("default bodyCap = %d, want %d", f.gw.bodyCap, DefaultBodyCap)
+	}
+	f.gw.SetBodyCap(128 * 1024)
+	// A 96 KiB body now passes the size gate (confirmation comes first).
+	big := strings.Repeat("a", 96*1024)
+	rec := f.ingest(t, f.raw, ingestJSON(f.addr, big, ""))
+	if rec.Code != StatusConfirmationRequired {
+		t.Fatalf("96KiB body with raised cap: code = %d, want 449", rec.Code)
+	}
+	// Status reports the overridden cap.
+	req := httptest.NewRequest(http.MethodGet, "/v1/bridge/status", nil)
+	req.Header.Set("Authorization", "Bearer "+f.raw)
+	srec := httptest.NewRecorder()
+	f.gw.Routes().ServeHTTP(srec, req)
+	var st struct {
+		BodyCapBytes int `json:"body_cap_bytes"`
+	}
+	if err := json.Unmarshal(srec.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.BodyCapBytes != 128*1024 {
+		t.Fatalf("status body_cap_bytes = %d, want %d", st.BodyCapBytes, 128*1024)
+	}
+	// Non-positive values keep the existing cap.
+	f.gw.SetBodyCap(0)
+	f.gw.SetBodyCap(-5)
+	if f.gw.bodyCap != 128*1024 {
+		t.Fatalf("bodyCap after non-positive SetBodyCap = %d, want 131072", f.gw.bodyCap)
 	}
 }
 
@@ -776,4 +811,141 @@ func TestAuditHelperFailureDoesNotBreakResponse(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("code = %d, want 401", rec.Code)
 	}
+}
+
+// TestIngestCallerRecordedInAudit (issue #94): the caller identity the
+// MCP server asserts is recorded on every audit row of the ingest
+// (confirmation, reserve, completion) and the chain still verifies.
+func TestIngestCallerRecordedInAudit(t *testing.T) {
+	f := newGwFixture(t)
+	body := func(confirm string) string {
+		m := map[string]string{"recipient": f.addr, "body": "hello", "caller": "someone@example.com"}
+		if confirm != "" {
+			m["confirm_token"] = confirm
+		}
+		b, _ := json.Marshal(m)
+		return string(b)
+	}
+	rec := f.ingest(t, f.raw, body(""))
+	if rec.Code != StatusConfirmationRequired {
+		t.Fatalf("first send code = %d, want 449", rec.Code)
+	}
+	var cr map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &cr); err != nil {
+		t.Fatal(err)
+	}
+	ct, _ := cr["confirm_token"].(string)
+	rec = f.ingest(t, f.raw, body(ct))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("confirmed send code = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	rows, err := f.store.ListAudit(AuditFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("audit rows = %d, want 3 (confirmation_requested, send_reserved, sent)", len(rows))
+	}
+	for _, r := range rows {
+		if r.Caller != "someone@example.com" {
+			t.Fatalf("row %d (%s) caller = %q, want someone@example.com", r.ID, r.Outcome, r.Caller)
+		}
+	}
+	if ok, _, _, err := f.store.VerifyAudit(); err != nil || !ok {
+		t.Fatalf("audit verify: %v %v", err, ok)
+	}
+}
+
+// TestIngestCallerSanitized: an overlong asserted caller is truncated,
+// never stored unbounded, and a rejected ingest records the caller
+// too.
+func TestIngestCallerSanitized(t *testing.T) {
+	f := newGwFixture(t)
+	long := strings.Repeat("a", 300) + "@example.com"
+	m := map[string]string{"recipient": f.addr, "body": "hello", "caller": long}
+	b, _ := json.Marshal(m)
+	rec := f.ingest(t, f.raw, string(b))
+	if rec.Code != StatusConfirmationRequired {
+		t.Fatalf("code = %d, want 449", rec.Code)
+	}
+	rows, err := f.store.ListAudit(AuditFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("audit rows = %d, want 1", len(rows))
+	}
+	if len(rows[0].Caller) != maxAuditCallerLen {
+		t.Fatalf("caller len = %d, want truncation to %d", len(rows[0].Caller), maxAuditCallerLen)
+	}
+	// Rejected ingests record the caller as well.
+	rec = f.ingest(t, f.raw, ingestJSON("ed25519:unallowlisted", "hi", ""))
+	_ = rec
+	rows, err = f.store.ListAudit(AuditFilter{Outcome: "rejected:not_allowlisted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rejected rows = %d, want 1", len(rows))
+	}
+	if rows[0].Caller != "" {
+		t.Fatalf("rejected row caller = %q, want empty (no caller asserted)", rows[0].Caller)
+	}
+}
+
+// TestAuditCallerMigration: a pre-#94 bridge.db without the caller
+// column migrates on open, keeps verifying, and accepts new rows with
+// callers.
+func TestAuditCallerMigration(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/bridge.db"
+	// Build an old-schema database by hand: audit table without the
+	// caller column, one pre-existing row.
+	s, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendAudit(&AuditEntry{Ts: 1, TokenID: "t", TokenLabel: "old", Outcome: OutcomeSent}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if err := removeAuditCallerColumn(path); err != nil {
+		t.Fatal(err)
+	}
+	// Reopen: the migration must add the column back.
+	s2, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("reopen after dropping caller column: %v", err)
+	}
+	defer s2.Close()
+	if ok, checked, _, err := s2.VerifyAudit(); err != nil || !ok || checked != 1 {
+		t.Fatalf("verify after migration: ok=%v checked=%d err=%v", ok, checked, err)
+	}
+	id, err := s2.AppendAudit(&AuditEntry{Ts: 2, TokenID: "t", TokenLabel: "new",
+		Outcome: OutcomeSent, Caller: "someone@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s2.ListAudit(AuditFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].ID != id || rows[0].Caller != "someone@example.com" || rows[1].Caller != "" {
+		t.Fatalf("bad rows after migration: %+v", rows)
+	}
+	if ok, _, _, err := s2.VerifyAudit(); err != nil || !ok {
+		t.Fatalf("verify after new row: %v %v", err, ok)
+	}
+}
+
+// removeAuditCallerColumn drops the caller column to simulate a
+// pre-#94 database file.
+func removeAuditCallerColumn(path string) error {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.Exec(`ALTER TABLE audit DROP COLUMN caller`)
+	return err
 }

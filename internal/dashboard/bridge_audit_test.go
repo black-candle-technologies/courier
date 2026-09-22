@@ -61,7 +61,7 @@ func auditTestServer(t *testing.T, gwURL string) (*Server, *http.Cookie, *http.C
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	srv := NewFull(st, BCTOAuthConfig{}, BridgeAuditConfig{URL: gwURL, AdminToken: "gw-admin-token"})
+	srv := NewFull(st, BCTOAuthConfig{}, DefaultAuthLimits(), BridgeAuditConfig{URL: gwURL, AdminToken: "gw-admin-token"})
 	mkuser := func(username string, admin bool) *http.Cookie {
 		t.Helper()
 		id := testIdentity(t)
@@ -75,24 +75,11 @@ func auditTestServer(t *testing.T, gwURL string) (*Server, *http.Cookie, *http.C
 		// Complete the forced password change, then log in.
 		c0 := login(t, srv, username, "a-temporary-password-1")
 		form := url.Values{"password": {"a-new-password-123"}, "confirm": {"a-new-password-123"}}
-		req := httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req.AddCookie(c0)
-		rec := httptest.NewRecorder()
-		srv.Routes().ServeHTTP(rec, req)
+		rec := postChangePassword(t, srv, c0, form)
 		if rec.Code != http.StatusSeeOther {
-			t.Fatalf("change-password: got %d", rec.Code)
+			t.Fatalf("change-password: got %d: %s", rec.Code, rec.Body.String())
 		}
-		var c *http.Cookie
-		for _, cc := range rec.Result().Cookies() {
-			if cc.Name == sessionCookie {
-				c = cc
-			}
-		}
-		if c == nil {
-			t.Fatal("no session cookie after password change")
-		}
-		return c
+		return loginFromRec(t, rec).session
 	}
 	return srv, mkuser("admin-user", true), mkuser("plain-user", false)
 }
@@ -156,26 +143,14 @@ func TestBridgeAuditDormant(t *testing.T) {
 	}
 	// Half-configured (URL without token): still dormant. A logged-in
 	// admin gets the catch-all redirect to /app, never the audit view.
-	srv = NewFull(st, BCTOAuthConfig{}, BridgeAuditConfig{URL: "http://127.0.0.1:8473"})
+	srv = NewFull(st, BCTOAuthConfig{}, DefaultAuthLimits(), BridgeAuditConfig{URL: "http://127.0.0.1:8473"})
 	// Reuse an admin login against the dormant server.
 	id := testIdentity(t)
 	register(t, srv, "ops2", "a-temporary-password-1", id)
 	c0 := login(t, srv, "ops2", "a-temporary-password-1")
 	form := url.Values{"password": {"a-new-password-123"}, "confirm": {"a-new-password-123"}}
-	req := httptest.NewRequest("POST", "/change-password", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(c0)
-	r2 := httptest.NewRecorder()
-	srv.Routes().ServeHTTP(r2, req)
-	var cookie *http.Cookie
-	for _, cc := range r2.Result().Cookies() {
-		if cc.Name == sessionCookie {
-			cookie = cc
-		}
-	}
-	if cookie == nil {
-		t.Fatal("no cookie after password change")
-	}
+	r2 := postChangePassword(t, srv, c0, form)
+	cookie := loginFromRec(t, r2).session
 	rec = get(t, srv, "/admin/bridge/audit", cookie)
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("dormant logged-in: got %d, want 303 to /app", rec.Code)

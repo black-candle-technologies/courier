@@ -574,6 +574,14 @@ courier-relay --untakedown <handle>
 - The relay sees metadata (which addresses exchange envelopes, when), but
   the connection is TLS-encrypted with a pinned certificate, so network
   observers cannot see it either.
+- Disappearing messages (`--ttl`) are an endpoint guarantee, not a
+  remote one: expiry deletes your local copies (client state,
+  dashboard), but cannot recall screenshots, backups, the recipient's
+  own logs, or the relay's envelope until retention prunes it.
+- Relay retention: envelopes and blobs older than `--retain-days`
+  (default 30) are pruned. The dashboard keeps pushed messages until
+  they expire or you delete them; operators should apply the same
+  deletion window to backups of relay/dashboard state.
 - Back up `~/.courier/config.json`. If you lose your seed, your address is
   dead — generate a new one with `courier init --force` and tell your
   contacts.

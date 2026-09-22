@@ -23,13 +23,44 @@ User=courier-bridge
 Group=courier-bridge
 WorkingDirectory=/opt/courier-bridge
 EnvironmentFile=/etc/courier-bridge.env
+# /opt/courier-bridge (bridge.db + bridge identity) is the gateway's
+# only writable path. StateDirectory can't express /opt paths, so
+# ReadWritePaths is used; ProtectSystem=strict keeps the rest of the
+# filesystem read-only (/etc/courier-bridge.env needs read only).
+ReadWritePaths=/opt/courier-bridge
 ExecStart=/opt/courier-bridge/courier-bridge-gateway serve --home /opt/courier-bridge --addr 127.0.0.1:8473
-Restart=always
-RestartSec=5
-NoNewPrivileges=true
-PrivateTmp=true
 # The gateway must stay localhost-only: the MCP server (and only the
 # MCP server) reaches it there. Never widen the bind address.
+Restart=always
+RestartSec=5
+# The gateway logs to stdout (journal); it writes no log files of its own.
+
+# --- Sandboxing (issue #114) ---
+# The gateway serves localhost HTTP and dials the relay over HTTPS.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+# TCP/UDP only (+AF_UNIX, harmless): binds 127.0.0.1:8473, dials the
+# relay at courier.blackcandletech.com:8470.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+# No capabilities needed: ports 8470+ are unprivileged.
+CapabilityBoundingSet=
+UMask=0027
+MemoryMax=256M
+TasksMax=128
 
 [Install]
 WantedBy=multi-user.target

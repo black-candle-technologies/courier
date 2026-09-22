@@ -278,13 +278,8 @@ func foldStateEventsAt(log []LoggedStateEvent, now int64) *StateView {
 	return v
 }
 
-// foldStateEventsInto folds log on top of an existing view (used to
-// apply post-snapshot events over compacted notes).
-func foldStateEventsInto(v *StateView, log []LoggedStateEvent) {
-	foldStateEventsIntoAt(v, log, time.Now().Unix())
-}
-
-// foldStateEventsIntoAt is foldStateEventsInto evaluated at a fixed now.
+// foldStateEventsIntoAt is the fixed-now fold used to apply
+// post-snapshot events over compacted notes.
 func foldStateEventsIntoAt(v *StateView, log []LoggedStateEvent, now int64) {
 	foldStateEventsOrdered(v, log)
 	// issue #53: expired items disappear from the derived view. Their

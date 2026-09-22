@@ -170,6 +170,18 @@ func OpenBackup(passphrase, raw []byte) (*BackupPayload, error) {
 	if f.KDF != "scrypt" {
 		return nil, fmt.Errorf("unsupported kdf %q", f.KDF)
 	}
+	// Reject KDF parameters that differ from what SealBackup writes before
+	// running scrypt.Key. The parameters are attacker-controlled (the file
+	// may arrive from an untrusted source), and scrypt's own guard still
+	// permits values whose allocation is fatal: e.g. N=2^30, r=8, p=1
+	// passes the guard and then allocates ~1 TiB, killing the process
+	// with an unrecoverable out-of-memory before any authentication.
+	// The legitimate writer only ever emits one parameter set, so strict
+	// validation breaks nothing. (Issue #125.)
+	if f.ScryptN != backupScryptN || f.ScryptR != backupScryptR || f.ScryptP != backupScryptP {
+		return nil, fmt.Errorf("unsupported scrypt parameters (n=%d r=%d p=%d): file may be tampered with",
+			f.ScryptN, f.ScryptR, f.ScryptP)
+	}
 	salt, err := b64.DecodeString(f.Salt)
 	if err != nil || len(salt) != backupSaltLen {
 		return nil, errors.New("bad salt in backup file")

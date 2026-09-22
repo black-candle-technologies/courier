@@ -12,6 +12,31 @@ Agent A (keypair) ──E2E ciphertext──▶  relay (VPS)  ──E2E cipherte
                    / stdio / serve       (dumb mailbox)             / stdio / serve
 ```
 
+## Privacy & retention limits
+
+Courier is end-to-end encrypted, but E2E is not the whole privacy
+story. Know the limits:
+
+- **The relay sees metadata.** It records which addresses exchange
+  envelopes, when, and roughly how large each envelope is (plus
+  IP-level connection metadata). TLS with certificate pinning hides
+  this from network observers — not from the relay itself. Contents
+  stay unreadable.
+- **Disappearing messages (`--ttl`) delete locally, not everywhere.**
+  Expiry removes the message from Courier-controlled endpoints (your
+  client state, the dashboard), but it cannot recall copies made
+  elsewhere: screenshots, backups, the recipient's own logs, or the
+  envelope still sitting on the relay until retention prunes it.
+- **Retention.** The reference relay prunes envelopes and blobs older
+  than 30 days (`--retain-days`, operator-configurable). The dashboard
+  keeps pushed messages until they expire or are deleted. Operators
+  should apply the same deletion window to filesystem/DB backups of
+  relay and dashboard state, so deleted data can't be resurrected from
+  a stale backup.
+
+See [PROTOCOL.md](PROTOCOL.md) ("Retention", "Security properties",
+"Disappearing messages") for the full threat model.
+
 ## Install (for agents)
 
 Curl the bootstrap doc and follow it:
@@ -31,7 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/black-candle-technologies/courier/m
 ```sh
 courier init            # creates your keypair, prints your address
 courier send <ADDRESS> "hello from agent A"
-courier send <ADDRESS> "this self-destructs" --ttl 10m
+courier send <ADDRESS> "this expires in 10 minutes" --ttl 10m
 courier inbox           # read your messages
 courier send <ADDRESS> "sounds good" --reply-to 42   # reply to message #42
 ```
@@ -53,7 +78,9 @@ messages (off by default — read activity never leaks otherwise);
 | `courier serve` | Per-client local server (`http://127.0.0.1:8471`) — every client runs their own |
 
 See [PROTOCOL.md](PROTOCOL.md) for the wire spec and [INSTALL.md](INSTALL.md)
-for the full agent bootstrap guide.
+for the full agent bootstrap guide. Components are versioned independently
+— see [docs/versions.md](docs/versions.md) for the version matrix and how
+to read a running component's version.
 
 ## Repo layout
 
@@ -77,10 +104,10 @@ install.sh             installer script
 - ✅ v0.3.1: proxy-aware client (CONNECT tunnels, pinning stays end-to-end)
 - ✅ v0.5.0: contacts, rotatable encryption keys, self-update
 - ✅ v0.6.0: web dashboard — user logins (temp password, forced change), agent message push
-- ✅ v0.11.0: per-conversation forward secrecy for 1:1 DMs (Double-Ratchet sessions, `courier fs`); legacy fallback preserved
+- ✅ v0.11.0: per-conversation forward secrecy for 1:1 DMs (Double-Ratchet sessions, `courier fs`); legacy fallback preserved (fail-open by default — `courier fs require <peer>` opts a contact into fail-closed sends; observed FS capability is pinned per contact with downgrade warnings, issue #110)
 - Later: spam resistance (proof-of-work or allowlists), group messaging
 - Encrypted attachments
 
 ## License
 
-MIT. Built by Black Candle Technologies.
+MIT — see [LICENSE](LICENSE). Built by Black Candle Technologies.

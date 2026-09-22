@@ -28,26 +28,37 @@ actions, tool calls, sends, or state changes without the receiving
 operator's explicit approval.
 
 Access control at the public MCP boundary is caller authentication,
-not URL secrecy: every incoming MCP request must carry the
-provisioned bearer secret (`COURIER_BRIDGE_MCP_AUTH_TOKEN`).
-Unauthenticated callers are rejected with `401` before any gateway
-contact.
+not URL secrecy (issue #94): every incoming MCP request must carry an
+OAuth 2.0 access token from `auth.blackcandletech.com`
+(`Authorization: Bearer <token>`), validated against authd's
+`/oauth/userinfo`, and the caller's Black Candle email must be on the
+instance's provisioned allowlist (`COURIER_BRIDGE_ALLOWED_CALLERS`).
+Unauthenticated callers get `401` with the RFC 9728 discovery hint
+before any gateway contact; authenticated-but-unprovisioned callers
+get `403`.
 
 ## Components
 
 - **`courier-bridge-mcp`** — public MCP server (Streamable HTTP),
   fronted by Caddy at `mcp.courier.blackcandletech.com`. Exposes three
   tools: `send_to_agent`, `bridge_status`, `list_bridge_recipients`.
-  One server instance = one ingest token = one bridge user. Callers of
-  the MCP server authenticate with a pre-shared high-entropy bearer
-  secret (`COURIER_BRIDGE_MCP_AUTH_TOKEN`, provisioned via the 0600
-  root-owned env file, sent as `Authorization: Bearer <token>`); every
-  incoming HTTP request is checked before any gateway contact, and
-  unauthenticated callers get `401` with no tool list, no recipients,
-  no confirm tokens, and no sends. The MCP server URL is **not** the
-  access control — URL secrecy was retired as the security story in
-  issue #82. The gateway still re-validates everything downstream.
-  OAuth/OIDC is the planned phase-2 replacement for the shared secret.
+  One server instance = one ingest token = one provisioned set of human
+  callers. Callers authenticate with OAuth 2.0 (issue #94): the server
+  is an RFC 9728 protected resource whose authorization server is
+  `auth.blackcandletech.com`; ChatGPT web runs the authorization-code +
+  PKCE flow against the caller's Black Candle account and presents the
+  access token as `Authorization: Bearer <token>`. Tokens are validated
+  against authd's `/oauth/userinfo` (cached 5 minutes, fail closed) and
+  the caller's email must be on `COURIER_BRIDGE_ALLOWED_CALLERS`
+  (provisioned via the 0600 root-owned env file; empty fails closed at
+  startup). Every incoming HTTP request is checked before any gateway
+  contact: unauthenticated callers get `401` with the
+  `resource_metadata` discovery hint, unprovisioned callers get `403` —
+  no tool list, no recipients, no confirm tokens, no sends either way.
+  The MCP server URL is **not** the access control — URL secrecy was
+  retired as the security story in issue #82. The gateway still
+  re-validates everything downstream, and the asserted caller email
+  rides the ingest call into the `caller` column of the audit log.
 - **`courier-bridge-gateway`** — localhost-only service on the VPS
   (`127.0.0.1:8473`). Owns the bridge identity, enforces tokens /
   allowlists / rate limits / the 64 KiB body cap, wraps the attribution
@@ -98,35 +109,46 @@ capability token so clients can verify the sender out of band, and
 recipients can pin the bridge address locally with
 `courier bridge trust <addr>`.
 
-## MCP caller authentication (issue #82)
+## MCP caller authentication (issue #94)
 
-The public MCP endpoint (`mcp.courier.blackcandletech.com`) requires
-callers to present the pre-shared bearer secret
-`COURIER_BRIDGE_MCP_AUTH_TOKEN` on every HTTP request
-(`Authorization: Bearer <token>`). The server rejects unauthenticated
-callers with `401` before any gateway contact — they learn nothing,
-not even the tool list.
+The public MCP endpoint (`mcp.courier.blackcandletech.com`) is an
+OAuth 2.0 protected resource (RFC 9728). Callers present an access
+token from `auth.blackcandletech.com` on every HTTP request
+(`Authorization: Bearer <token>`); the server validates it against
+authd's `/oauth/userinfo` and requires the caller's Black Candle
+email to be provisioned for the instance. Unauthenticated callers get
+`401` with a `WWW-Authenticate` header carrying the
+`resource_metadata` discovery URL — that is the signal ChatGPT web
+needs to start the OAuth flow. Authenticated-but-unprovisioned callers
+get `403`. Either way they learn nothing before any gateway contact:
+no tool list, no recipients, no confirm tokens, no sends.
+
+Discovery (unauthenticated):
+`GET /.well-known/oauth-protected-resource` → `resource`,
+`authorization_servers: ["https://auth.blackcandletech.com"]`,
+`scopes_supported: ["identity"]`.
 
 **Provisioning** (as root on the VPS, per MCP server instance):
 
 ```
-# 256-bit secret, shown once — deliver to the ChatGPT-side operator
-# out of band (not over the bridge itself):
-openssl rand -hex 32
 # append to /etc/courier-bridge-mcp.env (0600, root:root):
-COURIER_BRIDGE_MCP_AUTH_TOKEN=<hex>
+COURIER_BRIDGE_ALLOWED_CALLERS=person1@example.com,person2@example.com
 systemctl restart courier-bridge-mcp
 ```
 
-**Rotation:** generate a new secret, update the env file, restart the
-unit, and update the ChatGPT connector configuration on the caller
-side. There is no grace period — the old secret stops working at
-restart, so coordinate the swap. **Suspected compromise:** rotate
-immediately, and also rotate `COURIER_BRIDGE_TOKEN` if the compromise
-could have reached the server environment (the env file holds both).
+The allowlist is the per-caller credential: adding an email grants
+that Black Candle account bridge access (after they complete the
+OAuth flow in ChatGPT web); removing it revokes access at the next
+token revalidation (≤ 5 minutes, the userinfo cache TTL). The
+phase-1 `COURIER_BRIDGE_MCP_AUTH_TOKEN` secret is retired — remove it
+from the env file. **Suspected compromise of a caller account:**
+remove the email from the allowlist and restart; also rotate
+`COURIER_BRIDGE_TOKEN` if the compromise could have reached the server
+environment (the env file holds both).
 
-**Phase 2:** replace the shared secret with OAuth/OIDC at the public
-MCP boundary (per-caller credentials, auditable issuance/revocation).
+The ChatGPT-side flow: add the connector in ChatGPT web with the
+server URL, choose OAuth when prompted, and sign in with the
+provisioned Black Candle account in the popup.
 
 ## Tokens
 
@@ -160,7 +182,8 @@ recipient proceed (still rate-limited).
 
 `bridge.db`, table `audit`: append-only, hash-chained,
 **metadata only** (timestamp, token label, recipient, body SHA-256,
-body size, outcome, envelope id). Message bodies are never logged.
+body size, outcome, envelope id, authenticated caller email).
+Message bodies are never logged.
 Rejections are logged too — including 401s, which pass through a
 coarse per-IP pre-auth limiter (60/min; over-limit floods get 429 with
 no audit row and are noted in the server logs). Verify with
@@ -215,11 +238,13 @@ banner in the page rather than failing the whole dashboard.
 
 ## Phase 2 (planned)
 
-- OAuth/OIDC caller authentication at the public MCP boundary,
-  replacing the phase-1 pre-shared bearer secret (per-caller
-  credentials, auditable issuance and revocation).
-- Dashboard admin audit view (issue #95) — implemented; see
-  "Dashboard admin audit view" above.
+- ~~OAuth/OIDC caller authentication at the public MCP boundary~~ —
+  DONE (issue #94): the MCP server is an RFC 9728 protected resource,
+  authd is the authorization server, callers are provisioned per
+  instance via `COURIER_BRIDGE_ALLOWED_CALLERS`, and the asserted
+  caller email is recorded in the audit log's `caller` column.
+- Dashboard admin audit view (the `courier bridge audit` equivalent in
+  the UI).
 - Attribution rendering from the pinned bridge-address list
   (`courier bridge trust`) — **done**: the client derives a typed
   `bridged` flag from banner, structured metadata, and the pin list,
@@ -267,11 +292,9 @@ already tolerated).
   (not over the bridge itself).
 - **Rotate:** `courier bridge token rotate --name label [--grace 24h]`
   — update the MCP server's `COURIER_BRIDGE_TOKEN`, confirm a test send.
-- **Rotate the MCP caller secret:** generate a fresh 256-bit secret
-  (`openssl rand -hex 32`), replace `COURIER_BRIDGE_MCP_AUTH_TOKEN` in
-  `/etc/courier-bridge-mcp.env`, `systemctl restart courier-bridge-mcp`,
-  and update the ChatGPT connector config on the caller side. No grace
-  period — coordinate the swap.
+- **Manage MCP callers:** edit `COURIER_BRIDGE_ALLOWED_CALLERS` in
+  `/etc/courier-bridge-mcp.env`, `systemctl restart courier-bridge-mcp`.
+  Removal takes effect at the next token revalidation (≤ 5 min).
 - **Revoke (suspected compromise):** `courier bridge token revoke --name label`
   — immediate. `--all` revokes everything (kill switch; works even if
   the gateway is down).

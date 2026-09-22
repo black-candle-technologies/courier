@@ -25,13 +25,17 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/bridge"
 	"github.com/black-candle-technologies/courier/internal/client"
+	"github.com/black-candle-technologies/courier/internal/version"
 )
 
-const version = "0.11.0"
+// version.Bridge (internal/version) carries the bridge version, stamped at
+// build time via ldflags -X; see docs/versions.md.
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -46,7 +50,7 @@ func main() {
 	case "serve":
 		err = cmdServe(os.Args[2:])
 	case "version", "--version", "-v":
-		fmt.Println("courier-bridge-gateway", version)
+		fmt.Println("courier-bridge-gateway", version.Bridge)
 		return
 	default:
 		usage()
@@ -187,7 +191,7 @@ func cmdServe(args []string) error {
 	} else if n > 0 {
 		log.Printf("pruned %d audit rows older than retention", n)
 	}
-	gw := bridge.NewGateway(st, client.New(cfg), pepper, cfg.Address, id.EdPub[:], version)
+	gw := bridge.NewGateway(st, client.New(cfg), pepper, cfg.Address, id.EdPub[:], version.Bridge)
 	// issue #95: provision the admin bearer token for the read-only
 	// audit API. The raw secret never leaves this process's memory;
 	// only its SHA-256 is kept (see bridge.SetAdminToken).
@@ -197,11 +201,21 @@ func cmdServe(args []string) error {
 	} else {
 		log.Printf("bridge admin audit API disabled (COURIER_BRIDGE_ADMIN_TOKEN not set)")
 	}
+	// COURIER_BRIDGE_BODY_CAP_BYTES optionally overrides the ingest body cap
+	// (default 64 KiB). Unset keeps the default; the value is bytes.
+	if v := strings.TrimSpace(os.Getenv("COURIER_BRIDGE_BODY_CAP_BYTES")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("bad COURIER_BRIDGE_BODY_CAP_BYTES %q: must be a positive integer (bytes)", v)
+		}
+		gw.SetBodyCap(n)
+		log.Printf("body cap overridden: %d bytes", n)
+	}
 	srv := &http.Server{
 		Addr:              *addr,
 		Handler:           gw.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	log.Printf("courier-bridge-gateway %s: bridge %s listening on %s", version, cfg.Address, *addr)
+	log.Printf("courier-bridge-gateway %s: bridge %s listening on %s", version.Bridge, cfg.Address, *addr)
 	return srv.ListenAndServe()
 }

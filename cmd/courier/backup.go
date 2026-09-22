@@ -24,7 +24,7 @@ import (
 
 func cmdBackup(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: courier backup <create|restore|export-sync|import-sync> ...")
+		return errors.New("usage: courier backup <create|restore|export-sync|import-sync>")
 	}
 	switch args[0] {
 	case "create":

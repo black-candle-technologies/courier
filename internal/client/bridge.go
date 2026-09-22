@@ -15,6 +15,7 @@ package client
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"slices"
 
 	"github.com/black-candle-technologies/courier/internal/bridge"
@@ -72,7 +73,16 @@ func (c *Client) SendBridged(address, wrappedBody string, meta *bridge.BridgeMet
 		}
 		fsOut = nil
 	}
-	return c.sendSealed(address, plain, wrappedBody, 0, "", true, 0)
+	id, err := c.sendSealed(address, plain, wrappedBody, 0, "", true, 0)
+	if err != nil {
+		return 0, err
+	}
+	// Issue #110: surface a queued FS downgrade warning, if any, once
+	// the send succeeded (server-side: goes to the service log).
+	if w := c.FSConsumeWarning(address); w != "" {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+	return id, nil
 }
 
 // BridgeGateways manages the pinned bridge-gateway addresses in the

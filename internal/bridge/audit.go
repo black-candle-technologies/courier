@@ -75,6 +75,9 @@ const DefaultAuditRetention = 365 * 24 * time.Hour
 // send's completion event (sent / rejected:send_failed) back to its
 // send_reserved row; it is operational metadata and is deliberately
 // NOT part of row_hash, so linking never affects chain verification.
+// Caller IS part of row_hash: it is known at append time (the MCP
+// server asserts the OAuth-authenticated Black Candle email), so the
+// chain covers who sent, not just what.
 type AuditEntry struct {
 	ID         int64
 	Ts         int64
@@ -87,6 +90,7 @@ type AuditEntry struct {
 	EnvelopeID int64
 	Reason     string
 	SendRef    string
+	Caller     string
 	PrevHash   string
 	RowHash    string
 }
@@ -97,9 +101,9 @@ type AuditEntry struct {
 // links.
 func hashRow(prevHash string, e *AuditEntry) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%s|%d|%s|%s|%s|%s|%d|%s|%d|%s",
+	fmt.Fprintf(h, "%s|%d|%s|%s|%s|%s|%d|%s|%d|%s|%s",
 		prevHash, e.Ts, e.TokenID, e.TokenLabel, e.Recipient,
-		e.BodySHA256, e.BodySize, e.Outcome, e.EnvelopeID, e.Reason)
+		e.BodySHA256, e.BodySize, e.Outcome, e.EnvelopeID, e.Reason, e.Caller)
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -135,10 +139,10 @@ func (s *Store) AppendAudit(e *AuditEntry) (int64, error) {
 	e.PrevHash = prev
 	e.RowHash = hashRow(prev, e)
 	res, err := s.db.Exec(
-		`INSERT INTO audit(ts,token_id,token_label,recipient,body_sha256,body_size,outcome,envelope_id,reason,send_ref,prev_hash,row_hash)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO audit(ts,token_id,token_label,recipient,body_sha256,body_size,outcome,envelope_id,reason,send_ref,caller,prev_hash,row_hash)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		e.Ts, e.TokenID, e.TokenLabel, e.Recipient, e.BodySHA256, e.BodySize,
-		e.Outcome, e.EnvelopeID, e.Reason, e.SendRef, e.PrevHash, e.RowHash,
+		e.Outcome, e.EnvelopeID, e.Reason, e.SendRef, e.Caller, e.PrevHash, e.RowHash,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("append audit: %w", err)
@@ -153,7 +157,7 @@ func (s *Store) AppendAudit(e *AuditEntry) (int64, error) {
 // pruned, which is expected, not tampering).
 func (s *Store) VerifyAudit() (ok bool, checked int64, firstID int64, err error) {
 	rows, err := s.db.Query(
-		`SELECT id,ts,token_id,token_label,recipient,body_sha256,body_size,outcome,envelope_id,reason,send_ref,prev_hash,row_hash
+		`SELECT id,ts,token_id,token_label,recipient,body_sha256,body_size,outcome,envelope_id,reason,send_ref,caller,prev_hash,row_hash
 		 FROM audit ORDER BY id ASC`,
 	)
 	if err != nil {
@@ -164,7 +168,7 @@ func (s *Store) VerifyAudit() (ok bool, checked int64, firstID int64, err error)
 	for rows.Next() {
 		var e AuditEntry
 		if err := rows.Scan(&e.ID, &e.Ts, &e.TokenID, &e.TokenLabel, &e.Recipient, &e.BodySHA256,
-			&e.BodySize, &e.Outcome, &e.EnvelopeID, &e.Reason, &e.SendRef, &e.PrevHash, &e.RowHash); err != nil {
+			&e.BodySize, &e.Outcome, &e.EnvelopeID, &e.Reason, &e.SendRef, &e.Caller, &e.PrevHash, &e.RowHash); err != nil {
 			return false, checked, firstID, fmt.Errorf("scan audit: %w", err)
 		}
 		if checked == 0 {
@@ -205,7 +209,7 @@ type AuditFilter struct {
 
 // ListAudit returns audit rows, newest first, honoring the filter.
 func (s *Store) ListAudit(f AuditFilter) ([]*AuditEntry, error) {
-	q := `SELECT id,ts,token_id,token_label,recipient,body_sha256,body_size,outcome,envelope_id,reason,send_ref,prev_hash,row_hash
+	q := `SELECT id,ts,token_id,token_label,recipient,body_sha256,body_size,outcome,envelope_id,reason,send_ref,caller,prev_hash,row_hash
 	      FROM audit WHERE 1=1`
 	var args []any
 	if f.TokenLabel != "" {
@@ -230,7 +234,7 @@ func (s *Store) ListAudit(f AuditFilter) ([]*AuditEntry, error) {
 	for rows.Next() {
 		var e AuditEntry
 		if err := rows.Scan(&e.ID, &e.Ts, &e.TokenID, &e.TokenLabel, &e.Recipient, &e.BodySHA256,
-			&e.BodySize, &e.Outcome, &e.EnvelopeID, &e.Reason, &e.SendRef, &e.PrevHash, &e.RowHash); err != nil {
+			&e.BodySize, &e.Outcome, &e.EnvelopeID, &e.Reason, &e.SendRef, &e.Caller, &e.PrevHash, &e.RowHash); err != nil {
 			return nil, fmt.Errorf("scan audit: %w", err)
 		}
 		out = append(out, &e)

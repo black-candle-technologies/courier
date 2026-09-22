@@ -180,11 +180,11 @@ func (c *bctOAuthClient) authorizeURL(state, verifier, redirectURI string) strin
 
 var (
 	// errOAuthExchange means the code/token exchange with the provider failed.
-	errOAuthExchange = errors.New("Black Candle sign-in failed — try again")
+	errOAuthExchange = errors.New("sign-in with Black Candle failed — try again")
 	// errOAuthUnverified means the Black Candle email is not confirmed.
 	errOAuthUnverified = errors.New("confirm your Black Candle email first, then try again")
 	// errOAuthUnavailable means the provider could not be reached.
-	errOAuthUnavailable = errors.New("Black Candle sign-in is temporarily unavailable")
+	errOAuthUnavailable = errors.New("the Black Candle sign-in service is temporarily unavailable")
 )
 
 // exchangeCode trades an authorization code for an access token.
@@ -281,6 +281,16 @@ func (s *Server) startOAuthFlow(w http.ResponseWriter, r *http.Request, intent s
 		http.NotFound(w, r)
 		return
 	}
+	// Issue #108: the OAuth flow has its OWN rate-limit budget,
+	// separate from the local password-login budget, so a flood on one
+	// cannot starve the other.
+	lim := s.authLimits()
+	rate := s.rateLimiter()
+	if !rate.allow("oauth:global", lim.OAuthAttemptsGlobal, lim.OAuthGlobalWindow) ||
+		!rate.allow("oauth:ip:"+s.clientIP(r), lim.OAuthAttemptsPerIP, lim.OAuthIPWindow) {
+		http.Error(w, "too many sign-in attempts — try again later", http.StatusTooManyRequests)
+		return
+	}
 	redirectURI := s.bct.redirectURIFor(r)
 	state, verifier, err := s.bct.newState(intent, userID, redirectURI)
 	if err != nil {
@@ -313,8 +323,19 @@ func (s *Server) handleOAuthBCTCallback(w http.ResponseWriter, r *http.Request) 
 		http.NotFound(w, r)
 		return
 	}
+	// Issue #108: callbacks share the OAuth budget (they trigger a
+	// provider token exchange).
+	lim := s.authLimits()
+	rate := s.rateLimiter()
+	if !rate.allow("oauth:global", lim.OAuthAttemptsGlobal, lim.OAuthGlobalWindow) ||
+		!rate.allow("oauth:ip:"+s.clientIP(r), lim.OAuthAttemptsPerIP, lim.OAuthIPWindow) {
+		http.Error(w, "too many sign-in attempts — try again later", http.StatusTooManyRequests)
+		return
+	}
 	fail := func(msg string) {
-		render(w, loginTmpl, map[string]any{"Error": msg, "BCTEnabled": true})
+		render(w, loginTmpl, map[string]any{
+			"Error": msg, "BCTEnabled": true, "CSRF": ensureLoginCSRF(w, r),
+		})
 	}
 	q := r.URL.Query()
 	if q.Get("error") != "" {
@@ -369,6 +390,7 @@ func (s *Server) finishOAuthLink(w http.ResponseWriter, r *http.Request, st *oau
 		render(w, settingsTmpl, map[string]any{
 			"User": u.Username, "BCTEmail": u.BCTEmail, "Linked": u.BCTUserID != 0,
 			"Error": "That Black Candle account is already linked to another dashboard user.",
+			"CSRF":  s.csrfTokenForSession(r),
 		})
 		return
 	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -381,6 +403,7 @@ func (s *Server) finishOAuthLink(w http.ResponseWriter, r *http.Request, st *oau
 		render(w, settingsTmpl, map[string]any{
 			"User": u.Username, "BCTEmail": u.BCTEmail, "Linked": u.BCTUserID != 0,
 			"Error": "That Black Candle account is already linked to another dashboard user.",
+			"CSRF":  s.csrfTokenForSession(r),
 		})
 		return
 	}
@@ -395,6 +418,7 @@ func (s *Server) finishOAuthLogin(w http.ResponseWriter, r *http.Request, id *bc
 		render(w, loginTmpl, map[string]any{
 			"BCTEnabled": true,
 			"Error":      "No Courier account is linked to that Black Candle account yet — log in with your Courier credentials and link it in Settings.",
+			"CSRF":       ensureLoginCSRF(w, r),
 		})
 		return
 	}

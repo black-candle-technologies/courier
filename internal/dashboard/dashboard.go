@@ -22,20 +22,25 @@ import (
 	"hash/fnv"
 	"html/template"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/bridge"
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
 	"github.com/black-candle-technologies/courier/internal/store"
+	"github.com/black-candle-technologies/courier/internal/version"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// Version of the dashboard server.
-const Version = "0.13.0"
+// Version of the dashboard server. Kept as an alias for compatibility;
+// the value is stamped at build time via internal/version (see
+// docs/versions.md).
+var Version = version.Dashboard
 
 //go:embed static/icon-192.png static/icon-512.png static/apple-touch-icon.png
 var staticFiles embed.FS
@@ -82,6 +87,17 @@ type Server struct {
 	// operator configured the identity provider: the OAuth feature is
 	// dormant in self-hosted installs.
 	bct *bctOAuthClient
+	// limits configures the layered auth rate limits (issue #108).
+	// Zero value selects DefaultAuthLimits via authLimits().
+	limits AuthLimits
+	// trustedProxies are the parsed DASHBOARD_TRUSTED_PROXIES networks
+	// allowed to set X-Forwarded-For; loopback is always trusted.
+	trustedProxies []*net.IPNet
+	// rate is the in-memory fixed-window limiter for the per-IP and
+	// global budgets. Lazily initialized: tests may construct Server
+	// directly with a struct literal.
+	rateMu sync.Mutex
+	rate   *fixedWindowLimiter
 	// bridgeAudit is the optional bridge-gateway audit API client
 	// (issue #95). Nil unless the operator configured the gateway URL
 	// and admin token: the audit view is dormant otherwise.
@@ -89,22 +105,32 @@ type Server struct {
 }
 
 // New returns a Server backed by st.
-func New(st *store.Store) *Server { return &Server{store: st} }
+func New(st *store.Store) *Server {
+	return NewFull(st, BCTOAuthConfig{}, DefaultAuthLimits(), BridgeAuditConfig{})
+}
 
 // NewWithBCT returns a Server backed by st with optional Black Candle
 // login via OAuth. A zero BCTOAuthConfig disables the feature entirely:
 // the OAuth routes are not registered and the UI affordances never
 // render.
 func NewWithBCT(st *store.Store, cfg BCTOAuthConfig) *Server {
-	return NewFull(st, cfg, BridgeAuditConfig{})
+	return NewFull(st, cfg, DefaultAuthLimits(), BridgeAuditConfig{})
+}
+
+// NewWithBCTAndLimits is NewWithBCT with explicit auth rate limits
+// (issue #108). Zero-valued limit fields select the defaults.
+func NewWithBCTAndLimits(st *store.Store, cfg BCTOAuthConfig, limits AuthLimits) *Server {
+	return NewFull(st, cfg, limits, BridgeAuditConfig{})
 }
 
 // NewFull returns a Server backed by st with optional Black Candle
-// OAuth login and the optional bridge audit admin view. Zero configs
-// disable their features entirely: unconfigured routes are not
-// registered and their UI affordances never render.
-func NewFull(st *store.Store, bct BCTOAuthConfig, audit BridgeAuditConfig) *Server {
-	s := &Server{store: st}
+// OAuth login, explicit auth rate limits, and the optional bridge
+// audit admin view (issue #95). Zero configs disable their features
+// entirely: unconfigured routes are not registered and their UI
+// affordances never render.
+func NewFull(st *store.Store, bct BCTOAuthConfig, limits AuthLimits, audit BridgeAuditConfig) *Server {
+	limits = limits.withDefaults()
+	s := &Server{store: st, limits: limits, trustedProxies: parseTrustedProxies(limits.TrustedProxies)}
 	if bct.URL != "" && bct.ClientID != "" && bct.ClientSecret != "" {
 		s.bct = newBCTOAuthClient(bct)
 	}
@@ -112,6 +138,20 @@ func NewFull(st *store.Store, bct BCTOAuthConfig, audit BridgeAuditConfig) *Serv
 		s.bridgeAudit = newBridgeAuditClient(audit)
 	}
 	return s
+}
+
+// authLimits returns the effective rate limits (defaults filled in).
+func (s *Server) authLimits() AuthLimits { return s.limits.withDefaults() }
+
+// rateLimiter returns the server's fixed-window limiter, creating it
+// on first use.
+func (s *Server) rateLimiter() *fixedWindowLimiter {
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	if s.rate == nil {
+		s.rate = newFixedWindowLimiter()
+	}
+	return s.rate
 }
 
 // bctEnabled reports whether Black Candle OAuth login is configured.
@@ -218,6 +258,13 @@ type registerRequest struct {
 // that address. Returns the API token (shown once) the agent uses to push
 // messages.
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	// Issue #108: per-IP registration quota, checked before any
+	// expensive work (bcrypt, signature verification).
+	lim := s.authLimits()
+	if !s.rateLimiter().allow("register:ip:"+s.clientIP(r), lim.RegisterAttemptsPerIP, lim.RegisterIPWindow) {
+		writeErr(w, http.StatusTooManyRequests, "registration quota exceeded for this address — try again later")
+		return
+	}
 	var req registerRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
@@ -462,8 +509,14 @@ func (s *Server) setSession(w http.ResponseWriter, userID int64) error {
 		return err
 	}
 	token := hex.EncodeToString(raw[:])
-	sum := sha256.Sum256([]byte(token))
-	if err := s.store.CreateSession(hex.EncodeToString(sum[:]), userID, sessionTTL); err != nil {
+	// Issue #111: mint the session's synchronizer CSRF token alongside
+	// it and store it raw on the session row — the single source of
+	// truth for rendering and validating the hidden form field.
+	csrfToken, err := newCSRFToken()
+	if err != nil {
+		return err
+	}
+	if err := s.store.CreateSession(sessionTokenHash(token), userID, sessionTTL, csrfToken); err != nil {
 		return err
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -475,6 +528,8 @@ func (s *Server) setSession(w http.ResponseWriter, userID int64) error {
 		Secure:   true, // dashboard is TLS-only
 		SameSite: http.SameSiteLaxMode,
 	})
+	// The pre-login double-submit token has served its purpose.
+	clearLoginCSRF(w)
 	return nil
 }
 
@@ -495,29 +550,93 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/app", http.StatusSeeOther)
 		return
 	}
-	render(w, loginTmpl, map[string]any{"BCTEnabled": s.bctEnabled()})
+	// Issue #111: the pre-login double-submit CSRF token for POST /login.
+	render(w, loginTmpl, map[string]any{
+		"BCTEnabled": s.bctEnabled(),
+		"CSRF":       ensureLoginCSRF(w, r),
+	})
 }
+
+// loginPage renders the login form with an error, preserving the
+// pre-login CSRF token so the user can retry without a reload.
+func (s *Server) loginPage(w http.ResponseWriter, r *http.Request, code int, msg string) {
+	renderStatus(w, loginTmpl, map[string]any{
+		"Error":      msg,
+		"BCTEnabled": s.bctEnabled(),
+		"CSRF":       ensureLoginCSRF(w, r),
+	}, code)
+}
+
+// invalidCredentials is the single generic login failure message: it is
+// used for unknown users, wrong passwords, AND locked-out accounts, so
+// the per-account backoff (issue #108) cannot be used to enumerate
+// accounts.
+const invalidCredentials = "Invalid username or password."
+
+// dummyPasswordHash is a valid bcrypt hash of a password nobody knows.
+// Unknown usernames are checked against it so the response takes the
+// same bcrypt work as a wrong-password attempt — otherwise the timing
+// difference alone would let an attacker enumerate accounts.
+const dummyPasswordHash = "$2a$10$77In5WkMFg/eqqgYdL.R.OB4RxMBZLUt./MWwzgmnI89J8ZVngT/y"
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
+	lim := s.authLimits()
+	rate := s.rateLimiter()
+	ip := s.clientIP(r)
+	// Issue #108, layers 1+3: per-IP and global login budgets, checked
+	// before any credential work. These trigger identically for valid
+	// and invalid usernames, so they reveal nothing about accounts.
+	if !rate.allow("login:global", lim.LoginAttemptsGlobal, lim.LoginGlobalWindow) ||
+		!rate.allow("login:ip:"+ip, lim.LoginAttemptsPerIP, lim.LoginIPWindow) {
+		s.loginPage(w, r, http.StatusTooManyRequests,
+			"Too many login attempts — please wait a few minutes and try again.")
+		return
+	}
+	// Issue #111: double-submit CSRF token plus Origin/Referer
+	// defense-in-depth on the login form.
+	if !checkOrigin(r) || !checkLoginCSRF(r) {
+		http.Error(w, "invalid CSRF token — reload the login page and try again", http.StatusForbidden)
+		return
+	}
 	username, password := r.FormValue("username"), r.FormValue("password")
 	user, err := s.store.DashboardUserByName(username)
-	if err != nil || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)) != nil {
-		render(w, loginTmpl, map[string]any{"Error": "Invalid username or password.", "BCTEnabled": s.bctEnabled()})
+	hash := dummyPasswordHash
+	if err == nil {
+		hash = user.PasswordHash
+		// Issue #108, layer 2: per-account exponential backoff. A
+		// locked account renders the SAME generic error as a wrong
+		// password (no user enumeration), and skips the bcrypt work.
+		if user.LockUntil > time.Now().Unix() {
+			s.loginPage(w, r, http.StatusOK, invalidCredentials)
+			return
+		}
+	}
+	// Unknown users burn the same bcrypt work as a wrong password, so
+	// timing cannot distinguish them.
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil && err == nil {
+		_ = s.store.ClearLoginFailures(user.ID)
+		if err := s.setSession(w, user.ID); err != nil {
+			http.Error(w, "session failed", http.StatusInternalServerError)
+			return
+		}
+		if user.MustChange {
+			http.Redirect(w, r, "/change-password", http.StatusSeeOther)
+			return
+		}
+		http.Redirect(w, r, "/app", http.StatusSeeOther)
 		return
 	}
-	if err := s.setSession(w, user.ID); err != nil {
-		http.Error(w, "session failed", http.StatusInternalServerError)
-		return
+	if err == nil {
+		// Wrong password: atomically grow the failure counter and
+		// re-lock the account for the new backoff.
+		_ = s.store.NoteLoginFailure(username, lim.LoginBackoffBase, lim.LoginBackoffMax)
 	}
-	if user.MustChange {
-		http.Redirect(w, r, "/change-password", http.StatusSeeOther)
-		return
-	}
-	http.Redirect(w, r, "/app", http.StatusSeeOther)
+	// Unknown user or wrong password: identical generic response.
+	s.loginPage(w, r, http.StatusOK, invalidCredentials)
 }
 
 func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
@@ -577,7 +696,9 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 			Preview:         preview,
 		})
 	}
-	render(w, appTmpl, map[string]any{"User": u.Username, "Threads": views, "Q": q, "BCTEnabled": s.bctEnabled(),
+	render(w, appTmpl, map[string]any{
+		"User": u.Username, "Threads": views, "Q": q,
+		"BCTEnabled": s.bctEnabled(), "CSRF": s.csrfTokenForSession(r),
 		// issue #95: the Bridge audit link renders only for admins,
 		// and only when the audit view is configured.
 		"IsAdmin": u.IsAdmin, "BridgeAuditEnabled": s.bridgeAuditEnabled()})
@@ -662,7 +783,7 @@ func (s *Server) handleChangePasswordForm(w http.ResponseWriter, r *http.Request
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	render(w, changeTmpl, map[string]any{"Forced": true})
+	render(w, changeTmpl, map[string]any{"Forced": true, "CSRF": s.csrfTokenForSession(r)})
 }
 
 func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
@@ -675,6 +796,17 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
+	// Issue #111: synchronizer CSRF token plus Origin/Referer
+	// defense-in-depth on the password-change form.
+	if !checkOrigin(r) || !s.checkSessionCSRF(r) {
+		http.Error(w, "invalid CSRF token — reload the page and try again", http.StatusForbidden)
+		return
+	}
+	changePage := func(msg string) {
+		render(w, changeTmpl, map[string]any{
+			"Forced": u.MustChange, "Error": msg, "CSRF": s.csrfTokenForSession(r),
+		})
+	}
 	// F6: a non-forced change must prove the current password, so anyone
 	// holding only a stale session (or a leaked temp password after the
 	// owner already changed it) cannot lock the owner out. The forced
@@ -683,7 +815,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	if !u.MustChange {
 		cur := r.FormValue("current")
 		if cur == "" || bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(cur)) != nil {
-			render(w, changeTmpl, map[string]any{"Forced": false, "Error": "Current password is incorrect."})
+			changePage("Current password is incorrect.")
 			return
 		}
 	}
@@ -691,11 +823,11 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	// bcrypt errors past 72 bytes: enforce the byte limit up front (F15).
 	// len() on a string counts bytes, which is what bcrypt cares about.
 	if len(pw) < 12 || len(pw) > 72 {
-		render(w, changeTmpl, map[string]any{"Forced": u.MustChange, "Error": "Password must be 12-72 characters (max 72 bytes)."})
+		changePage("Password must be 12-72 characters (max 72 bytes).")
 		return
 	}
 	if pw != r.FormValue("confirm") {
-		render(w, changeTmpl, map[string]any{"Forced": u.MustChange, "Error": "Passwords do not match."})
+		changePage("Passwords do not match.")
 		return
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
@@ -717,6 +849,19 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	// Issue #111: logout is state-changing — require the session's CSRF
+	// token when a session is present. A CSRF-less hit without a session
+	// is a no-op redirect.
+	if s.sessionUser(r) != nil {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "bad form", http.StatusBadRequest)
+			return
+		}
+		if !checkOrigin(r) || !s.checkSessionCSRF(r) {
+			http.Error(w, "invalid CSRF token — reload the page and try again", http.StatusForbidden)
+			return
+		}
+	}
 	s.clearSession(w, r)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
@@ -753,6 +898,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		"User":     u.Username,
 		"BCTEmail": u.BCTEmail,
 		"Linked":   u.BCTUserID != 0,
+		"CSRF":     s.csrfTokenForSession(r),
 	})
 }
 
@@ -763,6 +909,16 @@ func (s *Server) handleUnlinkBCT(w http.ResponseWriter, r *http.Request) {
 	if u == nil {
 		return
 	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	// Issue #111: synchronizer CSRF token plus Origin/Referer
+	// defense-in-depth on the unlink form.
+	if !checkOrigin(r) || !s.checkSessionCSRF(r) {
+		http.Error(w, "invalid CSRF token — reload the page and try again", http.StatusForbidden)
+		return
+	}
 	if err := s.store.UnlinkBCTAccount(u.ID); err != nil {
 		http.Error(w, "store failed", http.StatusInternalServerError)
 		return
@@ -771,7 +927,14 @@ func (s *Server) handleUnlinkBCT(w http.ResponseWriter, r *http.Request) {
 }
 
 func render(w http.ResponseWriter, tmpl string, data any) {
+	renderStatus(w, tmpl, data, http.StatusOK)
+}
+
+// renderStatus renders tmpl with the given status code, setting headers
+// before WriteHeader.
+func renderStatus(w http.ResponseWriter, tmpl string, data any, code int) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(code)
 	t := template.Must(template.New("p").Funcs(template.FuncMap{
 		"ago":            ago,
 		"until":          until,
@@ -1145,6 +1308,7 @@ const loginTmpl = pageHead + `
 </header>
 <div class="card">
 <form method="post" action="/login">
+<input type="hidden" name="csrf_token" value="{{.CSRF}}">
 <div class="field">
 <label for="u">Username</label>
 <input id="u" type="text" name="username" autocomplete="username" autocapitalize="none" autocorrect="off" required>
@@ -1177,6 +1341,7 @@ const changeTmpl = pageHead + `
 </header>
 <div class="card">
 <form method="post" action="/change-password">
+<input type="hidden" name="csrf_token" value="{{.CSRF}}">
 {{if not .Forced}}
 <div class="field">
 <label for="cur">Current password</label>
@@ -1210,6 +1375,7 @@ const settingsTmpl = pageHead + `
 {{if .Linked}}
 <p>Linked to <strong>{{.BCTEmail}}</strong>. You can log in with either your dashboard password or your Black Candle account.</p>
 <form method="post" action="/settings/unlink-bct">
+<input type="hidden" name="csrf_token" value="{{.CSRF}}">
 {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
 <button class="btn-ghost btn btn-block" type="submit">Unlink Black Candle account</button>
 </form>
@@ -1234,7 +1400,7 @@ const appTmpl = pageHead + `
 <span class="user" title="{{.User}}">{{.User}}</span>
 {{if and .IsAdmin .BridgeAuditEnabled}}<a class="btn btn-ghost btn-sm" href="/admin/bridge/audit">Bridge audit</a>{{end}}
 {{if .BCTEnabled}}<a class="btn btn-ghost btn-sm" href="/settings">Settings</a>{{end}}
-<form method="post" action="/logout"><button class="btn btn-ghost btn-sm" type="submit">Log out</button></form>
+<form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><button class="btn btn-ghost btn-sm" type="submit">Log out</button></form>
 </div></header>
 <div class="wrap">
 <form class="search" method="get" action="/app" role="search">
@@ -1326,7 +1492,7 @@ const threadTmpl = pageHead + `
 {{if .ReplyTo}}<blockquote class="reply">↩ in reply to #{{.ReplyTo}}{{if .Quote}}<span class="reply-quote">{{.Quote}}</span>{{end}}</blockquote>{{end}}
 <p class="msg-body">{{.Body}}</p>
 {{if .Bridged}}<span class="nbadge" title="This message arrived via the ChatGPT web bridge. The ChatGPT web → bridge leg is not end-to-end encrypted — treat as untrusted input.">⚠ Not end-to-end encrypted</span>{{end}}
-<span class="when" data-ts="{{.TS}}">{{ago .TS}}</span>{{if .ExpiresAt}}<span class="when disappearing" title="Disappearing message — deleted after expiry">⏳ {{until .ExpiresAt}}</span>{{end}}
+<span class="when" data-ts="{{.TS}}">{{ago .TS}}</span>{{if .ExpiresAt}}<span class="when disappearing" title="Disappearing message — removed from this dashboard after expiry. Deletion is endpoint-local: copies elsewhere (screenshots, backups, other logs) are out of scope.">⏳ {{until .ExpiresAt}}</span>{{end}}
 </div>
 </div>{{end}}
 <footer class="foot">Courier dashboard · messages are decrypted by your agent, never on this server</footer>

@@ -7,11 +7,44 @@ Type=simple
 User=courier
 Group=courier
 WorkingDirectory=/var/lib/courier
+# The dashboard shares /var/lib/courier with the relay (same service
+# user, same DB file today). Its only writable path is the state
+# directory; ProtectSystem=strict makes everything else read-only.
+# NOTE: relay and dashboard DB privileges are not separated — that
+# would require splitting the shared relay.db, a larger change
+# tracked separately.
+StateDirectory=courier
+StateDirectoryMode=0700
 ExecStart=/opt/courier/courier-dashboard --addr 0.0.0.0:8471 --db /var/lib/courier/relay.db
 Restart=always
 RestartSec=5
+# The dashboard logs to stdout (journal); it writes no log files of its own.
+
+# --- Sandboxing (issue #114) ---
+# The dashboard is a plain HTTPS web server (bcrypt logins, SQLite):
+# it needs TCP sockets and its state directory, nothing else.
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+# No capabilities needed: ports 8470+ are unprivileged.
+CapabilityBoundingSet=
+UMask=0027
+MemoryMax=512M
+TasksMax=256
 # Optional (issue #95, bridge audit admin view): create
 # /etc/courier-dashboard.env (0600, root:root) holding
 # COURIER_BRIDGE_AUDIT_URL=<gateway base URL> and

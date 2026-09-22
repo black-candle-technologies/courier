@@ -32,7 +32,7 @@ func openBridgeStore(dbPath string) (*bridge.Store, error) {
 
 func cmdBridge(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: courier bridge <token|audit|trust> ...")
+		return fmt.Errorf("usage: courier bridge <token|audit|trust>")
 	}
 	switch args[0] {
 	case "token":
@@ -48,7 +48,7 @@ func cmdBridge(args []string) error {
 
 func cmdBridgeToken(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: courier bridge token <issue|list|revoke|rotate> ...")
+		return fmt.Errorf("usage: courier bridge token <issue|list|revoke|rotate>")
 	}
 	// --db is a global bridge flag; extract it before subcommand parsing.
 	dbPath := defaultBridgeDB
@@ -297,6 +297,9 @@ func cmdBridgeAudit(args []string) error {
 		}
 		fmt.Printf("#%-6d %s  %-16s %-24s %6dB  %s  env:%d  sha:%.12s\n",
 			r.ID, ts, r.TokenLabel, recipient, r.BodySize, r.Outcome, r.EnvelopeID, r.BodySHA256)
+		if r.Caller != "" {
+			fmt.Printf("         caller: %s\n", r.Caller)
+		}
 		if r.Reason != "" {
 			fmt.Printf("         reason: %s\n", r.Reason)
 		}
