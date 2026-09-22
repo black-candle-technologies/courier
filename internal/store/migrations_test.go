@@ -269,6 +269,84 @@ func TestAdoptPartialLegacyMigration(t *testing.T) {
 	}
 }
 
+// Migration 9 must not fail on pre-existing true duplicates (issue #134):
+// two bit-identical envelopes collapse to the earliest copy, mirroring
+// Save's ON CONFLICT(env_hash) DO NOTHING, and no distinct message is lost.
+func TestMigration9DedupsReplayedEnvelopes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dupes9.db")
+
+	// Pre-v0.6.11 shape: no env_hash column. Two bit-identical rows (an
+	// exact replay, e.g. a retried POST) plus one distinct envelope.
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE envelopes (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, recipient TEXT NOT NULL,
+		sender TEXT NOT NULL, eph TEXT NOT NULL, nonce TEXT NOT NULL,
+		ct TEXT NOT NULL, sent_at INTEGER NOT NULL,
+		received_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+		sig TEXT NOT NULL DEFAULT '')`); err != nil {
+		t.Fatal(err)
+	}
+	insert := `INSERT INTO envelopes(recipient, sender, eph, nonce, ct, sent_at, sig)
+		VALUES('ed25519:to','ed25519:from','e','n',?,1700000000,'s')`
+	for _, ct := range []string{"c", "c", "other"} {
+		if _, err := raw.Exec(insert, ct); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw.Close()
+
+	// Migration must succeed, not brick the upgrade on the replay.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open db with replayed envelopes: %v", err)
+	}
+	defer s.Close()
+
+	// The replay collapsed to the earliest copy: rows 1 and 3 survive.
+	type row struct {
+		id   int64
+		ct   string
+		hash string
+	}
+	rows, err := s.db.Query(`SELECT id, ct, env_hash FROM envelopes ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.ct, &r.hash); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		got = append(got, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].id != 1 || got[1].id != 3 {
+		t.Fatalf("surviving rows = %+v, want ids [1 3]", got)
+	}
+	if got[0].hash == "" || got[1].hash == "" || got[0].hash == got[1].hash {
+		t.Fatalf("bad backfilled hashes: %+v", got)
+	}
+	want := envelope.DedupHash("ed25519:to", "ed25519:from", "e", "n", 1700000000, "c", "s")
+	if got[0].hash != want {
+		t.Fatalf("survivor hash = %q, want %q", got[0].hash, want)
+	}
+
+	// Idempotent: a second open is a fixed point.
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second open: %v", err)
+	}
+	s2.Close()
+}
+
 func TestDowngradeRefused(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "downgrade.db")
 	s, err := Open(path)
