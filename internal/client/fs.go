@@ -189,11 +189,6 @@ var (
 	errFSGapTooLarge = errors.New("fs: message gap exceeds skipped-key window")
 	errFSIgnored     = errors.New("fs: handshake ignored")
 	errFSProcessed   = errors.New("fs: handshake already processed")
-	// errFSRequired is returned by fsPrepareSend when the per-contact
-	// require_fs policy (issue #110) is set and no FS session is
-	// established: the send fails closed instead of silently falling
-	// back to legacy encryption.
-	errFSRequired = errors.New("fs: forward secrecy is required for this peer but no session is established (the handshake may be suppressed; run `courier fs start <peer>` or `courier fs on <peer>` to retry it)")
 )
 
 // ---- tunables ----
@@ -201,10 +196,17 @@ var (
 const (
 	// maxFSSkippedKeys bounds the out-of-order message-key window.
 	maxFSSkippedKeys = 100
-	// fsRotateAfterMessages / fsRotateAfterSeconds trigger a sender-side
-	// ratchet rotation, prompting the peer's next DH step.
-	fsRotateAfterMessages = 25
-	fsRotateAfterSeconds  = 24 * 3600
+	// fsAutoRekeyAfterMessages / fsAutoRekeyAfterSeconds are the
+	// automatic-rekey policy (#146): an established session's sender
+	// ratchet rotates once either limit is reached — 100 sent messages
+	// or 7 days since the last rotation (LastRotateAt starts at
+	// handshake time), whichever comes first. Rotation prompts the
+	// peer's next DH step, bounding how much traffic one chain key can
+	// ever protect. Tune deliberately: more frequent rotation costs a
+	// DH operation per window; less frequent rotation widens the window
+	// a compromised chain key can decrypt.
+	fsAutoRekeyAfterMessages = 100
+	fsAutoRekeyAfterSeconds  = 7 * 24 * 3600
 	// fsInitRefreshSeconds: a pending (unaccepted) init is refreshed on
 	// the next send after this long.
 	fsInitRefreshSeconds = 300
@@ -223,18 +225,10 @@ const (
 	maxFSProcessedInits = 50
 	// fsDowngradeWarnCooldownSeconds: minimum interval between
 	// downgrade warnings surfaced for the same peer (issue #110). The
-	// persistent marker (visible in `courier fs status`) is set on the
-	// first detection and cleared on recovery; the user-facing warning
-	// is rate-limited so an actively-suppressed peer doesn't spam every
-	// send.
+	// persistent marker is set on the first detection and cleared on
+	// recovery; the user-facing warning is rate-limited so an
+	// actively-suppressed peer doesn't spam every send.
 	fsDowngradeWarnCooldownSeconds = 3600
-)
-
-// peer FS modes.
-const (
-	fsModeAuto = "auto" // default: use FS when the peer is known-capable
-	fsModeOn   = "on"   // user override: peer is FS-capable, initiate
-	fsModeOff  = "off"  // user override: never use FS with this peer
 )
 
 // ---- local state ----
@@ -294,16 +288,10 @@ type fsCapEntry struct {
 // fsFile is ~/.courier/fs.json.
 type fsFile struct {
 	Sessions       map[string]*fsSession `json:"sessions"`
-	PeerModes      map[string]string     `json:"peer_modes,omitempty"`
 	CapCache       map[string]fsCapEntry `json:"cap_cache,omitempty"`
 	NegCapCache    map[string]int64      `json:"neg_cap_cache,omitempty"`
 	ProcessedInits []string              `json:"processed_inits,omitempty"`
 	LastInitAt     map[string]int64      `json:"last_init_at,omitempty"`
-	// RequireFS (issue #110) is the per-contact fail-closed policy:
-	// when set for an address, sends to it refuse to fall back to
-	// legacy encryption unless an FS session is established. Default
-	// (absent) is fail-open, matching pre-#110 behavior.
-	RequireFS map[string]bool `json:"require_fs,omitempty"`
 	// FSPins (issue #110) pins observed FS capability: address ->
 	// unix timestamp of first proof the peer speaks FS (completed
 	// handshake or valid inbound FS frame). Pins are permanent: once
@@ -346,11 +334,9 @@ func (ff *fsFile) session(peer string) *fsSession {
 func newFSFile() *fsFile {
 	return &fsFile{
 		Sessions:          map[string]*fsSession{},
-		PeerModes:         map[string]string{},
 		CapCache:          map[string]fsCapEntry{},
 		NegCapCache:       map[string]int64{},
 		LastInitAt:        map[string]int64{},
-		RequireFS:         map[string]bool{},
 		FSPins:            map[string]int64{},
 		FSNegotiated:      map[string]string{},
 		Downgrade:         map[string]int64{},
@@ -378,9 +364,6 @@ func loadFSLocked() (*fsFile, error) {
 	if ff.Sessions == nil {
 		ff.Sessions = map[string]*fsSession{}
 	}
-	if ff.PeerModes == nil {
-		ff.PeerModes = map[string]string{}
-	}
 	if ff.CapCache == nil {
 		ff.CapCache = map[string]fsCapEntry{}
 	}
@@ -389,9 +372,6 @@ func loadFSLocked() (*fsFile, error) {
 	}
 	if ff.LastInitAt == nil {
 		ff.LastInitAt = map[string]int64{}
-	}
-	if ff.RequireFS == nil {
-		ff.RequireFS = map[string]bool{}
 	}
 	if ff.FSPins == nil {
 		ff.FSPins = map[string]int64{}
@@ -594,8 +574,8 @@ func fsAdvanceSendLocked(sess *fsSession) (*fsSendOutput, error) {
 		return nil, err
 	}
 	now := time.Now().Unix()
-	if sess.RekeyFlag || sess.SentSinceRotate >= fsRotateAfterMessages ||
-		now-sess.LastRotateAt >= fsRotateAfterSeconds {
+	if sess.RekeyFlag || sess.SentSinceRotate >= fsAutoRekeyAfterMessages ||
+		now-sess.LastRotateAt >= fsAutoRekeyAfterSeconds {
 		peerRPK, err := fsDecode32(sess.PeerRatchetPub)
 		if err != nil {
 			return nil, err
@@ -691,20 +671,15 @@ func fsSealMessage(out *fsSendOutput, plain []byte) ([]byte, error) {
 // the session upgrades from the next message (docs/forward-secrecy.md
 // §4.5).
 //
-// Issue #110: when the per-contact require_fs policy is set for
-// address, there is no silent legacy fallback — fsPrepareSend returns
-// errFSRequired unless an FS session is established, and the send fails
-// closed. On the legacy-fallback path it also runs downgrade detection
-// for pinned peers (fsAssessDowngrade).
+// On the legacy-fallback path it runs downgrade detection for pinned
+// peers (fsAssessDowngrade). Sends are fail-open to legacy by design
+// (#146): mixed-version pairs keep working with no flag day.
 func (c *Client) fsPrepareSend(address string) (*fsSendOutput, error) {
 	if address == c.cfg.Address {
 		return nil, nil
 	}
 	var out *fsSendOutput
 	err := updateFS(func(ff *fsFile) error {
-		if ff.PeerModes[address] == fsModeOff && !ff.RequireFS[address] {
-			return nil
-		}
 		sess := ff.session(address)
 		if sess != nil && sess.Established {
 			o, err := fsAdvanceSendLocked(sess)
@@ -714,14 +689,9 @@ func (c *Client) fsPrepareSend(address string) (*fsSendOutput, error) {
 			out = o
 			return nil
 		}
-		// No usable session. Fail closed when the peer requires FS —
-		// never silently fall back to legacy (issue #110). Note this
-		// deliberately wins over mode "off": "off" + "require" is a
-		// contradictory configuration, and refusing to send is the
-		// only safe reading of it.
-		if ff.RequireFS[address] {
-			return errFSRequired
-		}
+		// No established session: fall through to the legacy path
+		// below, which assesses downgrade risk and opportunistically
+		// initiates a handshake.
 		return nil
 	})
 	if err != nil || out != nil {
@@ -752,25 +722,20 @@ func (c *Client) fsPrepareSend(address string) (*fsSendOutput, error) {
 }
 
 // fsAssessDowngrade implements issue #110's downgrade detection. It
-// runs on the legacy-fallback path (no established session, sends not
-// fail-closed): a peer whose FS capability was previously observed
-// (pinned) but for which no *current* positive capability evidence
-// exists is downgrade-suspected — the relay may be suppressing
-// directory availability or handshake traffic. It records a persistent
-// marker (surfaced by `courier fs status`) and queues a rate-limited
-// user-facing warning (consumed via FSConsumeWarning, printed by the
-// send path).
+// runs on the legacy-fallback path (no established session): a peer
+// whose FS capability was previously observed (pinned) but for which
+// no *current* positive capability evidence exists is
+// downgrade-suspected — the relay may be suppressing directory
+// availability or handshake traffic. It records a persistent marker
+// and queues a rate-limited user-facing warning (consumed via
+// FSConsumeWarning, printed by the send path).
 //
 // A handshake already in flight suppresses the warning: a slow
-// round-trip is not a downgrade. Explicit `fs off` peers are exempt —
-// the user chose legacy.
+// round-trip is not a downgrade.
 func (c *Client) fsAssessDowngrade(address string) {
 	now := time.Now().Unix()
 	ff, err := loadFS()
 	if err != nil {
-		return
-	}
-	if ff.PeerModes[address] == fsModeOff {
 		return
 	}
 	if _, pinned := ff.FSPins[address]; !pinned {
@@ -778,12 +743,10 @@ func (c *Client) fsAssessDowngrade(address string) {
 	}
 	// Current positive evidence, excluding the pin itself: the point
 	// is the peer "suddenly only offers legacy".
-	positive := ff.PeerModes[address] == fsModeOn
-	if !positive {
-		if e, ok := ff.CapCache[address]; ok && e.Capable &&
-			now-e.At < fsCapCacheTTL {
-			positive = true
-		}
+	positive := false
+	if e, ok := ff.CapCache[address]; ok && e.Capable &&
+		now-e.At < fsCapCacheTTL {
+		positive = true
 	}
 	if !positive {
 		if at, ok := ff.NegCapCache[address]; ok && now-at < fsNegCapCacheTTL {
@@ -832,8 +795,8 @@ func (c *Client) fsAssessDowngrade(address string) {
 		if warnDue {
 			peer := shortPeer(address)
 			c.noteFSWarning(address, fmt.Sprintf(
-				"DOWNGRADE WARNING: %s previously negotiated forward secrecy but is currently reachable only via legacy encryption — the relay may be suppressing FS directory or handshake traffic. Run `courier fs start %s` to retry the handshake, or `courier fs require %s` to refuse legacy sends.",
-				peer, peer, peer))
+				"DOWNGRADE WARNING: %s previously negotiated forward secrecy but is currently reachable only via legacy encryption — the relay may be suppressing FS directory or handshake traffic. The client keeps retrying the handshake automatically on every send.",
+				peer))
 		}
 		return
 	}
@@ -852,9 +815,6 @@ func (c *Client) fsShouldInit(address string) bool {
 	if err != nil {
 		return false
 	}
-	if ff.PeerModes[address] == fsModeOff {
-		return false
-	}
 	if sess := ff.session(address); sess != nil {
 		if sess.Established {
 			return false
@@ -862,9 +822,6 @@ func (c *Client) fsShouldInit(address string) bool {
 		if time.Now().Unix()-sess.CreatedAt <= fsInitRefreshSeconds {
 			return false
 		}
-	}
-	if ff.PeerModes[address] == fsModeOn {
-		return true
 	}
 	// Issue #110: a pinned peer has proven FS support before. The pin
 	// is permanent capability knowledge, so handshake pressure
@@ -1597,177 +1554,11 @@ func (c *Client) fsDecryptMessage(from string, p fsPayload) (plain []byte, wrapK
 
 // ---- user-facing session management ----
 
-// FSSessionInfo is a human-readable session summary for `courier fs status`.
-type FSSessionInfo struct {
-	Peer           string
-	Established    bool
-	Initiator      bool
-	Mode           string
-	MsgsSent       int64
-	MsgsRecvd      int64
-	LastRotateAt   int64
-	SinceHandshake int64
-	// Issue #138: the negotiated FS suite (empty on pending sessions;
-	// legacy pre-negotiation sessions report the v1 suite id).
-	Suite string
-	// Issue #110: fail-closed policy, capability pin, downgrade state.
-	RequireFS          bool
-	Pinned             bool
-	DowngradeSuspected bool
-	DowngradeSince     int64
-}
-
-// FSStatus lists FS sessions (one peer, or all).
-func (c *Client) FSStatus(peer string) ([]FSSessionInfo, error) {
-	var address string
-	if peer != "" {
-		a, err := c.cfg.ResolveRecipient(peer)
-		if err != nil {
-			return nil, err
-		}
-		address = a
-	}
-	ff, err := loadFS()
-	if err != nil {
-		return nil, err
-	}
-	var out []FSSessionInfo
-	for addr, sess := range ff.Sessions {
-		if address != "" && addr != address {
-			continue
-		}
-		mode := ff.PeerModes[addr]
-		if mode == "" {
-			mode = fsModeAuto
-		}
-		_, pinned := ff.FSPins[addr]
-		downgradeSince, downgrade := ff.Downgrade[addr]
-		suite := sess.Suite
-		if suite == "" {
-			// Legacy pre-negotiation session: always v1.
-			suite = string(crypto.FSSuiteV1)
-		}
-		out = append(out, FSSessionInfo{
-			Peer: addr, Established: sess.Established,
-			Initiator: sess.Initiator, Mode: mode,
-			MsgsSent: sess.MsgsSent, MsgsRecvd: sess.MsgsRecvd,
-			LastRotateAt: sess.LastRotateAt, SinceHandshake: sess.CreatedAt,
-			Suite:     suite,
-			RequireFS: ff.RequireFS[addr], Pinned: pinned,
-			DowngradeSuspected: downgrade, DowngradeSince: downgradeSince,
-		})
-	}
-	return out, nil
-}
-
-// FSStart initiates an FS handshake now. It needs known capability
-// (directory, handshake memory, or `fs on`); otherwise it errors rather
-// than spamming a possibly-legacy peer with handshake frames.
-func (c *Client) FSStart(peer string) error {
-	address, err := c.cfg.ResolveRecipient(peer)
-	if err != nil {
-		return err
-	}
-	if address == c.cfg.Address {
-		return errors.New("cannot FS-handshake with self")
-	}
-	ff, err := loadFS()
-	if err != nil {
-		return err
-	}
-	known := ff.PeerModes[address] == fsModeOn || ff.session(address) != nil
-	if !known {
-		if e, ok := ff.CapCache[address]; ok && e.Capable &&
-			time.Now().Unix()-e.At < fsCapCacheTTL {
-			known = true
-		}
-	}
-	if !known && c.fsDirectoryCapable(address) {
-		known = true
-		_ = updateFS(func(ff *fsFile) error {
-			if ff.CapCache == nil {
-				ff.CapCache = map[string]fsCapEntry{}
-			}
-			ff.CapCache[address] = fsCapEntry{Capable: true, At: time.Now().Unix()}
-			return nil
-		})
-	}
-	if !known {
-		return fmt.Errorf("no FS capability known for %s (not in directory, no prior handshake); use `courier fs on %s` to mark them capable and initiate", shortPeer(address), peer)
-	}
-	return c.sendFSInit(address)
-}
-
-// FSSetPeerMode sets the per-peer FS mode ("on"/"off"/"auto"). "on"
-// marks the peer capable and initiates a handshake; "off" erases any
-// session and disables FS for the peer.
-func (c *Client) FSSetPeerMode(peer, mode string) error {
-	address, err := c.cfg.ResolveRecipient(peer)
-	if err != nil {
-		return err
-	}
-	switch mode {
-	case fsModeOn, fsModeOff, fsModeAuto:
-	default:
-		return fmt.Errorf("bad fs mode %q", mode)
-	}
-	err = updateFS(func(ff *fsFile) error {
-		if mode == fsModeOff {
-			// Erasure: disabling FS drops the session's keys now.
-			delete(ff.Sessions, address)
-			// Explicit user action, not a downgrade: clear markers.
-			// (The capability pin is a historical fact and is kept.)
-			delete(ff.Downgrade, address)
-			delete(ff.DowngradeWarnedAt, address)
-		}
-		if ff.PeerModes == nil {
-			ff.PeerModes = map[string]string{}
-		}
-		if mode == fsModeAuto {
-			delete(ff.PeerModes, address)
-		} else {
-			ff.PeerModes[address] = mode
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	if mode == fsModeOn {
-		return c.sendFSInit(address)
-	}
-	return nil
-}
-
-// FSSetRequireFS sets (or clears) the per-contact fail-closed policy
-// (issue #110): when set, sends to peer fail closed with errFSRequired
-// unless an FS session is established — they never silently fall back
-// to legacy encryption. The default is fail-open (policy absent),
-// matching pre-#110 behavior. Setting the policy does not initiate a
-// handshake; use `courier fs on <peer>` or `courier fs start <peer>`
-// to establish a session first, otherwise sends will fail until one
-// exists.
-func (c *Client) FSSetRequireFS(peer string, require bool) error {
-	address, err := c.cfg.ResolveRecipient(peer)
-	if err != nil {
-		return err
-	}
-	return updateFS(func(ff *fsFile) error {
-		if ff.RequireFS == nil {
-			ff.RequireFS = map[string]bool{}
-		}
-		if require {
-			ff.RequireFS[address] = true
-		} else {
-			delete(ff.RequireFS, address)
-		}
-		return nil
-	})
-}
-
-// FSRequireForPeer reports whether the fail-closed require_fs policy
-// (issue #110) is set for peer.
-func (c *Client) FSRequireForPeer(peer string) (bool, error) {
+// FSActive reports whether an established forward-secrecy session
+// exists with peer's address. Used by `courier contacts show` to render
+// the "Forward secrecy: active/inactive" line (#146); there is no
+// `courier fs` command surface anymore — FS is fully automatic.
+func (c *Client) FSActive(peer string) (bool, error) {
 	address, err := c.cfg.ResolveRecipient(peer)
 	if err != nil {
 		return false, err
@@ -1776,41 +1567,16 @@ func (c *Client) FSRequireForPeer(peer string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return ff.RequireFS[address], nil
+	sess := ff.session(address)
+	return sess != nil && sess.Established, nil
 }
 
-// FSPinnedAt returns the unix timestamp when FS capability was first
-// observed for the peer's address (issue #110), or 0 if never pinned.
-func (c *Client) FSPinnedAt(peer string) (int64, error) {
-	address, err := c.cfg.ResolveRecipient(peer)
-	if err != nil {
-		return 0, err
-	}
-	ff, err := loadFS()
-	if err != nil {
-		return 0, err
-	}
-	return ff.FSPins[address], nil
-}
-
-// FSRekey forces a DH rotation on the next send to peer.
-func (c *Client) FSRekey(peer string) error {
-	address, err := c.cfg.ResolveRecipient(peer)
-	if err != nil {
-		return err
-	}
-	return updateFS(func(ff *fsFile) error {
-		sess := ff.session(address)
-		if sess == nil || !sess.Established {
-			return fmt.Errorf("no established FS session with %s", shortPeer(address))
-		}
-		sess.RekeyFlag = true
-		return nil
-	})
-}
-
-// FSForget erases the FS session with peer and disables FS for them (so
-// a peer that keeps sending FS doesn't silently re-establish).
+// FSForget erases the forward-secrecy session with peer: session keys,
+// skipped keys, and handshake state are deleted, and the downgrade and
+// suite-negotiation markers are cleared so a later handshake starts
+// from scratch. It is invoked automatically on `courier contacts
+// remove` (#146); there is no CLI surface for it. Erasure is
+// best-effort local deletion — see docs/forward-secrecy.md §6.
 func (c *Client) FSForget(peer string) error {
 	address, err := c.cfg.ResolveRecipient(peer)
 	if err != nil {
@@ -1818,13 +1584,11 @@ func (c *Client) FSForget(peer string) error {
 	}
 	return updateFS(func(ff *fsFile) error {
 		delete(ff.Sessions, address)
-		if ff.PeerModes == nil {
-			ff.PeerModes = map[string]string{}
-		}
-		ff.PeerModes[address] = fsModeOff
-		// Explicit user action, not a downgrade: clear markers, including
-		// the suite-negotiation pin (issue #138) so a later fresh
-		// handshake can renegotiate from scratch.
+		// Contact removal is an explicit user action, not a downgrade:
+		// clear markers, including the suite-negotiation pin (issue
+		// #138) so a later fresh handshake can renegotiate from
+		// scratch. The capability pin (issue #110) is a historical
+		// fact and is kept.
 		delete(ff.Downgrade, address)
 		delete(ff.DowngradeWarnedAt, address)
 		delete(ff.FSNegotiated, address)

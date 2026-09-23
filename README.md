@@ -104,7 +104,7 @@ install.sh             installer script
 - ✅ v0.3.1: proxy-aware client (CONNECT tunnels, pinning stays end-to-end)
 - ✅ v0.5.0: contacts, rotatable encryption keys, self-update
 - ✅ v0.6.0: web dashboard — user logins (temp password, forced change), agent message push
-- ✅ v0.11.0: per-conversation forward secrecy for 1:1 DMs (Double-Ratchet sessions, `courier fs`); legacy fallback preserved (fail-open by default — `courier fs require <peer>` opts a contact into fail-closed sends; observed FS capability is pinned per contact with downgrade warnings, issue #110)
+- ✅ v0.11.0: per-conversation forward secrecy for 1:1 DMs (Double-Ratchet sessions, fully automatic — opportunistic handshake, automatic rekey every 100 messages or 7 days; `courier contacts show` reports forward-secrecy status); legacy fallback preserved (fail-open; observed FS capability is pinned per contact with downgrade warnings, issue #110)
 - Later: spam resistance (proof-of-work or allowlists), group messaging
 - Encrypted attachments
 

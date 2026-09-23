@@ -86,8 +86,6 @@ func main() {
 		err = cmdGroup(os.Args[2:])
 	case "rotate":
 		err = cmdRotate(os.Args[2:])
-	case "fs":
-		err = cmdFS(os.Args[2:])
 	case "publish-key":
 		err = cmdPublishKey()
 	case "backup":
@@ -179,12 +177,6 @@ func usage() {
   courier directory dismiss <id>         dismiss a pending introduction
   courier rotate                         rotate encryption key (durable crypto)
   courier publish-key                    re-announce your encryption key
-  courier fs status [<peer>]             show forward-secrecy sessions
-  courier fs start <peer>                initiate a forward-secrecy handshake
-  courier fs on <peer>                   mark a peer FS-capable and initiate
-  courier fs off <peer>                  disable FS for a peer (erases session)
-  courier fs rekey <peer>                rotate the FS ratchet on next send
-  courier fs forget <peer>               erase the FS session for a peer
   courier backup create [--output f]     write an encrypted identity backup
                                          (seed + live keys, passphrase-protected)
   courier backup restore [--force] <file>
@@ -991,6 +983,17 @@ func cmdContacts(args []string) error {
 			onOff = "on"
 		}
 		fmt.Printf("receipts: %s\n", onOff)
+		// #146: forward secrecy is fully automatic — no `courier fs`
+		// commands. Show whether an FS session is established.
+		fsActive, err := cl.FSActive(args[1])
+		if err != nil {
+			return err
+		}
+		fsState := "inactive"
+		if fsActive {
+			fsState = "active"
+		}
+		fmt.Printf("forward secrecy: %s\n", fsState)
 		if rec, ok := cfg.StoredVerification(args[1]); ok {
 			fmt.Printf("verified: %s\n", time.Unix(rec.VerifiedAt, 0).Format(time.RFC3339))
 			fmt.Printf("safety number: %s\n", rec.SafetyNumber)
@@ -1054,6 +1057,11 @@ func cmdContacts(args []string) error {
 	case "remove", "rm", "delete":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: courier contacts remove <name>")
+		}
+		// #146: secure-erase the forward-secrecy session automatically
+		// on contact removal (best-effort; removal proceeds regardless).
+		if ferr := cl.FSForget(args[1]); ferr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not erase FS session: %v\n", ferr)
 		}
 		if err := cfg.RemoveContact(args[1]); err != nil {
 			return err
