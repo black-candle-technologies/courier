@@ -2269,7 +2269,7 @@ the VHL layer, never surfaced as chat):
 
 - **approval-request** — an agent asks a human to review exact
   bytes; the human's inbox files it in their review queue
-  (`courier vhl requests`).
+  (`courier vhl request list`).
 - **attestation** — the human's signed approval travels back; the
   agent's inbox stores it for the send (`courier vhl attestations`).
 - **revocation** — session-token revocation, signed by the issuer
@@ -2279,7 +2279,7 @@ the VHL layer, never surfaced as chat):
 
 ### 30.6 Client behavior
 
-- `courier vhl enroll <address> [--name N]` — enroll a human
+- `courier vhl approver add <address> [--name N]` — enroll a human
   approver through a relay-hosted WebAuthn assertion ceremony
   (§30.8): the agent creates an `enroll-approver` ceremony binding
   the approver and agent addresses, the human approves the pairing
@@ -2289,7 +2289,8 @@ the VHL layer, never surfaced as chat):
   verification required) before the identity is trusted. Typed
   confirmation alone is not sufficient to create a trust root —
   a PTY-driving process could reproduce it. Enrollment is a Tier 2
-  human-approved event.
+  human-approved event. `approver list` lists enrolled approvers;
+  `approver remove <address|name>` revokes an approver.
 - `courier vhl enroll-webauthn [--device LABEL]` — enroll a
   WebAuthn credential via the relay-hosted ceremony (§30.8): the
   agent creates the ceremony, the human completes it with their
@@ -2319,8 +2320,9 @@ the VHL layer, never surfaced as chat):
   ceremony-bound — minting is impossible without a fresh WebAuthn
   ceremony. `session status` lists live tokens;
   `session revoke <id> [--broadcast]` revokes.
-- `courier vhl request --tier 2 --message TEXT [--to ADDR]` —
-  file an approval request for exact bytes; `courier vhl approve
+- `courier vhl request new --tier 2 --message TEXT [--to ADDR]` —
+  file an approval request for exact bytes; `courier vhl request
+  list` shows the pending queue; `courier vhl approve
   <request-id> [--presence pin|challenge|fido2|fido2_uv]` shows the
   human the exact bytes and the recomputed action hash before the
   ceremony. `fido2`/`fido2_uv` run the relay-hosted `approve`
@@ -2339,7 +2341,7 @@ the VHL layer, never surfaced as chat):
   a human approval attestation for the exact bytes fails closed;
   tiered sends refuse attachments (the approval hash binds the
   body bytes only).
-- `courier vhl challenge mint --action TEXT` — mint a one-time
+- `courier vhl challenge --action TEXT` — mint a one-time
   out-of-band challenge code bound to the exact action bytes
   (single-use, constant-time compare, 8 unambiguous characters
   from a 32-symbol alphabet; 256 mod 32 == 0 so the modulo

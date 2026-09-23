@@ -18,7 +18,7 @@ import (
 
 func cmdVHL(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: courier vhl <enroll|enroll-webauthn|approvers|unenroll|rp|session|request|requests|approve|attestations|challenge|policy> [args]")
+		return fmt.Errorf("usage: courier vhl <approver|enroll-webauthn|rp|session|request|approve|attestations|challenge|policy> [args]")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
@@ -26,32 +26,16 @@ func cmdVHL(args []string) error {
 	}
 	c := client.New(cfg)
 	switch args[0] {
-	case "enroll":
-		return cmdVHLEnroll(c, args[1:])
+	case "approver":
+		return cmdVHLApprover(c, args[1:])
 	case "enroll-webauthn":
 		return cmdVHLEnrollWebAuthn(c, args[1:])
-	case "approvers":
-		return cmdVHLApprovers(c)
-	case "unenroll":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: courier vhl unenroll <address|name>")
-		}
-		if !confirmTyping(fmt.Sprintf("type REVOKE to unenroll %s", args[1]), "REVOKE") {
-			return fmt.Errorf("cancelled")
-		}
-		if err := c.VHLUnenrollApprover(args[1]); err != nil {
-			return err
-		}
-		fmt.Println("approver revoked")
-		return nil
 	case "rp":
 		return cmdVHLRP(c, args[1:])
 	case "session":
 		return cmdVHLSession(c, args[1:])
 	case "request":
 		return cmdVHLRequest(c, args[1:])
-	case "requests":
-		return cmdVHLRequests(c)
 	case "approve":
 		return cmdVHLApprove(cfg, c, args[1:])
 	case "attestations":
@@ -61,7 +45,36 @@ func cmdVHL(args []string) error {
 	case "policy":
 		return cmdVHLPolicy(c, args[1:])
 	default:
-		return fmt.Errorf("usage: courier vhl <enroll|enroll-webauthn|approvers|unenroll|rp|session|request|requests|approve|attestations|challenge|policy> [args]")
+		return fmt.Errorf("usage: courier vhl <approver|enroll-webauthn|rp|session|request|approve|attestations|challenge|policy> [args]")
+	}
+}
+
+// cmdVHLApprover dispatches the approver subcommand group: add, list,
+// and remove replace the old top-level enroll/approvers/unenroll
+// commands (issue #146).
+func cmdVHLApprover(c *client.Client, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: courier vhl approver <add|list|remove> [args]")
+	}
+	switch args[0] {
+	case "add":
+		return cmdVHLApproverAdd(c, args[1:])
+	case "list":
+		return cmdVHLApproverList(c)
+	case "remove":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: courier vhl approver remove <address|name>")
+		}
+		if !confirmTyping(fmt.Sprintf("type REVOKE to unenroll %s", args[1]), "REVOKE") {
+			return fmt.Errorf("cancelled")
+		}
+		if err := c.VHLUnenrollApprover(args[1]); err != nil {
+			return err
+		}
+		fmt.Println("approver revoked")
+		return nil
+	default:
+		return fmt.Errorf("usage: courier vhl approver <add|list|remove> [args]")
 	}
 }
 
@@ -122,7 +135,7 @@ func sanitizeForTerminal(s string) string {
 	return b.String()
 }
 
-func cmdVHLEnroll(c *client.Client, args []string) error {
+func cmdVHLApproverAdd(c *client.Client, args []string) error {
 	var name string
 	var rest []string
 	for i := 0; i < len(args); i++ {
@@ -138,7 +151,7 @@ func cmdVHLEnroll(c *client.Client, args []string) error {
 		rest = append(rest, args[i])
 	}
 	if len(rest) < 1 {
-		return fmt.Errorf("usage: courier vhl enroll <address> [--name NAME]")
+		return fmt.Errorf("usage: courier vhl approver add <address> [--name NAME]")
 	}
 	address := rest[0]
 	// Enrollment is a human-controlled cryptographic ceremony
@@ -261,7 +274,7 @@ func cmdVHLRPSet(c *client.Client, args []string) error {
 	return nil
 }
 
-func cmdVHLApprovers(c *client.Client) error {
+func cmdVHLApproverList(c *client.Client) error {
 	approvers, err := c.VHLApprovers()
 	if err != nil {
 		return err
@@ -385,7 +398,23 @@ func cmdVHLSessionRevoke(c *client.Client, args []string) error {
 	return nil
 }
 
+// cmdVHLRequest dispatches the request subcommand group: new files an
+// approval request and list shows the pending queue (issue #146).
 func cmdVHLRequest(c *client.Client, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: courier vhl request <new|list> [args]")
+	}
+	switch args[0] {
+	case "new":
+		return cmdVHLRequestNew(c, args[1:])
+	case "list":
+		return cmdVHLRequestList(c)
+	default:
+		return fmt.Errorf("usage: courier vhl request <new|list> [args]")
+	}
+}
+
+func cmdVHLRequestNew(c *client.Client, args []string) error {
 	var tierStr, message, presenceStr, human string
 	for i := 0; i < len(args); i++ {
 		switch {
@@ -406,7 +435,7 @@ func cmdVHLRequest(c *client.Client, args []string) error {
 		case strings.HasPrefix(args[i], "--to="):
 			human = strings.TrimPrefix(args[i], "--to=")
 		default:
-			return fmt.Errorf("usage: courier vhl request --tier 2 --message TEXT [--presence pin] [--to HUMAN-ADDRESS]")
+			return fmt.Errorf("usage: courier vhl request new --tier 2 --message TEXT [--presence pin] [--to HUMAN-ADDRESS]")
 		}
 	}
 	// Tier 1 approvals are session-scoped: VHLApproveMint rejects
@@ -436,11 +465,11 @@ func cmdVHLRequest(c *client.Client, args []string) error {
 	}
 	h := vhl.MsgHashOf([]byte(message))
 	fmt.Printf("approval request %s recorded (tier %d, action hash %.16x…)\n", req.ID, tier, h)
-	fmt.Println("the human reviews it with `courier vhl requests` and approves with `courier vhl approve`")
+	fmt.Println("the human reviews it with `courier vhl request list` and approves with `courier vhl approve`")
 	return nil
 }
 
-func cmdVHLRequests(c *client.Client) error {
+func cmdVHLRequestList(c *client.Client) error {
 	reqs, err := c.VHLPendingRequests()
 	if err != nil {
 		return err
@@ -622,19 +651,20 @@ func cmdVHLPolicy(c *client.Client, args []string) error {
 	return nil
 }
 
+// cmdVHLChallenge mints a one-time challenge code in flag form
+// (issue #146): `courier vhl challenge --action TEXT`. There is no
+// verify subcommand on this branch — challenge verification happens
+// inside `courier vhl approve --presence challenge`.
 func cmdVHLChallenge(c *client.Client, args []string) error {
-	if len(args) == 0 || args[0] != "mint" {
-		return fmt.Errorf("usage: courier vhl challenge mint --action TEXT")
-	}
 	var action string
-	for i := 1; i < len(args); i++ {
+	for i := 0; i < len(args); i++ {
 		switch {
 		case args[i] == "--action" && i+1 < len(args):
 			action, i = args[i+1], i+1
 		case strings.HasPrefix(args[i], "--action="):
 			action = strings.TrimPrefix(args[i], "--action=")
 		default:
-			return fmt.Errorf("usage: courier vhl challenge mint --action TEXT")
+			return fmt.Errorf("usage: courier vhl challenge --action TEXT")
 		}
 	}
 	if strings.TrimSpace(action) == "" {
