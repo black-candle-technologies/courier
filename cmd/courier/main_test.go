@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/black-candle-technologies/courier/internal/client"
@@ -257,6 +258,24 @@ func TestSplitSendArgsDashForms(t *testing.T) {
 	}
 }
 
+// TestSendForceTerminatorRepro is the exact scenario from the GitHub
+// Codex review: `courier send lane -- hello --force` must transmit the
+// literal body "hello --force" without enabling force mode (which would
+// bypass first-contact confirmation).
+func TestSendForceTerminatorRepro(t *testing.T) {
+	noForce, force := stripForce([]string{"lane", "--", "hello", "--force"})
+	if force {
+		t.Errorf("force = true, want false (--force after -- is message text)")
+	}
+	pos, _, _, _, _, _, _, err := splitSendArgs(noForce)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	body := strings.Join(pos[1:], " ")
+	if body != "hello --force" {
+		t.Errorf("body = %q, want %q", body, "hello --force")
+	}
+}
 func TestStripForce(t *testing.T) {
 	cases := []struct {
 		name      string
