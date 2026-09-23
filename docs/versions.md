@@ -8,7 +8,7 @@ different cadences (e.g. v0.13.0 was dashboard-only), so there is no single
 
 | Component | Binary | Version source | Latest release |
 |---|---|---|---|
-| Client CLI | `courier` | `internal/version.Client` | v0.11.1 |
+| Client CLI | `courier` | `internal/version.Client` | v0.11.2 |
 | Relay server | `courier-relay` | `internal/version.Relay` | v0.9.3 |
 | Web dashboard | `courier-dashboard` | `internal/version.Dashboard` | v0.13.1 |
 | Bridge gateway | `courier-bridge-gateway` | `internal/version.Bridge` | v0.11.0 |
