@@ -557,31 +557,52 @@ func cmdSend(args []string) error {
 // positional, but the usage string documents flags after the message,
 // so this keeps both working.
 //
+// splitSendArgs extracts --file/--attach/--reply-to/--ttl flags from any
+// position in the send command's arguments, returning the remaining
+// positional arguments. Go's flag package stops parsing at the first
+// positional, but the usage string documents flags after the message,
+// so this keeps both working.
+//
+// An unrecognized --flag is an error, never message text: silently
+// sending the flag itself as the body (issue #155) is worse than
+// refusing. A lone "-" still means "read the body from stdin" and a
+// lone "--" still ends flag parsing the way users expect.
+//
 // A bare --tier with no value, or --tier= with an empty value, is an
 // argument error rather than a silent Tier 0: the human asked for a
 // verification tier and must not get an unattested message instead.
 func splitSendArgs(args []string) (positional []string, file, replyTo string, attach []string, ttl string, tier string, attestation string, err error) {
+	onlyPositional := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if onlyPositional {
+			positional = append(positional, a)
+			continue
+		}
 		switch {
-		case a == "--attach" && i+1 < len(args):
-			attach = append(attach, args[i+1])
+		case a == "--":
+			onlyPositional = true
+		case a == "--attach" || a == "--file" || a == "--reply-to" || a == "--ttl":
+			if i+1 >= len(args) {
+				return nil, "", "", nil, "", "", "", fmt.Errorf("flag %q requires a value", a)
+			}
+			switch a {
+			case "--attach":
+				attach = append(attach, args[i+1])
+			case "--file":
+				file = args[i+1]
+			case "--reply-to":
+				replyTo = args[i+1]
+			case "--ttl":
+				ttl = args[i+1]
+			}
 			i++
 		case strings.HasPrefix(a, "--attach="):
 			attach = append(attach, strings.TrimPrefix(a, "--attach="))
-		case a == "--file" && i+1 < len(args):
-			file = args[i+1]
-			i++
 		case strings.HasPrefix(a, "--file="):
 			file = strings.TrimPrefix(a, "--file=")
-		case a == "--reply-to" && i+1 < len(args):
-			replyTo = args[i+1]
-			i++
 		case strings.HasPrefix(a, "--reply-to="):
 			replyTo = strings.TrimPrefix(a, "--reply-to=")
-		case a == "--ttl" && i+1 < len(args):
-			ttl = args[i+1]
-			i++
 		case strings.HasPrefix(a, "--ttl="):
 			ttl = strings.TrimPrefix(a, "--ttl=")
 		case a == "--tier" && i+1 < len(args):
@@ -602,6 +623,11 @@ func splitSendArgs(args []string) (positional []string, file, replyTo string, at
 			i++
 		case strings.HasPrefix(a, "--attestation="):
 			attestation = strings.TrimPrefix(a, "--attestation=")
+		case len(a) > 2 && strings.HasPrefix(a, "--"):
+			if a == "--message-file" || strings.HasPrefix(a, "--message-file=") {
+				return nil, "", "", nil, "", "", "", fmt.Errorf("unknown flag %q (did you mean --file?)", a)
+			}
+			return nil, "", "", nil, "", "", "", fmt.Errorf("unknown flag %q", a)
 		default:
 			positional = append(positional, a)
 		}

@@ -137,6 +137,75 @@ func TestSplitSendArgs(t *testing.T) {
 	}
 }
 
+func TestSplitSendArgsUnknownFlag(t *testing.T) {
+	// Regression test for issue #155: an unrecognized --flag must fail
+	// loudly instead of being silently sent as the message body.
+	cases := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "message-file after positionals",
+			args:    []string{"lane", "--message-file", "/dev/stdin"},
+			wantErr: `unknown flag "--message-file" (did you mean --file?)`,
+		},
+		{
+			name:    "message-file equals form",
+			args:    []string{"lane", "--message-file=/dev/stdin"},
+			wantErr: `unknown flag "--message-file=/dev/stdin" (did you mean --file?)`,
+		},
+		{
+			name:    "unknown flag before positionals",
+			args:    []string{"--bogus", "x", "lane", "hello"},
+			wantErr: `unknown flag "--bogus"`,
+		},
+		{
+			name:    "unknown equals-form flag",
+			args:    []string{"lane", "hello", "--wat=1"},
+			wantErr: `unknown flag "--wat=1"`,
+		},
+		{
+			name:    "known flag missing value",
+			args:    []string{"lane", "hello", "--file"},
+			wantErr: `flag "--file" requires a value`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, _, _, _, _, _, err := splitSendArgs(tc.args)
+			if err == nil {
+				t.Fatalf("splitSendArgs(%v) = nil error, want %q", tc.args, tc.wantErr)
+			}
+			if err.Error() != tc.wantErr {
+				t.Errorf("splitSendArgs(%v) error = %q, want %q", tc.args, err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestSplitSendArgsDashForms(t *testing.T) {
+	// "-" alone still reads the body from stdin; "--" ends flag parsing.
+	pos, _, _, _, _, _, _, err := splitSendArgs([]string{"lane", "-"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(pos, []string{"lane", "-"}) {
+		t.Errorf("positional = %v, want [lane -]", pos)
+	}
+
+	pos, file, _, _, _, _, _, err := splitSendArgs([]string{"lane", "--", "--file"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(pos, []string{"lane", "--file"}) {
+		t.Errorf("positional = %v, want [lane --file]", pos)
+	}
+	if file != "" {
+		t.Errorf("file = %q, want empty (-- after -- is positional, not a flag)", file)
+	}
+}
+
 func TestSplitBackupArgs(t *testing.T) {
 	cases := []struct {
 		name        string
