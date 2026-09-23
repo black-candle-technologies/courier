@@ -461,7 +461,7 @@ func (c *Client) VHLFinishSessionMint(pending *vhl.PendingSessionMint, credentia
 	// derivation run here — never network I/O.
 	if err := updateVHL(func(ff *vhlFile) error {
 		if ff.RP.ID == "" || len(ff.RP.Origins) == 0 {
-			return fmt.Errorf("session mint refused: no WebAuthn relying party configured — no ceremony transport exists yet, so there is nothing trustworthy to verify against")
+			return fmt.Errorf("session mint refused: no WebAuthn relying party configured — run `courier vhl rp set` first, then enroll a credential with `courier vhl enroll-webauthn`")
 		}
 		var cred *vhl.Credential
 		for _, a := range ff.Registry.Approvers {

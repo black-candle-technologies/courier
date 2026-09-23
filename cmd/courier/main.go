@@ -211,10 +211,17 @@ func usage() {
   courier fs forget <peer>               erase the FS session for a peer
   courier vhl enroll <address> [--name N]
                                          enroll a human approver (interactive confirm)
+  courier vhl enroll-webauthn [--device LABEL]
+                                         enroll a WebAuthn credential via the
+                                         relay-hosted browser ceremony
+  courier vhl rp set --id DOMAIN --origin https://DOMAIN --attestation-root CERT_FILE [...]
+                                         configure the WebAuthn relying party
+  courier vhl rp show                    show the relying-party config
   courier vhl approvers                  list enrolled approvers
   courier vhl unenroll <address|name>    revoke an approver
-  courier vhl session mint            mint a tier-1 session token (refuses: no
-                                         WebAuthn ceremony transport yet)
+  courier vhl session mint [--scope ADDRESS] [--ttl DURATION]
+                                         mint a tier-1 session token via the
+                                         relay-hosted WebAuthn ceremony
   courier vhl session status             show live session tokens
   courier vhl session revoke <id> [--broadcast]
                                          revoke a session token

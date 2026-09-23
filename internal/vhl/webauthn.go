@@ -48,6 +48,17 @@ type WebAuthnRP struct {
 	// Origins lists the allowed clientData origins (e.g.
 	// "https://dashboard.example.com").
 	Origins []string
+	// AttestationRoots holds the attestation trust anchors for
+	// enrollment ceremonies: base64url-encoded DER certificates
+	// (e.g. the authenticator vendor's attestation root CA). The
+	// registration attestation statement must chain to one of
+	// these; without any configured roots, enrollment fails
+	// closed. "none" and self attestations are always rejected:
+	// they carry no proof a real authenticator was involved, so
+	// anyone holding the ceremony challenge (including a
+	// compromised relay, which sees every challenge) could forge
+	// them and enroll an attacker key.
+	AttestationRoots []string `json:"attestation_roots,omitempty"`
 }
 
 // credentialKey parses an enrolled WebAuthn credential public key.
@@ -252,6 +263,126 @@ func (d *cborDecoder) readMapLen() (int, error) {
 		return 0, fmt.Errorf("map too large")
 	}
 	return int(n), nil
+}
+
+// readTstr reads a CBOR text string (major type 3).
+func (d *cborDecoder) readTstr() (string, error) {
+	b, err := d.readByte()
+	if err != nil {
+		return "", err
+	}
+	if b>>5 != 3 {
+		return "", fmt.Errorf("want text string, got major %d", b>>5)
+	}
+	n, err := d.readUintArg(b & 0x1f)
+	if err != nil {
+		return "", err
+	}
+	if n > uint64(len(d.buf)-d.off) {
+		return "", fmt.Errorf("truncated text string")
+	}
+	out := string(d.buf[d.off : d.off+int(n)])
+	d.off += int(n)
+	return out, nil
+}
+
+// readBstr reads a CBOR byte string (major type 2) as a standalone value.
+func (d *cborDecoder) readBstr() ([]byte, error) {
+	b, err := d.readByte()
+	if err != nil {
+		return nil, err
+	}
+	if b>>5 != 2 {
+		return nil, fmt.Errorf("want byte string, got major %d", b>>5)
+	}
+	n, err := d.readUintArg(b & 0x1f)
+	if err != nil {
+		return nil, err
+	}
+	if n > uint64(len(d.buf)-d.off) {
+		return nil, fmt.Errorf("truncated byte string")
+	}
+	out := bytes.Clone(d.buf[d.off : d.off+int(n)])
+	d.off += int(n)
+	return out, nil
+}
+
+// readArrayLen reads a CBOR array header (major type 4) and returns
+// the element count.
+func (d *cborDecoder) readArrayLen() (int, error) {
+	b, err := d.readByte()
+	if err != nil {
+		return 0, err
+	}
+	if b>>5 != 4 {
+		return 0, fmt.Errorf("want array, got major %d", b>>5)
+	}
+	n, err := d.readUintArg(b & 0x1f)
+	if err != nil {
+		return 0, err
+	}
+	if n > 32 {
+		return 0, fmt.Errorf("array too large")
+	}
+	return int(n), nil
+}
+
+// skipValue skips one CBOR value of any supported shape: integers,
+// byte/text strings, arrays, and maps (recursively).
+func (d *cborDecoder) skipValue() error {
+	b, err := d.readByte()
+	if err != nil {
+		return err
+	}
+	major, info := b>>5, b&0x1f
+	switch major {
+	case 0, 1:
+		_, err := d.readUintArg(info)
+		return err
+	case 2, 3:
+		n, err := d.readUintArg(info)
+		if err != nil {
+			return err
+		}
+		if n > uint64(len(d.buf)-d.off) {
+			return fmt.Errorf("truncated string")
+		}
+		d.off += int(n)
+		return nil
+	case 4:
+		n, err := d.readUintArg(info)
+		if err != nil {
+			return err
+		}
+		if n > 32 {
+			return fmt.Errorf("array too large")
+		}
+		for i := 0; i < int(n); i++ {
+			if err := d.skipValue(); err != nil {
+				return err
+			}
+		}
+		return nil
+	case 5:
+		n, err := d.readUintArg(info)
+		if err != nil {
+			return err
+		}
+		if n > 32 {
+			return fmt.Errorf("map too large")
+		}
+		for i := 0; i < int(n); i++ {
+			if err := d.skipValue(); err != nil {
+				return err
+			}
+			if err := d.skipValue(); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported major type %d", major)
+	}
 }
 
 // webauthnAssertion is the JSON the ceremony produces (the

@@ -2182,12 +2182,13 @@ therefore survive process restart but die on machine reboot for
 the issuer, mirroring forward-secrecy session hygiene. Where no
 stable boot id exists the id is process-local by construction: a
 token minted by one process is dropped by the next, so tokens are
-single-process on those hosts. Minting is currently closed: the
-CLI's `session mint` refuses outright because no WebAuthn ceremony
-transport ships yet, and a command that can never complete a
-ceremony must not pretend it can (see §30.6). The same-or-stronger
-re-mint rule still applies: a live token is never renewable with a
-weaker ceremony.
+single-process on those hosts. Minting is ceremony-bound: the CLI's
+`session mint` creates a relay-hosted WebAuthn ceremony over the
+mint challenge and the mint completes only against the verified
+assertion the human's authenticator produced in the browser (see
+§30.8). There is no path that mints a token without a fresh
+WebAuthn ceremony. The same-or-stronger re-mint rule still
+applies: a live token is never renewable with a weaker ceremony.
 
 ### 30.4 Receiver verification
 
@@ -2249,11 +2250,30 @@ the VHL layer, never surfaced as chat):
 - `courier vhl enroll <address> [--name N]` — enroll a human
   approver (interactive confirmation; the enrollment event is
   recorded). Enrollment is a Tier 2 human-approved event.
-- `courier vhl session mint` — REFUSES. Session-token minting
-  requires a WebAuthn mint ceremony with an enrolled approver
-  credential, and no ceremony transport ships in the CLI yet; the
-  command fails closed by design rather than minting on a
-  caller-asserted ceremony. `session status` lists live tokens;
+- `courier vhl enroll-webauthn [--device LABEL]` — enroll a
+  WebAuthn credential via the relay-hosted ceremony (§30.8): the
+  agent creates the ceremony, the human completes it with their
+  security key in the browser, and the agent verifies the
+  attestation itself before enrolling locally and publishing the
+  signed enrollment. Requires a configured relying party
+  (`courier vhl rp set`); fails closed without one.
+- `courier vhl rp set --id DOMAIN --origin https://DOMAIN
+  [--origin ...] --attestation-root CERT_FILE [...]` — configure
+  the local WebAuthn relying party: the RP id, the allowed
+  origins, and the mandatory attestation trust roots (X.509 CA
+  certificates, PEM or DER — e.g. the authenticator vendor's
+  root). Attestation roots are mandatory: without them enrollment
+  cannot distinguish a real authenticator's attestation from one
+  forged by anyone holding the ceremony challenge, so enrollment
+  fails closed. `courier vhl rp show` prints the current config.
+- `courier vhl session mint [--scope ADDRESS] [--ttl DURATION]`
+  — mint a session token through the relay-hosted mint ceremony
+  (§30.8): the agent begins the mint locally, creates the
+  ceremony bound to the mint challenge, waits for the human to
+  approve it with their security key in the browser, and finishes
+  the mint against the verified assertion. The returned token is
+  ceremony-bound — minting is impossible without a fresh WebAuthn
+  ceremony. `session status` lists live tokens;
   `session revoke <id> [--broadcast]` revokes.
 - `courier vhl request --tier 2 --message TEXT [--to ADDR]` —
   file an approval request for exact bytes; `courier vhl approve
@@ -2275,12 +2295,18 @@ the VHL layer, never surfaced as chat):
 - The PIN ceremony is only as strong as the terminal it runs on:
   typing `APPROVE <id>` proves a human is at *that* keyboard, not
   which human. FIDO2/WebAuthn is the gold standard for approver
-  identity; the verifier checks real WebAuthn assertions
-  (challenge binding, origin, RP id, UP/UV flags, credential
-  signature) against enrolled credentials, but the RP
-  configuration is not yet wired to a dashboard ceremony, so
-  fido2 proofs fail closed until that flow lands. The CLI
-  currently performs PIN and challenge ceremonies.
+  identity: the verifier checks real WebAuthn attestations and
+  assertions (exact challenge binding, origin allowlist, RP id
+  hash, UP/UV flags, attested credential data, and the
+  authenticator's attestation chain or assertion signature)
+  against the locally configured relying party. Enrollment
+  accepts only `packed` (x5c) and `fido-u2f` attestations chained
+  to operator-provisioned attestation roots; `none` and self
+  attestations are rejected outright, and enrollment fails closed
+  when no roots are configured — anyone holding the ceremony
+  challenge (including a compromised relay, which sees every
+  challenge) could forge those. The CLI currently performs PIN,
+  challenge, and WebAuthn ceremonies.
 - Session tokens are bearer-adjacent: whoever holds the sealed
   token file and the process can mint Tier 1 attestations. The
   8-hour default, boot-id binding, and per-token revocation
@@ -2297,6 +2323,71 @@ the VHL layer, never surfaced as chat):
   attests the attacker's "approvals" faithfully — VHL verifies
   *human review happened*, not *which human* beyond enrollment.
   Enrollment itself must be a human-supervised event.
+
+### 30.8 Relay-hosted WebAuthn ceremony transport
+
+The agent cannot touch a YubiKey, so enrollment and session minting
+run as a relay-hosted ceremony. The relay is a courier, never a
+verifier: it stores the browser's response verbatim and the agent
+verifies it itself against its own challenge and RP config.
+
+- `POST /v1/vhl/ceremonies` (identity-signed): the agent creates a
+  ceremony of type `enroll` or `mint` over a fresh 32-byte random
+  challenge, the RP id, and (for mint) the enrolled credential ids.
+  The request carries a timestamp (5-minute skew window) and a
+  signature over the domain-separated canonical form binding the
+  address, type, challenge, and timestamp. The relay answers with
+  a cryptographically random 8-character single-use code (5-minute
+  TTL) and the ceremony page path.
+- `GET /v1/vhl/ceremonies/{code}` and
+  `POST /v1/vhl/ceremonies/{code}/attestation` (dashboard login):
+  the human opens the ceremony page in their browser while logged
+  into the dashboard; the page performs
+  `navigator.credentials.create()` (enrollment) or `.get()`
+  (mint) and submits the response. Both endpoints require the
+  dashboard session cookie, the session's Courier identity must
+  match the ceremony creator's (a second human on a shared relay
+  cannot complete or snoop someone else's ceremony), and the
+  submission carries the session's CSRF synchronizer token.
+- `GET /v1/vhl/ceremonies/{code}/result` (identity-signed): the
+  agent polls for the completed attestation. Only the creating
+  identity may read it. The agent then verifies the attestation
+  itself — exact challenge, RP id hash, origin allowlist, UP/UV,
+  attested credential data, and the attestation chain against its
+  operator-provisioned roots — and proceeds only on success. A
+  compromised relay that swaps the attestation, the challenge, or
+  the RP id fails closed at this step: the agent never trusts the
+  relay's word for what the authenticator said.
+- Ceremonies are single-use and short-lived: the first attestation
+  submission wins, double submission is a conflict, and expired or
+  completed records are purged. Missing enrollment, missing RP
+  config, missing login, expiry, malformed or tampered
+  challenges, and invalid attestations all fail closed with
+  explicit errors.
+- Enrollment publication: after verifying the attestation, the
+  agent enrolls the credential locally and publishes the signed
+  identity→credential binding to `POST /v1/vhl/enrollments` for
+  discovery (`GET /v1/vhl/enrollments/{address}`). Only the
+  address owner can publish (identity signature over the
+  domain-separated canonical form), and only a strictly increasing
+  epoch is applied — stale re-publications are no-ops. The local
+  registry stays the trust root: a directory entry can never
+  override a local enrollment.
+- Attestation roots are provisioned by the operator via
+  `courier vhl rp set --attestation-root CERT_FILE` (the
+  authenticator vendor's root CA, e.g. Yubico's). They are
+  mandatory: enrollment fails closed without them.
+- Deployment: the ceremony page must share the dashboard's origin
+  (session cookie + TLS certificate). The production RP id and
+  ceremony origin is `courier.blackcandletech.com`: operators
+  configure it with
+  `courier vhl rp set --id courier.blackcandletech.com --origin
+  https://courier.blackcandletech.com --attestation-root <CA>`
+  and route `/vhl/*` and `/v1/vhl/*` at that domain to the relay;
+  the relay and dashboard share one SQLite database so the
+  dashboard session is visible to the relay's login gate. No proxy
+  or production routing changes are part of this change — that is
+  separate deploy work.
 
 ## Appendix B. In-flight work requiring spec updates after merge
 

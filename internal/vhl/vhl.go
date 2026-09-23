@@ -44,7 +44,13 @@
 // and are retained on the audit trail.
 //
 // The relay never sees approval plaintext — approval metadata only,
-// same as all relay metadata. The relay needs no changes for VHL.
+// same as all relay metadata. Attestation artifacts travel in-band
+// as native Courier message types; the relay additionally hosts the
+// WebAuthn ceremony transport (§30.6 of PROTOCOL.md): short-lived
+// ceremony records that ferry the browser's ceremony responses back
+// to the agent. The relay is an authenticated pipe there — it never
+// sees private key material and cannot forge a ceremony, because
+// the agent verifies every attestation itself.
 package vhl
 
 import "fmt"

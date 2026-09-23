@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Courier VHL ceremony</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 34rem;
+         margin: 3rem auto; padding: 0 1.25rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; }
+  .card { border: 1px solid #8884; border-radius: 0.75rem; padding: 1.25rem;
+          margin: 1rem 0; }
+  #status { min-height: 3rem; }
+  button { font-size: 1.05rem; padding: 0.6rem 1.4rem; border-radius: 0.5rem;
+           border: 1px solid #888; background: #2a7; color: #fff; cursor: pointer; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  .err { color: #c22; }
+  .ok { color: #2a7; font-weight: 600; }
+  input[type=text] { font-size: 1rem; padding: 0.4rem; width: 12rem;
+                     font-family: ui-monospace, monospace; }
+  .mono { font-family: ui-monospace, monospace; font-size: 0.9rem;
+          word-break: break-all; }
+  .hint { color: #888; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>Courier VHL ceremony</h1>
+<div class="card">
+  <div id="ceremony-info"><span class="hint">Loading ceremony…</span></div>
+</div>
+<div class="card" id="code-card" hidden>
+  <label for="code">Ceremony code:</label>
+  <input type="text" id="code" autocomplete="off" spellcheck="false">
+  <button id="load">Load</button>
+</div>
+<div class="card">
+  <div id="status" role="status"></div>
+  <p><button id="go" disabled>Begin</button></p>
+  <p class="hint" id="expiry"></p>
+</div>
+<script>
+"use strict";
+// CSRF synchronizer token injected by the relay's page handler.
+const CSRF_TOKEN = "<!--CSRF_TOKEN-->";
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status"), goBtn = $("go"), expiryEl = $("expiry"),
+      infoEl = $("ceremony-info"), codeCard = $("code-card");
+
+function setStatus(html, cls) {
+  statusEl.innerHTML = html;
+  statusEl.className = cls || "";
+}
+
+function b64urlToBytes(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = s.length % 4;
+  if (pad) s += "=".repeat(4 - pad);
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function bytesToB64url(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+let details = null;
+let expiryTimer = null;
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || ("HTTP " + res.status));
+  return body;
+}
+
+function codeFromURL() {
+  const m = new URLSearchParams(location.search).get("code");
+  return (m || "").trim().toLowerCase();
+}
+
+async function loadCeremony(code) {
+  setStatus("Loading ceremony…");
+  goBtn.disabled = true;
+  try {
+    details = await api("/v1/vhl/ceremonies/" + encodeURIComponent(code));
+  } catch (e) {
+    setStatus("Could not load ceremony: " + escapeHtml(e.message), "err");
+    codeCard.hidden = false;
+    return;
+  }
+  codeCard.hidden = true;
+  const kind = details.type === "enroll"
+    ? "Register a security key"
+    : "Approve a session-token mint";
+  infoEl.innerHTML =
+    "<strong>" + escapeHtml(kind) + "</strong><br>" +
+    '<span class="hint">Identity</span> <span class="mono">' +
+    escapeHtml(details.address) + "</span><br>" +
+    '<span class="hint">Relying party</span> <span class="mono">' +
+    escapeHtml(details.rp_id) + "</span>";
+  goBtn.textContent = details.type === "enroll"
+    ? "Register my security key" : "Approve with my security key";
+  if (details.completed) {
+    setStatus("This ceremony was already completed.", "ok");
+    return;
+  }
+  setStatus("Ready. Your security key will be asked for.");
+  goBtn.disabled = false;
+  startExpiryCountdown();
+}
+
+function startExpiryCountdown() {
+  clearInterval(expiryTimer);
+  function tick() {
+    const left = Math.max(0, details.expires_at - Math.floor(Date.now() / 1000));
+    if (left <= 0) {
+      expiryEl.textContent = "This ceremony code has expired. Ask your agent for a new one.";
+      goBtn.disabled = true;
+      clearInterval(expiryTimer);
+      return;
+    }
+    const m = Math.floor(left / 60), s = left % 60;
+    expiryEl.textContent = "Code expires in " + m + ":" + String(s).padStart(2, "0");
+  }
+  tick();
+  expiryTimer = setInterval(tick, 1000);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function credToJSON(cred, isCreate) {
+  const response = {
+    clientDataJSON: bytesToB64url(cred.response.clientDataJSON),
+  };
+  if (isCreate) {
+    response.attestationObject = bytesToB64url(cred.response.attestationObject);
+  } else {
+    response.authenticatorData = bytesToB64url(cred.response.authenticatorData);
+    response.signature = bytesToB64url(cred.response.signature);
+    if (cred.response.userHandle)
+      response.userHandle = bytesToB64url(cred.response.userHandle);
+  }
+  return {
+    type: cred.type,
+    id: cred.id,
+    rawId: bytesToB64url(cred.rawId),
+    response,
+  };
+}
+
+async function runCeremony() {
+  goBtn.disabled = true;
+  setStatus("Waiting for your security key… touch it when it blinks.");
+  const isCreate = details.type === "enroll";
+  try {
+    let options;
+    if (isCreate) {
+      options = {
+        challenge: b64urlToBytes(details.challenge),
+        rp: { name: "Courier", id: details.rp_id },
+        user: {
+          id: new TextEncoder().encode(details.address),
+          name: details.address,
+          displayName: details.address,
+        },
+        pubKeyCredParams: [
+          { type: "public-key", alg: -7 },
+          { type: "public-key", alg: -8 },
+        ],
+        attestation: "direct",
+        authenticatorSelection: { userVerification: "required" },
+        timeout: 120000,
+      };
+    } else {
+      options = {
+        challenge: b64urlToBytes(details.challenge),
+        rpId: details.rp_id,
+        allowCredentials: (details.credential_ids || []).map((id) => ({
+          type: "public-key",
+          id: b64urlToBytes(id),
+        })),
+        userVerification: "required",
+        timeout: 120000,
+      };
+    }
+    const cred = isCreate
+      ? await navigator.credentials.create({ publicKey: options })
+      : await navigator.credentials.get({ publicKey: options });
+    if (!cred) throw new Error("no credential returned");
+
+    setStatus("Key ceremony complete — sending proof back…");
+    const payload = credToJSON(cred, isCreate);
+    await api("/v1/vhl/ceremonies/" + encodeURIComponent(codeFromURL()) + "/attestation", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        attestation: bytesToB64url(new TextEncoder().encode(JSON.stringify(payload))),
+        csrf_token: CSRF_TOKEN,
+      }),
+    });
+    clearInterval(expiryTimer);
+    expiryEl.textContent = "";
+    setStatus("Done. You can close this tab and return to your terminal.", "ok");
+  } catch (e) {
+    let msg = e && e.message ? e.message : String(e);
+    if (e && e.name === "NotAllowedError")
+      msg = "Ceremony cancelled or timed out. Click Begin to try again.";
+    else if (e && e.name === "InvalidStateError")
+      msg = "This security key is already registered here.";
+    else if (e && e.name === "NotSupportedError")
+      msg = "This browser does not support security keys (WebAuthn).";
+    setStatus("Ceremony failed: " + escapeHtml(msg), "err");
+    goBtn.disabled = false;
+  }
+}
+
+$("load").addEventListener("click", () => {
+  const code = $("code").value.trim().toLowerCase();
+  if (code) loadCeremony(code);
+});
+$("code").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("load").click();
+});
+goBtn.addEventListener("click", runCeremony);
+
+if (!window.PublicKeyCredential) {
+  setStatus("This browser does not support WebAuthn security keys.", "err");
+} else {
+  const code = codeFromURL();
+  if (code) loadCeremony(code);
+  else { codeCard.hidden = false; setStatus("Enter the ceremony code from your terminal."); }
+}
+</script>
+</body>
+</html>

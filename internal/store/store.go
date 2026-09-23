@@ -589,6 +589,18 @@ var migrations = []migration{
 	// under, so recipients can dispatch to the right opener. Existing rows
 	// predate suite tagging and are SuiteV1 by construction.
 	addColumnMigration(24, "envelope crypto suite", "envelopes", "suite", `suite TEXT NOT NULL DEFAULT 'ed25519-x25519-naclbox-v1'`),
+	createTablesMigration(25, "vhl_enrollments (issue #142)",
+		[]string{"vhl_enrollments"},
+		`CREATE TABLE IF NOT EXISTS vhl_enrollments(
+			address        TEXT PRIMARY KEY,
+			credential_id  TEXT NOT NULL,
+			credential_pub TEXT NOT NULL,
+			rp_id          TEXT NOT NULL,
+			aaguid         TEXT NOT NULL DEFAULT '',
+			epoch          INTEGER NOT NULL,
+			signature      TEXT NOT NULL,
+			published_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')))`,
+	),
 }
 
 // latestSchemaVersion is the newest migration version this build knows.

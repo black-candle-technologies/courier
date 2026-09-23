@@ -756,6 +756,22 @@ func legacyMigrate(db *sql.DB) error {
 	if err := addColumn(`ALTER TABLE dashboard_users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
+	// issue #142: VHL enrollment directory. One row per Courier
+	// address: the signed identity→credential binding the agent
+	// published after its WebAuthn enrollment ceremony. The epoch is
+	// strictly increasing per address so stale re-publications are
+	// no-ops (same pattern as the key directory).
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS vhl_enrollments(
+		address        TEXT PRIMARY KEY,
+		credential_id  TEXT NOT NULL,
+		credential_pub TEXT NOT NULL,
+		rp_id          TEXT NOT NULL,
+		aaguid         TEXT NOT NULL DEFAULT '',
+		epoch          INTEGER NOT NULL,
+		signature      TEXT NOT NULL,
+		published_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')))`); err != nil {
+		return err
+	}
 	return nil
 }
 

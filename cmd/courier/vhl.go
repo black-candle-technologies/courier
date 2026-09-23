@@ -17,7 +17,7 @@ import (
 
 func cmdVHL(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: courier vhl <enroll|approvers|unenroll|session|request|requests|approve|attestations|challenge> [args]")
+		return fmt.Errorf("usage: courier vhl <enroll|enroll-webauthn|approvers|unenroll|rp|session|request|requests|approve|attestations|challenge> [args]")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
@@ -27,6 +27,8 @@ func cmdVHL(args []string) error {
 	switch args[0] {
 	case "enroll":
 		return cmdVHLEnroll(c, args[1:])
+	case "enroll-webauthn":
+		return cmdVHLEnrollWebAuthn(c, args[1:])
 	case "approvers":
 		return cmdVHLApprovers(c)
 	case "unenroll":
@@ -41,6 +43,8 @@ func cmdVHL(args []string) error {
 		}
 		fmt.Println("approver revoked")
 		return nil
+	case "rp":
+		return cmdVHLRP(c, args[1:])
 	case "session":
 		return cmdVHLSession(c, args[1:])
 	case "request":
@@ -54,7 +58,7 @@ func cmdVHL(args []string) error {
 	case "challenge":
 		return cmdVHLChallenge(c, args[1:])
 	default:
-		return fmt.Errorf("usage: courier vhl <enroll|approvers|unenroll|session|request|requests|approve|attestations|challenge> [args]")
+		return fmt.Errorf("usage: courier vhl <enroll|enroll-webauthn|approvers|unenroll|rp|session|request|requests|approve|attestations|challenge> [args]")
 	}
 }
 
@@ -147,6 +151,106 @@ func cmdVHLEnroll(c *client.Client, args []string) error {
 	return nil
 }
 
+// cmdVHLEnrollWebAuthn enrolls the operator's own WebAuthn
+// credential (e.g. a YubiKey) through the relay ceremony transport:
+// the agent creates a ceremony, the human completes it in their
+// browser, and the agent verifies the attestation itself before
+// storing the credential locally and publishing the signed binding.
+func cmdVHLEnrollWebAuthn(c *client.Client, args []string) error {
+	var device string
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--device" && i+1 < len(args):
+			device = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--device="):
+			device = strings.TrimPrefix(args[i], "--device=")
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	if len(rest) > 0 {
+		return fmt.Errorf("usage: courier vhl enroll-webauthn [--device LABEL]")
+	}
+	if device == "" {
+		device = "yubikey"
+	}
+	printf := func(format string, a ...any) { fmt.Printf(format, a...) }
+	cred, err := c.VHLEnrollWebAuthn(device, printf)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("enrolled webauthn credential %s\n", cred.ID)
+	return nil
+}
+
+// cmdVHLRP manages the local WebAuthn relying-party config: `rp set`
+// stores the RP id, allowed origins, and attestation trust roots;
+// `rp show` prints the current config.
+func cmdVHLRP(c *client.Client, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: courier vhl rp <set|show> [args]")
+	}
+	switch args[0] {
+	case "show":
+		rp, err := c.VHLShowRP()
+		if err != nil {
+			return err
+		}
+		if rp.ID == "" {
+			fmt.Println("no relying party configured (run `courier vhl rp set ...`)")
+			return nil
+		}
+		fmt.Printf("rp id:   %s\n", rp.ID)
+		fmt.Printf("origins: %s\n", strings.Join(rp.Origins, ", "))
+		fmt.Printf("attestation roots: %d configured\n", len(rp.AttestationRoots))
+		return nil
+	case "set":
+		return cmdVHLRPSet(c, args[1:])
+	default:
+		return fmt.Errorf("usage: courier vhl rp <set|show> [args]")
+	}
+}
+
+func cmdVHLRPSet(c *client.Client, args []string) error {
+	var rpID string
+	var origins, roots []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--id" && i+1 < len(args):
+			rpID = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--id="):
+			rpID = strings.TrimPrefix(args[i], "--id=")
+		case args[i] == "--origin" && i+1 < len(args):
+			origins = append(origins, args[i+1])
+			i++
+		case strings.HasPrefix(args[i], "--origin="):
+			origins = append(origins, strings.TrimPrefix(args[i], "--origin="))
+		case args[i] == "--attestation-root" && i+1 < len(args):
+			roots = append(roots, args[i+1])
+			i++
+		case strings.HasPrefix(args[i], "--attestation-root="):
+			roots = append(roots, strings.TrimPrefix(args[i], "--attestation-root="))
+		default:
+			return fmt.Errorf("usage: courier vhl rp set --id DOMAIN --origin https://DOMAIN [--origin ...] --attestation-root CERT_FILE [...]")
+		}
+	}
+	if rpID == "" || len(origins) == 0 || len(roots) == 0 {
+		return fmt.Errorf("usage: courier vhl rp set --id DOMAIN --origin https://DOMAIN [--origin ...] --attestation-root CERT_FILE [...]")
+	}
+	old, _ := c.VHLShowRP()
+	if err := c.VHLSetRP(rpID, origins, roots); err != nil {
+		return err
+	}
+	fmt.Printf("relying party set: id=%s origins=%d attestation-roots=%d\n", rpID, len(origins), len(roots))
+	if old.ID != "" && old.ID != rpID {
+		fmt.Printf("warning: RP id changed from %s to %s — previously enrolled credentials were bound to the old id and must be re-enrolled\n", old.ID, rpID)
+	}
+	return nil
+}
+
 func cmdVHLApprovers(c *client.Client) error {
 	approvers, err := c.VHLApprovers()
 	if err != nil {
@@ -184,18 +288,48 @@ func cmdVHLSession(c *client.Client, args []string) error {
 }
 
 func cmdVHLSessionMint(c *client.Client, args []string) error {
-	// Session-token minting is closed until a real WebAuthn mint
-	// ceremony exists. The old command took a caller-supplied
-	// --presence and signed the token with the agent's identity
-	// key, so any process holding that key could mint Tier 1
-	// tokens with no human involved. Minting now requires a
-	// genuine authenticator assertion over the mint challenge,
-	// verified against an enrolled WebAuthn credential and the
-	// configured relying party — and no ceremony transport ships
-	// in this CLI yet. Refusing outright is the only honest
-	// behavior: a command that can never complete a ceremony must
-	// not exist in a form that pretends it can.
-	return fmt.Errorf("refusing: session minting requires a WebAuthn mint ceremony with an enrolled approver credential, and no ceremony transport exists in this CLI yet (see PROTOCOL.md §30). Minting with a merely asserted ceremony would let any process holding the identity key mint Tier 1 tokens with no human involved, defeating VHL")
+	var scope, ttlStr string
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--scope" && i+1 < len(args):
+			scope = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--scope="):
+			scope = strings.TrimPrefix(args[i], "--scope=")
+		case args[i] == "--ttl" && i+1 < len(args):
+			ttlStr = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--ttl="):
+			ttlStr = strings.TrimPrefix(args[i], "--ttl=")
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	if len(rest) > 0 {
+		return fmt.Errorf("usage: courier vhl session mint [--scope ADDRESS] [--ttl DURATION]")
+	}
+	var ttl time.Duration
+	if ttlStr != "" {
+		var err error
+		ttl, err = time.ParseDuration(ttlStr)
+		if err != nil {
+			return fmt.Errorf("bad --ttl: %w", err)
+		}
+	}
+	// Minting is ceremony-bound (issue #142): the agent creates a
+	// relay ceremony over the mint challenge, the human approves it
+	// with their security key in the browser, and the mint completes
+	// against the verified assertion. There is no path that mints a
+	// token without a fresh WebAuthn ceremony.
+	printf := func(format string, a ...any) { fmt.Printf(format, a...) }
+	tok, err := c.VHLSessionMintCeremony(scope, ttl, printf)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("minted session token %s (presence=%s expires=%s)\n", tok.ID, tok.Presence,
+		time.Unix(tok.ExpiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"))
+	return nil
 }
 
 func cmdVHLSessionStatus(c *client.Client) error {
@@ -204,7 +338,7 @@ func cmdVHLSessionStatus(c *client.Client) error {
 		return err
 	}
 	if len(toks) == 0 {
-		fmt.Println("no live session token (restart revokes tokens; minting requires a WebAuthn mint ceremony, not yet available in this CLI)")
+		fmt.Println("no live session token (restart revokes tokens; mint one with `courier vhl session mint`)")
 		return nil
 	}
 	for _, t := range toks {
