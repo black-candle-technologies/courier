@@ -1,4 +1,4 @@
-// Opt-in delivery/read receipt tests (issue #52).
+// Opt-in delivery receipt tests (issue #52; read side cut in #146).
 package client
 
 import (
@@ -10,13 +10,15 @@ import (
 
 // TestParseReceiptDMPayload: only well-formed receipt payloads are
 // intercepted; anything else falls through to ordinary delivery.
+// "read" payloads from older clients are still intercepted (so they
+// never surface as chat) but are never recorded (#146).
 func TestParseReceiptDMPayload(t *testing.T) {
 	mk := func(s string) []byte { return []byte(s) }
 	if p, ok := parseReceiptDMPayload(mk(`{"cr":3,"t":"delivery","m":42,"at":1700000000}`)); !ok || p.Type != receiptDelivery || p.MsgID != 42 {
 		t.Fatal("valid delivery receipt not recognized")
 	}
 	if p, ok := parseReceiptDMPayload(mk(`{"cr":3,"t":"read","m":7,"at":1700000001}`)); !ok || p.Type != receiptRead {
-		t.Fatal("valid read receipt not recognized")
+		t.Fatal("legacy read receipt not intercepted")
 	}
 	for _, bad := range []string{
 		``,
@@ -39,7 +41,7 @@ func TestParseReceiptDMPayload(t *testing.T) {
 }
 
 // TestReceiptsDefaultOff: a fresh identity has receipts disabled for
-// every address — read activity can never leak without an explicit
+// every address — nothing ever leaves the machine without an explicit
 // opt-in.
 func TestReceiptsDefaultOff(t *testing.T) {
 	cfg := testConfig(t)
@@ -133,8 +135,8 @@ func TestReceiptsNotSentWhenDisabled(t *testing.T) {
 
 // TestReceiptRoundTrip exercises the full issue #52 flow against a real
 // relay: opt in both ways, send, inbox delivery fires a delivery
-// receipt, surfacing fires a read receipt, the sender records both, and
-// receipt DMs never surface as chat or enter the sent log.
+// receipt, the sender records it, and receipt DMs never surface as chat
+// or enter the sent log.
 func TestReceiptRoundTrip(t *testing.T) {
 	e := newGroupTestEnv(t)
 
@@ -169,10 +171,7 @@ func TestReceiptRoundTrip(t *testing.T) {
 		t.Fatalf("bob got %d messages, want the chat message", len(msgs))
 	}
 
-	// Bob surfaces the message: the read receipt fires.
-	e.bob.SendReadReceipts(msgs)
-
-	// Alice's inbox consumes both receipt DMs silently.
+	// Alice's inbox consumes the receipt DM silently.
 	e.asAlice()
 	var aCursor int64
 	aMsgs := e.syncPersonal(e.alice, e.aCfg, &aCursor)
@@ -180,7 +179,7 @@ func TestReceiptRoundTrip(t *testing.T) {
 		t.Fatalf("alice got %d chat messages, want 0 (receipts are silent)", len(aMsgs))
 	}
 
-	// Both receipts recorded against the sent envelope.
+	// The delivery receipt is recorded against the sent envelope.
 	rs, err := loadReceipts()
 	if err != nil {
 		t.Fatal(err)
@@ -192,12 +191,6 @@ func TestReceiptRoundTrip(t *testing.T) {
 	if rec.DeliveryAt <= 0 {
 		t.Fatal("delivery receipt not recorded")
 	}
-	if rec.ReadAt <= 0 {
-		t.Fatal("read receipt not recorded")
-	}
-	if rec.ReadAt < rec.DeliveryAt {
-		t.Fatal("read recorded before delivery")
-	}
 
 	// ReceiptsStatus surfaces them for the CLI.
 	infos, err := e.alice.ReceiptsStatus("")
@@ -207,8 +200,8 @@ func TestReceiptRoundTrip(t *testing.T) {
 	if len(infos) != 1 {
 		t.Fatalf("ReceiptsStatus = %d entries, want 1", len(infos))
 	}
-	if infos[0].DeliveryAt != rec.DeliveryAt || infos[0].ReadAt != rec.ReadAt {
-		t.Fatal("ReceiptsStatus does not reflect recorded receipts")
+	if infos[0].DeliveryAt != rec.DeliveryAt {
+		t.Fatal("ReceiptsStatus does not reflect the recorded receipt")
 	}
 	if infos[0].ContactName != "bob" {
 		t.Fatalf("ContactName = %q, want bob", infos[0].ContactName)
@@ -312,21 +305,39 @@ func TestReceiptReplayIdempotent(t *testing.T) {
 	}
 }
 
-// TestReceiptSentDedup: each (peer, envelope, type) receipt fires at
-// most once, even if delivery/surfacing is re-attempted.
+// TestReceiptReadFromOldClientDropped: a "read" receipt from an older
+// client is intercepted (never surfaces as chat) but not recorded —
+// the read side was cut in #146.
+func TestReceiptReadFromOldClientDropped(t *testing.T) {
+	e := newGroupTestEnv(t)
+	e.asAlice()
+	id, err := e.alice.Send(e.bCfg.Address, "ping")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.alice.handleReceiptDM(e.bCfg.Address, receiptDMPayload{
+		Magic: receiptDMMagic, Type: receiptRead, MsgID: id, At: time.Now().Unix(),
+	})
+	rs, err := loadReceipts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rs.Received) != 0 {
+		t.Fatalf("legacy read receipt recorded: %v", rs.Received)
+	}
+}
+
+// TestReceiptSentDedup: each (peer, envelope) receipt fires at most
+// once, even if delivery is re-attempted.
 func TestReceiptSentDedup(t *testing.T) {
 	e := newGroupTestEnv(t)
 	e.asAlice()
 	if err := e.aCfg.SetReceiptsOptIn(e.bCfg.Address, true); err != nil {
 		t.Fatal(err)
 	}
-	// Send twice directly: the second send must be a no-op.
-	if err := e.alice.sendReceipt(e.bCfg.Address, 123, receiptRead); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.alice.sendReceipt(e.bCfg.Address, 123, receiptRead); err != nil {
-		t.Fatal(err)
-	}
+	// Fire twice directly: the second send must be a no-op.
+	e.alice.sendDeliveryReceipt(e.bCfg.Address, 123)
+	e.alice.sendDeliveryReceipt(e.bCfg.Address, 123)
 	rs, err := loadReceipts()
 	if err != nil {
 		t.Fatal(err)
@@ -345,7 +356,7 @@ func TestPruneReceiptStore(t *testing.T) {
 			rs.Received[receivedReceiptKey("ed25519:x", int64(i))] = &receiptRecord{DeliveryAt: int64(1000 + i)}
 		}
 		for i := 0; i < maxSentReceipts+100; i++ {
-			rs.Sent[sentReceiptKey("ed25519:x", int64(i), receiptDelivery)] = int64(1000 + i)
+			rs.Sent[sentReceiptKey("ed25519:x", int64(i))] = int64(1000 + i)
 		}
 		return nil
 	}); err != nil {
@@ -369,7 +380,7 @@ func TestPruneReceiptStore(t *testing.T) {
 
 // TestReceiptPayloadRoundTrip: marshal -> parse is the identity.
 func TestReceiptPayloadRoundTrip(t *testing.T) {
-	p := receiptDMPayload{Magic: receiptDMMagic, Type: receiptRead, MsgID: 99, At: 1700000000}
+	p := receiptDMPayload{Magic: receiptDMMagic, Type: receiptDelivery, MsgID: 99, At: 1700000000}
 	raw, err := json.Marshal(p)
 	if err != nil {
 		t.Fatal(err)

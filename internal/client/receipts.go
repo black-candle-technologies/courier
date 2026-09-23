@@ -1,24 +1,24 @@
-// Opt-in delivery/read receipts (issue #52).
+// Opt-in delivery receipts (issue #52).
 //
 // Receipts are strictly opt-in per contact: nothing about the reader's
 // activity ever leaves the machine unless the reader explicitly enabled
-// receipts for the sender (`courier contacts receipts-on <name>`).
-// Default is off everywhere.
+// receipts for the sender (`courier contacts delivery-receipts-on
+// <name>`). Default is off everywhere.
 //
 // A receipt is an ordinary encrypted DM envelope (kind "dm") carrying a
 // small JSON payload with the receipt magic, so the relay sees only
 // standard envelope metadata — sender, recipient, timestamp — and
-// cannot tell a receipt from chat or learn which message was read. The
-// envelope's Ed25519 signature authenticates `from`; replay safety comes
-// from the per-consumer seen sets plus local (sender, envelope, type)
-// dedup. Receipts are machine protocol traffic: they are sent via
-// sendProtocolDM (never logged to ~/.courier/sent.jsonl) and consumed
-// silently, never surfaced as chat.
+// cannot tell a receipt from chat. The envelope's Ed25519 signature
+// authenticates `from`; replay safety comes from the per-consumer seen
+// sets plus local (sender, envelope) dedup. Receipts are machine
+// protocol traffic: they are sent via sendProtocolDM (never logged to
+// ~/.courier/sent.jsonl) and consumed silently, never surfaced as chat.
 //
-// Two receipt types:
-//   - "delivery": the inbox consumer first delivered the envelope.
-//   - "read": the message was surfaced to the consumer (`courier inbox`
-//     printed it, or the stdio bridge returned it).
+// The only receipt type is "delivery": the inbox consumer first
+// delivered the envelope. Read receipts were cut pre-launch (#146) —
+// delivery confirmation is the whole feature. Receipt payloads of type
+// "read" from older clients are recognized and silently dropped so they
+// never surface as chat text.
 //
 // Held message requests never generate receipts; group messages are out
 // of scope. Dashboard thread opens are future work (the dashboard
@@ -42,10 +42,12 @@ import (
 // protocol layer. Group is 1 (cg), channel is 2 (cc); receipts are 3.
 const receiptDMMagic = 3
 
-// Receipt types.
+// Receipt types. Only "delivery" is emitted; "read" is recognized for
+// backward compatibility with older clients and silently dropped —
+// read receipts were cut pre-launch (#146).
 const (
 	receiptDelivery = "delivery"
-	receiptRead     = "read"
+	receiptRead     = "read" // retired; recognized, never recorded
 )
 
 // receiptDMPayload is the wire format for receipt protocol direct
@@ -80,9 +82,9 @@ func parseReceiptDMPayload(plain []byte) (receiptDMPayload, bool) {
 // ---- opt-in state (config.json) ----
 
 // ReceiptsEnabledFor reports whether this agent opted into sending
-// delivery/read receipts to the given address (issue #52). Default is
-// off: receipts never leak read activity unless explicitly enabled with
-// `courier contacts receipts-on <name>`.
+// delivery receipts to the given address (issue #52). Default is
+// off: receipts never leave the machine unless explicitly enabled with
+// `courier contacts delivery-receipts-on <name>`.
 func (c *Config) ReceiptsEnabledFor(address string) bool {
 	return c.ReceiptContacts[address]
 }
@@ -121,10 +123,9 @@ func (c *Config) contactNameForAddress(address string) string {
 // ---- receipt traffic state (~/.courier/receipts.json) ----
 
 // receiptRecord is the received-receipt state for one sent message:
-// the first delivery and read timestamps reported by the peer.
+// the first delivery timestamp reported by the peer.
 type receiptRecord struct {
 	DeliveryAt int64 `json:"delivery_at,omitempty"`
-	ReadAt     int64 `json:"read_at,omitempty"`
 }
 
 // receiptStore is the whole receipts.json document.
@@ -160,8 +161,8 @@ func receivedReceiptKey(peer string, msgID int64) string {
 	return fmt.Sprintf("%s|%d", peer, msgID)
 }
 
-func sentReceiptKey(peer string, msgID int64, typ string) string {
-	return fmt.Sprintf("%s|%d|%s", peer, msgID, typ)
+func sentReceiptKey(peer string, msgID int64) string {
+	return fmt.Sprintf("%s|%d", peer, msgID)
 }
 
 func loadReceiptsLocked() (*receiptStore, error) {
@@ -256,9 +257,6 @@ func loadReceipts() (*receiptStore, error) {
 }
 
 func receiptLastTouch(r *receiptRecord) int64 {
-	if r.ReadAt > r.DeliveryAt {
-		return r.ReadAt
-	}
 	return r.DeliveryAt
 }
 
@@ -290,14 +288,20 @@ func pruneReceiptStore(rs *receiptStore) {
 
 // ---- sending receipts ----
 
-// sendReceipt sends one receipt DM to peer for envelope msgID. It is
-// idempotent: each (peer, envelope, type) fires at most once, recorded
-// before sending so a retry or concurrent delivery cannot double-send.
-// The DM bypasses the sent log (sendProtocolDM): receipts are machine
-// traffic, not chat. Best-effort: a receipt must never fail message
-// delivery, so callers ignore the error.
-func (c *Client) sendReceipt(peer string, msgID int64, typ string) error {
-	key := sentReceiptKey(peer, msgID, typ)
+// sendDeliveryReceipt fires a delivery receipt for one newly delivered
+// envelope. It is idempotent: each (peer, envelope) fires at most once,
+// recorded before sending so a retry or concurrent delivery cannot
+// double-send. The DM bypasses the sent log (sendProtocolDM): receipts
+// are machine traffic, not chat. Best-effort: a receipt must never fail
+// message delivery, so callers ignore the error. Callers must have
+// already checked the opt-in.
+//
+// Note: keys written by older clients included a "|delivery" type
+// suffix, so a message delivered before this upgrade may send one more
+// duplicate receipt after upgrade. Harmless: the receiving side is
+// idempotent.
+func (c *Client) sendDeliveryReceipt(peer string, msgID int64) {
+	key := sentReceiptKey(peer, msgID)
 	var already bool
 	if err := updateReceipts(func(rs *receiptStore) error {
 		if _, ok := rs.Sent[key]; ok {
@@ -307,41 +311,17 @@ func (c *Client) sendReceipt(peer string, msgID int64, typ string) error {
 		rs.Sent[key] = time.Now().Unix()
 		return nil
 	}); err != nil {
-		return err
+		return
 	}
 	if already {
-		return nil
+		return
 	}
-	p := receiptDMPayload{Magic: receiptDMMagic, Type: typ, MsgID: msgID, At: time.Now().Unix()}
+	p := receiptDMPayload{Magic: receiptDMMagic, Type: receiptDelivery, MsgID: msgID, At: time.Now().Unix()}
 	raw, err := json.Marshal(p)
 	if err != nil {
-		return err
+		return
 	}
-	_, err = c.sendProtocolDM(peer, string(raw))
-	return err
-}
-
-// sendDeliveryReceipt fires a delivery receipt for one newly delivered
-// envelope. Callers must have already checked the opt-in.
-func (c *Client) sendDeliveryReceipt(peer string, msgID int64) {
-	_ = c.sendReceipt(peer, msgID, receiptDelivery)
-}
-
-// SendReadReceipts fires read receipts for messages surfaced to the
-// consumer (printed by `courier inbox`, returned by the stdio bridge).
-// Only messages from contacts with receipts explicitly enabled get one;
-// held requests never count as read. Best-effort and silent: receipt
-// traffic must never disturb the read path.
-func (c *Client) SendReadReceipts(msgs []Message) {
-	for _, m := range msgs {
-		if m.Request {
-			continue
-		}
-		if !c.cfg.ReceiptsEnabledFor(m.From) {
-			continue
-		}
-		_ = c.sendReceipt(m.From, m.ID, receiptRead)
-	}
+	_, _ = c.sendProtocolDM(peer, string(raw))
 }
 
 // ---- receiving receipts ----
@@ -375,21 +355,22 @@ func (c *Client) handleReceiptDM(from string, p receiptDMPayload) {
 	}
 	key := receivedReceiptKey(from, p.MsgID)
 	_ = updateReceipts(func(rs *receiptStore) error {
-		rec := rs.Received[key]
-		if rec == nil {
-			rec = &receiptRecord{}
-			rs.Received[key] = rec
-		}
-		// First receipt of each type wins: replays are idempotent.
+		// First receipt wins: replays are idempotent. "read" receipts
+		// from older clients are recognized above but never recorded
+		// (#146): read receipts were cut, and silently dropping the
+		// payload keeps it from surfacing as chat text.
 		switch p.Type {
 		case receiptDelivery:
+			rec := rs.Received[key]
+			if rec == nil {
+				rec = &receiptRecord{}
+				rs.Received[key] = rec
+			}
 			if rec.DeliveryAt == 0 {
 				rec.DeliveryAt = p.At
 			}
 		case receiptRead:
-			if rec.ReadAt == 0 {
-				rec.ReadAt = p.At
-			}
+			// retired: drop silently, store nothing
 		}
 		return nil
 	})
@@ -405,7 +386,6 @@ type ReceiptInfo struct {
 	Body        string
 	SentAt      int64
 	DeliveryAt  int64 // 0 when no delivery receipt arrived
-	ReadAt      int64 // 0 when no read receipt arrived
 }
 
 // ReceiptsEnabled reports whether this client opted into sending
@@ -454,7 +434,6 @@ func (c *Client) ReceiptsStatus(filter string) ([]ReceiptInfo, error) {
 		}
 		if rec := rs.Received[receivedReceiptKey(e.To, e.CourierID)]; rec != nil {
 			info.DeliveryAt = rec.DeliveryAt
-			info.ReadAt = rec.ReadAt
 		}
 		out = append(out, info)
 	}

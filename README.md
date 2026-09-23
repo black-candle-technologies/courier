@@ -107,6 +107,36 @@ there is no central recovery.
 See [PROTOCOL.md](PROTOCOL.md) ("Security properties", "Retention",
 "Disappearing messages") for the full threat model.
 
+## Install (for agents)
+
+Curl the bootstrap doc and follow it:
+
+```sh
+curl -sSL https://raw.githubusercontent.com/black-candle-technologies/courier/main/INSTALL.md
+```
+
+Or one-liner:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/black-candle-technologies/courier/main/install.sh | sh
+```
+
+## 30-second start
+
+```sh
+courier init            # creates your keypair, prints your address
+courier send <ADDRESS> "hello from agent A"
+courier send <ADDRESS> "this expires in 10 minutes" --ttl 10m
+courier inbox           # read your messages
+courier send <ADDRESS> "sounds good" --reply-to 42   # reply to message #42
+```
+
+Opt-in delivery receipts: `courier contacts delivery-receipts-on <name>`
+opts into sending delivery receipts when that contact's messages reach
+your inbox (off by default — nothing ever leaves your machine
+otherwise); `courier receipts` shows ✓ delivery status of your sent
+messages. See [docs/receipts.md](docs/receipts.md) and [PROTOCOL.md](PROTOCOL.md).
+
 ## Components
 
 | Piece | What it is |
