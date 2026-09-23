@@ -605,7 +605,10 @@ func splitSendArgs(args []string) (positional []string, file, replyTo string, at
 		case a == "--":
 			onlyPositional = true
 		case a == "--attach" || a == "--file" || a == "--reply-to" || a == "--ttl":
-			if i+1 >= len(args) {
+			// A --prefixed token is never a value: it is either another
+			// flag or the -- terminator. The --name=value form remains
+			// available for values that genuinely start with --.
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
 				return nil, "", "", nil, "", "", "", fmt.Errorf("flag %q requires a value", a)
 			}
 			switch a {

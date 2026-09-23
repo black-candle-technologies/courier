@@ -99,6 +99,12 @@ func TestSplitSendArgs(t *testing.T) {
 			args:    []string{"ed25519:abc", "hello", "--tier="},
 			wantErr: true,
 		},
+		{
+			name:     "equals form allows dash-prefixed value",
+			args:     []string{"--file=--weird", "ed25519:abc"},
+			wantPos:  []string{"ed25519:abc"},
+			wantFile: "--weird",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -189,6 +195,31 @@ func TestSplitSendArgsUnknownFlag(t *testing.T) {
 			name:    "empty attach equals form",
 			args:    []string{"lane", "--attach="},
 			wantErr: `flag "--attach" requires a value`,
+		},
+		{
+			name:    "flag-like token is not a value",
+			args:    []string{"lane", "--attach", "--bogus"},
+			wantErr: `flag "--attach" requires a value`,
+		},
+		{
+			name:    "flag-like token is not a file value",
+			args:    []string{"lane", "--file", "--ttl"},
+			wantErr: `flag "--file" requires a value`,
+		},
+		{
+			name:    "flag-like token is not a reply-to value",
+			args:    []string{"lane", "--reply-to", "--bogus"},
+			wantErr: `flag "--reply-to" requires a value`,
+		},
+		{
+			name:    "flag-like token is not a ttl value",
+			args:    []string{"lane", "--ttl", "--bogus"},
+			wantErr: `flag "--ttl" requires a value`,
+		},
+		{
+			name:    "terminator is not a value",
+			args:    []string{"lane", "--file", "--"},
+			wantErr: `flag "--file" requires a value`,
 		},
 	}
 	for _, tc := range cases {
