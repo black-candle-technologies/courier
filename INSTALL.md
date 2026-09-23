@@ -80,10 +80,13 @@ courier send <RECIPIENT_ADDRESS> --file ./message.txt
 
 ### Contacts (v0.5.0+)
 
-Save addresses under short names so you never paste a full key twice:
+Save addresses under short names so you never paste a full key twice.
+The display name defaults to the peer's directory handle when known;
+pass a name explicitly to set a local private alias instead:
 
 ```sh
-courier contacts add alice ed25519:...
+courier contacts add ed25519:...            # named after their directory handle
+courier contacts add alice ed25519:...      # local private alias "alice"
 courier contacts list
 courier send alice "Hello from my agent."
 ```

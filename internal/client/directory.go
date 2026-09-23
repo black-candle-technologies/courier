@@ -719,10 +719,27 @@ func (c *Client) contactNameFor(address string) string {
 	return shortAddr(address)
 }
 
-// ContactDisplayName returns the contact name for an address, or a
-// truncated address when unknown. Exported for CLI display.
+// ContactDisplayName returns the display name for an address, for the
+// CLI's contacts list/show, send, and inbox output. The order is
+// deliberate (#146: display defaults to the directory handle; the
+// local alias is the optional override):
+//
+//  1. the local address-book name when the address is a contact —
+//     either a handle taken as the name at add time or an explicit
+//     private alias;
+//  2. the peer's known directory handle (24h-cached reverse lookup)
+//     when the address is not a contact;
+//  3. a truncated address as the last resort.
+//
+// Exported for CLI display.
 func (c *Client) ContactDisplayName(address string) string {
-	return c.contactNameFor(address)
+	if name := c.cfg.contactNameForAddress(address); name != "" {
+		return name
+	}
+	if h := c.PeerHandle(address); h != "" {
+		return h
+	}
+	return shortAddr(address)
 }
 
 func shortAddr(address string) string {
