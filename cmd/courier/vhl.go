@@ -17,7 +17,7 @@ import (
 
 func cmdVHL(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: courier vhl <enroll|approvers|unenroll|session|request|requests|approve|attestations|challenge> ...")
+		return fmt.Errorf("usage: courier vhl <enroll|approvers|unenroll|session|request|requests|approve|attestations|challenge> [args]")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
@@ -54,7 +54,7 @@ func cmdVHL(args []string) error {
 	case "challenge":
 		return cmdVHLChallenge(c, args[1:])
 	default:
-		return fmt.Errorf("usage: courier vhl <enroll|approvers|unenroll|session|request|requests|approve|attestations|challenge> ...")
+		return fmt.Errorf("usage: courier vhl <enroll|approvers|unenroll|session|request|requests|approve|attestations|challenge> [args]")
 	}
 }
 
@@ -169,7 +169,7 @@ func cmdVHLApprovers(c *client.Client) error {
 
 func cmdVHLSession(c *client.Client, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: courier vhl session <mint|status|revoke> ...")
+		return fmt.Errorf("usage: courier vhl session <mint|status|revoke> [args]")
 	}
 	switch args[0] {
 	case "mint":
@@ -179,7 +179,7 @@ func cmdVHLSession(c *client.Client, args []string) error {
 	case "revoke":
 		return cmdVHLSessionRevoke(c, args[1:])
 	default:
-		return fmt.Errorf("usage: courier vhl session <mint|status|revoke> ...")
+		return fmt.Errorf("usage: courier vhl session <mint|status|revoke> [args]")
 	}
 }
 
