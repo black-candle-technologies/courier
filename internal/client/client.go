@@ -2102,7 +2102,13 @@ func (c *Client) AcceptRequest(id int64, asName string) ([]Message, error) {
 	if slices.Contains(req.Flags, "first_contact") && senderAddr(c.cfg, sender) == "" {
 		name := asName
 		if name == "" {
-			name = c.requestContactName(sender)
+			// #146: the display name defaults to the known directory
+			// handle; the generated name is the fallback.
+			if h := c.PeerHandle(sender); h != "" && contactNameRe.MatchString(h) {
+				name = h
+			} else {
+				name = c.requestContactName(sender)
+			}
 		} else if !contactNameRe.MatchString(name) {
 			return nil, fmt.Errorf("bad contact name %q: use 1-32 chars, lowercase letters, digits, - and _, starting with a letter or digit", asName)
 		}

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/client"
+	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/store"
 	"github.com/black-candle-technologies/courier/internal/update"
 	"github.com/black-candle-technologies/courier/internal/version"
@@ -145,7 +146,8 @@ func usage() {
   courier block list                     list blocked senders
   courier unblock <address|contact>      unblock a sender
   courier report-spam <message-id>       report a message as spam (throttles repeat offenders)
-  courier contacts add <name> <address>  save a contact
+  courier contacts add <address|@handle>   save a contact (uses their directory handle as the name)
+  courier contacts add <name> <address>  save a contact with a local private alias (overrides the handle)
   courier contacts list                  list contacts (with trust state)
   courier contacts show <name>           show a contact's address and trust state
   courier contacts verify <name> [--yes] verify a contact out of band (safety number)
@@ -437,7 +439,13 @@ func cmdSend(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("sent (id %d)", id)
+	// #146: confirm who the message went to — handle by default,
+	// private alias when one is set.
+	display := address
+	if resolved, rerr := cfg.ResolveRecipient(address); rerr == nil {
+		display = cl.ContactDisplayName(resolved)
+	}
+	fmt.Printf("sent to %s (id %d)", display, id)
 	if replyTo > 0 {
 		fmt.Printf(" in reply to #%d", replyTo)
 	}
@@ -502,7 +510,11 @@ func (s *stringSliceFlag) Set(v string) error {
 	return nil
 }
 
-func printMessages(msgs []client.Message) {
+// printMessages renders inbox-style messages. The sender line shows
+// the display name — handle by default, private alias when set
+// (#146) — resolved through the client so directory handles work for
+// non-contacts too.
+func printMessages(cl *client.Client, msgs []client.Message) {
 	for _, m := range msgs {
 		ts := time.Unix(m.ReceivedAt, 0).UTC().Format("2006-01-02 15:04:05Z")
 		flagStr := ""
@@ -513,7 +525,7 @@ func printMessages(msgs []client.Message) {
 		if m.ExpiresAt != 0 {
 			flagStr += fmt.Sprintf(" [expires %s]", time.Unix(m.ExpiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"))
 		}
-		fmt.Printf("[#%d] from %s at %s%s\n", m.ID, m.From, ts, flagStr)
+		fmt.Printf("[#%d] from %s at %s%s\n", m.ID, cl.ContactDisplayName(m.From), ts, flagStr)
 		// issues #96/#97: bridged messages are untrusted input. The
 		// marker renders from the typed flag — not the body banner —
 		// so attribution shows even when it comes from the pinned
@@ -559,11 +571,11 @@ func formatReplyQuote(q string) string {
 // separate from the normal inbox. Each request carries its
 // machine-readable flag reasons and the commands to accept or dismiss
 // it. Requests are held, never silently dropped.
-func printRequests(reqs []client.Message) {
+func printRequests(cl *client.Client, reqs []client.Message) {
 	fmt.Printf("Message requests (%d) — held for review, not in your inbox.\n", len(reqs))
 	fmt.Printf("Accept with `courier request accept <id>` (--as <name> to name the contact);\n")
 	fmt.Printf("dismiss with `courier request dismiss <id>`.\n\n")
-	printMessages(reqs)
+	printMessages(cl, reqs)
 }
 
 // saveAttachment writes verified attachment data into dir, never
@@ -640,7 +652,7 @@ func cmdInbox(args []string) error {
 			fmt.Println("no message requests.")
 			return nil
 		}
-		printRequests(held)
+		printRequests(cl, held)
 		return nil
 	}
 	after := cfg.Cursor
@@ -678,10 +690,10 @@ func cmdInbox(args []string) error {
 			return false, nil
 		}
 		if len(delivered) > 0 {
-			printMessages(delivered)
+			printMessages(cl, delivered)
 		}
 		if len(reqs) > 0 {
-			printRequests(reqs)
+			printRequests(cl, reqs)
 		}
 		if *attachDir != "" {
 			for _, m := range delivered {
@@ -925,16 +937,49 @@ func cmdContacts(args []string) error {
 	cl := client.New(cfg)
 	switch args[0] {
 	case "add":
-		if len(args) != 3 {
-			return fmt.Errorf("usage: courier contacts add <name> <address>")
+		// #146: the display name defaults to the known directory
+		// handle; a local alias is the optional private override.
+		// `contacts add <address>` names the contact after the
+		// peer's directory handle; `contacts add <name> <address>`
+		// stores <name> as the alias.
+		var name, address string
+		switch len(args) {
+		case 2:
+			// `contacts add @handle` resolves the handle, then
+			// stores the contact under it — no separate name and
+			// no manual directory lookup needed.
+			if addr, profile, isHandle, herr := cl.ResolveHandleTarget(args[1]); herr != nil {
+				return fmt.Errorf("handle resolution failed: %w", herr)
+			} else if isHandle {
+				address, name = addr, profile.Handle
+			} else {
+				address = args[1]
+				if _, err := crypto.ParseAddress(address); err != nil {
+					return fmt.Errorf("bad address %q: usage: courier contacts add <address|@handle> | courier contacts add <name> <address>", address)
+				}
+				handle := cl.PeerHandle(address)
+				if handle == "" {
+					return fmt.Errorf("no directory handle known for that address — add it with an explicit name: courier contacts add <name> <address>")
+				}
+				name = handle
+			}
+			// Never repoint an existing name at a different
+			// address silently (e.g. a transferred handle).
+			if addr, ok := cfg.Contacts[name]; ok && addr != address {
+				return fmt.Errorf("contact %q already exists for a different address", name)
+			}
+		case 3:
+			name, address = args[1], args[2]
+		default:
+			return fmt.Errorf("usage: courier contacts add <address|@handle> | courier contacts add <name> <address>")
 		}
-		if err := cfg.AddContact(args[1], args[2]); err != nil {
+		if err := cfg.AddContact(name, address); err != nil {
 			return err
 		}
-		fmt.Printf("contact %q saved.\n", args[1])
+		fmt.Printf("contact %q saved.\n", name)
 	case "list":
 		if len(cfg.Contacts) == 0 {
-			fmt.Println("no contacts yet. Add one with: courier contacts add <name> <address>")
+			fmt.Println("no contacts yet. Add one with: courier contacts add <address> (or courier contacts add <name> <address>)")
 			return nil
 		}
 		names := make([]string, 0, len(cfg.Contacts))
@@ -961,7 +1006,14 @@ func cmdContacts(args []string) error {
 			if cfg.ReceiptsEnabledFor(cfg.Contacts[n]) {
 				receipts = " ✉ receipts"
 			}
-			fmt.Printf("%-24s %-12s%s %s\n", n, badge, receipts, cfg.Contacts[n])
+			// #146: the stored name is the handle by default, or an
+			// explicit private alias. Show the directory handle
+			// alongside when an alias shadows it.
+			display := n
+			if h := cl.PeerHandle(cfg.Contacts[n]); h != "" && h != n {
+				display = fmt.Sprintf("%s (@%s)", n, h)
+			}
+			fmt.Printf("%-32s %-12s%s %s\n", display, badge, receipts, cfg.Contacts[n])
 		}
 	case "show":
 		if len(args) != 2 {
@@ -972,6 +1024,12 @@ func cmdContacts(args []string) error {
 			return err
 		}
 		fmt.Println(addr)
+		// #146: display defaults to the directory handle; the stored
+		// name is either that handle or an explicit private alias.
+		// Surface the handle when an alias shadows it.
+		if h := cl.PeerHandle(addr); h != "" && h != args[1] {
+			fmt.Printf("handle: @%s\n", h)
+		}
 		st, detail := cl.ContactTrust(args[1])
 		fmt.Printf("trust: %s (%s)\n", st, detail)
 		// issue #52: this agent's delivery-receipt opt-in for the contact.
@@ -1237,7 +1295,7 @@ func cmdRequest(args []string) error {
 			fmt.Println("no message requests.")
 			return nil
 		}
-		printRequests(held)
+		printRequests(cl, held)
 		return nil
 	case "accept":
 		if len(args) < 2 || len(args) > 4 {
@@ -1265,8 +1323,8 @@ func cmdRequest(args []string) error {
 			return nil
 		}
 		fmt.Printf("request #%d accepted from %s; released %d message(s):\n\n",
-			id, released[0].From, len(released))
-		printMessages(released)
+			id, cl.ContactDisplayName(released[0].From), len(released))
+		printMessages(cl, released)
 		return nil
 	case "dismiss":
 		if len(args) != 2 {

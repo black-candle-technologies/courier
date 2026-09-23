@@ -173,7 +173,7 @@ func cmdGroupInbox(cl *client.Client, cfg *client.Config, groupID string) error 
 	})
 	if len(msgs) > 0 {
 		fmt.Println("--- direct messages ---")
-		printMessages(msgs)
+		printMessages(cl, msgs)
 	}
 	if skipped > 0 {
 		fmt.Fprintf(os.Stderr, "(%d direct message(s) failed signature/decryption and were dropped)\n", skipped)

@@ -506,3 +506,51 @@ func TestVerifyDirectoryProfile(t *testing.T) {
 func b64enc(b []byte) string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
+
+// seedHandleCache stores a fresh directory-handle cache entry, so tests
+// can exercise handle-dependent behavior without a relay.
+func seedHandleCache(t *testing.T, cfg *Config, address, handle string) {
+	t.Helper()
+	if err := cfg.Update(func(fresh *Config) error {
+		if fresh.HandleCache == nil {
+			fresh.HandleCache = map[string]HandleCacheEntry{}
+		}
+		fresh.HandleCache[address] = HandleCacheEntry{Handle: handle, At: time.Now().Unix()}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestContactDisplayName: #146 — the display name defaults to the
+// known directory handle; the local alias is the optional override.
+func TestContactDisplayName(t *testing.T) {
+	_, carolID, bob := introIdentities(t)
+	bobAddr := addrOf(bob)
+
+	// Explicit alias wins over a cached handle.
+	aliased := introClient(t, carolID, map[string]string{"bobby": bobAddr})
+	seedHandleCache(t, aliased.cfg, bobAddr, "bob")
+	if got := aliased.ContactDisplayName(bobAddr); got != "bobby" {
+		t.Fatalf("alias must win over handle: got %q", got)
+	}
+
+	// No contact: the cached directory handle.
+	plain := introClient(t, carolID, map[string]string{})
+	seedHandleCache(t, plain.cfg, bobAddr, "bob")
+	if got := plain.ContactDisplayName(bobAddr); got != "bob" {
+		t.Fatalf("want cached handle, got %q", got)
+	}
+
+	// Contact named after the handle displays the handle.
+	named := introClient(t, carolID, map[string]string{"bob": bobAddr})
+	if got := named.ContactDisplayName(bobAddr); got != "bob" {
+		t.Fatalf("handle-as-name: got %q", got)
+	}
+
+	// Nothing known: truncated address (no relay — reverse fails fast).
+	unknown := "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	if got := plain.ContactDisplayName(unknown); got != shortAddr(unknown) {
+		t.Fatalf("want truncated address, got %q", got)
+	}
+}
