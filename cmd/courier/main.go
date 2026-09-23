@@ -394,15 +394,7 @@ func cmdSend(args []string) error {
 	fs.Var(&attach, "attach", "attach a file (repeatable, max 25 MiB each)")
 	// --force may appear anywhere; strip it before splitSendArgs so the
 	// v0.7.1 positional parsing (and its regression tests) is untouched.
-	var force bool
-	noForce := make([]string, 0, len(args))
-	for _, a := range args {
-		if a == "--force" {
-			force = true
-			continue
-		}
-		noForce = append(noForce, a)
-	}
+	noForce, force := stripForce(args)
 	// Accept flags before or after the positional address/message, as the
 	// usage string documents: Go's flag package stops parsing at the first
 	// positional argument, so extract them manually first.
@@ -551,6 +543,36 @@ func cmdSend(args []string) error {
 	return nil
 }
 
+// eqValue returns the value of a --name=value argument. An empty value
+// is rejected the same way a missing trailing value is: silently
+// dropping a requested --ttl or --reply-to would be worse than refusing.
+func eqValue(arg, name string) (string, error) {
+	v := strings.TrimPrefix(arg, name+"=")
+	if v == "" {
+		return "", fmt.Errorf("flag %q requires a value", name)
+	}
+	return v, nil
+}
+
+// stripForce removes --force from the argument list, reporting whether it
+// was present. A lone -- ends flag parsing: anything after it (including a
+// literal --force) is positional message text, not a flag.
+func stripForce(args []string) (noForce []string, force bool) {
+	noForce = make([]string, 0, len(args))
+	flagsDone := false
+	for _, a := range args {
+		if a == "--" {
+			flagsDone = true
+		}
+		if a == "--force" && !flagsDone {
+			force = true
+			continue
+		}
+		noForce = append(noForce, a)
+	}
+	return noForce, force
+}
+
 // splitSendArgs extracts --file/--attach/--reply-to/--ttl flags from any
 // position in the send command's arguments, returning the remaining
 // positional arguments. Go's flag package stops parsing at the first
@@ -598,13 +620,29 @@ func splitSendArgs(args []string) (positional []string, file, replyTo string, at
 			}
 			i++
 		case strings.HasPrefix(a, "--attach="):
-			attach = append(attach, strings.TrimPrefix(a, "--attach="))
+			v, verr := eqValue(a, "--attach")
+			if verr != nil {
+				return nil, "", "", nil, "", "", "", verr
+			}
+			attach = append(attach, v)
 		case strings.HasPrefix(a, "--file="):
-			file = strings.TrimPrefix(a, "--file=")
+			v, verr := eqValue(a, "--file")
+			if verr != nil {
+				return nil, "", "", nil, "", "", "", verr
+			}
+			file = v
 		case strings.HasPrefix(a, "--reply-to="):
-			replyTo = strings.TrimPrefix(a, "--reply-to=")
+			v, verr := eqValue(a, "--reply-to")
+			if verr != nil {
+				return nil, "", "", nil, "", "", "", verr
+			}
+			replyTo = v
 		case strings.HasPrefix(a, "--ttl="):
-			ttl = strings.TrimPrefix(a, "--ttl=")
+			v, verr := eqValue(a, "--ttl")
+			if verr != nil {
+				return nil, "", "", nil, "", "", "", verr
+			}
+			ttl = v
 		case a == "--tier" && i+1 < len(args):
 			tier = args[i+1]
 			if tier == "" {

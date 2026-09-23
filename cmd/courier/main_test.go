@@ -170,6 +170,26 @@ func TestSplitSendArgsUnknownFlag(t *testing.T) {
 			args:    []string{"lane", "hello", "--file"},
 			wantErr: `flag "--file" requires a value`,
 		},
+		{
+			name:    "empty ttl equals form",
+			args:    []string{"lane", "hello", "--ttl="},
+			wantErr: `flag "--ttl" requires a value`,
+		},
+		{
+			name:    "empty reply-to equals form",
+			args:    []string{"lane", "hello", "--reply-to="},
+			wantErr: `flag "--reply-to" requires a value`,
+		},
+		{
+			name:    "empty file equals form",
+			args:    []string{"lane", "--file="},
+			wantErr: `flag "--file" requires a value`,
+		},
+		{
+			name:    "empty attach equals form",
+			args:    []string{"lane", "--attach="},
+			wantErr: `flag "--attach" requires a value`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -203,6 +223,57 @@ func TestSplitSendArgsDashForms(t *testing.T) {
 	}
 	if file != "" {
 		t.Errorf("file = %q, want empty (-- after -- is positional, not a flag)", file)
+	}
+}
+
+func TestStripForce(t *testing.T) {
+	cases := []struct {
+		name      string
+		args      []string
+		wantArgs  []string
+		wantForce bool
+	}{
+		{
+			name:      "force anywhere",
+			args:      []string{"lane", "hello", "--force"},
+			wantArgs:  []string{"lane", "hello"},
+			wantForce: true,
+		},
+		{
+			name:      "force before positionals",
+			args:      []string{"--force", "lane", "hello"},
+			wantArgs:  []string{"lane", "hello"},
+			wantForce: true,
+		},
+		{
+			name:      "no force",
+			args:      []string{"lane", "hello"},
+			wantArgs:  []string{"lane", "hello"},
+			wantForce: false,
+		},
+		{
+			name:      "force after terminator stays positional",
+			args:      []string{"lane", "--", "--force"},
+			wantArgs:  []string{"lane", "--", "--force"},
+			wantForce: false,
+		},
+		{
+			name:      "force before terminator still strips",
+			args:      []string{"lane", "--force", "--", "hello"},
+			wantArgs:  []string{"lane", "--", "hello"},
+			wantForce: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotArgs, gotForce := stripForce(tc.args)
+			if !reflect.DeepEqual(gotArgs, tc.wantArgs) {
+				t.Errorf("args = %v, want %v", gotArgs, tc.wantArgs)
+			}
+			if gotForce != tc.wantForce {
+				t.Errorf("force = %v, want %v", gotForce, tc.wantForce)
+			}
+		})
 	}
 }
 
