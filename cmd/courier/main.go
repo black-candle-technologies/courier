@@ -160,8 +160,14 @@ func usage() {
   courier receipts [contact] [--limit N] show delivery status of sent messages
   courier group create --name <name> [addr...]
                                          create an encrypted group (you are admin)
+  courier group add <group-id> <addr>    add a member (admin only)
+  courier group remove <group-id> <addr> remove a member (admin only; sender keys rotate)
+  courier group transfer <group-id> <addr>
+                                         transfer adminship to a member (admin only)
   courier group send <group-id> <msg>    send a message to the group
   courier group inbox <group-id>         read new group messages
+  courier group list                     list your groups
+  courier group show <group-id>          show group details and roster
   courier state note add <peer> --title <t>
                                          share a note with a collaborator
   courier state task add <peer> --title <t> [--assignee <a>]
