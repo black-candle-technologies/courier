@@ -41,12 +41,6 @@ relay delays identically on both ends.
 
 Expiry is enforced on **read/sync paths**, never by a delete RPC:
 
-- **State:** expired items are excluded from the derived view
-  (`viewOf`, used by `state list/show/search`). Their events are pruned
-  from the local log — real local deletion — in `applyStateEvents`
-  (covers inbox, dashboard-push, and state-sync consumers plus the
-  sender's own local apply), in `StateSync`, and on the `StateConversation`
-  read funnel (covers `list`/`show`/`search` when no new events arrive).
 - **Chat, recipient:** a message already expired at fetch time is consumed
   silently — dropped, never delivered to inbox, dashboard, or requests.
   A message still alive is delivered with its `expires_at` attached.
@@ -63,7 +57,6 @@ own copies on its own schedule. A peer that never fetches keeps its
 
 | Store | Meaning of expiry |
 |---|---|
-| `~/.courier/state.json` | Expired notes'/tasks' events are pruned from the conversation log; expired snapshot entries dropped. Gone from `state list/show/search`. |
 | `~/.courier/sent.jsonl` | Expired entries pruned on read. |
 | Dashboard DB (`dashboard_messages`) | Expired rows filtered from every read and deleted by the push-time sweep. |
 | Relay envelopes | **Not** deleted per-message. TTL is an *endpoint* guarantee, not a relay guarantee. Envelopes age out under the relay's existing retention policy (daily prune of envelopes older than `--retain-days`). |
@@ -106,11 +99,10 @@ means expired. Senders that need tighter semantics should pad the TTL.
 
 - `courier send <addr> <msg> --ttl 10m` (Go duration syntax: `30s`,
   `10m`, `2h`, …; must be positive)
-- `courier state note add <peer> --title <t> [--body <b>] --ttl 10m`
-- `courier state task add <peer> --title <t> ... --ttl 1h`
 
-`courier inbox` annotates live messages with their expiry; `courier
-state show` reports it for notes/tasks.
+`courier inbox` annotates live messages with their expiry. (Shared
+notes/tasks were cut pre-launch in #146; TTLs apply to ordinary chat
+messages only.)
 
 ## Non-goals / future work
 
