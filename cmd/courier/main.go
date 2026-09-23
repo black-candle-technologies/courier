@@ -156,10 +156,10 @@ func usage() {
   courier contacts show <name>           show a contact's address and trust state
   courier contacts verify <name> [--yes] verify a contact out of band (safety number)
   courier contacts unverify <name>       clear a contact's verification
-  courier contacts receipts-on <name>    opt into delivery/read receipts for a contact
-  courier contacts receipts-off <name>   opt out of delivery/read receipts (default)
+  courier contacts delivery-receipts-on <name>    opt into delivery receipts for a contact
+  courier contacts delivery-receipts-off <name>   opt out of delivery receipts (default)
   courier contacts remove <name>         delete a contact
-  courier receipts [contact] [--limit N] show delivery/read status of sent messages
+  courier receipts [contact] [--limit N] show delivery status of sent messages
   courier group create --name <name> [addr...]
                                          create an encrypted group (you are admin)
   courier group send <group-id> <msg>    send a message to the group
@@ -477,9 +477,9 @@ func cmdSend(args []string) error {
 	fmt.Println()
 	// issue #52: receipts for my messages depend on the *recipient's*
 	// opt-in, which is their private state. Note mine, which controls
-	// the receipts I send when reading their replies.
+	// the delivery receipts I send for their messages.
 	if resolved, rerr := cfg.ResolveRecipient(address); rerr == nil && cfg.ReceiptsEnabledFor(resolved) {
-		fmt.Fprintf(os.Stderr, "receipts on for this contact — delivery/read status in `courier receipts`\n")
+		fmt.Fprintf(os.Stderr, "receipts on for this contact — delivery status in `courier receipts`\n")
 	}
 	return nil
 }
@@ -706,11 +706,6 @@ func cmdInbox(args []string) error {
 		}
 		if len(delivered) > 0 {
 			printMessages(delivered)
-			// issue #52: printing the messages counts as reading them.
-			// Fire read receipts for contacts this agent explicitly
-			// opted into (best effort, silent). The 60s inbox poller
-			// counts as a read too — the agent reading is reading.
-			cl.SendReadReceipts(delivered)
 		}
 		if len(reqs) > 0 {
 			printRequests(reqs)
@@ -866,10 +861,6 @@ func cmdStdio() error {
 				sm = append(sm, toStdioMessage(m))
 			}
 			reply(stdioResp{ID: req.ID, OK: true, Messages: sm})
-			// issue #52: returning the messages to the harness counts
-			// as reading them. Fire read receipts for opted-in
-			// contacts (best effort, silent).
-			cl.SendReadReceipts(msgs)
 		case "health":
 			if err := cl.Ping(); err != nil {
 				reply(stdioResp{ID: req.ID, OK: false, Error: err.Error()})
@@ -952,7 +943,7 @@ func writeSvcJSON(w http.ResponseWriter, code int, v any) {
 
 func cmdContacts(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|receipts-on|receipts-off|remove>")
+		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|remove>")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
@@ -989,9 +980,10 @@ func cmdContacts(args []string) error {
 			default:
 				badge = "• unverified"
 			}
-			// issue #52: receipt opt-in badge. Receipts are strictly
-			// opt-in; the badge shows this agent's own choice, which
-			// controls whether read activity leaks to this contact.
+			// issue #52: delivery-receipt opt-in badge. Receipts are
+			// strictly opt-in; the badge shows this agent's own choice,
+			// which controls whether delivery receipts go to this
+			// contact.
 			receipts := ""
 			if cfg.ReceiptsEnabledFor(cfg.Contacts[n]) {
 				receipts = " ✉ receipts"
@@ -1009,9 +1001,9 @@ func cmdContacts(args []string) error {
 		fmt.Println(addr)
 		st, detail := cl.ContactTrust(args[1])
 		fmt.Printf("trust: %s (%s)\n", st, detail)
-		// issue #52: this agent's receipt opt-in for the contact.
-		// On: this agent sends delivery/read receipts when it reads
-		// the contact's messages (read activity leaks to them).
+		// issue #52: this agent's delivery-receipt opt-in for the contact.
+		// On: this agent sends delivery receipts when the contact's
+		// messages are delivered to its inbox.
 		// Off (default): nothing is ever sent.
 		onOff := "off"
 		if cfg.ReceiptsEnabledFor(addr) {
@@ -1057,11 +1049,11 @@ func cmdContacts(args []string) error {
 			return err
 		}
 		fmt.Printf("verification for %q cleared.\n", args[1])
-	case "receipts-on", "receipts-off":
-		// issue #52: the explicit opt-in (or opt-out) for
-		// delivery/read receipts with one contact. Enabling means
-		// this agent sends receipts — leaking its own read activity —
-		// when it reads the contact's messages. Default is off.
+	case "delivery-receipts-on", "delivery-receipts-off":
+		// issue #52: the explicit opt-in (or opt-out) for delivery
+		// receipts with one contact. Enabling means this agent sends
+		// delivery receipts when the contact's messages arrive.
+		// Default is off.
 		if len(args) != 2 {
 			return fmt.Errorf("usage: courier contacts %s <name>", args[0])
 		}
@@ -1069,14 +1061,14 @@ func cmdContacts(args []string) error {
 		if err != nil {
 			return err
 		}
-		on := args[0] == "receipts-on"
+		on := args[0] == "delivery-receipts-on"
 		if err := cfg.SetReceiptsOptIn(addr, on); err != nil {
 			return err
 		}
 		if on {
-			fmt.Printf("receipts on for %q: delivery/read receipts will be sent when you read their messages.\n", args[1])
+			fmt.Printf("delivery receipts on for %q: receipts will be sent when their messages are delivered.\n", args[1])
 		} else {
-			fmt.Printf("receipts off for %q.\n", args[1])
+			fmt.Printf("delivery receipts off for %q.\n", args[1])
 		}
 	case "remove", "rm", "delete":
 		if len(args) != 2 {
@@ -1087,17 +1079,17 @@ func cmdContacts(args []string) error {
 		}
 		fmt.Printf("contact %q removed.\n", args[1])
 	default:
-		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|receipts-on|receipts-off|remove)", args[0])
+		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|remove)", args[0])
 	}
 	return nil
 }
 
-// ---- delivery/read receipts CLI (issue #52) ----
+// ---- delivery receipts CLI (issue #52) ----
 
-// cmdReceipts shows receipt status for sent messages, newest first:
-// ✓ delivered, ✓✓ read, or "no receipt yet". Receipts only arrive
-// from peers who opted in on their side — absence of a receipt is not
-// a signal that the message is unread.
+// cmdReceipts shows delivery status for sent messages, newest first:
+// ✓ delivered, or "no receipt yet". Receipts only arrive from peers
+// who opted in on their side — absence of a receipt is not a signal
+// that the message is undelivered.
 func cmdReceipts(args []string) error {
 	fs := flag.NewFlagSet("receipts", flag.ContinueOnError)
 	limit := fs.Int("limit", 20, "max sent messages to show")
@@ -1141,15 +1133,12 @@ func cmdReceipts(args []string) error {
 		}
 		ts := time.Unix(in.SentAt, 0).UTC().Format("2006-01-02 15:04:05Z")
 		status := "· no receipt yet"
-		switch {
-		case in.ReadAt > 0:
-			status = "✓✓ read " + time.Unix(in.ReadAt, 0).UTC().Format("2006-01-02 15:04:05Z")
-		case in.DeliveryAt > 0:
+		if in.DeliveryAt > 0 {
 			status = "✓ delivered " + time.Unix(in.DeliveryAt, 0).UTC().Format("2006-01-02 15:04:05Z")
 		}
 		fmt.Printf("[#%d → %s] %q at %s — %s\n", in.CourierID, peer, body, ts, status)
 	}
-	fmt.Println("(✓ delivered · ✓✓ read · no receipt is not a signal: the recipient may simply not have receipts enabled for you)")
+	fmt.Println("(✓ delivered · no receipt is not a signal: the recipient may simply not have receipts enabled for you)")
 	return nil
 }
 

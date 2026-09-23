@@ -301,7 +301,7 @@ func min(a, b int) int {
 //
 // Replay suppression is bypassed for exactly this envelope and nothing
 // else: the envelope is not marked seen, the inbox cursor is untouched,
-// no read receipts are sent, no shared-state events are applied, and no
+// no delivery receipts are sent, no shared-state events are applied, and no
 // protocol handlers run. The fetch is strictly read-only, so it is safe
 // to repeat and invisible to every other consumer.
 //

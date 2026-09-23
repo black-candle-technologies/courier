@@ -116,8 +116,9 @@ state show` reports it for notes/tasks.
 
 - Per-message relay deletion (would need a signed delete endpoint +
   relay deploy; the retention window already bounds relay storage).
-- Read-receipt-triggered expiry ("disappear after read", issue #52 could
-  compose with this later).
+- Read-receipt-triggered expiry ("disappear after read") was a
+  considered non-goal and is now moot: read receipts were cut
+  pre-launch (#146); only delivery receipts remain.
 - Expiry on group/channel control traffic (out of scope; group messages
   could adopt `messagePayload.expires_at` later since they share the
   plaintext format path).
