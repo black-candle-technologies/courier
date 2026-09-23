@@ -12,13 +12,15 @@ import (
 
 func TestSplitSendArgs(t *testing.T) {
 	cases := []struct {
-		name     string
-		args     []string
-		wantPos  []string
-		wantFile string
-		wantRply string
-		wantAtt  []string
-		wantTTL  string
+		name      string
+		args      []string
+		wantPos   []string
+		wantFile  string
+		wantRply  string
+		wantAtt   []string
+		wantTTL   string
+		wantTier  string
+		wantAttst string
 	}{
 		{
 			name:    "flags before positionals",
@@ -73,10 +75,23 @@ func TestSplitSendArgs(t *testing.T) {
 			wantPos: []string{"ed25519:abc", "hello"},
 			wantTTL: "2h",
 		},
+		{
+			name:      "tier and attestation flags",
+			args:      []string{"ed25519:abc", "hello", "--tier", "2", "--attestation=abc123"},
+			wantPos:   []string{"ed25519:abc", "hello"},
+			wantTier:  "2",
+			wantAttst: "abc123",
+		},
+		{
+			name:     "tier equals form before positionals",
+			args:     []string{"--tier=1", "ed25519:abc", "hello"},
+			wantPos:  []string{"ed25519:abc", "hello"},
+			wantTier: "1",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pos, file, replyTo, att, ttl := splitSendArgs(tc.args)
+			pos, file, replyTo, att, ttl, tier, attest := splitSendArgs(tc.args)
 			if !reflect.DeepEqual(pos, tc.wantPos) {
 				t.Errorf("positional = %v, want %v", pos, tc.wantPos)
 			}
@@ -91,6 +106,12 @@ func TestSplitSendArgs(t *testing.T) {
 			}
 			if ttl != tc.wantTTL {
 				t.Errorf("ttl = %q, want %q", ttl, tc.wantTTL)
+			}
+			if tier != tc.wantTier {
+				t.Errorf("tier = %q, want %q", tier, tc.wantTier)
+			}
+			if attest != tc.wantAttst {
+				t.Errorf("attestation = %q, want %q", attest, tc.wantAttst)
 			}
 		})
 	}

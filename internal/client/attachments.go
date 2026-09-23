@@ -24,6 +24,7 @@ import (
 	"github.com/black-candle-technologies/courier/internal/bridge"
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
+	"github.com/black-candle-technologies/courier/internal/vhl"
 	"golang.org/x/crypto/nacl/secretbox"
 )
 
@@ -40,11 +41,18 @@ var b64 = base64.RawURLEncoding
 // JSON envelope even without attachments; old clients render the
 // wrapper as raw text (message preserved, TTL ignored) while new
 // clients enforce expiry.
+//
+// issue #142: VHLTier tags the message's VHL tier and VHL carries the
+// optional inline approval attestation. Both ride inside the E2E
+// ciphertext, so the tag is authenticated by the sender's signature:
+// a relay cannot strip or downgrade it.
 type messagePayload struct {
 	Version     int                           `json:"v"`
 	Body        string                        `json:"body"`
 	Attachments []envelope.AttachmentManifest `json:"attachments,omitempty"`
 	ExpiresAt   int64                         `json:"expires_at,omitempty"`
+	VHLTier     int                           `json:"vhl_tier,omitempty"`
+	VHL         *vhl.Attestation              `json:"vhl,omitempty"`
 }
 
 // parseMessagePayload splits a decrypted plaintext into its body text,
@@ -66,7 +74,7 @@ func parseMessagePayload(plain []byte) (string, []envelope.AttachmentManifest, r
 	}
 	switch p.Version {
 	case 1:
-		if len(p.Attachments) == 0 && p.ExpiresAt == 0 {
+		if len(p.Attachments) == 0 && p.ExpiresAt == 0 && p.VHLTier == 0 && p.VHL == nil {
 			return string(plain), nil, replyInfo{}, 0, nil
 		}
 		return p.Body, p.Attachments, replyInfo{}, p.ExpiresAt, nil
@@ -399,6 +407,25 @@ func (c *Client) FetchMessage(id int64) (Message, error) {
 		Attachments: c.unwrapAttachmentKeys(manifests, nil), ExpiresAt: expiresAt,
 		ReplyTo: rinfo.To, ReplyQuote: rinfo.Quote, Bridge: bmeta,
 		Bridged: bridged, Flags: flags,
+	}
+	// issue #142: the explicit fetch also reports the VHL status
+	// (read-only here: the inbox path is the policy enforcement
+	// point, and the verifier is built per call so the replay
+	// guard's envelope awareness keeps this from consuming the
+	// attestation out from under the inbox consumer).
+	if tier, att := parseVHLPayload(plain); tier != vhl.Tier0 || att != nil {
+		vfr, verr := c.vhlVerifier()
+		var out vhl.EvalOutcome
+		if verr != nil {
+			out = vhl.EvalOutcome{Verdict: vhl.VerdictInvalid, Tier: tier, Reason: "vhl-unavailable"}
+		} else {
+			out = c.vhlEvaluateInbound(vfr, tier, []byte(body), att, m.ID)
+			_ = vhlMergeSeen(vfr)
+		}
+		msg.VHL = &VHLStatus{
+			Tier: int(tier), Verdict: out.Verdict.String(),
+			Approver: out.Approver, Reason: out.Reason,
+		}
 	}
 	return msg, nil
 }

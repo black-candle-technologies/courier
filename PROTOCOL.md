@@ -2097,6 +2097,150 @@ Safety numbers (not a signature) use the hash domain
 `courier-safety-v1` over both parties' Ed25519 keys, X25519 keys,
 and key epochs (§19).
 
+## 30. Verified Human in the Loop (issue #142)
+
+VHL lets a **receiver** verify that a message an agent sent was
+actually reviewed and approved by a human — countering malicious or
+compromised agents sending instructions other agents would follow.
+Attestation is receiver-enforced, never a sender-side protocol
+guarantee: the sender claims a tier, the receiver verifies the claim
+against its own locally-enrolled trust root, and anything unverified
+is held for human review — never acted on, never silently discarded.
+
+### 30.1 Tiers
+
+- **Tier 0** — unattested chat and status. The legacy wire is
+  untouched: a message with no VHL fields is Tier 0.
+- **Tier 1** — routine instructions and file reads, attested via a
+  human-minted **session token** (default 8-hour lifetime).
+- **Tier 2** — spending, merges/releases, irreversible sends, and
+  other policy-sensitive actions. Requires a **per-message human
+  approval** bound to the exact action bytes; drawn signatures do not
+  count as presence.
+
+### 30.2 Wire format
+
+The tier tag and the inline attestation live **inside the
+E2E-encrypted DM plaintext** (v1/v2 payloads gain `vhl_tier` and
+`vhl` fields) — no relay changes, no new endpoints. Tier 0 without an
+attestation keeps the exact legacy wire. Because the fields ride
+inside the signed E2E plaintext, the relay can neither strip a tier
+claim nor upgrade one without invalidating the message signature.
+
+A Tier 0 message that improperly carries an attestation is
+**invalid**, not harmless Tier 0 — an unattested tier tag with a
+smuggled artifact is a downgrade/evasiveness signal.
+
+### 30.3 Attestations
+
+An attestation is a signed, versioned artifact binding the action
+hash, tier, approver identity, timestamp, presence proof, and the
+locally enrolled signer key:
+
+- Tier 1 attestations wrap a live session token (the token attests
+  the session; the attestation id keeps each message's artifact
+  unique for the replay set).
+- Tier 2 attestations bind `MsgHashOf(body)` — the exact bytes the
+  human reviewed — and expire 15 minutes after minting. A request id
+  binds the approval to the approval request that carried the draft;
+  it is part of the signed bytes.
+- The presence ladder: hash-bound hold-and-release (challenge),
+  FIDO2/WebAuthn, out-of-band challenge-response, PIN fallback.
+  Proof kinds are `fido2`, `challenge`, `pin`, `session`; each maps
+  to a strength, and a ceremony must meet the requested strength —
+  no silent downgrades.
+
+Session tokens carry issuer/session/expiry/counterparty/boot id,
+mint with the same-or-stronger ceremony rule, verify against the
+receiver-local clock with ~5 minutes of skew tolerance, and are
+bound to the machine boot: each token embeds the kernel boot id
+(`/proc/sys/kernel/random/boot_id` on Linux), and a token whose
+boot id differs from the current one is rejected. Tokens therefore
+survive process restart but die on machine reboot, mirroring
+forward-secrecy session hygiene. A local process can still
+mint tokens, so the boot id is an anti-theft-of-backup measure,
+not a hardware root of trust.
+
+### 30.4 Receiver verification
+
+The receiver's verifier (`internal/vhl/policy.go`) checks, in order:
+tier tag validity → attestation presence → structural validity →
+tier match → approver enrollment in the **receiver-local registry**
+(the trust root; no shared directory can override it) → signature
+under an enrolled key → revocation → replay → expiry → (Tier 2)
+action-hash match → (Tier 1) token validity and expiry.
+
+The replay set is keyed by attestation id and records the relay
+envelope id: re-evaluating the same envelope (e.g. a second inbox
+consumer) is allowed; reusing one attestation across two envelopes
+is a replay and the second is held.
+
+Verdicts: `attested` (flagged `vhl_attested`), `missing-attestation`
+and `invalid-attestation` (flagged `vhl_unverified`, held for
+review). `courier inbox` renders a typed badge — `✔ human-verified
+(tier N) by <address>` or `⚠ UNVERIFIED … HELD for human review` —
+never body text, so an unverified claim can never look reviewed.
+
+### 30.5 Native frames
+
+Three frame types travel as E2E-encrypted protocol DMs (consumed by
+the VHL layer, never surfaced as chat):
+
+- **approval-request** — an agent asks a human to review exact
+  bytes; the human's inbox files it in their review queue
+  (`courier vhl requests`).
+- **attestation** — the human's signed approval travels back; the
+  agent's inbox stores it for the send (`courier vhl attestations`).
+- **revocation** — session-token revocation, signed by the issuer
+  and verified against the enrolled key for the claimed issuer
+  (anyone cannot revoke anyone's tokens). Broadcast reaches the
+  sender's contacts.
+
+### 30.6 Client behavior
+
+- `courier vhl enroll <address> [--name N]` — enroll a human
+  approver (interactive confirmation; the enrollment event is
+  recorded). Enrollment is a Tier 2 human-approved event.
+- `courier vhl session mint [--scope ADDR] [--ttl 8h]` — the human
+  performs the PIN ceremony at their own terminal and mints a
+  session token. `session status` lists live tokens; `session
+  revoke <id> [--broadcast]` revokes.
+- `courier vhl request --tier 2 --message TEXT [--to ADDR]` —
+  file an approval request for exact bytes; `courier vhl approve
+  <request-id> [--presence pin|challenge]` shows the human the
+  exact bytes and the recomputed action hash before the ceremony.
+- `courier send --tier 1|2 [--attestation <id>]` — tiered send.
+  Tier 1 without a live session token fails closed; Tier 2 without
+  a human approval attestation for the exact bytes fails closed;
+  tiered sends refuse attachments (the approval hash binds the
+  body bytes only).
+- `courier vhl challenge mint --action TEXT` — mint a one-time
+  out-of-band challenge code bound to the exact action bytes
+  (single-use, constant-time compare, 8 unambiguous characters
+  from a 32-symbol alphabet; 256 mod 32 == 0 so the modulo
+  sampling is unbiased).
+
+### 30.7 Security properties stated honestly
+
+- The PIN ceremony is only as strong as the terminal it runs on:
+  typing `APPROVE <id>` proves a human is at *that* keyboard, not
+  which human. FIDO2/WebAuthn is the gold standard for approver
+  identity; the verifier checks real WebAuthn assertions
+  (challenge binding, origin, RP id, UP/UV flags, credential
+  signature) against enrolled credentials, but the RP
+  configuration is not yet wired to a dashboard ceremony, so
+  fido2 proofs fail closed until that flow lands. The CLI
+  currently performs PIN and challenge ceremonies.
+- Session tokens are bearer-adjacent: whoever holds the sealed
+  token file and the process can mint Tier 1 attestations. The
+  8-hour default, boot-id binding, and per-token revocation
+  bound the exposure; Tier 2 never uses tokens.
+- The receiver-local enrollment registry is the whole trust root.
+  If an attacker enrolls themselves on the victim's machine, VHL
+  attests the attacker's "approvals" faithfully — VHL verifies
+  *human review happened*, not *which human* beyond enrollment.
+  Enrollment itself must be a human-supervised event.
+
 ## Appendix B. In-flight work requiring spec updates after merge
 
 This spec describes `origin/main` (+ merged bridge phase 1). The

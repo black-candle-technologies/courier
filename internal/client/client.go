@@ -35,6 +35,7 @@ import (
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
 	"github.com/black-candle-technologies/courier/internal/update"
+	"github.com/black-candle-technologies/courier/internal/vhl"
 )
 
 // DefaultRelay is the central relay (HTTPS, pinned certificate).
@@ -1058,7 +1059,7 @@ func (c *Client) SendReplyWithAttachments(toOrName, body string, attachPaths []s
 	if replyTo > 0 {
 		quote, _ = LookupReplyParent(replyTo)
 	}
-	return c.send(toOrName, body, attachPaths, replyTo, quote, true, 0)
+	return c.send(toOrName, body, attachPaths, replyTo, quote, true, 0, vhl.Tier0, nil)
 }
 
 // SendWithAttachments encrypts body for the agent at toOrName and
@@ -1069,7 +1070,7 @@ func (c *Client) SendReplyWithAttachments(toOrName, body string, attachPaths []s
 // never sees filenames, MIME types, plaintext hashes, or data keys.
 // Returns the relay message id.
 func (c *Client) SendWithAttachments(toOrName, body string, attachPaths []string) (int64, error) {
-	return c.send(toOrName, body, attachPaths, 0, "", true, 0)
+	return c.send(toOrName, body, attachPaths, 0, "", true, 0, vhl.Tier0, nil)
 }
 
 // SendWithTTL encrypts body for the agent at toOrName as a disappearing
@@ -1080,7 +1081,7 @@ func (c *Client) SendWithTTL(toOrName, body string, ttl time.Duration) (int64, e
 	if ttl <= 0 {
 		return 0, fmt.Errorf("ttl must be positive")
 	}
-	return c.send(toOrName, body, nil, 0, "", true, ttl)
+	return c.send(toOrName, body, nil, 0, "", true, ttl, vhl.Tier0, nil)
 }
 
 // SendFull is the general send path: attachments, reply threading
@@ -1098,17 +1099,48 @@ func (c *Client) SendFull(toOrName, body string, attachPaths []string, replyTo i
 	if replyTo > 0 {
 		quote, _ = LookupReplyParent(replyTo)
 	}
-	return c.send(toOrName, body, attachPaths, replyTo, quote, true, ttl)
+	return c.send(toOrName, body, attachPaths, replyTo, quote, true, ttl, vhl.Tier0, nil)
+}
+
+// SendTiered encrypts body for the agent at toOrName with the VHL
+// tier tag and an inline attestation (issue #142).
+//
+// Tier 1 attests via the live session token: pass att=nil and the
+// token is wrapped automatically (mint one with
+// `courier vhl session mint`). Tier 2 requires a human approval
+// attestation: pass the one received from the human (a vhl-attest
+// frame, via `courier send --attestation`). The attestation must bind
+// the exact body bytes; a mismatch fails before anything is sent.
+func (c *Client) SendTiered(toOrName, body string, tier vhl.Tier, att *vhl.Attestation) (int64, error) {
+	return c.send(toOrName, body, nil, 0, "", true, 0, tier, att)
+}
+
+// sendVHLFrame sends an in-band VHL protocol frame (approval request,
+// attestation, or revocation), already encoded with the vhl package's
+// Encode* helpers, as an E2E DM. Frames are not recorded in the sent
+// log and never enter an FS session: they are protocol traffic, and a
+// frame must be readable even when no FS session exists with the peer.
+func (c *Client) sendVHLFrame(address string, raw []byte) (int64, error) {
+	return c.sendSealed(address, raw, "", 0, "", false, 0)
 }
 
 // sendProtocolDM sends a machine-protocol DM (channel handshake traffic)
 // without recording it in the sent log: protocol DMs are not chat and
 // must not be pushed to the dashboard as sent messages.
 func (c *Client) sendProtocolDM(toOrName, body string) (int64, error) {
-	return c.send(toOrName, body, nil, 0, "", false, 0)
+	return c.send(toOrName, body, nil, 0, "", false, 0, vhl.Tier0, nil)
 }
 
-func (c *Client) send(toOrName, body string, attachPaths []string, replyTo int64, quote string, logSent bool, ttl time.Duration) (int64, error) {
+func (c *Client) send(toOrName, body string, attachPaths []string, replyTo int64, quote string, logSent bool, ttl time.Duration, tier vhl.Tier, att *vhl.Attestation) (int64, error) {
+	// issue #142: resolve the outgoing attestation before anything
+	// else — Tier 1 mints from the live session token, Tier 2
+	// requires a human approval attestation binding these exact
+	// bytes. A failure here fails the send: nothing unauthenticated
+	// ever goes out under a claimed tier.
+	att, err := c.vhlAttestForSend(tier, body, att)
+	if err != nil {
+		return 0, err
+	}
 	address, err := c.cfg.ResolveRecipient(toOrName)
 	if err != nil {
 		return 0, err
@@ -1180,7 +1212,7 @@ func (c *Client) send(toOrName, body string, attachPaths []string, replyTo int64
 			return 0, err
 		}
 	}
-	plain, err = encodeMessageBody(body, manifests, replyTo, quote, expiresAt)
+	plain, err = encodeMessageBodyVHL(body, manifests, replyTo, quote, expiresAt, tier, att)
 	if err != nil {
 		return 0, fmt.Errorf("encode payload: %w", err)
 	}
@@ -1545,6 +1577,13 @@ type Message struct {
 	// included it in the E2E payload (nil when bridged-ness was derived
 	// from the pin list or the body banner alone).
 	Bridge *bridge.BridgeMeta `json:"bridge,omitempty"`
+	// VHL carries the receiver-side Verified Human in the Loop
+	// evaluation (issue #142): the tier tag from the E2E plaintext
+	// plus the verdict for the inline attestation. Tier 0 messages
+	// (the default) evaluate as unattested without appearing here —
+	// the field is only set when the sender claimed a tier or sent an
+	// attestation.
+	VHL *VHLStatus `json:"vhl,omitempty"`
 }
 
 // inboxEnvelope is one row of the relay's /v1/inbox page: the encrypted
@@ -1818,6 +1857,16 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 	// flushed once after the loop.
 	var cacheEntries []replyCacheEntry
 	seen := c.seenSet(consumer)
+	// issue #142: the VHL verifier is built once per fetch from
+	// local state (enrollment registry, seen-artifact replay set,
+	// revocations). Attestation ids consumed during evaluation are
+	// persisted after the loop via vhlMergeSeen. If state cannot be
+	// loaded, any message claiming a tier is held for review (fail
+	// closed); tier 0 is unaffected.
+	vfr, vfrErr := c.vhlVerifier()
+	if vfrErr != nil {
+		vfr = nil
+	}
 	for _, m := range inboxEnvs {
 		// Track the highest inspected envelope id regardless of
 		// outcome: the cursor must advance past undecryptable and
@@ -1923,6 +1972,17 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			newHashes = append(newHashes, h)
 			continue
 		}
+		// issue #142: VHL protocol frames (approval requests,
+		// attestations, revocations) are consumed by the VHL layer
+		// and never surface as chat messages. Payloads that fail
+		// frame parsing fall through as ordinary messages — never
+		// silently swallowed.
+		if vf, ok := vhl.ParseFrame(plain); ok {
+			c.handleVHLFrame(m.From, vf, m.ID)
+			seen[h] = true
+			newHashes = append(newHashes, h)
+			continue
+		}
 		// issue #39: introduction protocol DMs are consumed by the
 		// introduction layer and never surface as chat messages (same
 		// as group-control DMs, issue #32). Valid payloads are recorded
@@ -2002,6 +2062,28 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// the delivery paths cannot drift.
 		bridged, flags, hold, _ := c.classifyInbound(m.From, m.SenderFlags, body, bmeta)
 		msg.Bridged, msg.Flags = bridged, flags
+		// issue #142: VHL verification. The tier tag and inline
+		// attestation ride inside the E2E plaintext, so they are
+		// sender-authenticated — a claimed tier can neither be
+		// stripped nor upgraded in transit. An attested message is
+		// flagged; a claimed tier without a valid attestation is
+		// held for review (never acted on, never silently dropped).
+		if tier, att := parseVHLPayload(plain); tier != vhl.Tier0 || att != nil {
+			out := c.vhlEvaluateInbound(vfr, tier, []byte(body), att, m.ID)
+			msg.VHL = &VHLStatus{
+				Tier: int(tier), Verdict: out.Verdict.String(),
+				Approver: out.Approver, Reason: out.Reason,
+			}
+			switch out.Verdict {
+			case vhl.VerdictAttested:
+				flags = append(flags, "vhl_attested")
+				msg.Flags = flags
+			case vhl.VerdictMissing, vhl.VerdictInvalid:
+				hold = true
+				flags = append(flags, "vhl_unverified")
+				msg.Flags = flags
+			}
+		}
 		// issue #51: remember this delivery in the reply cache so a
 		// later reply to it can quote the parent without a relay
 		// round-trip. Best effort; delivery never depends on it.
@@ -2088,6 +2170,12 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 	}
 	// Best-effort reply cache write; delivery never depends on it.
 	writeReplyCache(cacheEntries)
+	// issue #142: persist attestation ids consumed during this
+	// fetch (replay guard) and any revocations applied. Best
+	// effort: delivery already happened; a failure here only risks
+	// re-evaluating an already-seen attestation, which the
+	// envelope-aware replay check tolerates.
+	_ = vhlMergeSeen(vfr)
 	if markSeen {
 		c.recordSeen(consumer, newHashes)
 	}
