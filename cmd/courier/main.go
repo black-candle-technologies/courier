@@ -213,8 +213,8 @@ func usage() {
                                          enroll a human approver (interactive confirm)
   courier vhl approvers                  list enrolled approvers
   courier vhl unenroll <address|name>    revoke an approver
-  courier vhl session mint [--scope ADDR] [--ttl 8h]
-                                         mint a tier-1 session token (PIN ceremony)
+  courier vhl session mint            mint a tier-1 session token (refuses: no
+                                         WebAuthn ceremony transport yet)
   courier vhl session status             show live session tokens
   courier vhl session revoke <id> [--broadcast]
                                          revoke a session token
@@ -486,7 +486,8 @@ func cmdSend(args []string) error {
 		}
 	}
 	// issue #142: VHL tiered send. --tier 1 attests via the live
-	// session token (minted with `courier vhl session mint`); --tier 2
+	// session token (minted through the WebAuthn mint ceremony once
+	// a ceremony transport exists); --tier 2
 	// needs a human approval attestation from `courier vhl approve`.
 	// Tiered sends refuse attachments: the approval hash binds the
 	// body bytes, and an unattested attachment would bypass review.

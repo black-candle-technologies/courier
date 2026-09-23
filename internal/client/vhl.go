@@ -41,6 +41,7 @@ type vhlFile struct {
 	Registry     *vhl.Registry                `json:"registry"`
 	Seen         *vhl.SeenSet                 `json:"seen"`
 	Revoked      *vhl.RevocationSet           `json:"revoked"`
+	RP           vhl.WebAuthnRP               `json:"rp,omitempty"`
 	SealedTokens string                       `json:"sealed_tokens,omitempty"`
 	SealedChall  string                       `json:"sealed_challenges,omitempty"`
 	Requests     map[string]*vhlRequestRecord `json:"requests,omitempty"`
@@ -411,11 +412,13 @@ func (c *Client) vhlVerifier() (*vhl.Verifier, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The WebAuthn relying party is intentionally left unconfigured:
-	// fido2 proofs then fail closed ("no relying party configured")
-	// until the dashboard ceremony flow supplies the RP id and
-	// origins. The schema alone never counts as verified presence.
-	return &vhl.Verifier{Registry: ff.Registry, Seen: ff.Seen, Revoked: ff.Revoked}, nil
+	// The WebAuthn relying party comes from operator configuration
+	// (vhlFile.RP), set by the ceremony transport that defines it.
+	// Until a ceremony flow exists and configures the RP, it stays
+	// empty and fido2 proofs — including session-token mint
+	// assertions — fail closed ("no relying party configured").
+	// The schema alone never counts as verified presence.
+	return &vhl.Verifier{Registry: ff.Registry, Seen: ff.Seen, Revoked: ff.Revoked, WebAuthn: ff.RP}, nil
 }
 
 // vhlMergeSeen persists verifier mutations (consumed attestation ids,

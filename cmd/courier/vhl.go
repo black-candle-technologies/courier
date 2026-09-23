@@ -184,63 +184,18 @@ func cmdVHLSession(c *client.Client, args []string) error {
 }
 
 func cmdVHLSessionMint(c *client.Client, args []string) error {
-	var scope, ttlStr, presenceStr string
-	for i := 0; i < len(args); i++ {
-		switch {
-		case args[i] == "--scope" && i+1 < len(args):
-			scope, i = args[i+1], i+1
-		case strings.HasPrefix(args[i], "--scope="):
-			scope = strings.TrimPrefix(args[i], "--scope=")
-		case args[i] == "--ttl" && i+1 < len(args):
-			ttlStr, i = args[i+1], i+1
-		case strings.HasPrefix(args[i], "--ttl="):
-			ttlStr = strings.TrimPrefix(args[i], "--ttl=")
-		case args[i] == "--presence" && i+1 < len(args):
-			presenceStr, i = args[i+1], i+1
-		case strings.HasPrefix(args[i], "--presence="):
-			presenceStr = strings.TrimPrefix(args[i], "--presence=")
-		default:
-			return fmt.Errorf("usage: courier vhl session mint [--scope ADDR] [--ttl 8h] [--presence pin]")
-		}
-	}
-	ttl := vhl.DefaultSessionTTL
-	if ttlStr != "" {
-		var err error
-		ttl, err = time.ParseDuration(ttlStr)
-		if err != nil || ttl <= 0 {
-			return fmt.Errorf("--ttl must be a positive duration (e.g. 8h)")
-		}
-	}
-	presence := vhl.PresencePIN
-	if presenceStr != "" {
-		var err error
-		presence, err = vhl.ParsePresence(presenceStr)
-		if err != nil {
-			return err
-		}
-	}
-	// The CLI performs the PIN-grade ceremony: the human types the
-	// confirmation at their own terminal. Stronger ceremonies
-	// (FIDO2) arrive with the dashboard flow.
-	if presence != vhl.PresencePIN {
-		return fmt.Errorf("the CLI performs the pin ceremony only; use the dashboard for %q", presence)
-	}
-	if !confirmTyping("mint VHL session token (type MINT to confirm)", "MINT") {
-		return fmt.Errorf("cancelled")
-	}
-	tok, err := c.VHLMintSessionToken(scope, ttl, presence)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("session token %s minted, expires %s\n", tok.ID,
-		time.Unix(tok.ExpiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"))
-	if scope != "" {
-		fmt.Printf("scoped to %s\n", scope)
-	}
-	if !c.VHLBootIDStable() {
-		fmt.Println("warning: no stable machine boot id on this host — this token is bound to the current process and will not be served by later processes")
-	}
-	return nil
+	// Session-token minting is closed until a real WebAuthn mint
+	// ceremony exists. The old command took a caller-supplied
+	// --presence and signed the token with the agent's identity
+	// key, so any process holding that key could mint Tier 1
+	// tokens with no human involved. Minting now requires a
+	// genuine authenticator assertion over the mint challenge,
+	// verified against an enrolled WebAuthn credential and the
+	// configured relying party — and no ceremony transport ships
+	// in this CLI yet. Refusing outright is the only honest
+	// behavior: a command that can never complete a ceremony must
+	// not exist in a form that pretends it can.
+	return fmt.Errorf("refusing: session minting requires a WebAuthn mint ceremony with an enrolled approver credential, and no ceremony transport exists in this CLI yet (see PROTOCOL.md §30). Minting with a merely asserted ceremony would let any process holding the identity key mint Tier 1 tokens with no human involved, defeating VHL")
 }
 
 func cmdVHLSessionStatus(c *client.Client) error {
@@ -249,7 +204,7 @@ func cmdVHLSessionStatus(c *client.Client) error {
 		return err
 	}
 	if len(toks) == 0 {
-		fmt.Println("no live session token (restart revokes tokens; mint a new one with `courier vhl session mint`)")
+		fmt.Println("no live session token (restart revokes tokens; minting requires a WebAuthn mint ceremony, not yet available in this CLI)")
 		return nil
 	}
 	for _, t := range toks {
@@ -314,7 +269,7 @@ func cmdVHLRequest(c *client.Client, args []string) error {
 	// them, so recording a Tier 1 request here would be a dead end.
 	// Point the user at session minting instead.
 	if tierStr == "1" {
-		return fmt.Errorf("tier 1 is session-scoped: mint a session token with `courier vhl session mint` instead of requesting an approval")
+		return fmt.Errorf("tier 1 is session-scoped: session tokens are minted through the WebAuthn mint ceremony (no ceremony transport in this CLI yet), not through approval requests")
 	}
 	if tierStr != "2" {
 		return fmt.Errorf("--tier must be 2")

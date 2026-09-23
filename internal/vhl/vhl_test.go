@@ -2,8 +2,11 @@ package vhl
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
+	"strings"
 	"testing"
 	"time"
 )
@@ -40,6 +43,70 @@ func testVerifier(t *testing.T, addr string, pub []byte) *Verifier {
 	return &Verifier{Registry: testRegistry(t, addr, pub), Seen: NewSeenSet(), Revoked: NewRevocationSet()}
 }
 
+// mintCeremony is the test fixture for a complete session-token
+// mint ceremony: an enrolled WebAuthn credential plus the RP the
+// ceremony runs under. The authenticator private key stays
+// test-side, standing in for the human's security key.
+type mintCeremony struct {
+	cred *Credential
+	rp   WebAuthnRP
+	priv *ecdsa.PrivateKey
+}
+
+// newMintCeremony enrolls a fresh WebAuthn credential for addr in
+// reg and returns the ceremony fixture.
+func newMintCeremony(t *testing.T, reg *Registry, addr string) *mintCeremony {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var idRaw [6]byte
+	if _, err := rand.Read(idRaw[:]); err != nil {
+		t.Fatal(err)
+	}
+	mc := &mintCeremony{
+		rp:   WebAuthnRP{ID: "dashboard.test", Origins: []string{"https://dashboard.test"}},
+		priv: priv,
+	}
+	mc.cred = &Credential{
+		ID:         "mint-cred-" + b64.EncodeToString(idRaw[:]),
+		Kind:       "webauthn",
+		PublicKey:  b64.EncodeToString(coseEncodeKey(t, &priv.PublicKey)),
+		EnrolledAt: time.Now().Unix(),
+		Device:     "test-yubikey",
+	}
+	if err := reg.Enroll(addr, "test-human", *mc.cred, true); err != nil {
+		t.Fatal(err)
+	}
+	return mc
+}
+
+// mint completes a session-token mint through the real ceremony:
+// begin, craft a genuine UV assertion over the pending's
+// challenge, finish.
+func (mc *mintCeremony) mint(t *testing.T, addr, scope string, idPriv ed25519.PrivateKey) *SessionToken {
+	t.Helper()
+	pending, err := BeginSessionMint(addr, scope, DefaultSessionTTL, "boot-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := craftAssertion(t, mc.priv, pending.Challenge(),
+		"https://dashboard.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified)
+	tok, err := pending.Finish(mc.cred, assertion, mc.rp, idPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
+
+// mintVerifier returns a Verifier configured the way a real
+// receiver must be: registry plus the relying party the mint
+// ceremony ran under.
+func (mc *mintCeremony) mintVerifier(reg *Registry) *Verifier {
+	return &Verifier{Registry: reg, Seen: NewSeenSet(), Revoked: NewRevocationSet(), WebAuthn: mc.rp}
+}
+
 func TestTierString(t *testing.T) {
 	if !Tier0.Valid() || !Tier1.Valid() || !Tier2.Valid() {
 		t.Fatal("tiers should be valid")
@@ -63,12 +130,17 @@ func TestPresenceRanking(t *testing.T) {
 
 func TestSessionTokenRoundTrip(t *testing.T) {
 	addr, pub, priv := testIdentity(t)
-	tok, err := MintSessionToken(addr, "", PresencePIN, DefaultSessionTTL, "boot-1", priv)
-	if err != nil {
-		t.Fatal(err)
-	}
+	reg := testRegistry(t, addr, pub)
+	mc := newMintCeremony(t, reg, addr)
+	tok := mc.mint(t, addr, "", priv)
 	if err := tok.Validate(); err != nil {
 		t.Fatal(err)
+	}
+	if tok.Presence != PresenceFIDO2UV.String() {
+		t.Fatalf("mint presence = %q, want fido2_uv: the ceremony, not a caller claim, sets the strength", tok.Presence)
+	}
+	if tok.CredentialID != mc.cred.ID {
+		t.Fatalf("credential id = %q, want %q", tok.CredentialID, mc.cred.ID)
 	}
 	if err := tok.verifySignature(pub); err != nil {
 		t.Fatal(err)
@@ -84,21 +156,21 @@ func TestSessionTokenRoundTrip(t *testing.T) {
 	if tok.LiveAt(tok.IssuedAt - 1) {
 		t.Fatal("pre-issued token should not be live")
 	}
-	// Re-mint: same strength OK, weaker not.
-	if !tok.MayRemint(PresencePIN) {
+	// Re-mint guard: a fido2_uv token is renewable at the same
+	// strength, never weaker. (Minting itself only ever produces
+	// fido2_uv, so the guard is pinned on struct-shaped tokens.)
+	uv := &SessionToken{Presence: PresenceFIDO2UV.String()}
+	pin := &SessionToken{Presence: PresencePIN.String()}
+	if !uv.MayRemint(PresenceFIDO2UV) {
 		t.Fatal("same-strength re-mint should be allowed")
 	}
-	if !tok.MayRemint(PresenceFIDO2UV) {
+	if !pin.MayRemint(PresenceFIDO2UV) {
 		t.Fatal("stronger re-mint should be allowed")
 	}
-	uvTok, err := MintSessionToken(addr, "", PresenceFIDO2UV, DefaultSessionTTL, "boot-1", priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if uvTok.MayRemint(PresencePIN) {
+	if uv.MayRemint(PresencePIN) {
 		t.Fatal("fido2_uv token must not be re-mintable with pin")
 	}
-	if uvTok.MayRemint(PresenceChallenge) {
+	if uv.MayRemint(PresenceChallenge) {
 		t.Fatal("fido2_uv token must not be re-mintable with challenge")
 	}
 }
@@ -217,13 +289,13 @@ func TestTierClaimWithoutAttestation(t *testing.T) {
 
 func TestTier1SessionFlow(t *testing.T) {
 	addr, pub, priv := testIdentity(t)
-	v := testVerifier(t, addr, pub)
+	reg := testRegistry(t, addr, pub)
+	mc := newMintCeremony(t, reg, addr)
+	v := mc.mintVerifier(reg)
 	receiver := "ed25519:receiver"
-	// Mint a token scoped to the receiver.
-	tok, err := MintSessionToken(addr, receiver, PresencePIN, DefaultSessionTTL, "boot-1", priv)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Mint a token scoped to the receiver, through the real
+	// ceremony.
+	tok := mc.mint(t, addr, receiver, priv)
 	now := time.Now().Unix()
 	if err := v.VerifyTokenStandalone(tok, receiver, now); err != nil {
 		t.Fatal(err)
@@ -377,12 +449,11 @@ func TestFrames(t *testing.T) {
 
 func TestRevocation(t *testing.T) {
 	addr, pub, priv := testIdentity(t)
-	v := testVerifier(t, addr, pub)
+	reg := testRegistry(t, addr, pub)
+	mc := newMintCeremony(t, reg, addr)
+	v := mc.mintVerifier(reg)
 	receiver := "ed25519:receiver"
-	tok, err := MintSessionToken(addr, receiver, PresencePIN, DefaultSessionTTL, "boot-1", priv)
-	if err != nil {
-		t.Fatal(err)
-	}
+	tok := mc.mint(t, addr, receiver, priv)
 	now := time.Now().Unix()
 	// Revoke the token.
 	rev := &Revocation{Version: 1, Issuer: addr, IssuedAt: now, TokenIDs: []string{tok.ID}}
@@ -544,7 +615,7 @@ func TestReenrollRevokedApproverDropsCredentials(t *testing.T) {
 }
 
 func TestProofStrengthCeiling(t *testing.T) {
-	addr, _, priv := testIdentity(t)
+	addr, pub, priv := testIdentity(t)
 	body := []byte("high-stakes action")
 	// A PIN proof claiming fido2_uv must fail validation: the
 	// claim would otherwise skip FIDO2 verification while the
@@ -572,10 +643,9 @@ func TestProofStrengthCeiling(t *testing.T) {
 	}
 	// A session proof's strength must equal the token's mint presence.
 	_, _, tokPriv := testIdentity(t)
-	tok, err := MintSessionToken(addr, "", PresenceFIDO2UV, DefaultSessionTTL, "boot-1", tokPriv)
-	if err != nil {
-		t.Fatal(err)
-	}
+	tokReg := testRegistry(t, addr, pub)
+	tokMC := newMintCeremony(t, tokReg, addr)
+	tok := tokMC.mint(t, addr, "", tokPriv)
 	sa, err := NewTier1Attestation(tok, tokPriv)
 	if err != nil {
 		t.Fatal(err)
@@ -583,5 +653,198 @@ func TestProofStrengthCeiling(t *testing.T) {
 	sa.Proof.Strength = PresencePIN.String()
 	if err := sa.Validate(); err == nil {
 		t.Fatal("session proof strength differing from token presence should fail validation")
+	}
+}
+
+// TestSessionMintFailsClosed pins the fail-closed mint: without a
+// genuine authenticator assertion over the pending's challenge,
+// verified against an enrolled WebAuthn credential and a configured
+// RP, Finish must refuse. No parameter combination may produce a
+// token from a caller-supplied presence claim — there is no
+// presence parameter at all.
+func TestSessionMintFailsClosed(t *testing.T) {
+	addr, pub, priv := testIdentity(t)
+	reg := testRegistry(t, addr, pub)
+	mc := newMintCeremony(t, reg, addr)
+
+	begin := func(t *testing.T) *PendingSessionMint {
+		t.Helper()
+		p, err := BeginSessionMint(addr, "", DefaultSessionTTL, "boot-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	goodAssertion := func(t *testing.T, p *PendingSessionMint) string {
+		t.Helper()
+		return craftAssertion(t, mc.priv, p.Challenge(),
+			"https://dashboard.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified)
+	}
+
+	// No relying party configured.
+	if _, err := begin(t).Finish(mc.cred, goodAssertion(t, begin(t)), WebAuthnRP{}, priv); err == nil {
+		t.Fatal("finish without relying party should fail")
+	}
+	// Empty assertion.
+	if _, err := begin(t).Finish(mc.cred, "", mc.rp, priv); err == nil {
+		t.Fatal("finish without assertion should fail")
+	}
+	// Assertion over the wrong challenge.
+	p := begin(t)
+	wrong := craftAssertion(t, mc.priv, []byte("not-the-mint-challenge-padded-to-32b"),
+		"https://dashboard.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified)
+	if _, err := p.Finish(mc.cred, wrong, mc.rp, priv); err == nil {
+		t.Fatal("finish with assertion over wrong challenge should fail")
+	}
+	// Assertion from a different key than the enrolled credential.
+	other, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2 := begin(t)
+	forged := craftAssertion(t, other, p2.Challenge(),
+		"https://dashboard.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified)
+	if _, err := p2.Finish(mc.cred, forged, mc.rp, priv); err == nil {
+		t.Fatal("finish with assertion from unenrolled key should fail")
+	}
+	// Non-WebAuthn credential kind.
+	p3 := begin(t)
+	edCred := &Credential{ID: "ed-cred", Kind: "ed25519", PublicKey: b64.EncodeToString(make([]byte, 32))}
+	if _, err := p3.Finish(edCred, goodAssertion(t, p3), mc.rp, priv); err == nil {
+		t.Fatal("finish with non-webauthn credential should fail")
+	}
+	// Missing origin (UV) flag: a touch-only assertion must not mint
+	// a session token.
+	p4 := begin(t)
+	touchOnly := craftAssertion(t, mc.priv, p4.Challenge(),
+		"https://dashboard.test", "dashboard.test", authFlagUserPresent)
+	if _, err := p4.Finish(mc.cred, touchOnly, mc.rp, priv); err == nil {
+		t.Fatal("finish with touch-only assertion should fail: session mint requires UV")
+	}
+	// Begin validation.
+	if _, err := BeginSessionMint("", "", DefaultSessionTTL, "boot-1"); err == nil {
+		t.Fatal("begin without issuer should fail")
+	}
+	if _, err := BeginSessionMint(addr, "", 0, "boot-1"); err == nil {
+		t.Fatal("begin with non-positive TTL should fail")
+	}
+}
+
+// TestTier1RejectsTransplantedAssertion is the residual-finding
+// regression test: a process holding the issuer's identity key
+// takes a valid token's assertion, transplants it onto a forged
+// token with different bytes, and re-signs with the identity key.
+// The receiver must reject it, because the assertion is bound to
+// the original token's mint challenge — the issuer signature alone
+// is not sufficient.
+func TestTier1RejectsTransplantedAssertion(t *testing.T) {
+	addr, pub, priv := testIdentity(t)
+	reg := testRegistry(t, addr, pub)
+	mc := newMintCeremony(t, reg, addr)
+	v := mc.mintVerifier(reg)
+	receiver := "ed25519:receiver"
+
+	good := mc.mint(t, addr, receiver, priv)
+
+	// Forge: fresh token ids (so the token is structurally valid
+	// and live), the victim's assertion transplanted in, re-signed
+	// with the real identity key — exactly what a co-located
+	// process with the key can do.
+	p, err := BeginSessionMint(addr, receiver, DefaultSessionTTL, "boot-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evil := p.tokenForChallenge()
+	evil.CredentialID = good.CredentialID
+	evil.Assertion = good.Assertion
+	if err := evil.sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	if err := evil.Validate(); err != nil {
+		t.Fatalf("forged token should be structurally valid (the attack is semantic): %v", err)
+	}
+	a, err := NewTier1Attestation(evil, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := v.Evaluate(EvalInput{Tier: Tier1, Body: []byte("attacker orders"), Attestation: a, Receiver: receiver, Now: time.Now().Unix()})
+	if out.Verdict != VerdictInvalid {
+		t.Fatalf("transplanted assertion should be rejected, got %v (%s)", out.Verdict, out.Reason)
+	}
+	if !strings.HasPrefix(out.Reason, "token-mint:") {
+		t.Fatalf("want token-mint rejection, got %q", out.Reason)
+	}
+}
+
+// TestTier1RejectsStrippedAssertion: stripping the assertion and
+// re-signing with the identity key must not produce a usable token
+// — structural validation rejects it before any signature is
+// trusted.
+func TestTier1RejectsStrippedAssertion(t *testing.T) {
+	addr, pub, priv := testIdentity(t)
+	reg := testRegistry(t, addr, pub)
+	mc := newMintCeremony(t, reg, addr)
+
+	good := mc.mint(t, addr, "", priv)
+	stripped := *good
+	stripped.Assertion = ""
+	if err := stripped.sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	if err := stripped.Validate(); err == nil {
+		t.Fatal("token without mint assertion should fail structural validation")
+	}
+	if _, err := NewTier1Attestation(&stripped, priv); err == nil {
+		t.Fatal("attestation wrapping an assertion-less token should fail construction")
+	}
+}
+
+// TestTier1RejectsLegacyV1Token: v1 tokens (issuer signature only,
+// caller-supplied presence) are dead. The version check rejects
+// them structurally, so no v1 token can ever evaluate.
+func TestTier1RejectsLegacyV1Token(t *testing.T) {
+	addr, _, _ := testIdentity(t)
+	now := time.Now().Unix()
+	legacy := &SessionToken{
+		Version:   1,
+		ID:        b64.EncodeToString(make([]byte, 16)),
+		Issuer:    addr,
+		SessionID: b64.EncodeToString(make([]byte, 16)),
+		IssuedAt:  now,
+		ExpiresAt: now + 3600,
+		Presence:  PresencePIN.String(),
+		BootID:    "boot-1",
+	}
+	// v1 tokens cannot even be signed (canonical rejects the
+	// version); structural validation rejects them regardless.
+	if err := legacy.Validate(); err == nil {
+		t.Fatal("v1 token should fail structural validation")
+	}
+}
+
+// TestTier1FailsClosedWithoutRP: a receiver with no relying party
+// configured rejects even a genuinely minted token — there is
+// nothing trustworthy to verify the mint assertion against.
+func TestTier1FailsClosedWithoutRP(t *testing.T) {
+	addr, pub, priv := testIdentity(t)
+	reg := testRegistry(t, addr, pub)
+	mc := newMintCeremony(t, reg, addr)
+	// Note: this verifier deliberately has no relying party —
+	// it is built straight from the registry, not via mintVerifier.
+	verifier := &Verifier{Registry: reg, Seen: NewSeenSet(), Revoked: NewRevocationSet()}
+	receiver := "ed25519:receiver"
+
+	tok := mc.mint(t, addr, receiver, priv)
+	now := time.Now().Unix()
+	if err := verifier.VerifyTokenStandalone(tok, receiver, now); err == nil {
+		t.Fatal("token verification without relying party should fail closed")
+	}
+	a, err := NewTier1Attestation(tok, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := verifier.Evaluate(EvalInput{Tier: Tier1, Body: []byte("orders"), Attestation: a, Receiver: receiver, Now: now})
+	if out.Verdict != VerdictInvalid || !strings.HasPrefix(out.Reason, "token-mint:") {
+		t.Fatalf("want token-mint rejection without RP, got %v (%s)", out.Verdict, out.Reason)
 	}
 }

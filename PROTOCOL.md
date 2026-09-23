@@ -2150,26 +2150,44 @@ locally enrolled signer key:
   to a strength, and a ceremony must meet the requested strength —
   no silent downgrades.
 
-Session tokens carry issuer/session/expiry/counterparty/boot id,
-mint with the same-or-stronger ceremony rule, verify against the
-receiver-local clock with ~5 minutes of skew tolerance, and are
-bound to the machine boot: each token embeds the kernel boot id
+Session tokens carry issuer/session/expiry/counterparty/boot id
+plus the WebAuthn assertion that proves the mint-time human
+ceremony, and mint through a two-phase ceremony: `BeginSessionMint`
+binds issuer, scope, lifetime, and random ids into a pending mint
+and produces the challenge; the human's authenticator signs that
+challenge; `Finish` verifies the assertion against the enrolled
+WebAuthn credential (UV required) and the configured relying party
+BEFORE the issuer key signs the token. There is no presence
+parameter anywhere in the mint path — the ceremony strength is
+established by the assertion, never by a caller-supplied claim —
+so a process holding the issuer's identity key cannot mint Tier 1
+tokens on its own: the receiver re-verifies the embedded assertion
+independently of the issuer signature, and a forged or
+transplanted assertion fails there even though the issuer
+signature is valid. The mint challenge is the SHA-256 of the
+token's canonical bytes with assertion and credential id zeroed,
+so an assertion cannot be transplanted onto a token with different
+scope, lifetime, or ids. Tokens verify against the receiver-local
+clock with ~5 minutes of skew tolerance, and are bound to the
+machine boot: each token embeds the kernel boot id
 (`/proc/sys/kernel/random/boot_id` on Linux). The boot binding is
 issuer-side only: the issuer's keystore loader drops tokens whose
 boot id differs from the current boot, so pre-reboot tokens are
 never re-served — but a remote receiver cannot check the issuer's
 boot id, and the Tier 1 verification path checks lifetime, scope,
-signature, revocation, and replay only. It is not
+signatures, mint assertion, revocation, and replay only. It is not
 receiver-verifiable reboot revocation. Where the host exposes a
 stable boot id (Linux `/proc/sys/kernel/random/boot_id`), tokens
 therefore survive process restart but die on machine reboot for
 the issuer, mirroring forward-secrecy session hygiene. Where no
 stable boot id exists the id is process-local by construction: a
 token minted by one process is dropped by the next, so tokens are
-single-process on those hosts (`courier vhl session mint` warns
-when this is the case). A local process can still
-mint tokens, so the boot id is an anti-theft-of-backup measure,
-not a hardware root of trust.
+single-process on those hosts. Minting is currently closed: the
+CLI's `session mint` refuses outright because no WebAuthn ceremony
+transport ships yet, and a command that can never complete a
+ceremony must not pretend it can (see §30.6). The same-or-stronger
+re-mint rule still applies: a live token is never renewable with a
+weaker ceremony.
 
 ### 30.4 Receiver verification
 
@@ -2178,7 +2196,15 @@ tier tag validity → attestation presence → structural validity →
 tier match → approver enrollment in the **receiver-local registry**
 (the trust root; no shared directory can override it) → signature
 under an enrolled key → revocation → replay → expiry → (Tier 2)
-action-hash match → (Tier 1) token validity and expiry.
+action-hash match → (Tier 1) token validity, token issuer
+signature, and the token's mint assertion: the embedded WebAuthn
+assertion must be a genuine UV assertion over the token's mint
+challenge from an enrolled WebAuthn credential for the issuer,
+verified against the configured relying party. The mint-assertion
+check is independent of the issuer signature — it is what stops a
+process holding the issuer's identity key from minting Tier 1
+tokens with no human involved. An unconfigured relying party fails
+closed.
 
 The replay set is keyed by attestation id and records the relay
 envelope id: re-evaluating the same envelope (e.g. a second inbox
@@ -2223,10 +2249,12 @@ the VHL layer, never surfaced as chat):
 - `courier vhl enroll <address> [--name N]` — enroll a human
   approver (interactive confirmation; the enrollment event is
   recorded). Enrollment is a Tier 2 human-approved event.
-- `courier vhl session mint [--scope ADDR] [--ttl 8h]` — the human
-  performs the PIN ceremony at their own terminal and mints a
-  session token. `session status` lists live tokens; `session
-  revoke <id> [--broadcast]` revokes.
+- `courier vhl session mint` — REFUSES. Session-token minting
+  requires a WebAuthn mint ceremony with an enrolled approver
+  credential, and no ceremony transport ships in the CLI yet; the
+  command fails closed by design rather than minting on a
+  caller-asserted ceremony. `session status` lists live tokens;
+  `session revoke <id> [--broadcast]` revokes.
 - `courier vhl request --tier 2 --message TEXT [--to ADDR]` —
   file an approval request for exact bytes; `courier vhl approve
   <request-id> [--presence pin|challenge]` shows the human the
@@ -2256,7 +2284,14 @@ the VHL layer, never surfaced as chat):
 - Session tokens are bearer-adjacent: whoever holds the sealed
   token file and the process can mint Tier 1 attestations. The
   8-hour default, boot-id binding, and per-token revocation
-  bound the exposure; Tier 2 never uses tokens.
+  bound the exposure; Tier 2 never uses tokens. The mint itself,
+  however, cannot be forged by a process holding the issuer's
+  identity key: the embedded WebAuthn assertion is verified by
+  the receiver against the enrolled credential and the
+  configured relying party, independently of the issuer
+  signature, and the mint challenge binds the assertion to the
+  exact token bytes — so neither a caller-supplied presence
+  claim nor a transplanted assertion produces a usable token.
 - The receiver-local enrollment registry is the whole trust root.
   If an attacker enrolls themselves on the victim's machine, VHL
   attests the attacker's "approvals" faithfully — VHL verifies

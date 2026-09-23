@@ -410,19 +410,39 @@ func (c *Client) VHLApprovers() ([]ApproverInfo, error) {
 	return out, nil
 }
 
-// VHLMintSessionToken mints a Tier 1 session token signed with this
-// identity's key and seals it into the keystore. scope limits which
-// recipient the token attests for ("" = any). The caller performs
-// the interactive presence ceremony and passes its strength.
-func (c *Client) VHLMintSessionToken(scope string, ttl time.Duration, presence vhl.PresenceStrength) (*vhl.SessionToken, error) {
-	if !presence.Valid() {
-		return nil, fmt.Errorf("unknown presence ceremony")
-	}
+// VHLBeginSessionMint starts minting a Tier 1 session token for
+// this identity. It returns the pending mint — including the
+// challenge the human's authenticator must sign in the WebAuthn
+// mint ceremony. Complete it with VHLFinishSessionMint once the
+// ceremony transport delivers the authenticator's assertion.
+//
+// There is deliberately no presence parameter: the ceremony
+// strength is established by the assertion Finish verifies, never
+// by a caller-supplied claim. A process holding this identity's
+// key cannot complete a mint on its own — Finish fails closed
+// without a real authenticator signature over the challenge.
+func (c *Client) VHLBeginSessionMint(scope string, ttl time.Duration) (*vhl.PendingSessionMint, error) {
 	if ttl <= 0 {
 		ttl = vhl.DefaultSessionTTL
 	}
 	if ttl > 24*time.Hour {
 		return nil, fmt.Errorf("session TTL over 24h is not allowed")
+	}
+	return vhl.BeginSessionMint(c.cfg.Address, scope, ttl, vhlBootIDNow())
+}
+
+// VHLFinishSessionMint completes a session-token mint started with
+// VHLBeginSessionMint. credentialID names the enrolled WebAuthn
+// credential the human used; assertionB64 is the authenticator's
+// WebAuthn assertion over the pending's challenge. The assertion is
+// verified against the enrolled credential and the configured
+// relying party BEFORE the token is signed and sealed — no real
+// authenticator signature, no token. The same-or-stronger re-mint
+// guard applies as before: a live fido2_uv token is never renewable
+// with a weaker ceremony.
+func (c *Client) VHLFinishSessionMint(pending *vhl.PendingSessionMint, credentialID, assertionB64 string) (*vhl.SessionToken, error) {
+	if pending == nil {
+		return nil, fmt.Errorf("no pending session mint")
 	}
 	id, err := c.cfg.Identity()
 	if err != nil {
@@ -433,13 +453,31 @@ func (c *Client) VHLMintSessionToken(scope string, ttl time.Duration, presence v
 		return nil, err
 	}
 	var tok *vhl.SessionToken
-	// Load, guard, mint, and reseal inside one lock-protected
-	// critical section: the same-or-stronger re-mint check and the
-	// keystore append must see each other's writes, or a concurrent
-	// mint slips past the ceremony-downgrade guard (issue #142
-	// review). Only local crypto and the seal key derivation run
-	// here — never network I/O.
+	// Load, guard, finish, and reseal inside one lock-protected
+	// critical section: the credential lookup, RP check, re-mint
+	// guard, and keystore append must see each other's writes, or
+	// a concurrent mint slips past the ceremony-downgrade guard
+	// (issue #142 review). Only local crypto and the seal key
+	// derivation run here — never network I/O.
 	if err := updateVHL(func(ff *vhlFile) error {
+		if ff.RP.ID == "" || len(ff.RP.Origins) == 0 {
+			return fmt.Errorf("session mint refused: no WebAuthn relying party configured — no ceremony transport exists yet, so there is nothing trustworthy to verify against")
+		}
+		var cred *vhl.Credential
+		for _, a := range ff.Registry.Approvers {
+			if a.Identity != c.cfg.Address {
+				continue
+			}
+			for i := range a.Credentials {
+				if a.Credentials[i].ID == credentialID {
+					cred = &a.Credentials[i]
+					break
+				}
+			}
+		}
+		if cred == nil {
+			return fmt.Errorf("session mint refused: credential %q is not enrolled for this identity", credentialID)
+		}
 		toks, err := openTokensLocked(ff.SealedTokens, key)
 		if err != nil {
 			return err
@@ -449,12 +487,12 @@ func (c *Client) VHLMintSessionToken(scope string, ttl time.Duration, presence v
 		// stronger ceremony must never be renewable with a weaker one —
 		// no downgrade path.
 		for _, t := range live {
-			if !t.MayRemint(presence) {
+			if !t.MayRemint(vhl.PresenceFIDO2UV) {
 				cur, _ := t.MintPresence()
-				return fmt.Errorf("cannot re-mint with %q: live token %s was minted with stronger ceremony %q", presence, t.ID, cur)
+				return fmt.Errorf("cannot re-mint with %q: live token %s was minted with stronger ceremony %q", vhl.PresenceFIDO2UV, t.ID, cur)
 			}
 		}
-		tok, err = vhl.MintSessionToken(c.cfg.Address, scope, presence, ttl, vhlBootIDNow(), id.EdPriv)
+		tok, err = pending.Finish(cred, assertionB64, ff.RP, id.EdPriv)
 		if err != nil {
 			return err
 		}

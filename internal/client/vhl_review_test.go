@@ -34,10 +34,8 @@ func TestVHLRevocationAppliesWithinSamePage(t *testing.T) {
 	if err := env.senderCfg.AddContact("recipient", env.recipCfg.Address); err != nil {
 		t.Fatalf("add contact: %v", err)
 	}
-	tok, err := env.sender.VHLMintSessionToken("", 0, vhl.PresencePIN)
-	if err != nil {
-		t.Fatalf("mint: %v", err)
-	}
+	fix := setupMintFixture(t, env)
+	tok := fix.mint(t, env, "")
 	// Build the Tier 1 attestation while the token is live, then
 	// revoke: the broadcast revocation frame lands in the
 	// recipient's page BEFORE the message that uses the token.
@@ -89,13 +87,9 @@ func TestVHLTier1ScopedTokenSelection(t *testing.T) {
 	}
 
 	env.asSender()
-	unscoped, err := env.sender.VHLMintSessionToken("", 0, vhl.PresencePIN)
-	if err != nil {
-		t.Fatalf("mint unscoped: %v", err)
-	}
-	if _, err := env.sender.VHLMintSessionToken(env.snoopCfg.Address, 0, vhl.PresencePIN); err != nil {
-		t.Fatalf("mint third-party-scoped: %v", err)
-	}
+	fix := setupMintFixture(t, env)
+	unscoped := fix.mint(t, env, "")
+	fix.mint(t, env, env.snoopCfg.Address)
 	tok, err := env.sender.vhlLiveToken(env.recipCfg.Address)
 	if err != nil {
 		t.Fatalf("live token: %v", err)
@@ -105,10 +99,7 @@ func TestVHLTier1ScopedTokenSelection(t *testing.T) {
 	}
 	// A token scoped to the recipient itself wins when it is the
 	// newest usable one.
-	scoped, err := env.sender.VHLMintSessionToken(env.recipCfg.Address, 0, vhl.PresencePIN)
-	if err != nil {
-		t.Fatalf("mint recipient-scoped: %v", err)
-	}
+	scoped := fix.mint(t, env, env.recipCfg.Address)
 	tok, err = env.sender.vhlLiveToken(env.recipCfg.Address)
 	if err != nil {
 		t.Fatalf("live token: %v", err)
@@ -151,9 +142,8 @@ func TestVHLExplicitFetchDoesNotConsumeReplay(t *testing.T) {
 	}
 
 	env.asSender()
-	if _, err := env.sender.VHLMintSessionToken("", 0, vhl.PresencePIN); err != nil {
-		t.Fatalf("mint: %v", err)
-	}
+	fix := setupMintFixture(t, env)
+	fix.mint(t, env, "")
 	att, err := env.sender.vhlAttestForSend(vhl.Tier1, "rotate keys", nil, env.recipCfg.Address)
 	if err != nil {
 		t.Fatalf("attest: %v", err)
@@ -219,10 +209,8 @@ func TestVHLHeldSenderFramesGated(t *testing.T) {
 	if err := env.senderCfg.AddContact("recipient", env.recipCfg.Address); err != nil {
 		t.Fatalf("add contact: %v", err)
 	}
-	tok, err := env.sender.VHLMintSessionToken("", 0, vhl.PresencePIN)
-	if err != nil {
-		t.Fatalf("mint: %v", err)
-	}
+	fix := setupMintFixture(t, env)
+	tok := fix.mint(t, env, "")
 
 	// A held sender's approval-request frame must not land in the
 	// recipient's review queue: it falls through to normal delivery

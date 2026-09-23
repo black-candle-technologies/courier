@@ -24,9 +24,8 @@ func TestVHLTier1EndToEnd(t *testing.T) {
 	}
 
 	env.asSender()
-	if _, err := env.sender.VHLMintSessionToken("", 0, vhl.PresencePIN); err != nil {
-		t.Fatalf("mint session token: %v", err)
-	}
+	fix := setupMintFixture(t, env)
+	fix.mint(t, env, "")
 	if _, err := env.sender.SendTiered(env.recipCfg.Address, "deploy staging", vhl.Tier1, nil); err != nil {
 		t.Fatalf("send tier 1: %v", err)
 	}
@@ -240,9 +239,8 @@ func TestVHLReplayHeldAcrossEnvelopes(t *testing.T) {
 	}
 
 	env.asSender()
-	if _, err := env.sender.VHLMintSessionToken("", 0, vhl.PresencePIN); err != nil {
-		t.Fatalf("mint session token: %v", err)
-	}
+	fix := setupMintFixture(t, env)
+	fix.mint(t, env, "")
 	att, err := env.sender.vhlAttestForSend(vhl.Tier1, "rotate keys", nil, env.recipCfg.Address)
 	if err != nil {
 		t.Fatalf("attest: %v", err)
@@ -358,10 +356,8 @@ func TestVHLSessionRevocationBroadcast(t *testing.T) {
 	if err := env.senderCfg.AddContact("recipient", env.recipCfg.Address); err != nil {
 		t.Fatalf("add contact: %v", err)
 	}
-	tok, err := env.sender.VHLMintSessionToken("", 0, vhl.PresencePIN)
-	if err != nil {
-		t.Fatalf("mint: %v", err)
-	}
+	fix := setupMintFixture(t, env)
+	tok := fix.mint(t, env, "")
 	// Give the recipient something to verify against before
 	// revocation: one attested message lands fine.
 	if _, err := env.sender.SendTiered(env.recipCfg.Address, "status ok", vhl.Tier1, nil); err != nil {
@@ -442,9 +438,8 @@ func TestVHLTier0WithAttestationRejected(t *testing.T) {
 	}
 
 	env.asSender()
-	if _, err := env.sender.VHLMintSessionToken("", 0, vhl.PresencePIN); err != nil {
-		t.Fatalf("mint: %v", err)
-	}
+	fix := setupMintFixture(t, env)
+	fix.mint(t, env, "")
 	att, err := env.sender.vhlAttestForSend(vhl.Tier1, "hello", nil, env.recipCfg.Address)
 	if err != nil {
 		t.Fatalf("attest: %v", err)
@@ -489,9 +484,8 @@ func TestVHLPersistenceAcrossRestart(t *testing.T) {
 		t.Fatalf("enroll approver: %v", err)
 	}
 	env.asSender()
-	if _, err := env.sender.VHLMintSessionToken("", 0, vhl.PresencePIN); err != nil {
-		t.Fatalf("mint: %v", err)
-	}
+	fix := setupMintFixture(t, env)
+	fix.mint(t, env, "")
 
 	// Reload both clients from disk — new Client instances with the
 	// same HOME, as a process restart would.

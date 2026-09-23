@@ -323,6 +323,16 @@ func (v *Verifier) Evaluate(in EvalInput) EvalOutcome {
 		if !tokOK {
 			return EvalOutcome{Verdict: VerdictInvalid, Tier: tier, Approver: a.Approver, Reason: "token-bad-signature"}
 		}
+		// The mint ceremony proof is verified independently of the
+		// issuer signature: the embedded WebAuthn assertion must
+		// be a real authenticator signature over the mint
+		// challenge for an enrolled WebAuthn credential. This is
+		// the check that stops a process holding the issuer's
+		// identity key from minting Tier 1 tokens with no human
+		// involved — re-signing a forged token is not enough.
+		if err := v.verifyMintAssertion(tok); err != nil {
+			return EvalOutcome{Verdict: VerdictInvalid, Tier: tier, Approver: a.Approver, Reason: "token-mint: " + err.Error()}
+		}
 	}
 	// All checks passed: consume the attestation id so exact
 	// replays fail. (The session token id is not consumed: it
@@ -366,7 +376,42 @@ func (v *Verifier) VerifyTokenStandalone(tok *SessionToken, receiver string, now
 	if v.Revoked.Revoked(tok.ID, "") {
 		return fmt.Errorf("session token revoked")
 	}
+	if err := v.verifyMintAssertion(tok); err != nil {
+		return fmt.Errorf("mint assertion: %w", err)
+	}
 	return nil
+}
+
+// verifyMintAssertion verifies the WebAuthn assertion embedded in a
+// session token: the credential must be an enrolled WebAuthn
+// credential for the token's issuer, and the assertion must be a
+// genuine authenticator signature over the token's mint challenge
+// (UV required). The mint challenge binds the full token bytes, so
+// the assertion cannot be transplanted onto a different token. An
+// unconfigured relying party fails closed: without it there is
+// nothing trustworthy to verify against.
+func (v *Verifier) verifyMintAssertion(tok *SessionToken) error {
+	if v.WebAuthn.ID == "" || len(v.WebAuthn.Origins) == 0 {
+		return fmt.Errorf("no relying party configured")
+	}
+	_, webAuthn, err := v.Registry.KeysFor(tok.Issuer)
+	if err != nil {
+		return fmt.Errorf("no credentials: %w", err)
+	}
+	var enrolled *Credential
+	for i := range webAuthn {
+		if webAuthn[i].ID == tok.CredentialID {
+			enrolled = &webAuthn[i]
+			break
+		}
+	}
+	if enrolled == nil {
+		return fmt.Errorf("mint credential %q not enrolled for %q", tok.CredentialID, tok.Issuer)
+	}
+	if enrolled.Kind != "webauthn" {
+		return fmt.Errorf("mint credential %q is %s (want webauthn)", tok.CredentialID, enrolled.Kind)
+	}
+	return tok.verifyMintAssertion(enrolled, v.WebAuthn)
 }
 
 // verifyFIDO2Proof cryptographically verifies the WebAuthn assertion
