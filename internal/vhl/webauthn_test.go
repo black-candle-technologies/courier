@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 )
@@ -164,11 +165,31 @@ func TestFIDO2VerificationAccepts(t *testing.T) {
 	}
 }
 
+// TestFIDO2SameEnvelopeReevaluation pins the same-envelope
+// idempotency: two consumers (inbox CLI vs. dashboard push)
+// evaluating the same envelope must both see attested. The second
+// pass must not trip the FIDO2 signature-counter check — the first
+// pass already advanced the stored counter.
+func TestFIDO2SameEnvelopeReevaluation(t *testing.T) {
+	body := []byte("transfer the funds")
+	v, _, _, a := fido2TestSetup(t, body, PresenceFIDO2UV)
+	in := EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "r", Now: time.Now().Unix(), EnvelopeID: 7}
+	first := v.Evaluate(in)
+	if first.Verdict != VerdictAttested {
+		t.Fatalf("first verdict = %s (%s), want attested", first.Verdict, first.Reason)
+	}
+	second := v.Evaluate(in)
+	if second.Verdict != VerdictAttested {
+		t.Fatalf("second verdict = %s (%s), want attested", second.Verdict, second.Reason)
+	}
+}
+
 func TestFIDO2VerificationRejects(t *testing.T) {
 	body := []byte("transfer the funds")
 	cases := []struct {
-		name   string
-		mutate func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey)
+		name       string
+		wantReason string // when set, the rejection must come from this check
+		mutate     func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey)
 	}{
 		{
 			name: "wrong challenge",
@@ -236,12 +257,18 @@ func TestFIDO2VerificationRejects(t *testing.T) {
 			},
 		},
 		{
-			name: "clientDataJSON swapped to a different challenge",
+			name:       "clientDataJSON bytes changed, challenge kept",
+			wantReason: "fido2: signature invalid",
 			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey) {
 				// Keep the valid signature but swap the
-				// clientDataJSON for one carrying a different
-				// challenge: the signature no longer binds the
-				// presented client data, so it must be rejected.
+				// clientDataJSON for different bytes carrying the
+				// SAME challenge and origin: every field check
+				// passes, so only the signature check can reject
+				// the assertion. (The previous version of this
+				// case swapped the challenge, which the challenge
+				// check rejects before the signature is ever
+				// verified — it could not catch a signature that
+				// fails to bind clientDataJSON.)
 				raw, err := b64.DecodeString(a.Proof.Assertion)
 				if err != nil {
 					t.Fatal(err)
@@ -254,16 +281,59 @@ func TestFIDO2VerificationRejects(t *testing.T) {
 				if !ok {
 					t.Fatal("assertion has no response object")
 				}
-				other := MsgHashOf([]byte("something else"))
+				h := MsgHashOf(body)
 				cdJSON, err := json.Marshal(map[string]string{
-					"type":      "webauthn.get",
-					"challenge": b64.EncodeToString(other[:]),
-					"origin":    "https://dashboard.test",
+					"type":        "webauthn.get",
+					"challenge":   b64.EncodeToString(h[:]),
+					"origin":      "https://dashboard.test",
+					"crossOrigin": "false",
 				})
 				if err != nil {
 					t.Fatal(err)
 				}
 				resp["clientDataJSON"] = b64.EncodeToString(cdJSON)
+				raw2, err := json.Marshal(cred)
+				if err != nil {
+					t.Fatal(err)
+				}
+				a.Proof.Assertion = b64.EncodeToString(raw2)
+				resignAttestation(t, a, idPriv)
+			},
+		},
+		{
+			name:       "authenticatorData bit flip",
+			wantReason: "fido2: signature invalid",
+			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey) {
+				// Flip a bit inside authenticatorData (in the
+				// signature-counter bytes; the UP/UV flags at
+				// byte 32 stay set): every field check passes, so
+				// only the signature check can reject the
+				// assertion.
+				raw, err := b64.DecodeString(a.Proof.Assertion)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var cred map[string]any
+				if err := json.Unmarshal(raw, &cred); err != nil {
+					t.Fatal(err)
+				}
+				resp, ok := cred["response"].(map[string]any)
+				if !ok {
+					t.Fatal("assertion has no response object")
+				}
+				authDataB64, ok := resp["authenticatorData"].(string)
+				if !ok {
+					t.Fatal("assertion has no authenticatorData")
+				}
+				authData, err := b64.DecodeString(authDataB64)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(authData) < 37 {
+					t.Fatal("authenticatorData too short")
+				}
+				authData[36] ^= 0x01
+				resp["authenticatorData"] = b64.EncodeToString(authData)
 				raw2, err := json.Marshal(cred)
 				if err != nil {
 					t.Fatal(err)
@@ -280,6 +350,9 @@ func TestFIDO2VerificationRejects(t *testing.T) {
 			out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "r", Now: time.Now().Unix(), EnvelopeID: 1})
 			if out.Verdict != VerdictInvalid {
 				t.Fatalf("verdict = %s (%s), want invalid", out.Verdict, out.Reason)
+			}
+			if tc.wantReason != "" && !strings.Contains(out.Reason, tc.wantReason) {
+				t.Fatalf("reason = %q, want it to contain %q", out.Reason, tc.wantReason)
 			}
 		})
 	}

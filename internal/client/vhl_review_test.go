@@ -2,6 +2,7 @@ package client
 
 import (
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/black-candle-technologies/courier/internal/vhl"
@@ -283,6 +284,47 @@ func TestVHLConsumeAttestationAtomic(t *testing.T) {
 	seen, err = vhlConsumeAttestation("att-atomic-1", 101)
 	if err != nil || !seen {
 		t.Fatalf("different envelope: seen=%v err=%v, want true, nil", seen, err)
+	}
+}
+
+// TestVHLConsumeAttestationConcurrent pins the atomicity primitive
+// under real concurrency: N goroutines racing to consume the same
+// attestation id behind a shared start barrier must agree on exactly
+// one winner (seen=false once). The sequential test above cannot
+// detect two callers both passing the Seen check before either one
+// saves — the race this primitive exists to prevent.
+func TestVHLConsumeAttestationConcurrent(t *testing.T) {
+	env := newAttachTestEnv(t)
+	env.asRecipient()
+	const n = 8
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	fresh := make(chan int64, n)
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(envelope int64) {
+			defer wg.Done()
+			<-start
+			seen, err := vhlConsumeAttestation("att-race", envelope)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if !seen {
+				fresh <- envelope
+			}
+		}(int64(100 + i))
+	}
+	close(start)
+	wg.Wait()
+	close(fresh)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("consume error: %v", err)
+	}
+	if got := len(fresh); got != 1 {
+		t.Fatalf("fresh consumes = %d, want exactly 1", got)
 	}
 }
 

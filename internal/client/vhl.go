@@ -198,6 +198,17 @@ func vhlBootIDNow() string {
 	return vhlBootID
 }
 
+// VHLBootIDStable reports whether session tokens are bound to a
+// boot id that survives process restart on this host. Without a
+// stable machine boot id the id is process-local by construction,
+// so a token minted by one process is never served by the next —
+// tokens are single-process there. Callers that mint tokens (the
+// CLI, the dashboard) should surface this so the human is not
+// surprised when a minted token vanishes on the next invocation.
+func (c *Client) VHLBootIDStable() bool {
+	return strings.HasPrefix(vhlBootIDNow(), "boot-")
+}
+
 // machineBootID identifies the current machine boot. Session tokens
 // bind to it so that a reboot revokes them by construction (issue
 // #142). It must be stable across processes on the same boot — a

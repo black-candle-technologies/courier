@@ -2160,9 +2160,14 @@ boot id differs from the current boot, so pre-reboot tokens are
 never re-served — but a remote receiver cannot check the issuer's
 boot id, and the Tier 1 verification path checks lifetime, scope,
 signature, revocation, and replay only. It is not
-receiver-verifiable reboot revocation. Tokens therefore survive
-process restart but die on machine reboot for the issuer,
-mirroring forward-secrecy session hygiene. A local process can still
+receiver-verifiable reboot revocation. Where the host exposes a
+stable boot id (Linux `/proc/sys/kernel/random/boot_id`), tokens
+therefore survive process restart but die on machine reboot for
+the issuer, mirroring forward-secrecy session hygiene. Where no
+stable boot id exists the id is process-local by construction: a
+token minted by one process is dropped by the next, so tokens are
+single-process on those hosts (`courier vhl session mint` warns
+when this is the case). A local process can still
 mint tokens, so the boot id is an anti-theft-of-backup measure,
 not a hardware root of trust.
 

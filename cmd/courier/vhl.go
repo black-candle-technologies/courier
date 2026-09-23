@@ -237,6 +237,9 @@ func cmdVHLSessionMint(c *client.Client, args []string) error {
 	if scope != "" {
 		fmt.Printf("scoped to %s\n", scope)
 	}
+	if !c.VHLBootIDStable() {
+		fmt.Println("warning: no stable machine boot id on this host — this token is bound to the current process and will not be served by later processes")
+	}
 	return nil
 }
 

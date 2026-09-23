@@ -578,6 +578,9 @@ func splitSendArgs(args []string) (positional []string, file, replyTo string, at
 			ttl = strings.TrimPrefix(a, "--ttl=")
 		case a == "--tier" && i+1 < len(args):
 			tier = args[i+1]
+			if tier == "" {
+				return nil, "", "", nil, "", "", "", fmt.Errorf("--tier needs a value (1 or 2); refusing to send an unattested message")
+			}
 			i++
 		case a == "--tier":
 			return nil, "", "", nil, "", "", "", fmt.Errorf("--tier needs a value (1 or 2); refusing to send an unattested message")

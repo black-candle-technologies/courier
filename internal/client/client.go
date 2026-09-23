@@ -2097,13 +2097,19 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			// different envelope downgrades the verdict to a
 			// replay hold.
 			if out.Verdict == vhl.VerdictAttested && tier == vhl.Tier2 && att != nil {
-				if replayed, cerr := vhlConsumeAttestation(att.ID, m.ID); cerr == nil && replayed {
+				replayed, cerr := vhlConsumeAttestation(att.ID, m.ID)
+				switch {
+				case cerr != nil:
+					// Fail closed: without a committed replay mark,
+					// another consumer could accept the same
+					// attestation. The message is held for review,
+					// never delivered as attested.
+					out.Verdict = vhl.VerdictInvalid
+					out.Reason = "vhl-unavailable"
+				case replayed:
 					out.Verdict = vhl.VerdictInvalid
 					out.Reason = "replay"
 				}
-				// A consume failure is best effort: the
-				// fetch-local mark plus the end-of-fetch union
-				// merge still converge the persisted set.
 			}
 			msg.VHL = &VHLStatus{
 				Tier: int(tier), Verdict: out.Verdict.String(),

@@ -110,6 +110,12 @@ func (r *Registry) Enroll(identity, name string, cred Credential, tier2HumanAppr
 	}
 	for i, c := range a.Credentials {
 		if c.ID == cred.ID && c.Kind == cred.Kind {
+			// Re-enrollment must never rewind the FIDO2
+			// signature counter: keep the greater of the
+			// stored and incoming values.
+			if c.SignCount > cred.SignCount {
+				cred.SignCount = c.SignCount
+			}
 			a.Credentials[i] = cred
 			return nil
 		}

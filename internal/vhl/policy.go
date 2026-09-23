@@ -135,6 +135,18 @@ func (s *SeenSet) Mark(id string, envelopeID int64) {
 	}
 }
 
+// SeenInEnvelope reports whether id was already recorded against
+// exactly this envelope id. Unlike Seen (which flags a *different*
+// envelope as a replay), this identifies a re-evaluation of the
+// same envelope by another consumer.
+func (s *SeenSet) SeenInEnvelope(id string, envelopeID int64) bool {
+	if s == nil || s.IDs == nil {
+		return false
+	}
+	env, ok := s.IDs[id]
+	return ok && env == envelopeID
+}
+
 // RevocationSet tracks revoked token and attestation ids.
 type RevocationSet struct {
 	Tokens    map[string]int64 `json:"tokens,omitempty"`    // token id -> revoked unix time
@@ -262,7 +274,15 @@ func (v *Verifier) Evaluate(in EvalInput) EvalOutcome {
 		// action hash, signed by the enrolled credential. Presence
 		// of the assertion fields alone never suffices.
 		if a.Proof.Kind == ProofFIDO2 {
-			if err := v.verifyFIDO2Proof(a, h[:]); err != nil {
+			// Same-envelope re-evaluation (e.g. the inbox CLI and
+			// the dashboard push deriving the same message): the
+			// first evaluation already advanced the stored
+			// signature counter, so the counter-increase check is
+			// skipped — otherwise a valid attestation would flip
+			// to invalid on re-check. The assertion itself is
+			// still fully verified cryptographically.
+			skipCounter := v.Seen.SeenInEnvelope(a.ID, in.EnvelopeID)
+			if err := v.verifyFIDO2Proof(a, h[:], skipCounter); err != nil {
 				return EvalOutcome{Verdict: VerdictInvalid, Tier: tier, Approver: a.Approver, Reason: err.Error()}
 			}
 		}
@@ -363,7 +383,13 @@ func (v *Verifier) VerifyTokenStandalone(tok *SessionToken, receiver string, now
 // the envelope-layer attestation-id dedup catches exact replays, and
 // the authenticator's signature counter below must strictly increase
 // per credential.
-func (v *Verifier) verifyFIDO2Proof(a *Attestation, actionHash []byte) error {
+// verifyFIDO2Proof cryptographically verifies the WebAuthn assertion
+// for a Tier 2 attestation. When skipCounterCheck is set (a
+// re-evaluation of an envelope this attestation was already
+// recorded against), the signature-counter increase check is
+// skipped — the first evaluation already advanced the counter —
+// but the assertion itself is still fully verified.
+func (v *Verifier) verifyFIDO2Proof(a *Attestation, actionHash []byte, skipCounterCheck bool) error {
 	if a.Proof.CredentialID == "" {
 		return fmt.Errorf("missing credential id")
 	}
@@ -402,11 +428,15 @@ func (v *Verifier) verifyFIDO2Proof(a *Attestation, actionHash []byte) error {
 	// Standard WebAuthn replay control: the counter must strictly
 	// increase per credential. A counter-less authenticator reports
 	// 0 forever, which the spec permits only while the stored value
-	// is also 0.
-	if stored := enrolled.SignCount; signCount <= stored && (stored != 0 || signCount != 0) {
-		return fmt.Errorf("fido2: signature counter did not increase (got %d, want > %d)", signCount, stored)
+	// is also 0. Skipped on same-envelope re-evaluation: the first
+	// pass already advanced the stored counter, and re-checking
+	// would reject a valid attestation.
+	if !skipCounterCheck {
+		if stored := enrolled.SignCount; signCount <= stored && (stored != 0 || signCount != 0) {
+			return fmt.Errorf("fido2: signature counter did not increase (got %d, want > %d)", signCount, stored)
+		}
+		// KeysFor returns copies, so persist against the registry itself.
+		v.Registry.NoteSignCount(a.Approver, enrolled.ID, signCount)
 	}
-	// KeysFor returns copies, so persist against the registry itself.
-	v.Registry.NoteSignCount(a.Approver, enrolled.ID, signCount)
 	return nil
 }

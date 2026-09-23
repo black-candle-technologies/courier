@@ -14,14 +14,9 @@ var b64 = base64.RawURLEncoding
 
 // Attestation wire version. Versioned so future proof kinds can extend
 // the schema without breaking old verifiers (unknown versions are
-// rejected loudly, never parsed optimistically). Version 2
-// length-prefixes every variable field in the canonical bytes; v1
-// artifacts still verify (see attestationCanonical).
+// rejected loudly, never parsed optimistically). The canonical form
+// length-prefixes every variable field in the canonical bytes.
 const attestationVersion = 2
-
-// First-version artifacts (pre-length-prefix canonical form) still
-// verify: the canonical bytes for v1 are frozen.
-const attestationVersionV1 = 1
 
 // Domain separators keep VHL signatures distinct from every other use
 // of an approver's Ed25519 key: a signature for one can never validate
@@ -125,77 +120,16 @@ func MsgHashOf(body []byte) [32]byte { return sha256.Sum256(body) }
 
 // attestationCanonical builds the signed bytes for an attestation.
 // Every field that matters to a verifier is covered; nothing is
-// left to unsigned JSON parsing. Version 1 artifacts verify with the
-// frozen v1 form; new artifacts use the v2 form, which
+// left to unsigned JSON parsing. The canonical form
 // length-prefixes every variable-length field so field boundaries
-// are unambiguous (v1 concatenated some fields with no delimiter,
-// e.g. ChallengeID || RequestID).
+// are unambiguous.
 func attestationCanonical(a *Attestation) ([]byte, error) {
 	switch a.Version {
-	case attestationVersionV1:
-		return attestationCanonicalV1(a)
 	case attestationVersion:
 		return attestationCanonicalV2(a)
 	default:
-		return nil, fmt.Errorf("attestation version %d (want %d or %d)", a.Version, attestationVersionV1, attestationVersion)
+		return nil, fmt.Errorf("attestation version %d (want %d)", a.Version, attestationVersion)
 	}
-}
-
-// attestationCanonicalV1 is the frozen version-1 canonical form. Do
-// not change: existing v1 signatures verify against exactly these
-// bytes.
-func attestationCanonicalV1(a *Attestation) ([]byte, error) {
-	msgHash, err := b64.DecodeString(a.MsgHash)
-	if err != nil && a.MsgHash != "" {
-		return nil, fmt.Errorf("msg_hash: %w", err)
-	}
-	if a.MsgHash != "" && len(msgHash) != 32 {
-		return nil, fmt.Errorf("msg_hash: want 32 bytes, got %d", len(msgHash))
-	}
-	out := make([]byte, 0, 256)
-	out = append(out, attestDomain...)
-	out = append(out, byte(a.Version))
-	out = append(out, byte(a.Tier))
-	id, err := b64.DecodeString(a.ID)
-	if err != nil {
-		return nil, fmt.Errorf("id: %w", err)
-	}
-	out = append(out, id...)
-	out = append(out, msgHash...)
-	out = append(out, []byte(a.Approver)...)
-	out = append(out, []byte{0}...)
-	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], uint64(a.IssuedAt))
-	out = append(out, b[:]...)
-	binary.BigEndian.PutUint64(b[:], uint64(a.ExpiresAt))
-	out = append(out, b[:]...)
-	out = append(out, []byte(a.Proof.Kind)...)
-	out = append(out, []byte{0}...)
-	out = append(out, []byte(a.Proof.Strength)...)
-	out = append(out, []byte{0}...)
-	switch a.Proof.Kind {
-	case ProofSession:
-		if a.Proof.Token == nil {
-			return nil, fmt.Errorf("session proof without token")
-		}
-		tc, err := a.Proof.Token.canonical()
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, tc...)
-	case ProofFIDO2:
-		out = append(out, []byte(a.Proof.CredentialID)...)
-		out = append(out, []byte{0}...)
-		out = append(out, []byte(a.Proof.Assertion)...)
-	case ProofChallenge:
-		out = append(out, []byte(a.Proof.ChallengeID)...)
-	case ProofPIN:
-		// Presence is the ceremony; nothing further to bind.
-	default:
-		return nil, fmt.Errorf("unknown proof kind %q", a.Proof.Kind)
-	}
-	out = append(out, []byte(a.RequestID)...)
-	return out, nil
 }
 
 // lpField appends a length-prefixed field: an 8-byte big-endian
@@ -386,8 +320,8 @@ const Tier2Expiry = 15 * time.Minute
 // Validate checks the attestation's structural invariants without
 // touching signatures or enrollment.
 func (a *Attestation) Validate() error {
-	if a.Version != attestationVersionV1 && a.Version != attestationVersion {
-		return fmt.Errorf("attestation version %d (want %d or %d)", a.Version, attestationVersionV1, attestationVersion)
+	if a.Version != attestationVersion {
+		return fmt.Errorf("attestation version %d (want %d)", a.Version, attestationVersion)
 	}
 	if a.Tier != 1 && a.Tier != 2 {
 		return fmt.Errorf("attestation tier %d (want 1 or 2)", a.Tier)
