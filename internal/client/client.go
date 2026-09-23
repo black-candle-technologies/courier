@@ -111,11 +111,6 @@ type Config struct {
 	SeenEnvelopeHashes []string `json:"seen_envelope_hashes,omitempty"` // deprecated: use the per-consumer sets
 	SeenInboxHashes    []string `json:"seen_inbox_hashes,omitempty"`
 	SeenPushHashes     []string `json:"seen_push_hashes,omitempty"`
-	// issue #49: SeenStateHashes covers `courier state sync`, the
-	// shared-state catch-up fetch. It starts empty on upgrade; the
-	// sync cursor is seeded from the inbox/push cursors, whose fetches
-	// already applied older state events.
-	SeenStateHashes []string `json:"seen_state_hashes,omitempty"`
 	// issue #52: per-contact delivery receipt opt-in, keyed by
 	// recipient address. Strictly opt-in: receipts never leave the
 	// machine unless the operator explicitly enabled them for the
@@ -231,11 +226,6 @@ const (
 	// seenConsumerPush covers `courier dashboard push` — everything
 	// whose delivery target is the web dashboard.
 	seenConsumerPush
-	// seenConsumerState covers `courier state sync` — the shared-state
-	// catch-up fetch (issue #49). It never consumes inbox or
-	// dashboard-push messages: it only applies state events, which the
-	// other consumers apply idempotently on their own passes.
-	seenConsumerState
 )
 
 // migrateSeenSets applies the v0.9.2 lazy migration (issue #45): the
@@ -1129,7 +1119,7 @@ func (c *Client) send(toOrName, body string, attachPaths []string, replyTo int64
 	// until the peer accepts.
 	//
 	// FS applies only to human sends (logSent=true). Machine protocol
-	// traffic (group/channel/shared-state DMs, logSent=false) stays on
+	// traffic (group DMs, logSent=false) stays on
 	// legacy encryption by design, so protocol payloads never enter an
 	// FS session's ratchet.
 	var fsOut *fsSendOutput
@@ -1207,10 +1197,10 @@ func (c *Client) send(toOrName, body string, attachPaths []string, replyTo int64
 
 // sendSealed encrypts plain for address and posts it as a DM. sentLogBody
 // is the human-readable summary recorded in the local sent log (and shown
-// on the dashboard); it may differ from the plaintext, e.g. for protocol
-// payloads like shared-state events (issue #49). replyTo/quote thread
+// on the dashboard); it may differ from the plaintext for machine
+// protocol payloads. replyTo/quote thread
 // the sent log for human replies (issue #51). logSent=false skips the
-// sent log for machine protocol DMs (channel handshakes). expiresAt is
+// sent log for machine protocol DMs. expiresAt is
 // the issue #53 disappearing-message expiry (0 = never); the sent-log
 // entry is pruned once it passes.
 func (c *Client) sendSealed(address string, plain []byte, sentLogBody string, replyTo int64, quote string, logSent bool, expiresAt int64) (int64, error) {
@@ -1770,7 +1760,7 @@ func (c *Client) classifyInbound(from string, senderFlags []string, body string,
 // the lastID contract. Delivered envelopes are marked seen so they are
 // never delivered twice (v0.6.11 F3).
 func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, int, error) {
-	msgs, lastID, skipped, filtered, _, _, err := c.inbox(after, limit, true, seenConsumerInbox)
+	msgs, lastID, skipped, filtered, _, err := c.inbox(after, limit, true, seenConsumerInbox)
 	return msgs, lastID, skipped, filtered, err
 }
 
@@ -1780,10 +1770,7 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, int, erro
 // acknowledges — so a failed batch's messages stay re-fetchable on
 // retry instead of being suppressed as replays while the cursor
 // advances past them (v0.6.11 F11). It returns the dedup hashes of the
-// delivered messages for that bookkeeping, plus the shared-state
-// events newly applied to the local log during this fetch (issue #49)
-// with their envelope metadata — the dashboard push announces those;
-// other consumers ignore them.
+// delivered messages for that bookkeeping.
 //
 // The consumer selects which replay-suppression set is used (issue
 // #45): inbox delivery and dashboard pushing are independent
@@ -1797,13 +1784,13 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, int, erro
 // dedup, never an attack, and the "no new messages." sentinel contract
 // depends on them staying silent. The three are reported separately so
 // routine delivery mechanics never look like an attack.
-func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsumer) ([]Message, int64, int, int, []string, []appliedStateEvent, error) {
+func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsumer) ([]Message, int64, int, int, []string, error) {
 	// v0.6.11 (F10): the inbox request is signed by the recipient, so
 	// the relay serves ciphertext only to the address owner. after and
 	// limit are covered by the signature to prevent cursor tampering.
 	inboxEnvs, err := c.fetchEnvelopePage(after, limit)
 	if err != nil {
-		return nil, after, 0, 0, nil, nil, err
+		return nil, after, 0, 0, nil, err
 
 	}
 	var out []Message
@@ -1811,9 +1798,6 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 	filtered := 0
 	lastID := after
 	var newHashes []string
-	// issue #49: shared-state events newly applied during this fetch,
-	// with envelope metadata for the dashboard push announcements.
-	var stateApplied []appliedStateEvent
 	// issue #51: reply-cache entries for this fetch's deliveries,
 	// flushed once after the loop.
 	var cacheEntries []replyCacheEntry
@@ -1923,34 +1907,6 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// ordinary messages — never silently swallowed.
 		if ip, ok := parseIntroductionPayload(plain); ok {
 			if _, rec := c.recordIntroduction(m.From, m.ID, ip); rec {
-				seen[h] = true
-				newHashes = append(newHashes, h)
-				continue
-			}
-		}
-		// issue #49: shared-agent-state payloads are consumed by the
-		// state layer and never surface as chat messages (same as
-		// group-control DMs, issue #32). Events are appended to the
-		// per-peer log; application is idempotent, so every consumer
-		// (inbox, dashboard push, state sync) applies them on its own
-		// pass. A sender held for review does not get events applied:
-		// the payload falls through as an ordinary message instead, so
-		// a quarantined stranger cannot write into the shared log.
-		if sp, ok := parseStatePayload(plain); ok {
-			if c.cfg.HoldForReview(m.From) || slices.Contains(m.SenderFlags, "reported") {
-				// fall through to normal delivery below
-			} else {
-				applied, aerr := c.applyStateEvents(m.From, m.From, sp.Events)
-				_ = aerr // best effort: the cursor must advance regardless
-				if consumer == seenConsumerPush {
-					for _, ev := range applied {
-						stateApplied = append(stateApplied, appliedStateEvent{
-							From: m.From, EnvelopeID: m.ID,
-							SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
-							Hash: h, Event: ev,
-						})
-					}
-				}
 				seen[h] = true
 				newHashes = append(newHashes, h)
 				continue
@@ -2082,14 +2038,14 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 	if markSeen {
 		c.recordSeen(consumer, newHashes)
 	}
-	return out, lastID, skipped, filtered, newHashes, stateApplied, nil
+	return out, lastID, skipped, filtered, newHashes, nil
 }
 
 // InboxReview re-derives the messages currently held as requests,
 // without advancing the inbox cursor or marking anything seen. Review
 // is read-only: it never changes delivery state.
 func (c *Client) InboxReview(limit int) ([]Message, error) {
-	msgs, _, _, _, _, _, err := c.inbox(0, limit, false, seenConsumerInbox)
+	msgs, _, _, _, _, err := c.inbox(0, limit, false, seenConsumerInbox)
 	if err != nil {
 		return nil, err
 	}
@@ -2252,8 +2208,6 @@ func (c *Client) seenSet(which seenConsumer) map[string]bool {
 	switch which {
 	case seenConsumerPush:
 		stored = c.cfg.SeenPushHashes
-	case seenConsumerState:
-		stored = c.cfg.SeenStateHashes
 	default:
 		stored = c.cfg.SeenInboxHashes
 	}
@@ -2278,8 +2232,6 @@ func (c *Client) recordSeen(which seenConsumer, hashes []string) {
 		switch which {
 		case seenConsumerPush:
 			fresh.SeenPushHashes = unionSeen(fresh.SeenPushHashes, hashes)
-		case seenConsumerState:
-			fresh.SeenStateHashes = unionSeen(fresh.SeenStateHashes, hashes)
 		default:
 			fresh.SeenInboxHashes = unionSeen(fresh.SeenInboxHashes, hashes)
 		}
@@ -2591,7 +2543,7 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 	// suppressed as replays while the cursor advances past them.
 	// The push consumer uses its own replay set (issue #45): envelopes
 	// the inbox poller already delivered are still new to the pusher.
-	msgs, lastID, _, _, hashes, stateEvents, err := c.inbox(c.cfg.DashboardCursor, 200, false, seenConsumerPush)
+	msgs, lastID, _, _, hashes, err := c.inbox(c.cfg.DashboardCursor, 200, false, seenConsumerPush)
 	if err != nil {
 		return 0, err
 	}
@@ -2605,18 +2557,6 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
 			ReplyTo: m.ReplyTo, Quote: m.ReplyQuote,
 			ExpiresAt: m.ExpiresAt, Bridged: m.Bridged,
-		}})
-	}
-	// issue #49: newly applied shared-state events are announced to
-	// the dashboard as human-readable summaries, so the user sees
-	// their agent's notes and tasks. The envelope hash rides along so
-	// the push consumer's replay bookkeeping covers the state message
-	// exactly like a chat message.
-	for _, a := range stateEvents {
-		items = append(items, pushItem{hash: a.Hash, msg: pushMsg{
-			CourierID: a.EnvelopeID, From: a.From,
-			Body:   stateSummary(a.From, a.Event),
-			SentAt: a.SentAt, ReceivedAt: a.ReceivedAt,
 		}})
 	}
 	// Outbound messages, oldest first, from the local sent log.

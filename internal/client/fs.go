@@ -95,6 +95,15 @@ type fsPayload struct {
 // Only well-formed frames with a recognized type are intercepted;
 // anything else falls through as an ordinary message — never silently
 // swallowed.
+// shortPeer renders an address as its first 8 chars for summaries.
+func shortPeer(addr string) string {
+	a := strings.TrimPrefix(addr, "ed25519:")
+	if len(a) > 8 {
+		return a[:8]
+	}
+	return a
+}
+
 func parseFSPayload(plain []byte) (fsPayload, bool) {
 	var p fsPayload
 	if json.Unmarshal(plain, &p) != nil {

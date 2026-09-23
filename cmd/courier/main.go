@@ -84,8 +84,6 @@ func main() {
 		err = cmdDirectory(os.Args[2:])
 	case "group":
 		err = cmdGroup(os.Args[2:])
-	case "state":
-		err = cmdState(os.Args[2:])
 	case "rotate":
 		err = cmdRotate(os.Args[2:])
 	case "fs":
@@ -162,12 +160,6 @@ func usage() {
                                          create an encrypted group (you are admin)
   courier group send <group-id> <msg>    send a message to the group
   courier group inbox <group-id>         read new group messages
-  courier state note add <peer> --title <t>
-                                         share a note with a collaborator
-  courier state task add <peer> --title <t> [--assignee <a>]
-                                         share a task (state machine: assign/done/reopen)
-  courier state list <peer>              list shared notes + tasks
-  courier state sync <peer>              catch-up: fetch and apply missed state events
   courier directory register <handle> [--visibility public|unlisted|private]
       [--caps a,b] [--policy open|contacts]
                                          claim a handle (first-come, signed)

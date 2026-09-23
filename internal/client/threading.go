@@ -11,8 +11,7 @@
 // emit v1 byte-for-byte so old clients render them unchanged. Anything
 // that is not a recognized payload version falls back to legacy raw
 // text: old clients display a v2 reply's JSON as chat text (harmless,
-// the established precedent for introduction DMs and shared-state
-// events), and new clients never choke on foreign payloads.
+// the established precedent for introduction DMs), and new clients never choke on foreign payloads.
 package client
 
 import (
