@@ -189,6 +189,12 @@ var (
 	errFSGapTooLarge = errors.New("fs: message gap exceeds skipped-key window")
 	errFSIgnored     = errors.New("fs: handshake ignored")
 	errFSProcessed   = errors.New("fs: handshake already processed")
+	// errFSRequired is returned by fsPrepareSend when the per-contact
+	// require-fs policy (#146, per #327) is set and no FS session is
+	// established. The handshake is still retried automatically on
+	// the next send; the operator clears the policy with
+	// `courier contacts require-fs-off <name>`.
+	errFSRequired = errors.New("fs: forward secrecy is required for this contact but no session is established (the handshake is retried automatically on the next send)")
 )
 
 // ---- tunables ----
@@ -314,6 +320,14 @@ type fsFile struct {
 	Downgrade map[string]int64 `json:"downgrade_since,omitempty"`
 	// DowngradeWarnedAt rate-limits the user-facing warning per peer.
 	DowngradeWarnedAt map[string]int64 `json:"downgrade_warned_at,omitempty"`
+	// RequireFS (#146, per #327) is the per-contact fail-closed
+	// policy: address -> true means sends to the peer refuse legacy
+	// encryption — fsPrepareSend returns errFSRequired unless an FS
+	// session is established. The default policy is fail-open;
+	// opting a contact in is an explicit operator decision.
+	// Keyed by address (the cryptographic identity), never by
+	// contact name. Cleared by FSForget on contact removal.
+	RequireFS map[string]bool `json:"require_fs,omitempty"`
 }
 
 func fsFilePath() (string, error) {
@@ -341,6 +355,7 @@ func newFSFile() *fsFile {
 		FSNegotiated:      map[string]string{},
 		Downgrade:         map[string]int64{},
 		DowngradeWarnedAt: map[string]int64{},
+		RequireFS:         map[string]bool{},
 	}
 }
 
@@ -673,12 +688,17 @@ func fsSealMessage(out *fsSendOutput, plain []byte) ([]byte, error) {
 //
 // On the legacy-fallback path it runs downgrade detection for pinned
 // peers (fsAssessDowngrade). Sends are fail-open to legacy by design
-// (#146): mixed-version pairs keep working with no flag day.
+// (#146): mixed-version pairs keep working with no flag day — unless
+// the operator opted the contact into the per-contact require-fs
+// policy (#327), in which case a missing session fails the send
+// closed (errFSRequired) after the opportunistic handshake attempt,
+// so handshake pressure continues for the next try.
 func (c *Client) fsPrepareSend(address string) (*fsSendOutput, error) {
 	if address == c.cfg.Address {
 		return nil, nil
 	}
 	var out *fsSendOutput
+	var required bool
 	err := updateFS(func(ff *fsFile) error {
 		sess := ff.session(address)
 		if sess != nil && sess.Established {
@@ -689,16 +709,20 @@ func (c *Client) fsPrepareSend(address string) (*fsSendOutput, error) {
 			out = o
 			return nil
 		}
-		// No established session: fall through to the legacy path
-		// below, which assesses downgrade risk and opportunistically
+		// No established session: record whether this peer is
+		// fail-closed, then fall through to the legacy path below,
+		// which assesses downgrade risk and opportunistically
 		// initiates a handshake.
+		required = ff.RequireFS[address]
 		return nil
 	})
 	if err != nil || out != nil {
 		return out, err
 	}
 	// Legacy-fallback path: downgrade detection for pinned peers, then
-	// the usual opportunistic handshake.
+	// the usual opportunistic handshake. Required peers run it too —
+	// a failed-closed send must still pressure the handshake so a
+	// later send can succeed.
 	c.fsAssessDowngrade(address)
 	if c.fsShouldInit(address) {
 		var due bool
@@ -717,6 +741,9 @@ func (c *Client) fsPrepareSend(address string) (*fsSendOutput, error) {
 			// later ones, until the next due init) go legacy.
 			_ = c.sendFSInit(address)
 		}
+	}
+	if required {
+		return nil, errFSRequired
 	}
 	return nil, nil
 }
@@ -1571,6 +1598,44 @@ func (c *Client) FSActive(peer string) (bool, error) {
 	return sess != nil && sess.Established, nil
 }
 
+// FSRequire sets or clears the per-contact fail-closed policy (#146,
+// per #327): when set, sends to the peer refuse legacy encryption —
+// fsPrepareSend returns errFSRequired unless an FS session is
+// established. The default policy is fail-open. This is an explicit
+// operator decision per contact, managed with
+// `courier contacts require-fs-on|require-fs-off <name>`.
+func (c *Client) FSRequire(peer string, require bool) error {
+	address, err := c.cfg.ResolveRecipient(peer)
+	if err != nil {
+		return err
+	}
+	return updateFS(func(ff *fsFile) error {
+		if ff.RequireFS == nil {
+			ff.RequireFS = map[string]bool{}
+		}
+		if require {
+			ff.RequireFS[address] = true
+		} else {
+			delete(ff.RequireFS, address)
+		}
+		return nil
+	})
+}
+
+// FSRequired reports whether the per-contact fail-closed policy is
+// set for peer.
+func (c *Client) FSRequired(peer string) (bool, error) {
+	address, err := c.cfg.ResolveRecipient(peer)
+	if err != nil {
+		return false, err
+	}
+	ff, err := loadFS()
+	if err != nil {
+		return false, err
+	}
+	return ff.RequireFS[address], nil
+}
+
 // FSForget erases the forward-secrecy session with peer: session keys,
 // skipped keys, and handshake state are deleted, and the downgrade and
 // suite-negotiation markers are cleared so a later handshake starts
@@ -1592,6 +1657,10 @@ func (c *Client) FSForget(peer string) error {
 		delete(ff.Downgrade, address)
 		delete(ff.DowngradeWarnedAt, address)
 		delete(ff.FSNegotiated, address)
+		// The require-fs policy is per-contact: removing the contact
+		// drops it, so a re-added contact starts on the fail-open
+		// default.
+		delete(ff.RequireFS, address)
 		return nil
 	})
 }

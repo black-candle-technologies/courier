@@ -152,6 +152,9 @@ func usage() {
   courier contacts unverify <name>       clear a contact's verification
   courier contacts delivery-receipts-on <name>    opt into delivery receipts for a contact
   courier contacts delivery-receipts-off <name>   opt out of delivery receipts (default)
+  courier contacts require-fs-on <name>      require forward secrecy: sends fail
+                                         rather than fall back to legacy (default off)
+  courier contacts require-fs-off <name>    clear the require-forward-secrecy policy
   courier contacts remove <name>         delete a contact
   courier receipts [contact] [--limit N] show delivery status of sent messages
   courier group create --name <name> [addr...]
@@ -916,7 +919,7 @@ func writeSvcJSON(w http.ResponseWriter, code int, v any) {
 
 func cmdContacts(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|remove>")
+		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|require-fs-on|require-fs-off|remove>")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
@@ -984,14 +987,22 @@ func cmdContacts(args []string) error {
 		}
 		fmt.Printf("receipts: %s\n", onOff)
 		// #146: forward secrecy is fully automatic — no `courier fs`
-		// commands. Show whether an FS session is established.
+		// commands. Show whether an FS session is established, and
+		// whether the per-contact fail-closed policy is set (#327).
 		fsActive, err := cl.FSActive(args[1])
+		if err != nil {
+			return err
+		}
+		fsRequired, err := cl.FSRequired(args[1])
 		if err != nil {
 			return err
 		}
 		fsState := "inactive"
 		if fsActive {
 			fsState = "active"
+		}
+		if fsRequired {
+			fsState += " (required: sends fail closed without a session)"
 		}
 		fmt.Printf("forward secrecy: %s\n", fsState)
 		if rec, ok := cfg.StoredVerification(args[1]); ok {
@@ -1054,6 +1065,25 @@ func cmdContacts(args []string) error {
 		} else {
 			fmt.Printf("delivery receipts off for %q.\n", args[1])
 		}
+	case "require-fs-on", "require-fs-off":
+		// #146 (per #327): the per-contact fail-closed policy.
+		// Opting a contact in means sends to them refuse legacy
+		// encryption — without an established FS session the send
+		// fails instead of falling back. The handshake is still
+		// retried automatically on the next send. Default is off
+		// (fail-open).
+		if len(args) != 2 {
+			return fmt.Errorf("usage: courier contacts %s <name>", args[0])
+		}
+		on := args[0] == "require-fs-on"
+		if err := cl.FSRequire(args[1], on); err != nil {
+			return err
+		}
+		if on {
+			fmt.Printf("forward secrecy required for %q: sends will fail rather than fall back to legacy encryption until an FS session is established.\n", args[1])
+		} else {
+			fmt.Printf("forward secrecy no longer required for %q (fail-open default).\n", args[1])
+		}
 	case "remove", "rm", "delete":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: courier contacts remove <name>")
@@ -1068,7 +1098,7 @@ func cmdContacts(args []string) error {
 		}
 		fmt.Printf("contact %q removed.\n", args[1])
 	default:
-		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|remove)", args[0])
+		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|require-fs-on|require-fs-off|remove)", args[0])
 	}
 	return nil
 }

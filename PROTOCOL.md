@@ -1049,8 +1049,11 @@ it without euphemism:
   pinned per contact, so handshake pressure continues even when the
   relay suppresses directory availability; a pinned peer suddenly
   reachable only via legacy raises a rate-limited send-time warning.
-  There is no fail-closed option (#146): sends never block on a
-  handshake round-trip.
+  The default policy is fail-open (#146): sends never block on a
+  handshake round-trip — unless the operator opted the contact into
+  the per-contact require-fs policy (`courier contacts require-fs-on
+  <name>`, #327), in which case sends to that contact fail closed
+  without an established FS session.
 - Protocol DMs (group/handshake traffic) stay
   legacy-sealed by design: delivery reliability matters more for
   machine state, and the inbox pipeline decrypts FS before dispatch.

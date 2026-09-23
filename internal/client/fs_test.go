@@ -3,6 +3,7 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -333,6 +334,57 @@ func TestFSForget(t *testing.T) {
 		}
 		if _, ok := ff.FSNegotiated[h.bobCfg.Address]; ok {
 			t.Fatal("suite-negotiation pin survived forget")
+		}
+	})
+}
+
+// TestFSRequireFailClosed: the per-contact require-fs policy (#146,
+// #327) fails sends closed without an established FS session; the
+// default stays fail-open, an established session overrides the flag,
+// and FSForget clears the flag with the session.
+func TestFSRequireFailClosed(t *testing.T) {
+	h := newFSHarness(t)
+	h.asAlice(func() {
+		// Default: fail-open — the legacy send works with no session.
+		if _, err := h.alice.Send(h.bobCfg.Address, "legacy hello"); err != nil {
+			t.Fatalf("fail-open send: %v", err)
+		}
+		// Opt in: the send fails closed with no session.
+		if err := h.alice.FSRequire(h.bobCfg.Address, true); err != nil {
+			t.Fatalf("require on: %v", err)
+		}
+		if req, err := h.alice.FSRequired(h.bobCfg.Address); err != nil || !req {
+			t.Fatalf("FSRequired = %v, %v; want true, nil", req, err)
+		}
+		if _, err := h.alice.Send(h.bobCfg.Address, "must not go"); !errors.Is(err, errFSRequired) {
+			t.Fatalf("required send err = %v; want errFSRequired", err)
+		}
+		// Opt out: fail-open again.
+		if err := h.alice.FSRequire(h.bobCfg.Address, false); err != nil {
+			t.Fatalf("require off: %v", err)
+		}
+		if _, err := h.alice.Send(h.bobCfg.Address, "legacy again"); err != nil {
+			t.Fatalf("fail-open send after clear: %v", err)
+		}
+		// Re-arm, then establish a session: the send succeeds.
+		if err := h.alice.FSRequire(h.bobCfg.Address, true); err != nil {
+			t.Fatalf("require on: %v", err)
+		}
+	})
+	// Drain bob's inbox: the earlier fail-open sends are real chat
+	// messages, and doHandshake asserts the handshake itself is silent.
+	_ = h.bobInbox(t)
+	h.doHandshake(t)
+	h.asAlice(func() {
+		if _, err := h.alice.Send(h.bobCfg.Address, "fs hello"); err != nil {
+			t.Fatalf("send with session: %v", err)
+		}
+		// Forget clears the flag along with the session.
+		if err := h.alice.FSForget(h.bobCfg.Address); err != nil {
+			t.Fatalf("forget: %v", err)
+		}
+		if req, err := h.alice.FSRequired(h.bobCfg.Address); err != nil || req {
+			t.Fatalf("FSRequired after forget = %v, %v; want false, nil", req, err)
 		}
 	})
 }
