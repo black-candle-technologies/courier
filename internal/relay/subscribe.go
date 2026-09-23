@@ -56,9 +56,13 @@ var SubscribeTimeout = 55 * time.Second
 const maxSubscribersPerIdentity = 4
 
 // inboxMsgJSON is one envelope in an inbox or subscribe response.
+// Suite names the crypto suite the envelope is sealed under (issue #138);
+// it is always populated by relays running the v24 migration, and absent
+// on envelopes stored by older relays (recipients read absent as SuiteV1).
 type inboxMsgJSON struct {
 	ID          int64    `json:"id"`
 	From        string   `json:"from"`
+	Suite       string   `json:"suite,omitempty"`
 	Eph         string   `json:"eph"`
 	Nonce       string   `json:"nonce"`
 	Ct          string   `json:"ct"`
@@ -113,7 +117,7 @@ func (s *Server) buildInboxPage(envs []store.Envelope) []inboxMsgJSON {
 			break
 		}
 		out = append(out, inboxMsgJSON{
-			ID: e.ID, From: e.From, Eph: e.Eph, Nonce: e.Nonce,
+			ID: e.ID, From: e.From, Suite: e.Suite, Eph: e.Eph, Nonce: e.Nonce,
 			Ct: e.Ct, SentAt: e.SentAt, ReceivedAt: e.ReceivedAt, Sig: e.Sig,
 			SenderFlags: senderFlags[e.From],
 		})

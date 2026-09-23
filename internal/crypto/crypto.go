@@ -29,7 +29,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"strings"
 
 	"filippo.io/edwards25519"
 	"filippo.io/edwards25519/field"
@@ -42,7 +41,9 @@ var b64 = base64.RawURLEncoding
 
 // AddressPrefix marks v0.2.0+ Ed25519 addresses. The prefix is part of the
 // address: it makes the key type explicit and makes v0.1.0 X25519 addresses
-// fail loudly instead of encrypting to a dead key.
+// fail loudly instead of encrypting to a dead key. The prefix also names the
+// crypto suite: "ed25519:" addresses are SuiteV1. Future suites use their own
+// prefix (e.g. "mldsa65:"), so an address always identifies its suite.
 const AddressPrefix = "ed25519:"
 
 const (
@@ -150,19 +151,22 @@ func FormatAddress(edPub []byte) string {
 
 // ParseAddress parses a Courier address, strictly requiring the
 // "ed25519:" prefix. v0.1.0 bare X25519 addresses are rejected loudly.
+// This is the SuiteV1 compatibility view: it returns the 32-byte Ed25519
+// key and rejects addresses of any other suite. Suite-aware code should
+// use ParseAddressSuite and treat the key as opaque bytes.
 func ParseAddress(s string) ([32]byte, error) {
 	var out [32]byte
-	if !strings.HasPrefix(s, AddressPrefix) {
-		return out, fmt.Errorf("address must start with %q (bare v0.1.0 X25519 addresses are not supported; ask the owner for their new address)", AddressPrefix)
-	}
-	raw, err := b64.DecodeString(strings.TrimPrefix(s, AddressPrefix))
+	pa, err := ParseAddressSuite(s)
 	if err != nil {
-		return out, fmt.Errorf("invalid address: %w", err)
+		return out, err
 	}
-	if len(raw) != PubKeyLen {
-		return out, fmt.Errorf("invalid address: want %d bytes, got %d", PubKeyLen, len(raw))
+	if pa.Suite != SuiteV1 {
+		return out, fmt.Errorf("address suite %q is not Ed25519 (SuiteV1)", pa.Suite)
 	}
-	copy(out[:], raw)
+	if len(pa.PublicKey) != PubKeyLen {
+		return out, fmt.Errorf("invalid address: want %d bytes, got %d", PubKeyLen, len(pa.PublicKey))
+	}
+	copy(out[:], pa.PublicKey)
 	return out, nil
 }
 

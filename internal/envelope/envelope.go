@@ -1,6 +1,15 @@
 // Package envelope defines the canonical signed payloads for Courier
 // (v0.2.0+). Both the client and the relay use these, so a signature made
 // by one is verifiable by the other.
+//
+// Crypto-suite versioning (issue #138): every signature domain below ends
+// in "-v1", and that suffix IS the version marker for the crypto suite
+// (SuiteV1: Ed25519 signatures, X25519 key exchange, NaCl box). A future
+// suite (e.g. post-quantum, issue #54) gets "-v2" domains with new
+// canonical layouts; v1 canonical bytes are frozen forever so existing
+// signatures keep verifying. The suite is therefore authenticated by the
+// signature itself — a v1 signature can never validate as a v2 signature
+// or vice versa, which rules out downgrade attacks at the signing layer.
 package envelope
 
 import (

@@ -249,6 +249,45 @@ All in `internal/crypto` (Go standard library plus
 - Ciphertext is Poly1305-authenticated; decryption failure is a hard
   error, never a partial read.
 
+### 6.1 Crypto suites and versioning (issue #138)
+
+Every cryptographic operation names the **suite** it runs under — a
+versioned bundle of algorithms with a stable string id:
+
+| Suite id | Kind | Algorithms |
+|---|---|---|
+| `ed25519-x25519-naclbox-v1` | message suite | Ed25519 signatures, X25519 key agreement, NaCl `crypto_box` (XSalsa20-Poly1305) |
+| `x25519-hkdf-sha256-v1` | FS suite | X25519 DH, HKDF-SHA256 KDF, Signal-shaped chains, NaCl `secretbox` message keys |
+
+A suite is "known" **if and only if** a descriptor with real
+implementations is registered (`crypto.Descriptor`,
+`crypto.FSDescriptor`). A bare suite name — on the wire, in a
+config, anywhere — never selects behavior by itself: unknown names
+are a loud refusal, never a silent fallback to v1. Every DH, KDF,
+seal/open, and signature verification dispatches through the
+resolved suite's descriptor (or an exhaustive switch over the
+registry), so a future suite is an **additive registration**, not a
+cross-cutting rewrite.
+
+**Default-to-v1 compatibility.** The `suite` wire field is
+`omitempty` everywhere it appears (DM envelope §8, key announcement
+§9.5, group envelope §16.2, FS accept §15.3): absent means v1, so
+pre-#138 peers interoperate without changes. Senders that know the
+field MUST always emit it.
+
+**Address/suite agreement.** Wherever a wire suite label meets
+addresses (key-directory lookups, DM receive), the label and **every
+address involved** must agree: `crypto.AgreeSuite` defaults an
+absent label to v1 and requires the label to equal the suite parsed
+from each address. A mismatch — or a label naming a suite the peer
+does not implement — is a loud refusal to encrypt/decrypt, never a
+best-effort attempt under the wrong algorithms.
+
+Adding a suite is a deliberate, reviewed protocol change (§29):
+register the descriptor, put it on the offer list, document the id
+in the table above, and keep the v1 default intact so old clients
+keep working.
+
 ## 7. Signed canonical forms
 
 Every signature in Courier is Ed25519 over a **domain-separated
@@ -288,10 +327,19 @@ that verifies came from the holder of that address's private key.
   "sent_at": 1758316234,
   "sig":     "<base64url: Ed25519 signature>",
   "kind":    "dm",
-  "key_epoch": 3
+  "key_epoch": 3,
+  "suite":   "ed25519-x25519-naclbox-v1"
 }
 ```
 
+- `suite` (issue #138) names the message crypto suite (§6.1).
+  Senders MUST emit it; absent means
+  `ed25519-x25519-naclbox-v1` (pre-#138 envelopes). The relay
+  validates that a present `suite` is a known suite id and rejects
+  unknown ones with `400` — it never executes v1 validation for a
+  future suite's name. Recipients require agreement between the
+  envelope's suite label and the sender/recipient address suites
+  (§6.1); a mismatch is a hard decrypt refusal.
 - `kind` is `""` (or `"dm"`) for direct messages and `"group"` for
   group messages (§16). The relay rejects unknown kinds with `400`.
   Clients MUST skip envelopes whose kind is neither `""` nor `"dm"`
@@ -430,7 +478,8 @@ identity to its current X25519 encryption key:
 ```
 POST /v1/keys
 {"address": "ed25519:...", "x25519_pub": "<base64url 32B>",
- "epoch": 1758316234, "sig": "<base64url>"}
+ "epoch": 1758316234, "sig": "<base64url>",
+ "suite": "ed25519-x25519-naclbox-v1"}
 ```
 
 `sig` is over `envelope.KeyAnnounce(address, x25519_pub, epoch)`
@@ -439,14 +488,25 @@ positive unix time and **strictly greater** than the stored epoch;
 otherwise `409`. Only the address owner can rotate; old announcements
 cannot be replayed to downgrade the key.
 
+`suite` (issue #138) names the crypto suite the announced key
+belongs to (§6.1); absent means
+`ed25519-x25519-naclbox-v1` (older announcers). The relay stores and
+serves it verbatim. A future suite uses its own key field alongside
+its own canonical signing layout — `envelope.KeyAnnounce` is frozen
+for v1, so a v2 announcement is a new shape, not a reinterpreted
+v1 one.
+
 ```
 GET /v1/keys/{address} →
-  {"address": ..., "x25519_pub": ..., "epoch": ..., "sig": ...}
+  {"address": ..., "x25519_pub": ..., "epoch": ..., "sig": ..., "suite": ...}
 ```
 
 `404` when the owner never published: senders then fall back to the
 address-derived key (§5.2). Clients SHOULD verify the served
-announcement's signature before use (`Client.verifyKeyAnnouncement`).
+announcement's signature before use (`Client.verifyKeyAnnouncement`),
+and MUST require the announcement's suite to agree with the
+recipient address's suite (§6.1) — a mismatch is a refusal to
+encrypt, never a seal attempt under the wrong algorithms.
 
 ### 9.6 POST /v1/report
 
@@ -909,6 +969,51 @@ derived. **Forward-secret from message one:** `root0` mixes two
 keys (even both parties') and the full relay transcript recovers
 `rk0` from the init envelope but cannot compute `dh1` or `dh2`.
 
+#### 15.3.1 Suite negotiation (issue #138)
+
+`fs-init` carries `suites`: the initiator's **ordered offer** of FS
+suite ids, most-preferred first (`["x25519-hkdf-sha256-v1"]` today).
+`fs-accept` carries `suite`: the responder's **single selection**.
+The rules are strict on both sides:
+
+- **Responder:** selects its most-preferred suite from the offer
+  that this build implements (`crypto.FSDescriptor`). It never
+  invents a suite. No overlap → no accept, no handshake (fail
+  closed, never a silent v1 assumption about an offer it cannot
+  read).
+- **Initiator:** the selection MUST have been in the offered list
+  **and** be a suite this build implements. A selection that was
+  never offered, or that names an unknown suite, is a tampered or
+  mismatched accept — the handshake aborts and the session stays
+  pending.
+- **Transcript binding:** the selection and the exact offered list
+  (as seen by the deriving party) are bound into the KDF. For a
+  negotiated handshake the salt becomes
+  `"courier-fs-handshake-v1" || 0x00 || suite || 0x00 ||
+  SHA256(length-prefixed offer list) || sid`.
+  A middlebox that strips, reorders, or relabels the negotiation
+  makes the two sides derive **different roots**: the handshake
+  fails closed instead of silently downgrading.
+- **Suite pin (TOFU downgrade resistance):** once a peer completes a
+  negotiated handshake, the suite id is pinned
+  (`fs.json` `fs_negotiated`). Later handshakes with that peer MUST
+  carry the offer/selection — a missing `suites` on init or a
+  missing `suite` on accept is treated as a stripped-field
+  downgrade attempt and ignored. The pin persists until
+  `courier fs forget <peer>` clears it.
+- **All DH/KDF dispatches through the negotiated suite's
+  descriptor** (`crypto.FSSuiteDescriptor`): handshake DH, root
+  derivation, chain steps, root steps, and attachment wrap keys. A
+  future suite changes these primitives by registration, not by
+  editing the ratchet.
+
+**Legacy interop.** An `fs-init` without `suites` is an older
+(v0.11.x) client: the handshake completes exactly as above with the
+original salt (no transcript binding), and the session is recorded
+as the v1 suite. A suitless `fs-accept` is likewise honored — but
+only from an **unpinned** peer; a pinned peer that stops
+negotiating is ignored per the pin rule above.
+
 Conflict resolution: receiving `fs-init` while a handshake is already
 pending-out or a session is established resolves by **address
 tie-break** — if the peer's address is lexicographically smaller,
@@ -995,7 +1100,7 @@ sent over FS, only their relay-side metadata (blob id, size, timing).
 ### 15.8 CLI
 
 ```
-courier fs status [<peer>]   show FS sessions (peer, established, messages sent, last DH rotation, mode)
+courier fs status [<peer>]   show FS sessions (peer, established, negotiated suite, messages sent, last DH rotation, mode)
 courier fs start <peer>      initiate a handshake now (needs known capability or `fs on`)
 courier fs on <peer>         mark peer FS-capable and initiate
 courier fs off <peer>        disable FS for peer (legacy only from now on)
@@ -1039,7 +1144,8 @@ are unchanged; `eph` is 32 random bytes (no X25519 exchange happens);
   "sent_at":   1758316234,
   "sig":       "<base64url: Ed25519 signature>",
   "kind":      "group",
-  "key_epoch": 3
+  "key_epoch": 3,
+  "suite":     "ed25519-x25519-naclbox-v1"
 }
 ```
 
@@ -1050,6 +1156,14 @@ envelope to the exact key that must open it, so a captured envelope
 cannot be replayed under a different epoch. The relay verifies this
 signature and additionally requires the sender to be a **current**
 group member, else `403`.
+
+`suite` (issue #138) names the message crypto suite (§6.1) for the
+envelope's signature verification and field validation; absent
+means `ed25519-x25519-naclbox-v1`. Group sends always emit it, and
+group inbox responses carry it per envelope. Receivers require the
+envelope suite to agree with the sender address's suite (§6.1) —
+control-message signatures (invites, removes) dispatch on the
+admin's address suite. A mismatch is a hard refusal.
 
 `key_epoch` starts at 1 per member per group and increments on every
 rotation. The relay stores it alongside the envelope and returns it in

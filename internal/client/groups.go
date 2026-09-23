@@ -530,7 +530,7 @@ func (c *Client) GroupSend(groupID, body string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	fromEd, err := crypto.ParseAddress(c.cfg.Address)
+	fromAddr, err := crypto.ParseAddressSuite(c.cfg.Address)
 	if err != nil {
 		return 0, err
 	}
@@ -551,10 +551,13 @@ func (c *Client) GroupSend(groupID, body string) (int64, error) {
 		return 0, fmt.Errorf("eph: %w", err)
 	}
 	sentAt := time.Now().Unix()
-	sig := id.Sign(envelope.GroupCanonical(groupID, fromEd[:], g.MyEpoch, eph[:], nonce, sentAt, ct))
+	// Issue #138: group envelopes name the sender's crypto suite, like
+	// DMs do. This client sends SuiteV1.
+	sig := id.Sign(envelope.GroupCanonical(groupID, fromAddr.PublicKey, g.MyEpoch, eph[:], nonce, sentAt, ct))
 	data, code, err := c.post("/v1/send", map[string]any{
 		"to":        groupID,
 		"from":      c.cfg.Address,
+		"suite":     string(crypto.SuiteV1),
 		"eph":       base64.RawURLEncoding.EncodeToString(eph[:]),
 		"nonce":     base64.RawURLEncoding.EncodeToString(nonce),
 		"ct":        base64.RawURLEncoding.EncodeToString(ct),
@@ -586,6 +589,7 @@ type groupInboxResponse struct {
 	Messages []struct {
 		ID         int64  `json:"id"`
 		From       string `json:"from"`
+		Suite      string `json:"suite"`
 		Eph        string `json:"eph"`
 		Nonce      string `json:"nonce"`
 		Ct         string `json:"ct"`
@@ -687,16 +691,26 @@ func (c *Client) GroupInbox(groupID string) ([]Message, error) {
 			return nil, fmt.Errorf("group %s: control epoch gap (have %d, got %d)",
 				groupID, g.ControlEpoch, ctl.Epoch)
 		}
-		adminEd, err := crypto.ParseAddress(ctl.Admin)
+		// Issue #138: the control signer's suite comes from the admin's
+		// address and must be one this client implements; signature
+		// verification dispatches through the suite's descriptor.
+		adminAddr, err := crypto.ParseAddressSuite(ctl.Admin)
 		if err != nil {
 			return nil, fmt.Errorf("group %s: bad control admin: %w", groupID, err)
 		}
+		adminDesc, ok := crypto.Descriptor(adminAddr.Suite)
+		if !ok {
+			return nil, fmt.Errorf("group %s: control signed under unknown suite %q", groupID, adminAddr.Suite)
+		}
 		sigRaw, err := base64.RawURLEncoding.DecodeString(ctl.Sig)
-		if err != nil || len(sigRaw) != 64 {
+		if err != nil {
 			return nil, fmt.Errorf("group %s: bad control signature", groupID)
 		}
+		if err := adminDesc.ValidateSignatureFields(sigRaw); err != nil {
+			return nil, fmt.Errorf("group %s: bad control signature: %w", groupID, err)
+		}
 		canon := envelope.GroupControl(groupID, ctl.Action, ctl.Target, ctl.Admin, ctl.Epoch)
-		if !crypto.Verify(adminEd[:], canon, sigRaw) {
+		if !adminDesc.VerifySignature(adminAddr.PublicKey, canon, sigRaw) {
 			return nil, fmt.Errorf("group %s: control signature verification failed", groupID)
 		}
 		// The signer must be the admin I know: the relay only accepts
@@ -761,11 +775,24 @@ func (c *Client) GroupInbox(groupID string) ([]Message, error) {
 			skipped++
 			continue
 		}
-		fromEd, err := crypto.ParseAddress(m.From)
+		// Issue #138: the envelope's suite must agree with the
+		// sender's address suite and be one this client implements.
+		// Absent means SuiteV1 (older senders). A mismatch is a
+		// loud skip, never a silent v1 verify of foreign key
+		// material.
+		fromAddr, err := crypto.ParseAddressSuite(m.From)
 		if err != nil {
 			skipped++
 			continue
 		}
+		suite, err := crypto.AgreeSuite(m.Suite, fromAddr)
+		if err != nil {
+			skipped++
+			continue
+		}
+		// AgreeSuite guarantees a descriptor; every suite-specific
+		// operation below dispatches through it.
+		desc, _ := crypto.Descriptor(suite)
 		eph, err1 := base64.RawURLEncoding.DecodeString(m.Eph)
 		nonce, err2 := base64.RawURLEncoding.DecodeString(m.Nonce)
 		ct, err3 := base64.RawURLEncoding.DecodeString(m.Ct)
@@ -774,11 +801,19 @@ func (c *Client) GroupInbox(groupID string) ([]Message, error) {
 			skipped++
 			continue
 		}
+		if err := desc.ValidateEnvelopeFields(eph, nonce); err != nil {
+			skipped++
+			continue
+		}
+		if err := desc.ValidateSignatureFields(sigRaw); err != nil {
+			skipped++
+			continue
+		}
 		// Re-verify the group signature client-side (the relay verified
 		// it too): the key epoch is covered, binding the envelope to the
 		// exact sender key that must open it.
-		canon := envelope.GroupCanonical(groupID, fromEd[:], m.KeyEpoch, eph, nonce, m.SentAt, ct)
-		if !crypto.Verify(fromEd[:], canon, sigRaw) {
+		canon := envelope.GroupCanonical(groupID, fromAddr.PublicKey, m.KeyEpoch, eph, nonce, m.SentAt, ct)
+		if !desc.VerifySignature(fromAddr.PublicKey, canon, sigRaw) {
 			skipped++
 			continue
 		}

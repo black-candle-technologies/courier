@@ -586,3 +586,344 @@ func TestParseFSPayloadRejectsJunk(t *testing.T) {
 		t.Fatal("valid fs-msg frame rejected")
 	}
 }
+
+// ---- FS suite negotiation tests (issue #138) ----
+
+var fsV1ID = string(crypto.FSSuiteV1)
+
+// fsTestInit builds a well-formed fs-init payload with the given suite
+// offer (nil = legacy pre-negotiation init).
+func fsTestInit(t *testing.T, suites []string) fsPayload {
+	t.Helper()
+	rk0, err := fsRand32()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ephPub, _, err := fsGenX25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rPub, _, err := fsGenX25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid, err := fsRand16()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initID, err := fsRand16()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fsPayload{
+		Magic: fsMagic, Type: fsTypeInit, Version: fsPayloadVersion,
+		SID: b64fs.EncodeToString(sid[:]), InitID: b64fs.EncodeToString(initID[:]),
+		RK0: b64fs.EncodeToString(rk0[:]), EphPub: b64fs.EncodeToString(ephPub[:]),
+		RPub: b64fs.EncodeToString(rPub[:]), Suites: suites,
+	}
+}
+
+// fsTestAccept builds a well-formed fs-accept for initID/sid with the
+// given suite selection ("" = legacy pre-negotiation accept).
+func fsTestAccept(t *testing.T, initID, sid, suite string) fsPayload {
+	t.Helper()
+	ephPub, _, err := fsGenX25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rPub, _, err := fsGenX25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fsPayload{
+		Magic: fsMagic, Type: fsTypeAccept, Version: fsPayloadVersion,
+		SID: sid, InitID: initID,
+		EphPub: b64fs.EncodeToString(ephPub[:]), RPub: b64fs.EncodeToString(rPub[:]),
+		Suite: suite,
+	}
+}
+
+// fsPlantPending writes a pending (unestablished) init session into the
+// client's fs.json and returns its InitID/SID. asWho selects whose HOME
+// (and thus whose fs.json) is used.
+func fsPlantPending(t *testing.T, asWho func(func()), peer string, offered []string) (initID, sid string) {
+	t.Helper()
+	rk0, err := fsRand32()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ephPriv, err := fsGenX25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rPub, rPriv, err := fsGenX25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sidB, err := fsRand16()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initIDB, err := fsRand16()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initID = b64fs.EncodeToString(initIDB[:])
+	sid = b64fs.EncodeToString(sidB[:])
+	asWho(func() {
+		if err := updateFS(func(ff *fsFile) error {
+			ff.Sessions[peer] = &fsSession{
+				Peer: peer, SID: sid, Initiator: true,
+				InitID: initID, RK0: b64fs.EncodeToString(rk0[:]),
+				EphPriv:     b64fs.EncodeToString(ephPriv[:]),
+				RatchetPriv: b64fs.EncodeToString(rPriv[:]),
+				RatchetPub:  b64fs.EncodeToString(rPub[:]),
+				Offered:     offered,
+				Skipped:     map[string]string{},
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	return initID, sid
+}
+
+// fsSessionOf reads one session from the client's fs.json.
+func fsSessionOf(t *testing.T, asWho func(func()), peer string) *fsSession {
+	t.Helper()
+	var sess *fsSession
+	asWho(func() {
+		ff, err := loadFS()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sess = ff.Sessions[peer]
+	})
+	return sess
+}
+
+// The responder selects its most-preferred overlap and never invents a
+// suite; with no overlap there is no handshake.
+func TestFSSelectSuite(t *testing.T) {
+	if s, ok := fsSelectSuite([]string{fsV1ID}); !ok || s != crypto.FSSuiteV1 {
+		t.Fatalf("select([v1]) = %q, %v", s, ok)
+	}
+	// Unknown entries are skipped, not selected.
+	if s, ok := fsSelectSuite([]string{"x25519-hkdf-sha256-v99", fsV1ID}); !ok || s != crypto.FSSuiteV1 {
+		t.Fatalf("select([unknown, v1]) = %q, %v", s, ok)
+	}
+	// Most-preferred overlap wins (offer order = initiator preference).
+	if s, ok := fsSelectSuite([]string{fsV1ID, "x25519-hkdf-sha256-v99"}); !ok || s != crypto.FSSuiteV1 {
+		t.Fatalf("select([v1, unknown]) = %q, %v", s, ok)
+	}
+	if _, ok := fsSelectSuite([]string{"x25519-hkdf-sha256-v99"}); ok {
+		t.Fatal("select([unknown]) unexpectedly succeeded")
+	}
+	if _, ok := fsSelectSuite(nil); ok {
+		t.Fatal("select(nil) unexpectedly succeeded")
+	}
+}
+
+// The initiator accepts only a selection it actually offered and that
+// this build implements.
+func TestFSCheckSelectedSuite(t *testing.T) {
+	offered := []string{"x25519-hkdf-sha256-v99", fsV1ID}
+	if s, err := fsCheckSelectedSuite(fsV1ID, offered); err != nil || s != crypto.FSSuiteV1 {
+		t.Fatalf("check(v1, offered) = %q, %v", s, err)
+	}
+	if _, err := fsCheckSelectedSuite(fsV1ID, []string{"x25519-hkdf-sha256-v99"}); err == nil {
+		t.Fatal("unoffered selection unexpectedly accepted")
+	}
+	if _, err := fsCheckSelectedSuite("x25519-hkdf-sha256-v99", offered); err == nil {
+		t.Fatal("unknown suite selection unexpectedly accepted")
+	}
+	if _, err := fsCheckSelectedSuite(fsV1ID, nil); err == nil {
+		t.Fatal("selection against empty offer unexpectedly accepted")
+	}
+}
+
+// Full network handshake negotiates v1: both sides record the suite,
+// pin the peer, and the session carries traffic.
+func TestFSSuiteNegotiatedV1(t *testing.T) {
+	h := newFSHarness(t)
+	h.doHandshake(t)
+
+	for _, tc := range []struct {
+		c     *Client
+		asWho func(func())
+		peer  string
+	}{
+		{h.alice, h.asAlice, h.bobCfg.Address},
+		{h.bob, h.asBob, h.aliceCfg.Address},
+	} {
+		var infos []FSSessionInfo
+		tc.asWho(func() {
+			var err error
+			infos, err = tc.c.FSStatus(tc.peer)
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+		if len(infos) != 1 || !infos[0].Established {
+			t.Fatalf("session not established: %+v", infos)
+		}
+		if infos[0].Suite != fsV1ID {
+			t.Fatalf("negotiated suite = %q, want %q", infos[0].Suite, fsV1ID)
+		}
+		// The TOFU downgrade pin is set on both sides.
+		tc.asWho(func() {
+			ff, err := loadFS()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ff.FSNegotiated[tc.peer] != fsV1ID {
+				t.Fatalf("FSNegotiated pin = %q, want %q", ff.FSNegotiated[tc.peer], fsV1ID)
+			}
+		})
+	}
+
+	// The negotiated session carries traffic both ways.
+	h.asAlice(func() {
+		if _, err := h.alice.Send(h.bobCfg.Address, "negotiated v1"); err != nil {
+			t.Fatalf("alice send: %v", err)
+		}
+	})
+	if msgs := h.bobInbox(t); len(msgs) != 1 || msgs[0].Body != "negotiated v1" {
+		t.Fatalf("bob inbox: %+v", msgs)
+	}
+}
+
+// An init whose offer has no overlap with our suites is ignored: no
+// session, no handshake — fail closed, never a silent v1 assumption.
+func TestFSSuiteInitNoCommonSuite(t *testing.T) {
+	h := newFSHarness(t)
+	init := fsTestInit(t, []string{"x25519-hkdf-sha256-v99"})
+	h.asBob(func() { h.bob.handleFSInit(h.aliceCfg.Address, init) })
+	if sess := fsSessionOf(t, h.asBob, h.aliceCfg.Address); sess != nil {
+		t.Fatalf("session created despite no common suite: %+v", sess)
+	}
+}
+
+// An accept selecting a suite that was never offered aborts the
+// handshake: the session stays pending.
+func TestFSSuiteAcceptUnofferedSelection(t *testing.T) {
+	h := newFSHarness(t)
+	initID, sid := fsPlantPending(t, h.asAlice, h.bobCfg.Address, []string{"x25519-hkdf-sha256-v99"})
+	acc := fsTestAccept(t, initID, sid, fsV1ID)
+	h.asAlice(func() { h.alice.handleFSAccept(h.bobCfg.Address, acc) })
+	sess := fsSessionOf(t, h.asAlice, h.bobCfg.Address)
+	if sess == nil || sess.Established {
+		t.Fatalf("unoffered selection established a session: %+v", sess)
+	}
+}
+
+// An accept selecting an unknown suite aborts the handshake.
+func TestFSSuiteAcceptUnknownSelection(t *testing.T) {
+	h := newFSHarness(t)
+	initID, sid := fsPlantPending(t, h.asAlice, h.bobCfg.Address, []string{fsV1ID})
+	acc := fsTestAccept(t, initID, sid, "x25519-hkdf-sha256-v99")
+	h.asAlice(func() { h.alice.handleFSAccept(h.bobCfg.Address, acc) })
+	sess := fsSessionOf(t, h.asAlice, h.bobCfg.Address)
+	if sess == nil || sess.Established {
+		t.Fatalf("unknown selection established a session: %+v", sess)
+	}
+}
+
+// A valid selection establishes: suite recorded, offer erased, peer pinned.
+func TestFSSuiteAcceptValidSelection(t *testing.T) {
+	h := newFSHarness(t)
+	initID, sid := fsPlantPending(t, h.asAlice, h.bobCfg.Address, []string{"x25519-hkdf-sha256-v99", fsV1ID})
+	acc := fsTestAccept(t, initID, sid, fsV1ID)
+	h.asAlice(func() { h.alice.handleFSAccept(h.bobCfg.Address, acc) })
+	sess := fsSessionOf(t, h.asAlice, h.bobCfg.Address)
+	if sess == nil || !sess.Established {
+		t.Fatalf("valid selection did not establish: %+v", sess)
+	}
+	if sess.Suite != fsV1ID {
+		t.Fatalf("session suite = %q, want %q", sess.Suite, fsV1ID)
+	}
+	if len(sess.Offered) != 0 || sess.RK0 != "" || sess.EphPriv != "" {
+		t.Fatal("handshake secrets not erased at establishment")
+	}
+	h.asAlice(func() {
+		ff, err := loadFS()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ff.FSNegotiated[h.bobCfg.Address] != fsV1ID {
+			t.Fatalf("FSNegotiated pin = %q, want %q", ff.FSNegotiated[h.bobCfg.Address], fsV1ID)
+		}
+	})
+}
+
+// Downgrade resistance, initiator side: a peer pinned as negotiating
+// that stops offering suites gets its init ignored.
+func TestFSSuiteDowngradePinInit(t *testing.T) {
+	h := newFSHarness(t)
+	h.asBob(func() {
+		if err := updateFS(func(ff *fsFile) error {
+			fsPinNegotiatedLocked(ff, h.aliceCfg.Address, crypto.FSSuiteV1)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	init := fsTestInit(t, nil) // legacy init: suites stripped
+	h.asBob(func() { h.bob.handleFSInit(h.aliceCfg.Address, init) })
+	if sess := fsSessionOf(t, h.asBob, h.aliceCfg.Address); sess != nil {
+		t.Fatalf("downgraded init created a session: %+v", sess)
+	}
+}
+
+// Downgrade resistance, responder side: a peer pinned as negotiating
+// that stops selecting a suite gets its accept ignored.
+func TestFSSuiteDowngradePinAccept(t *testing.T) {
+	h := newFSHarness(t)
+	initID, sid := fsPlantPending(t, h.asAlice, h.bobCfg.Address, []string{fsV1ID})
+	h.asAlice(func() {
+		if err := updateFS(func(ff *fsFile) error {
+			fsPinNegotiatedLocked(ff, h.bobCfg.Address, crypto.FSSuiteV1)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	acc := fsTestAccept(t, initID, sid, "") // legacy accept: selection stripped
+	h.asAlice(func() { h.alice.handleFSAccept(h.bobCfg.Address, acc) })
+	sess := fsSessionOf(t, h.asAlice, h.bobCfg.Address)
+	if sess == nil || sess.Established {
+		t.Fatalf("downgraded accept established a session: %+v", sess)
+	}
+}
+
+// Legacy interop: an unoffered init from an unpinned (older) peer still
+// completes as v1, exactly like the pre-negotiation handshake.
+func TestFSSuiteLegacyInitInterop(t *testing.T) {
+	h := newFSHarness(t)
+	init := fsTestInit(t, nil)
+	h.asBob(func() { h.bob.handleFSInit(h.aliceCfg.Address, init) })
+	sess := fsSessionOf(t, h.asBob, h.aliceCfg.Address)
+	if sess == nil || !sess.Established {
+		t.Fatalf("legacy init did not establish: %+v", sess)
+	}
+	if sess.Suite != fsV1ID {
+		t.Fatalf("legacy session suite = %q, want %q", sess.Suite, fsV1ID)
+	}
+}
+
+// Legacy interop: a suitless accept for an unoffered pending init still
+// completes as v1.
+func TestFSSuiteLegacyAcceptInterop(t *testing.T) {
+	h := newFSHarness(t)
+	initID, sid := fsPlantPending(t, h.asAlice, h.bobCfg.Address, nil)
+	acc := fsTestAccept(t, initID, sid, "")
+	h.asAlice(func() { h.alice.handleFSAccept(h.bobCfg.Address, acc) })
+	sess := fsSessionOf(t, h.asAlice, h.bobCfg.Address)
+	if sess == nil || !sess.Established {
+		t.Fatalf("legacy accept did not establish: %+v", sess)
+	}
+	if sess.Suite != fsV1ID {
+		t.Fatalf("legacy session suite = %q, want %q", sess.Suite, fsV1ID)
+	}
+}

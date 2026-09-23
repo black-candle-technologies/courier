@@ -22,6 +22,7 @@ type Envelope struct {
 	ID         int64
 	To         string // v0.2.0+ "ed25519:<base64url>" address, or "group:<base64url>" (issue #32)
 	From       string // sender address (signature-authenticated in v0.2.0+)
+	Suite      string // crypto suite id (issue #138); "" reads as SuiteV1
 	Eph        string // base64url ephemeral X25519 public key (32 random bytes for group messages)
 	Nonce      string // base64url nonce
 	Ct         string // base64url ciphertext
@@ -62,7 +63,8 @@ CREATE TABLE IF NOT EXISTS envelopes (
 	sig         TEXT NOT NULL DEFAULT '',
 	env_hash    TEXT,
 	kind        TEXT NOT NULL DEFAULT '',
-	key_epoch   INTEGER NOT NULL DEFAULT 0
+	key_epoch   INTEGER NOT NULL DEFAULT 0,
+	suite       TEXT NOT NULL DEFAULT 'ed25519-x25519-naclbox-v1'
 );
 CREATE INDEX IF NOT EXISTS idx_envelopes_recipient ON envelopes(recipient, id);
 -- The UNIQUE index on env_hash is created by the v0.6.11 (F3) migration,
@@ -76,7 +78,8 @@ CREATE TABLE IF NOT EXISTS keys (
 	address    TEXT PRIMARY KEY,
 	x25519_pub TEXT NOT NULL,
 	epoch      INTEGER NOT NULL,
-	signature  TEXT NOT NULL DEFAULT ''
+	signature  TEXT NOT NULL DEFAULT '',
+	suite      TEXT NOT NULL DEFAULT 'ed25519-x25519-naclbox-v1'
 );
 
 -- v0.6.0: web dashboard accounts. One dashboard user per Courier address.
@@ -578,6 +581,14 @@ var migrations = []migration{
 	// column defaults to 0 (non-admin); the operator grants admin with
 	// `courier dashboard set-admin <username>`.
 	addColumnMigration(22, "dashboard_users.is_admin (issue #95)", "dashboard_users", "is_admin", `is_admin INTEGER NOT NULL DEFAULT 0`),
+	// v23 (issue #138): the key directory records the crypto suite each
+	// announcement belongs to. Existing rows predate suite tagging and are
+	// SuiteV1 by construction (the relay only ever accepted v1 keys).
+	addColumnMigration(23, "key directory crypto suite", "keys", "suite", `suite TEXT NOT NULL DEFAULT 'ed25519-x25519-naclbox-v1'`),
+	// v24 (issue #138): envelopes record the crypto suite they were sealed
+	// under, so recipients can dispatch to the right opener. Existing rows
+	// predate suite tagging and are SuiteV1 by construction.
+	addColumnMigration(24, "envelope crypto suite", "envelopes", "suite", `suite TEXT NOT NULL DEFAULT 'ed25519-x25519-naclbox-v1'`),
 }
 
 // latestSchemaVersion is the newest migration version this build knows.
@@ -1030,10 +1041,10 @@ func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) Save(e *Envelope) (id int64, stored bool, err error) {
 	h := envelope.DedupHash(e.To, e.From, e.Eph, e.Nonce, e.SentAt, e.Ct, e.Sig)
 	res, err := s.db.Exec(
-		`INSERT INTO envelopes (recipient, sender, eph, nonce, ct, sent_at, sig, env_hash, kind, key_epoch)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO envelopes (recipient, sender, suite, eph, nonce, ct, sent_at, sig, env_hash, kind, key_epoch)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(env_hash) DO NOTHING`,
-		e.To, e.From, e.Eph, e.Nonce, e.Ct, e.SentAt, e.Sig, h, e.Kind, e.KeyEpoch,
+		e.To, e.From, e.Suite, e.Eph, e.Nonce, e.Ct, e.SentAt, e.Sig, h, e.Kind, e.KeyEpoch,
 	)
 	if err != nil {
 		return 0, false, fmt.Errorf("insert: %w", err)
@@ -1060,7 +1071,7 @@ func (s *Store) Save(e *Envelope) (id int64, stored bool, err error) {
 // oldest first.
 func (s *Store) List(recipient string, after int64, limit int) ([]Envelope, error) {
 	rows, err := s.db.Query(
-		`SELECT id, recipient, sender, eph, nonce, ct, sent_at, received_at, sig, kind, key_epoch
+		`SELECT id, recipient, sender, suite, eph, nonce, ct, sent_at, received_at, sig, kind, key_epoch
 		 FROM envelopes WHERE recipient = ? AND id > ?
 		 ORDER BY id ASC LIMIT ?`,
 		recipient, after, limit,
@@ -1073,7 +1084,7 @@ func (s *Store) List(recipient string, after int64, limit int) ([]Envelope, erro
 	var out []Envelope
 	for rows.Next() {
 		var e Envelope
-		if err := rows.Scan(&e.ID, &e.To, &e.From, &e.Eph, &e.Nonce, &e.Ct, &e.SentAt, &e.ReceivedAt, &e.Sig, &e.Kind, &e.KeyEpoch); err != nil {
+		if err := rows.Scan(&e.ID, &e.To, &e.From, &e.Suite, &e.Eph, &e.Nonce, &e.Ct, &e.SentAt, &e.ReceivedAt, &e.Sig, &e.Kind, &e.KeyEpoch); err != nil {
 			return nil, fmt.Errorf("scan: %w", err)
 		}
 		out = append(out, e)
@@ -1149,6 +1160,7 @@ func (s *Store) PruneBlobs(retainDays int) (int64, error) {
 // KeyAnnouncement is one published encryption key for an address.
 type KeyAnnouncement struct {
 	Address   string
+	Suite     string // crypto suite id (issue #138); "" reads as SuiteV1
 	X25519Pub string // base64url 32-byte X25519 public key
 	Epoch     int64  // unix seconds of rotation; strictly increasing
 	Sig       string // base64url Ed25519 signature over the announcement
@@ -1161,10 +1173,10 @@ type KeyAnnouncement struct {
 // Returns false for stale or replayed announcements.
 func (s *Store) SaveKey(k *KeyAnnouncement) (bool, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO keys (address, x25519_pub, epoch, signature) VALUES (?, ?, ?, ?)
-		 ON CONFLICT(address) DO UPDATE SET x25519_pub = excluded.x25519_pub, epoch = excluded.epoch, signature = excluded.signature
+		`INSERT INTO keys (address, suite, x25519_pub, epoch, signature) VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(address) DO UPDATE SET suite = excluded.suite, x25519_pub = excluded.x25519_pub, epoch = excluded.epoch, signature = excluded.signature
 		 WHERE excluded.epoch > keys.epoch`,
-		k.Address, k.X25519Pub, k.Epoch, k.Sig,
+		k.Address, k.Suite, k.X25519Pub, k.Epoch, k.Sig,
 	)
 	if err != nil {
 		return false, fmt.Errorf("save key: %w", err)
@@ -1181,9 +1193,9 @@ func (s *Store) SaveKey(k *KeyAnnouncement) (bool, error) {
 func (s *Store) GetKey(address string) (*KeyAnnouncement, error) {
 	var k KeyAnnouncement
 	err := s.db.QueryRow(
-		`SELECT address, x25519_pub, epoch, signature FROM keys WHERE address = ?`,
+		`SELECT address, suite, x25519_pub, epoch, signature FROM keys WHERE address = ?`,
 		address,
-	).Scan(&k.Address, &k.X25519Pub, &k.Epoch, &k.Sig)
+	).Scan(&k.Address, &k.Suite, &k.X25519Pub, &k.Epoch, &k.Sig)
 	if err != nil {
 		return nil, err
 	}

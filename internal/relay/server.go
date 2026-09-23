@@ -281,9 +281,12 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 // Kind/KeyEpoch carry issue #32 group messages: kind is "" (or "dm")
 // for direct messages and "group" for group messages; key_epoch is the
 // sender's group sender-key epoch covered by the group signature.
+// Suite names the crypto suite the envelope is sealed under (issue #138);
+// absent means SuiteV1 (older clients).
 type sendRequest struct {
 	To       string `json:"to"`
 	From     string `json:"from"`
+	Suite    string `json:"suite,omitempty"`
 	Eph      string `json:"eph"`
 	Nonce    string `json:"nonce"`
 	Ct       string `json:"ct"`
@@ -327,24 +330,41 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, `"kind" must be "" or "dm" for direct messages`)
 		return
 	}
-	to, err := parseAddress(req.To)
+	toAddr, err := crypto.ParseAddressSuite(req.To)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"to": %v`, err))
 		return
 	}
-	from, err := parseAddress(req.From)
+	fromAddr, err := crypto.ParseAddressSuite(req.From)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"from": %v`, err))
 		return
 	}
+	// Issue #138: the envelope names its crypto suite. Absent means
+	// SuiteV1 (older clients). The suite must agree with both addresses
+	// and have a registered descriptor — a mismatch is rejected loudly,
+	// never stored as if it were v1.
+	suite, err := crypto.AgreeSuite(req.Suite, toAddr, fromAddr)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"suite": %v`, err))
+		return
+	}
+	// AgreeSuite guarantees a descriptor; the suite owns its wire
+	// shapes, so a registered-but-unimplemented suite cannot pass a
+	// generic gate and then be interpreted as v1.
+	desc, _ := crypto.Descriptor(suite)
 	eph, err := base64.RawURLEncoding.DecodeString(req.Eph)
-	if err != nil || len(eph) != crypto.PubKeyLen {
-		writeErr(w, http.StatusBadRequest, `"eph" must be a base64url X25519 public key`)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, `"eph" must be base64url`)
 		return
 	}
 	nonce, err := base64.RawURLEncoding.DecodeString(req.Nonce)
-	if err != nil || len(nonce) != crypto.NonceLen {
-		writeErr(w, http.StatusBadRequest, `"nonce" must be base64url 24-byte nonce`)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, `"nonce" must be base64url`)
+		return
+	}
+	if err := desc.ValidateEnvelopeFields(eph, nonce); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	ct, err := base64.RawURLEncoding.DecodeString(req.Ct)
@@ -361,14 +381,20 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sig, err := base64.RawURLEncoding.DecodeString(req.Sig)
-	if err != nil || len(sig) != 64 {
-		writeErr(w, http.StatusBadRequest, `"sig" must be a base64url Ed25519 signature`)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, `"sig" must be base64url`)
+		return
+	}
+	if err := desc.ValidateSignatureFields(sig); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	// Verify the sender's signature over the canonical envelope bytes.
-	canon := envelope.Canonical(to[:], from[:], eph, nonce, req.SentAt, ct)
-	if !crypto.Verify(from[:], canon, sig) {
+	// The canonical layout is suite-specific; the descriptor owns
+	// signature verification for its suite.
+	canon := envelope.Canonical(toAddr.PublicKey, fromAddr.PublicKey, eph, nonce, req.SentAt, ct)
+	if !desc.VerifySignature(fromAddr.PublicKey, canon, sig) {
 		writeErr(w, http.StatusBadRequest, "signature verification failed")
 		return
 	}
@@ -393,7 +419,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id, stored, err := s.store.Save(&store.Envelope{
-		To: req.To, From: req.From, Eph: req.Eph,
+		To: req.To, From: req.From, Suite: string(suite), Eph: req.Eph,
 		Nonce: req.Nonce, Ct: req.Ct, SentAt: req.SentAt, Sig: req.Sig,
 	})
 	if err != nil {
@@ -413,12 +439,17 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 
 // ---- v0.5.0: signed encryption-key directory ----
 
-// keyAnnounceRequest is the wire format for POST /v1/keys.
+// keyAnnounceRequest is the wire format for POST /v1/keys. Suite names
+// the crypto suite the announced key belongs to (issue #138); it is
+// optional and defaults to SuiteV1 for announcements from older clients.
+// A future suite uses its own key field alongside its own canonical
+// signing layout (envelope.KeyAnnounce is frozen for v1).
 type keyAnnounceRequest struct {
-	Address   string `json:"address"`    // ed25519:<base64url> identity
-	X25519Pub string `json:"x25519_pub"` // base64url 32-byte encryption key
-	Epoch     int64  `json:"epoch"`      // unix seconds of rotation
-	Sig       string `json:"sig"`        // base64url Ed25519 signature
+	Address   string `json:"address"`         // ed25519:<base64url> identity
+	Suite     string `json:"suite,omitempty"` // crypto suite id; "" means SuiteV1
+	X25519Pub string `json:"x25519_pub"`      // base64url 32-byte encryption key (SuiteV1)
+	Epoch     int64  `json:"epoch"`           // unix seconds of rotation
+	Sig       string `json:"sig"`             // base64url Ed25519 signature
 }
 
 // handleKeyAnnounce accepts a signed key announcement. The signature must
@@ -431,14 +462,29 @@ func (s *Server) handleKeyAnnounce(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	addr, err := parseAddress(req.Address)
+	addr, err := crypto.ParseAddressSuite(req.Address)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"address": %v`, err))
 		return
 	}
+	// Issue #138: the announcement names its crypto suite. Empty means
+	// SuiteV1 (older clients). The suite is bound to the address: it
+	// must agree with the address's suite and have a registered
+	// descriptor. Anything else is rejected loudly — never stored as if
+	// it were v1.
+	suite, err := crypto.AgreeSuite(req.Suite, addr)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"suite": %v`, err))
+		return
+	}
+	desc, _ := crypto.Descriptor(suite)
 	pubRaw, err := base64.RawURLEncoding.DecodeString(req.X25519Pub)
-	if err != nil || len(pubRaw) != crypto.PubKeyLen {
-		writeErr(w, http.StatusBadRequest, `"x25519_pub" must be a base64url 32-byte X25519 public key`)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, `"x25519_pub" must be base64url`)
+		return
+	}
+	if err := desc.ValidateKeyFields(pubRaw); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if req.Epoch <= 0 {
@@ -446,18 +492,22 @@ func (s *Server) handleKeyAnnounce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sig, err := base64.RawURLEncoding.DecodeString(req.Sig)
-	if err != nil || len(sig) != 64 {
-		writeErr(w, http.StatusBadRequest, `"sig" must be a base64url Ed25519 signature`)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, `"sig" must be base64url`)
 		return
 	}
-	canon := envelope.KeyAnnounce(addr[:], pubRaw, req.Epoch)
-	if !crypto.Verify(addr[:], canon, sig) {
+	if err := desc.ValidateSignatureFields(sig); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	canon := envelope.KeyAnnounce(addr.PublicKey, pubRaw, req.Epoch)
+	if !desc.VerifySignature(addr.PublicKey, canon, sig) {
 		writeErr(w, http.StatusBadRequest, "signature verification failed")
 		return
 	}
 	ok, err := s.store.SaveKey(&store.KeyAnnouncement{
-		Address: req.Address, X25519Pub: req.X25519Pub, Epoch: req.Epoch,
-		Sig: req.Sig,
+		Address: req.Address, Suite: string(suite), X25519Pub: req.X25519Pub,
+		Epoch: req.Epoch, Sig: req.Sig,
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "store failed")
@@ -485,8 +535,8 @@ func (s *Server) handleKeyLookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"address": k.Address, "x25519_pub": k.X25519Pub, "epoch": k.Epoch,
-		"sig": k.Sig,
+		"address": k.Address, "suite": k.Suite, "x25519_pub": k.X25519Pub,
+		"epoch": k.Epoch, "sig": k.Sig,
 	})
 }
 

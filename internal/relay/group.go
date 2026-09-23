@@ -36,11 +36,21 @@ func (s *Server) handleGroupSend(w http.ResponseWriter, req sendRequest) {
 		writeErr(w, http.StatusBadRequest, `"kind" must be "group" for group messages`)
 		return
 	}
-	from, err := parseAddress(req.From)
+	fromAddr, err := crypto.ParseAddressSuite(req.From)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"from": %v`, err))
 		return
 	}
+	// Issue #138: group envelopes carry the sender's crypto suite like DMs
+	// do. Absent means SuiteV1 (older clients); it must agree with the
+	// sender's address suite and have a registered descriptor — a
+	// mismatch is rejected loudly, never stored as if it were v1.
+	suite, err := crypto.AgreeSuite(req.Suite, fromAddr)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(`"suite": %v`, err))
+		return
+	}
+	desc, _ := crypto.Descriptor(suite)
 
 	member, err := s.store.IsGroupMember(groupID, req.From)
 	if err != nil {
@@ -53,13 +63,17 @@ func (s *Server) handleGroupSend(w http.ResponseWriter, req sendRequest) {
 	}
 
 	eph, err := base64.RawURLEncoding.DecodeString(req.Eph)
-	if err != nil || len(eph) != crypto.PubKeyLen {
-		writeErr(w, http.StatusBadRequest, `"eph" must be base64url 32 random bytes`)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, `"eph" must be base64url`)
 		return
 	}
 	nonce, err := base64.RawURLEncoding.DecodeString(req.Nonce)
-	if err != nil || len(nonce) != crypto.NonceLen {
-		writeErr(w, http.StatusBadRequest, `"nonce" must be base64url 24-byte nonce`)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, `"nonce" must be base64url`)
+		return
+	}
+	if err := desc.ValidateEnvelopeFields(eph, nonce); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	ct, err := base64.RawURLEncoding.DecodeString(req.Ct)
@@ -76,20 +90,25 @@ func (s *Server) handleGroupSend(w http.ResponseWriter, req sendRequest) {
 		return
 	}
 	sig, err := base64.RawURLEncoding.DecodeString(req.Sig)
-	if err != nil || len(sig) != 64 {
-		writeErr(w, http.StatusBadRequest, `"sig" must be a base64url Ed25519 signature`)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, `"sig" must be base64url`)
+		return
+	}
+	if err := desc.ValidateSignatureFields(sig); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// Verify the sender's signature over the group canonical bytes.
-	canon := envelope.GroupCanonical(groupID, from[:], req.KeyEpoch, eph, nonce, req.SentAt, ct)
-	if !crypto.Verify(from[:], canon, sig) {
+	// Verify the sender's signature over the group canonical bytes,
+	// dispatching through the suite's descriptor.
+	canon := envelope.GroupCanonical(groupID, fromAddr.PublicKey, req.KeyEpoch, eph, nonce, req.SentAt, ct)
+	if !desc.VerifySignature(fromAddr.PublicKey, canon, sig) {
 		writeErr(w, http.StatusBadRequest, "signature verification failed")
 		return
 	}
 
 	id, stored, err := s.store.Save(&store.Envelope{
-		To: req.To, From: req.From, Eph: req.Eph,
+		To: req.To, From: req.From, Suite: string(suite), Eph: req.Eph,
 		Nonce: req.Nonce, Ct: req.Ct, SentAt: req.SentAt, Sig: req.Sig,
 		Kind: "group", KeyEpoch: req.KeyEpoch,
 	})
@@ -103,10 +122,12 @@ func (s *Server) handleGroupSend(w http.ResponseWriter, req sendRequest) {
 }
 
 // groupMessageJSON is one group envelope in a group inbox response.
-// KeyEpoch tells the reader which sender key sealed the body.
+// KeyEpoch tells the reader which sender key sealed the body. Suite names
+// the sender's crypto suite (issue #138); absent means SuiteV1.
 type groupMessageJSON struct {
 	ID         int64  `json:"id"`
 	From       string `json:"from"`
+	Suite      string `json:"suite,omitempty"`
 	Eph        string `json:"eph"`
 	Nonce      string `json:"nonce"`
 	Ct         string `json:"ct"`
@@ -212,7 +233,7 @@ func (s *Server) handleGroupInbox(w http.ResponseWriter, r *http.Request) {
 	msgs := make([]groupMessageJSON, 0, len(envs))
 	for _, e := range envs {
 		msgs = append(msgs, groupMessageJSON{
-			ID: e.ID, From: e.From, Eph: e.Eph, Nonce: e.Nonce, Ct: e.Ct,
+			ID: e.ID, From: e.From, Suite: e.Suite, Eph: e.Eph, Nonce: e.Nonce, Ct: e.Ct,
 			KeyEpoch: e.KeyEpoch,
 			SentAt:   e.SentAt, ReceivedAt: e.ReceivedAt, Sig: e.Sig,
 		})
