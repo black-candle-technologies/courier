@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -195,5 +197,76 @@ func TestToStdioMessageBridged(t *testing.T) {
 	}
 	if _, ok := wire["bridged"]; ok {
 		t.Error("non-bridged message must omit the bridged field")
+	}
+}
+
+// TestSaveAttachmentHardened (issue #136 review): recovered plaintext is
+// written with strict local-file semantics — a directory created by the
+// command is 0700, files are 0600, creation is atomic O_CREATE|O_EXCL
+// (no stat-then-write TOCTOU window), an existing name gets a numeric
+// suffix instead of being overwritten, and a planted symlink is never
+// followed.
+func TestSaveAttachmentHardened(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "dl")
+
+	p, err := saveAttachment(target, "secret.bin", []byte("plaintext"))
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if want := filepath.Join(target, "secret.bin"); p != want {
+		t.Fatalf("path = %q, want %q", p, want)
+	}
+	if fi, err := os.Stat(target); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm() != 0o700 {
+		t.Fatalf("created dir mode = %o, want 700", fi.Mode().Perm())
+	}
+	if fi, err := os.Stat(p); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("file mode = %o, want 600", fi.Mode().Perm())
+	}
+	if b, err := os.ReadFile(p); err != nil || string(b) != "plaintext" {
+		t.Fatalf("content = %q, err = %v", b, err)
+	}
+
+	// An existing name is never overwritten: a numeric suffix is added.
+	p2, err := saveAttachment(target, "secret.bin", []byte("v2"))
+	if err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	if p2 == p {
+		t.Fatal("second save overwrote the first file")
+	}
+	if b, _ := os.ReadFile(p); string(b) != "plaintext" {
+		t.Fatal("first file was clobbered by the second save")
+	}
+	if b, _ := os.ReadFile(p2); string(b) != "v2" {
+		t.Fatal("second file has wrong content")
+	}
+
+	// A symlink planted at the target name is never followed: the save
+	// takes the next free suffix and the link target is untouched.
+	victim := filepath.Join(dir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("do not touch"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(target, "link.bin")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatal(err)
+	}
+	p3, err := saveAttachment(target, "link.bin", []byte("data"))
+	if err != nil {
+		t.Fatalf("save over symlink: %v", err)
+	}
+	if p3 == link {
+		t.Fatal("save returned the symlink path itself")
+	}
+	if b, _ := os.ReadFile(victim); string(b) != "do not touch" {
+		t.Fatal("planted symlink was followed: victim file overwritten")
+	}
+	if b, _ := os.ReadFile(p3); string(b) != "data" {
+		t.Fatal("suffixed file has wrong content")
 	}
 }

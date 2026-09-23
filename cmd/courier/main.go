@@ -597,27 +597,44 @@ func printRequests(reqs []client.Message) {
 // overwriting an existing file (a numeric suffix is added instead). The
 // manifest filename is a validated bare name, so no path traversal is
 // possible; filepath.Base is applied defensively anyway.
+//
+// The file is created with O_CREATE|O_EXCL (mode 0600): creation is
+// atomic, so there is no stat-then-write TOCTOU window, and an existing
+// entry — including a planted symlink — is never followed or truncated;
+// the numeric-suffix loop simply retries on EEXIST. A directory created
+// here gets mode 0700, so recovered plaintext is not exposed to other
+// local users.
 func saveAttachment(dir string, filename string, data []byte) (string, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
 	name := filepath.Base(filename)
-	path := filepath.Join(dir, name)
-	if _, err := os.Stat(path); err == nil {
-		ext := filepath.Ext(name)
-		base := strings.TrimSuffix(name, ext)
-		for i := 2; ; i++ {
-			p := filepath.Join(dir, fmt.Sprintf("%s-%d%s", base, i, ext))
-			if _, err := os.Stat(p); os.IsNotExist(err) {
-				path = p
-				break
-			}
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	for i := 1; ; i++ {
+		candidate := name
+		if i > 1 {
+			candidate = fmt.Sprintf("%s-%d%s", base, i, ext)
 		}
+		path := filepath.Join(dir, candidate)
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			return "", err
+		}
+		_, werr := f.Write(data)
+		cerr := f.Close()
+		if werr != nil {
+			os.Remove(path) // best effort: don't leave a truncated file
+			return "", werr
+		}
+		if cerr != nil {
+			return "", cerr
+		}
+		return path, nil
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return "", err
-	}
-	return path, nil
 }
 
 func cmdInbox(args []string) error {

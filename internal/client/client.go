@@ -1638,6 +1638,55 @@ func (c *Client) unwrapAttachmentKeys(manifests []envelope.AttachmentManifest, f
 	return atts
 }
 
+// holdForReview reports whether an inbound envelope from `from` carrying
+// the relay's sender flags must be held for review under the recipient's
+// request/quarantine policy: the contacts-only policy quarantines first
+// contacts, and a relay-reported sender is held even under the open
+// policy. It depends only on envelope metadata — never on decrypted
+// content — so it can (and should) run before decryption: a quarantined
+// sender's ciphertext is never opened just to decide it should not be
+// delivered. The second return distinguishes a policy quarantine (the
+// recipient must accept the request) from a relay-reported hold.
+func (c *Client) holdForReview(from string, senderFlags []string) (held, policyHold bool) {
+	if c.cfg.HoldForReview(from) {
+		return true, true
+	}
+	return slices.Contains(senderFlags, "reported"), false
+}
+
+// classifyInbound applies Courier's shared inbound-message policy —
+// bridge attribution, machine-readable flags, and the hold/request rule
+// — to one decrypted envelope. It is side-effect-free and driven only by
+// envelope metadata plus the decrypted body (which the bridge-banner
+// check needs), so every delivery path (inbox, dashboard push, targeted
+// re-fetch) classifies identically and the paths cannot silently drift.
+// What a held message means is the caller's decision: inbox() delivers
+// it as a request; FetchMessage refuses it outright before decrypting.
+func (c *Client) classifyInbound(from string, senderFlags []string, body string, bmeta *bridge.BridgeMeta) (bridged bool, flags []string, hold, policyHold bool) {
+	// issues #96/#97: bridged-message attribution and untrusted-input
+	// enforcement signal. Derived here — the single choke point every
+	// consumer flows through — so no consumer can receive a bridged
+	// message without the typed flag. See deriveBridged for the layers.
+	bridged = deriveBridged(from, c.cfg.BridgeGateways, bmeta, body)
+	// Machine-readable flag reasons. "first_contact" is derived locally
+	// (sender not in contacts and not self); the rest are relay-attached
+	// sender-reputation metadata (advisory). Flags ride along on
+	// delivered messages too, so agents can see at a glance why a
+	// message was singled out.
+	if c.cfg.IsFirstContact(from) {
+		flags = append(flags, "first_contact")
+	}
+	flags = append(flags, senderFlags...)
+	hold, policyHold = c.holdForReview(from, senderFlags)
+	if policyHold {
+		// Machine-readable reason when the hold comes from the
+		// recipient's contacts-only policy (as opposed to the relay's
+		// spam throttle, which arrives as a flag).
+		flags = append(flags, "quarantined_by_policy")
+	}
+	return bridged, flags, hold, policyHold
+}
+
 // Inbox fetches envelopes addressed to this agent after message id `after`,
 // verifies each sender signature, and decrypts. Envelopes that fail
 // verification or decryption are skipped and counted, never fatal.
@@ -1867,12 +1916,11 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			ReplyTo: rinfo.To, ReplyQuote: rinfo.Quote,
 			Bridge: bmeta,
 		}
-		// issues #96/#97: bridged-message attribution and untrusted-input
-		// enforcement signal. Derived here — the single choke point every
-		// consumer (inbox CLI, stdio, serve, dashboard push, review)
-		// flows through — so no consumer can receive a bridged message
-		// without the typed flag. See deriveBridged for the layers.
-		msg.Bridged = deriveBridged(m.From, c.cfg.BridgeGateways, bmeta, body)
+		// Shared inbound classification (bridge attribution, flags,
+		// hold/request policy) — the same helper FetchMessage uses, so
+		// the delivery paths cannot drift.
+		bridged, flags, hold, _ := c.classifyInbound(m.From, m.SenderFlags, body, bmeta)
+		msg.Bridged, msg.Flags = bridged, flags
 		// issue #51: remember this delivery in the reply cache so a
 		// later reply to it can quote the parent without a relay
 		// round-trip. Best effort; delivery never depends on it.
@@ -1880,15 +1928,6 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			CourierID: m.ID, From: m.From,
 			Snippet: truncateQuote(body), SentAt: m.SentAt,
 		})
-		// Machine-readable flag reasons. "first_contact" is derived
-		// locally (sender not in contacts and not self); the rest are
-		// relay-attached sender-reputation metadata (advisory). Flags
-		// ride along on delivered messages too, so agents can see at a
-		// glance why a message was singled out.
-		if c.cfg.IsFirstContact(m.From) {
-			msg.Flags = append(msg.Flags, "first_contact")
-		}
-		msg.Flags = append(msg.Flags, m.SenderFlags...)
 		// Hold rule: a message becomes a request (held for review,
 		// never delivered to the inbox or dashboard) when the
 		// recipient's contacts-only policy quarantines a first contact,
@@ -1896,15 +1935,8 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// for spam — even under the open policy. Held messages are not
 		// marked seen, so review re-derives them; the empty hash keeps
 		// newHashes parallel to out for DashboardPush.
-		hold := c.cfg.HoldForReview(m.From) || slices.Contains(msg.Flags, "reported")
 		if hold {
 			msg.Request = true
-			// Machine-readable reason when the hold comes from the
-			// recipient's contacts-only policy (as opposed to the
-			// relay's spam throttle, which arrives as a flag).
-			if c.cfg.HoldForReview(m.From) {
-				msg.Flags = append(msg.Flags, "quarantined_by_policy")
-			}
 			out = append(out, msg)
 			newHashes = append(newHashes, "")
 			continue

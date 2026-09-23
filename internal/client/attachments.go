@@ -343,6 +343,14 @@ func (c *Client) FetchMessage(id int64) (Message, error) {
 	if c.cfg.IsBlocked(m.From) || c.cfg.IsDismissed(m.From) {
 		return Message{}, fmt.Errorf("message #%d is from a blocked or dismissed sender", id)
 	}
+	// The request/quarantine policy applies to the explicit re-fetch
+	// too (issue #136 review): a held message is never decrypted or
+	// unwrapped here — accept the sender's request first. This is the
+	// same metadata-only classification inbox() uses, so the two paths
+	// cannot drift.
+	if held, _ := c.holdForReview(m.From, m.SenderFlags); held {
+		return Message{}, fmt.Errorf("message #%d is held for review: accept the sender's request first", id)
+	}
 	plain, err := c.openEnvelope(m)
 	if err != nil {
 		return Message{}, fmt.Errorf("message #%d: %w", id, err)
@@ -380,11 +388,17 @@ func (c *Client) FetchMessage(id int64) (Message, error) {
 	if stateExpired(time.Now().Unix(), expiresAt) {
 		return Message{}, fmt.Errorf("message #%d has expired", id)
 	}
+	// Shared inbound classification — the same helper inbox() uses, so
+	// bridge attribution, flags, and the hold policy cannot drift
+	// between the delivery paths. (A held message can never reach here:
+	// it is refused above, before decryption.)
+	bridged, flags, _, _ := c.classifyInbound(m.From, m.SenderFlags, body, bmeta)
 	msg := Message{
 		ID: m.ID, From: m.From, Body: body,
 		SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
 		Attachments: c.unwrapAttachmentKeys(manifests, nil), ExpiresAt: expiresAt,
 		ReplyTo: rinfo.To, ReplyQuote: rinfo.Quote, Bridge: bmeta,
+		Bridged: bridged, Flags: flags,
 	}
 	return msg, nil
 }
