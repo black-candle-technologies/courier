@@ -86,8 +86,6 @@ func main() {
 		err = cmdGroup(os.Args[2:])
 	case "state":
 		err = cmdState(os.Args[2:])
-	case "channel":
-		err = cmdChannel(os.Args[2:])
 	case "rotate":
 		err = cmdRotate(os.Args[2:])
 	case "fs":
@@ -170,15 +168,6 @@ func usage() {
                                          share a task (state machine: assign/done/reopen)
   courier state list <peer>              list shared notes + tasks
   courier state sync <peer>              catch-up: fetch and apply missed state events
-  courier channel create <name>          create a private channel (you are admin)
-  courier channel invite <channel-id>    mint a one-time out-of-band join code
-  courier channel join <inviter> <code>   join a private channel via OOB code
-  courier channel send <channel-id> <msg> send a message to the channel
-  courier channel inbox <channel-id>     read channel messages
-  courier channel list                   list your private channels
-  courier channel remove <channel-id> <addr|contact>
-                                         remove a member (admin; rotates the channel key)
-  courier channel leave <channel-id>     leave a private channel
   courier directory register <handle> [--visibility public|unlisted|private]
       [--caps a,b] [--policy open|contacts]
                                          claim a handle (first-come, signed)

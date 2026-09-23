@@ -227,7 +227,7 @@ func saveReceiptsLocked(rs *receiptStore) error {
 }
 
 // updateReceipts performs an atomic read-modify-write of receipts.json
-// under the cross-process config lock (same discipline as channels.json
+// under the cross-process config lock (same discipline as groups.json
 // and Config.Update), pruning both tables to their bounds afterwards.
 func updateReceipts(fn func(*receiptStore) error) error {
 	return withConfigLock(func() error {
