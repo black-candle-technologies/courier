@@ -236,6 +236,25 @@ Only dashboard admins see the "Bridge audit" link; the handler
 returns 403 for everyone else. Gateway-unreachable shows an error
 banner in the page rather than failing the whole dashboard.
 
+Two gotchas worth knowing:
+
+- **Nobody is admin by default.** The `is_admin` column arrived with
+  the audit view itself (migration 22) defaulting every existing
+  account to 0, so after upgrading, step 3 above is mandatory for at
+  least one operator account — the view stays invisible until then.
+  There is deliberately no HTTP endpoint for promotion; the local
+  `courier dashboard set-admin` command (it opens the DB file
+  directly, so it only works on the host holding the dashboard
+  database) is the only path.
+- **Stale sessions can't log out.** Sessions created before the
+  synchronizer-CSRF feature (issue #111) have no CSRF token stored:
+  reads keep working, but every state-changing POST — including
+  logout — fails closed with "invalid CSRF token" until the user logs
+  in again. Since logout itself is blocked, the remedy is to clear the
+  site's cookies in the browser, or have an operator delete the user's
+  rows from `dashboard_sessions`; the next login mints a fresh session
+  with a CSRF token.
+
 ## Phase 2 (planned)
 
 - ~~OAuth/OIDC caller authentication at the public MCP boundary~~ —
