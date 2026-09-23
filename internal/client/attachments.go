@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"time"
 
 	"github.com/black-candle-technologies/courier/internal/bridge"
 	"github.com/black-candle-technologies/courier/internal/crypto"
@@ -292,4 +293,112 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// FetchMessage re-fetches the single envelope with the given relay id so
+// its attachments can be downloaded again after a flag-less `inbox`
+// fetch already consumed the message (issue #136).
+//
+// Replay suppression is bypassed for exactly this envelope and nothing
+// else: the envelope is not marked seen, the inbox cursor is untouched,
+// no read receipts are sent, no shared-state events are applied, and no
+// protocol handlers run. The fetch is strictly read-only, so it is safe
+// to repeat and invisible to every other consumer.
+//
+// Forward-secret messages (issue #50) cannot be re-fetched: their
+// per-message keys — including the attachment data-key wrap key derived
+// from the message key — are deleted on first delivery by design, so
+// there is nothing left to decrypt with.
+func (c *Client) FetchMessage(id int64) (Message, error) {
+	if id <= 0 {
+		return Message{}, fmt.Errorf("invalid message id %d", id)
+	}
+	// The relay lists one recipient's envelopes ordered by id, so
+	// after=id-1&limit=1 returns exactly this envelope while it still
+	// exists; anything else in the page is not ours to take.
+	envs, err := c.fetchEnvelopePage(id-1, 1)
+	if err != nil {
+		return Message{}, err
+	}
+	var found *inboxEnvelope
+	for i := range envs {
+		if envs[i].ID == id {
+			found = &envs[i]
+			break
+		}
+	}
+	if found == nil {
+		return Message{}, fmt.Errorf("message #%d not found on the relay (envelopes are retained for 30 days)", id)
+	}
+	m := *found
+	// issue #32: only chat messages are re-fetchable. Other envelope
+	// kinds belong to newer clients or protocol layers and never carry
+	// user attachments.
+	if m.Kind != "" && m.Kind != "dm" {
+		return Message{}, fmt.Errorf("message #%d is not a chat message (kind %q)", id, m.Kind)
+	}
+	// The recipient's own read-time rules still apply: a blocked or
+	// dismissed sender stays blocked/dismissed even for an explicit
+	// re-fetch.
+	if c.cfg.IsBlocked(m.From) || c.cfg.IsDismissed(m.From) {
+		return Message{}, fmt.Errorf("message #%d is from a blocked or dismissed sender", id)
+	}
+	// The request/quarantine policy applies to the explicit re-fetch
+	// too (issue #136 review): a held message is never decrypted or
+	// unwrapped here — accept the sender's request first. This is the
+	// same metadata-only classification inbox() uses, so the two paths
+	// cannot drift.
+	if held, _ := c.holdForReview(m.From, m.SenderFlags); held {
+		return Message{}, fmt.Errorf("message #%d is held for review: accept the sender's request first", id)
+	}
+	plain, err := c.openEnvelope(m)
+	if err != nil {
+		return Message{}, fmt.Errorf("message #%d: %w", id, err)
+	}
+	// issue #50: forward-secret frames cannot be re-opened. Re-running
+	// the ratchet would desynchronize the session, and the message key
+	// it needs was deleted on first delivery anyway — that is what
+	// forward secrecy means.
+	if fp, ok := parseFSPayload(plain); ok {
+		if fp.Type == fsTypeMsg {
+			return Message{}, fmt.Errorf("message #%d is forward-secret encrypted: its keys were deleted on first delivery, so its attachments cannot be re-downloaded", id)
+		}
+		return Message{}, fmt.Errorf("message #%d is a protocol handshake, not a chat message", id)
+	}
+	// Protocol DMs are consumed by their layers on delivery and never
+	// surface as chat messages; there is nothing to re-fetch here.
+	if _, ok := parseGroupDMPayload(plain); ok {
+		return Message{}, fmt.Errorf("message #%d is a group protocol message, not a chat message", id)
+	}
+	if _, ok := parseChannelDMPayload(plain); ok {
+		return Message{}, fmt.Errorf("message #%d is a channel protocol message, not a chat message", id)
+	}
+	if _, ok := parseReceiptDMPayload(plain); ok {
+		return Message{}, fmt.Errorf("message #%d is a receipt protocol message, not a chat message", id)
+	}
+	if _, ok := parseIntroductionPayload(plain); ok {
+		return Message{}, fmt.Errorf("message #%d is an introduction protocol message, not a chat message", id)
+	}
+	if _, ok := parseStatePayload(plain); ok {
+		return Message{}, fmt.Errorf("message #%d is a shared-state protocol message, not a chat message", id)
+	}
+	body, manifests, rinfo, expiresAt, bmeta := parseMessagePayload(plain)
+	// issue #53: an expired message is gone. The inbox consumes it
+	// silently; the explicit fetch says so instead.
+	if stateExpired(time.Now().Unix(), expiresAt) {
+		return Message{}, fmt.Errorf("message #%d has expired", id)
+	}
+	// Shared inbound classification — the same helper inbox() uses, so
+	// bridge attribution, flags, and the hold policy cannot drift
+	// between the delivery paths. (A held message can never reach here:
+	// it is refused above, before decryption.)
+	bridged, flags, _, _ := c.classifyInbound(m.From, m.SenderFlags, body, bmeta)
+	msg := Message{
+		ID: m.ID, From: m.From, Body: body,
+		SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
+		Attachments: c.unwrapAttachmentKeys(manifests, nil), ExpiresAt: expiresAt,
+		ReplyTo: rinfo.To, ReplyQuote: rinfo.Quote, Bridge: bmeta,
+		Bridged: bridged, Flags: flags,
+	}
+	return msg, nil
 }
