@@ -159,6 +159,16 @@ chainR2I = HMAC-SHA256(root0, "courier-fs-chain-v1:responder-to-initiator")
   peerRatchet=rA_pub.
 - `ephA_priv` / `ephB_priv` are erased immediately after `root0` is derived.
 
+> **Amendment (issue #138):** the handshake now negotiates the FS
+> suite — `fs-init` carries an ordered `suites` offer, `fs-accept`
+> carries the single selected `suite`, and the selection plus the
+> exact offer are bound into the root's KDF salt (a tampered
+> negotiation yields divergent roots and the handshake fails
+> closed). All DH/KDF dispatches through the negotiated suite's
+> descriptor. The formula above is the legacy/unoffered form, kept
+> for v0.11.x interop. The normative wire format is PROTOCOL.md
+> §15.3.1.
+
 **Why this is forward-secret from message one:** `root0` mixes two
 *ephemeral-ephemeral* DH outputs. An attacker holding only long-term keys
 (even both parties') and the full relay transcript recovers `rk0` from the

@@ -103,3 +103,56 @@ func TestSealOpenViaConvertedKey(t *testing.T) {
 	}
 	_ = sender
 }
+
+func TestValidSuite(t *testing.T) {
+	if !ValidSuite(SuiteV1) {
+		t.Fatal("SuiteV1 must be valid")
+	}
+	if ValidSuite("") {
+		t.Fatal("empty suite must be invalid")
+	}
+	if ValidSuite("pq-hybrid-v1") {
+		t.Fatal("unknown suite must be invalid")
+	}
+	// KnownSuites is derived from the registry: every entry must have
+	// a descriptor (a name with no implementation is not "known"), and
+	// SuiteV1 must always be present.
+	foundV1 := false
+	for _, s := range KnownSuites {
+		if s == SuiteV1 {
+			foundV1 = true
+		}
+		if !ValidSuite(s) {
+			t.Fatalf("KnownSuites entry %q has no descriptor", s)
+		}
+	}
+	if !foundV1 {
+		t.Fatalf("KnownSuites = %v, want SuiteV1 present", KnownSuites)
+	}
+}
+
+func TestParseAddressSuite(t *testing.T) {
+	id, _ := IdentityFromSeed(testSeed())
+	addr := FormatAddress(id.EdPub[:])
+
+	pa, err := ParseAddressSuite(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalBytes(pa.PublicKey, id.EdPub[:]) {
+		t.Fatal("pubkey mismatch")
+	}
+	if pa.Suite != SuiteV1 {
+		t.Fatalf("suite = %q, want %q", pa.Suite, SuiteV1)
+	}
+
+	// An unknown address prefix fails closed: it can never be mistaken
+	// for SuiteV1.
+	if _, err := ParseAddressSuite("pq:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); err == nil {
+		t.Fatal("expected rejection of unknown suite prefix")
+	}
+	// Legacy bare addresses still fail.
+	if _, err := ParseAddressSuite("nqzNmuqgxGUuA4CWQsL8AKxKiChPm1LVbiFl6lyXviE"); err == nil {
+		t.Fatal("expected rejection of legacy bare address")
+	}
+}

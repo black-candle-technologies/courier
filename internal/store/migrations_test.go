@@ -758,3 +758,80 @@ func legacyMigrate(db *sql.DB) error {
 	}
 	return nil
 }
+
+// Issue #138 / PR #141 review (P0): the suite migrations must be numbered
+// 23/24, not 21/22 — current main already uses v21
+// (dashboard_messages.bridged) and v22 (dashboard_users.is_admin). A
+// database upgraded to current main carries ledger rows 21/22; had the
+// suite migrations kept those numbers they would have been skipped as
+// already-applied and the suite columns never added, while a merged list
+// with duplicate versions would collide on the ledger primary key. This
+// test builds a v22 database (suite columns and their ledger rows
+// removed), inserts pre-suite rows, re-opens, and asserts both columns
+// are added and backfilled with the SuiteV1 default.
+func TestSuiteMigrationsUpgradeFromV22(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v22.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a database that stopped at current-main v22: drop the
+	// suite columns the v23/v24 migrations add and remove their ledger
+	// rows, so the re-open below exercises the real upgrade path.
+	for _, ddl := range []string{
+		`ALTER TABLE keys DROP COLUMN suite`,
+		`ALTER TABLE envelopes DROP COLUMN suite`,
+		`DELETE FROM schema_migrations WHERE version IN (23, 24)`,
+	} {
+		if _, err := s.db.Exec(ddl); err != nil {
+			s.Close()
+			t.Skipf("cannot simulate v22 schema: %v", err)
+		}
+	}
+	// Pre-suite rows, written exactly as the v22 code wrote them (no
+	// suite column involved).
+	if _, err := s.db.Exec(
+		`INSERT INTO keys (address, x25519_pub, epoch, signature)
+		 VALUES ('ed25519:alice', 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 1000, 'sig')`,
+	); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO envelopes (recipient, sender, eph, nonce, ct, sent_at, sig)
+		 VALUES ('ed25519:bob', 'ed25519:alice', 'eph', 'nonce', 'ct', 1000, 'sig')`,
+	); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	s.Close()
+
+	// Re-open: migrations 23/24 must run (not be skipped) and backfill.
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("re-open after v22: %v", err)
+	}
+	defer s2.Close()
+
+	ledger := ledgerRows(t, s2)
+	for _, v := range []int{23, 24} {
+		if src := ledger[v]; src != "ran" {
+			t.Fatalf("migration %d source = %q, want %q (must run, not be skipped as already-applied)", v, src, "ran")
+		}
+	}
+	const wantSuite = "ed25519-x25519-naclbox-v1"
+	var keySuite string
+	if err := s2.db.QueryRow(`SELECT suite FROM keys WHERE address = 'ed25519:alice'`).Scan(&keySuite); err != nil {
+		t.Fatal(err)
+	}
+	if keySuite != wantSuite {
+		t.Fatalf("keys.suite backfill = %q, want %q", keySuite, wantSuite)
+	}
+	var envSuite string
+	if err := s2.db.QueryRow(`SELECT suite FROM envelopes WHERE sender = 'ed25519:alice'`).Scan(&envSuite); err != nil {
+		t.Fatal(err)
+	}
+	if envSuite != wantSuite {
+		t.Fatalf("envelopes.suite backfill = %q, want %q", envSuite, wantSuite)
+	}
+}

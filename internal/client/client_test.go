@@ -348,14 +348,22 @@ func TestRecipientKeyRejectsRollback(t *testing.T) {
 	if _, err := cl.recipientKey(peer.Address); err != nil {
 		t.Fatal(err)
 	}
+	addr, err := crypto.ParseAddressSuite(peer.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desc, ok := crypto.Descriptor(crypto.SuiteV1)
+	if !ok {
+		t.Fatal("v1 suite descriptor missing")
+	}
 	// A validly signed but older announcement must be rejected.
-	if _, err := cl.verifyKeyAnnouncement(peer.Address, announcedPub, 4,
-		signAnn(t, peerID, peer.Address, announcedPub, 4)); err == nil {
+	if _, err := cl.verifyKeyAnnouncement(addr, peer.Address, announcedPub, 4,
+		signAnn(t, peerID, peer.Address, announcedPub, 4), desc); err == nil {
 		t.Fatal("rollback to older epoch was accepted; want rejection")
 	}
 	// Same epoch (re-announcement) is fine.
-	if _, err := cl.verifyKeyAnnouncement(peer.Address, announcedPub, 9,
-		signAnn(t, peerID, peer.Address, announcedPub, 9)); err != nil {
+	if _, err := cl.verifyKeyAnnouncement(addr, peer.Address, announcedPub, 9,
+		signAnn(t, peerID, peer.Address, announcedPub, 9), desc); err != nil {
 		t.Fatalf("same-epoch re-announcement rejected: %v", err)
 	}
 }

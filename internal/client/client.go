@@ -689,7 +689,8 @@ func (c *Client) RotateKey() (published bool, err error) {
 }
 
 // PublishKey announces the current encryption key to the relay's key
-// directory, signed by the Ed25519 identity key.
+// directory, signed by the Ed25519 identity key. The announcement names
+// its crypto suite (issue #138); this client only speaks SuiteV1.
 func (c *Client) PublishKey() error {
 	id, err := c.cfg.Identity()
 	if err != nil {
@@ -703,6 +704,7 @@ func (c *Client) PublishKey() error {
 	sig := id.Sign(canon)
 	data, code, err := c.post("/v1/keys", map[string]any{
 		"address":    c.cfg.Address,
+		"suite":      string(crypto.SuiteV1),
 		"x25519_pub": base64.RawURLEncoding.EncodeToString(pub[:]),
 		"epoch":      epoch,
 		"sig":        base64.RawURLEncoding.EncodeToString(sig),
@@ -726,7 +728,7 @@ func (c *Client) PublishKey() error {
 // address. A relay that substitutes keys — or omits the signature — fails
 // closed instead of silently downgrading confidentiality.
 func (c *Client) recipientKey(address string) ([32]byte, error) {
-	k, _, err := c.recipientKeyWithEpoch(address)
+	_, k, _, err := c.recipientKeyWithEpoch(address)
 	return k, err
 }
 
@@ -736,61 +738,105 @@ func (c *Client) recipientKey(address string) ([32]byte, error) {
 // (deterministic, so both sides of a safety-number computation agree).
 // Needed by contact verification (issue #48), which pins the epoch the
 // safety number was computed over.
-func (c *Client) recipientKeyWithEpoch(address string) ([32]byte, int64, error) {
+func (c *Client) recipientKeyWithEpoch(address string) (desc *crypto.SuiteDescriptor, key [32]byte, epoch int64, err error) {
 	var out [32]byte
+	// Issue #138: the address names its suite, and the key directory's
+	// announcement must agree with it. The suite is authenticated by the
+	// address itself — never by relay metadata alone.
+	addr, err := crypto.ParseAddressSuite(address)
+	if err != nil {
+		return nil, out, 0, err
+	}
 	hc, err := c.httpClient()
 	if err != nil {
-		return out, 0, err
+		return nil, out, 0, err
 	}
 	resp, err := hc.Get(c.cfg.RelayURL + "/v1/keys/" + url.PathEscape(address))
 	if err != nil {
-		return out, 0, fmt.Errorf("relay unreachable: %w", err)
+		return nil, out, 0, fmt.Errorf("relay unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 	if resp.StatusCode == http.StatusNotFound {
-		toEd, err := crypto.ParseAddress(address)
+		// No announcement: fall back to the suite's address-derived
+		// key rule, if it has one. Only SuiteV1 defines one.
+		suite, err := crypto.AgreeSuite("", addr)
 		if err != nil {
-			return out, 0, err
+			return nil, out, 0, err
 		}
-		k, err := crypto.Ed25519PubToX25519(toEd[:])
-		return k, 0, err
+		desc, _ := crypto.Descriptor(suite)
+		switch suite {
+		case crypto.SuiteV1:
+			var toEd [32]byte
+			copy(toEd[:], addr.PublicKey)
+			k, err := crypto.Ed25519PubToX25519(toEd[:])
+			return desc, k, 0, err
+		default:
+			return nil, out, 0, fmt.Errorf("no key announcement for %s and suite %q defines no address-derived key: refusing to encrypt", address, suite)
+		}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return out, 0, relayErr(data)
+		return nil, out, 0, relayErr(data)
 	}
 	var ann struct {
+		Suite     string `json:"suite"`
 		X25519Pub string `json:"x25519_pub"`
 		Epoch     int64  `json:"epoch"`
 		Sig       string `json:"sig"`
 	}
 	if err := json.Unmarshal(data, &ann); err != nil {
-		return out, 0, fmt.Errorf("bad relay response: %w", err)
+		return nil, out, 0, fmt.Errorf("bad relay response: %w", err)
 	}
-	k, err := c.verifyKeyAnnouncement(address, ann.X25519Pub, ann.Epoch, ann.Sig)
-	return k, ann.Epoch, err
+	// Issue #138: the announcement names its crypto suite. Absent means
+	// SuiteV1 (older relays). It must agree with the address's suite and
+	// be one this client implements — a mismatch or an unknown suite is
+	// a loud refusal, not a silent box-open attempt against the wrong
+	// algorithm.
+	suite, err := crypto.AgreeSuite(ann.Suite, addr)
+	if err != nil {
+		return nil, out, 0, fmt.Errorf("key announcement for %s: %v: refusing to encrypt", address, err)
+	}
+	// AgreeSuite guarantees a descriptor.
+	desc, _ = crypto.Descriptor(suite)
+	k, err := c.verifyKeyAnnouncement(addr, address, ann.X25519Pub, ann.Epoch, ann.Sig, desc)
+	return desc, k, ann.Epoch, err
 }
 
 // verifyKeyAnnouncement authenticates one key-directory announcement and
-// returns the X25519 key to seal for. It records the highest verified
-// epoch per recipient so rollbacks are rejected.
-func (c *Client) verifyKeyAnnouncement(address, x25519Pub string, epoch int64, sig string) ([32]byte, error) {
+// returns the X25519 key to seal for. The announcement's suite was
+// already agreed with the recipient's address suite by the caller;
+// verification dispatches through the suite's descriptor, and the key
+// encoding is converted per-suite by the exhaustive switch below — a
+// suite this client cannot send with is a loud refusal. It records the
+// highest verified epoch per recipient so rollbacks are rejected.
+func (c *Client) verifyKeyAnnouncement(addr crypto.ParsedAddress, address, x25519Pub string, epoch int64, sig string, desc *crypto.SuiteDescriptor) ([32]byte, error) {
 	var out [32]byte
-	toEd, err := crypto.ParseAddress(address)
-	if err != nil {
-		return out, fmt.Errorf("bad address: %w", err)
-	}
 	raw, err := base64.RawURLEncoding.DecodeString(x25519Pub)
-	if err != nil || len(raw) != 32 {
+	if err != nil {
 		return out, fmt.Errorf("bad relay response: invalid x25519_pub")
 	}
+	if err := desc.ValidateKeyFields(raw); err != nil {
+		return out, fmt.Errorf("bad relay response: %w", err)
+	}
 	sigRaw, err := base64.RawURLEncoding.DecodeString(sig)
-	if err != nil || len(sigRaw) != 64 {
+	if err != nil {
 		return out, fmt.Errorf("bad relay response: key announcement is not signed (refusing to encrypt to an unauthenticated key)")
 	}
-	canon := envelope.KeyAnnounce(toEd[:], raw, epoch)
-	if !crypto.Verify(toEd[:], canon, sigRaw) {
+	if err := desc.ValidateSignatureFields(sigRaw); err != nil {
+		return out, fmt.Errorf("bad relay response: %w", err)
+	}
+	canon := envelope.KeyAnnounce(addr.PublicKey, raw, epoch)
+	if !desc.VerifySignature(addr.PublicKey, canon, sigRaw) {
 		return out, fmt.Errorf("key announcement signature verification failed for %s: refusing to encrypt", address)
+	}
+	// Exhaustive suite dispatch for the key encoding: the descriptor
+	// validated the shapes above, but converting to the client's
+	// [32]byte X25519 key handle is suite-specific.
+	switch desc.Suite {
+	case crypto.SuiteV1:
+		copy(out[:], raw)
+	default:
+		return out, fmt.Errorf("cannot encrypt to %s: suite %q is not implemented by this client", address, desc.Suite)
 	}
 	if epoch <= 0 {
 		return out, fmt.Errorf("bad relay response: invalid announcement epoch")
@@ -1168,11 +1214,14 @@ func (c *Client) send(toOrName, body string, attachPaths []string, replyTo int64
 // the issue #53 disappearing-message expiry (0 = never); the sent-log
 // entry is pruned once it passes.
 func (c *Client) sendSealed(address string, plain []byte, sentLogBody string, replyTo int64, quote string, logSent bool, expiresAt int64) (int64, error) {
-	toEd, err := crypto.ParseAddress(address)
+	toAddr, err := crypto.ParseAddressSuite(address)
 	if err != nil {
 		return 0, err
 	}
-	toX, err := c.recipientKey(address)
+	// recipientKeyWithEpoch agrees the announcement suite with the
+	// address suite and returns the descriptor to seal with — the
+	// encryption algorithm is dispatched by suite, never assumed.
+	desc, toX, _, err := c.recipientKeyWithEpoch(address)
 	if err != nil {
 		return 0, fmt.Errorf("recipient key: %w", err)
 	}
@@ -1180,17 +1229,18 @@ func (c *Client) sendSealed(address string, plain []byte, sentLogBody string, re
 	if err != nil {
 		return 0, err
 	}
-	eph, nonce, ct, err := crypto.Seal(&toX, plain)
+	eph, nonce, ct, err := desc.SealMessage(toX[:], plain)
 	if err != nil {
 		return 0, err
 	}
 	sentAt := time.Now().Unix()
-	canon := envelope.Canonical(toEd[:], id.EdPub[:], eph, nonce, sentAt, ct)
+	canon := envelope.Canonical(toAddr.PublicKey, id.EdPub[:], eph, nonce, sentAt, ct)
 	sig := id.Sign(canon)
 
 	data, code, err := c.post("/v1/send", map[string]any{
 		"to":      address,
 		"from":    c.cfg.Address,
+		"suite":   string(crypto.SuiteV1),
 		"eph":     base64.RawURLEncoding.EncodeToString(eph),
 		"nonce":   base64.RawURLEncoding.EncodeToString(nonce),
 		"ct":      base64.RawURLEncoding.EncodeToString(ct),
@@ -1503,6 +1553,7 @@ type Message struct {
 type inboxEnvelope struct {
 	ID          int64    `json:"id"`
 	From        string   `json:"from"`
+	Suite       string   `json:"suite"` // issue #138: "" reads as SuiteV1
 	Eph         string   `json:"eph"`
 	Nonce       string   `json:"nonce"`
 	Ct          string   `json:"ct"`
@@ -1559,10 +1610,26 @@ func (c *Client) fetchEnvelopePage(after int64, limit int) ([]inboxEnvelope, err
 // forged, corrupted, or undecryptable envelope is an error, never a
 // message.
 func (c *Client) openEnvelope(m inboxEnvelope) ([]byte, error) {
-	fromEd, err := crypto.ParseAddress(m.From)
+	// Issue #138: the envelope names its crypto suite. Absent means
+	// SuiteV1 (older senders). The suite must agree with the sender's
+	// and the local recipient's address suites and be one this client
+	// implements — a mismatch is a loud refusal, never a silent v1
+	// open of foreign key material.
+	fromAddr, err := crypto.ParseAddressSuite(m.From)
 	if err != nil {
 		return nil, fmt.Errorf("bad sender address: %w", err)
 	}
+	toAddr, err := crypto.ParseAddressSuite(c.cfg.Address)
+	if err != nil {
+		return nil, fmt.Errorf("bad address: %w", err)
+	}
+	suite, err := crypto.AgreeSuite(m.Suite, fromAddr, toAddr)
+	if err != nil {
+		return nil, fmt.Errorf("crypto suite: %w", err)
+	}
+	// AgreeSuite guarantees a descriptor; every suite-specific
+	// operation below dispatches through it.
+	desc, _ := crypto.Descriptor(suite)
 	eph, err1 := base64.RawURLEncoding.DecodeString(m.Eph)
 	nonce, err2 := base64.RawURLEncoding.DecodeString(m.Nonce)
 	ct, err3 := base64.RawURLEncoding.DecodeString(m.Ct)
@@ -1570,16 +1637,18 @@ func (c *Client) openEnvelope(m inboxEnvelope) ([]byte, error) {
 	if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
 		return nil, errors.New("bad envelope encoding")
 	}
-	toEd, err := crypto.ParseAddress(c.cfg.Address)
-	if err != nil {
-		return nil, fmt.Errorf("bad address: %w", err)
+	if err := desc.ValidateEnvelopeFields(eph, nonce); err != nil {
+		return nil, fmt.Errorf("bad envelope: %w", err)
 	}
-	canon := envelope.Canonical(toEd[:], fromEd[:], eph, nonce, m.SentAt, ct)
-	if !crypto.Verify(fromEd[:], canon, sig) {
+	if err := desc.ValidateSignatureFields(sig); err != nil {
+		return nil, fmt.Errorf("bad envelope: %w", err)
+	}
+	canon := envelope.Canonical(toAddr.PublicKey, fromAddr.PublicKey, eph, nonce, m.SentAt, ct)
+	if !desc.VerifySignature(fromAddr.PublicKey, canon, sig) {
 		return nil, errors.New("sender signature verification failed")
 	}
 	for _, xp := range c.cfg.encryptionPrivKeys() {
-		if p, err := crypto.Open(xp[:], eph, nonce, ct); err == nil {
+		if p, err := desc.OpenMessage(xp[:], eph, nonce, ct); err == nil {
 			return p, nil
 		}
 	}
@@ -1735,6 +1804,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 	inboxEnvs, err := c.fetchEnvelopePage(after, limit)
 	if err != nil {
 		return nil, after, 0, 0, nil, nil, err
+
 	}
 	var out []Message
 	skipped := 0
@@ -1772,6 +1842,17 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// inbox poller, and vice versa.
 		h := envelope.DedupHash(c.cfg.Address, m.From, m.Eph, m.Nonce, m.SentAt, m.Ct, m.Sig)
 		if seen[h] {
+			continue
+		}
+		// Issue #138: the envelope names its crypto suite. Absent means
+		// SuiteV1 (older relays). A suite this client does not understand
+		// is skipped loudly — never trial-decrypted as if it were v1.
+		suite := crypto.Suite(m.Suite)
+		if suite == "" {
+			suite = crypto.SuiteV1
+		}
+		if !crypto.ValidSuite(suite) {
+			skipped++
 			continue
 		}
 		// Blocklist and dismissed requests: messages from these senders

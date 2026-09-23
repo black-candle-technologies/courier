@@ -126,7 +126,7 @@ func (c *Client) SafetyNumberForContact(name string) (number, address string, er
 	if err != nil {
 		return "", "", fmt.Errorf("no local encryption key: %w", err)
 	}
-	contactPub, contactEpoch, err := c.recipientKeyWithEpoch(address)
+	_, contactPub, contactEpoch, err := c.recipientKeyWithEpoch(address)
 	if err != nil {
 		return "", "", err
 	}
@@ -147,7 +147,7 @@ func (c *Client) VerifyContact(name string) error {
 	if err != nil {
 		return err
 	}
-	_, contactEpoch, err := c.recipientKeyWithEpoch(address)
+	_, _, contactEpoch, err := c.recipientKeyWithEpoch(address)
 	if err != nil {
 		return err
 	}
@@ -200,7 +200,7 @@ func (c *Client) ContactTrust(name string) (TrustState, string) {
 	if rec.Address != address {
 		return TrustStale, "contact address changed since verification"
 	}
-	_, epoch, err := c.recipientKeyWithEpoch(address)
+	_, _, epoch, err := c.recipientKeyWithEpoch(address)
 	if err != nil {
 		if rec.KeyEpoch >= 0 {
 			return TrustVerified, "verified (could not revalidate: relay unreachable)"

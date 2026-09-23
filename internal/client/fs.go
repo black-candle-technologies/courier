@@ -79,6 +79,16 @@ type fsPayload struct {
 	PN      int64  `json:"pn,omitempty"`      // previous sending-chain length (msg)
 	Nonce   string `json:"nonce,omitempty"`   // base64url 24B (msg)
 	CT      string `json:"ct,omitempty"`      // base64url secretbox (msg)
+	// Suites is the initiator's offered FS suites, most-preferred first
+	// (issue #138, init only). Absent means an older client that
+	// predates negotiation — the handshake falls back to legacy v1.
+	Suites []string `json:"suites,omitempty"`
+	// Suite is the responder's selected FS suite (issue #138, accept
+	// only). It must be one of the offered suites; anything else is a
+	// tampered or mismatched selection and the handshake is aborted.
+	// Absent means an older responder — legacy v1, unless the peer is
+	// pinned as negotiating (possible downgrade: aborted).
+	Suite string `json:"suite,omitempty"`
 }
 
 // parseFSPayload returns the FS frame if plain is one, false otherwise.
@@ -98,6 +108,66 @@ func parseFSPayload(plain []byte) (fsPayload, bool) {
 		return p, true
 	}
 	return p, false
+}
+
+// ---- FS suite negotiation (issue #138) ----
+
+// fsSelectSuite picks the responder's suite: the most-preferred offered
+// suite this build implements. The responder never invents a suite —
+// no overlap means no handshake (fail closed, never a silent v1
+// assumption about an offer it cannot read).
+func fsSelectSuite(offered []string) (crypto.FSSuite, bool) {
+	for _, s := range offered {
+		if suite := crypto.FSSuite(s); crypto.ValidFSSuite(suite) {
+			return suite, true
+		}
+	}
+	return "", false
+}
+
+// fsCheckSelectedSuite validates the initiator's view of the accept:
+// the selected suite must have been in the offered list and be one
+// this build implements. A selection that was never offered — or that
+// names an unknown suite — is a tampered or mismatched accept, and
+// the handshake is aborted.
+func fsCheckSelectedSuite(selected string, offered []string) (crypto.FSSuite, error) {
+	suite := crypto.FSSuite(selected)
+	if !crypto.ValidFSSuite(suite) {
+		return "", fmt.Errorf("fs: peer selected unknown suite %q", selected)
+	}
+	for _, o := range offered {
+		if o == selected {
+			return suite, nil
+		}
+	}
+	return "", fmt.Errorf("fs: peer selected %q which was not offered", selected)
+}
+
+// fsSuiteDesc resolves the descriptor for a session's negotiated suite.
+// A session that predates negotiation has no suite recorded — it is a
+// legacy v1 session. An unimplemented suite is a loud error, never a
+// silent v1 fallback.
+func fsSuiteDesc(sess *fsSession) (*crypto.FSSuiteDescriptor, error) {
+	suite := crypto.FSSuite(sess.Suite)
+	if suite == "" {
+		suite = crypto.FSSuiteV1
+	}
+	desc, ok := crypto.FSDescriptor(suite)
+	if !ok {
+		return nil, fmt.Errorf("fs: session suite %q not implemented", suite)
+	}
+	return desc, nil
+}
+
+// fsPinNegotiatedLocked records the TOFU downgrade pin: this peer has
+// completed a negotiated handshake, so future handshakes must carry
+// the suite offer/selection. A missing offer or selection afterwards
+// is treated as a stripped-field downgrade attempt.
+func fsPinNegotiatedLocked(ff *fsFile, peer string, suite crypto.FSSuite) {
+	if ff.FSNegotiated == nil {
+		ff.FSNegotiated = map[string]string{}
+	}
+	ff.FSNegotiated[peer] = string(suite)
 }
 
 // fs frame validation errors (internal sentinels; the inbox counts them
@@ -169,6 +239,14 @@ type fsSession struct {
 	Initiator   bool   `json:"initiator"`
 	Established bool   `json:"established"`
 	InitID      string `json:"init_id,omitempty"` // pending only
+	// Suite is the negotiated FS suite (issue #138). Absent means a
+	// legacy session from a pre-negotiation handshake — always v1.
+	Suite string `json:"suite,omitempty"`
+	// Offered is the exact suite list this side offered, pending only.
+	// The accept's selection is checked against it, and its hash is
+	// bound into the session root (downgrade resistance). Erased at
+	// establishment with the other handshake secrets.
+	Offered []string `json:"offered,omitempty"`
 	// Pending-handshake secrets (erased at establishment).
 	RK0       string `json:"rk0,omitempty"`      // base64url 32B
 	EphPriv   string `json:"eph_priv,omitempty"` // base64url 32B
@@ -225,6 +303,13 @@ type fsFile struct {
 	// peer is legacy-only. Pins also keep handshake pressure on
 	// (fsShouldInit) when the relay suppresses directory availability.
 	FSPins map[string]int64 `json:"fs_pins,omitempty"`
+	// FSNegotiated (issue #138) is the suite-negotiation downgrade pin:
+	// address -> the FS suite id of the last negotiated handshake.
+	// Once a peer has negotiated, later handshakes MUST carry the
+	// suite offer/selection — a missing offer or selection is treated
+	// as a stripped-field downgrade attempt and the handshake is
+	// ignored. Like FSPins, pins are permanent; `fs forget` clears them.
+	FSNegotiated map[string]string `json:"fs_negotiated,omitempty"`
 	// Downgrade (issue #110): address -> unix timestamp when a
 	// pinned peer was first observed falling back to legacy with no
 	// current positive capability evidence. Cleared when the peer
@@ -258,6 +343,7 @@ func newFSFile() *fsFile {
 		LastInitAt:        map[string]int64{},
 		RequireFS:         map[string]bool{},
 		FSPins:            map[string]int64{},
+		FSNegotiated:      map[string]string{},
 		Downgrade:         map[string]int64{},
 		DowngradeWarnedAt: map[string]int64{},
 	}
@@ -300,6 +386,9 @@ func loadFSLocked() (*fsFile, error) {
 	}
 	if ff.FSPins == nil {
 		ff.FSPins = map[string]int64{}
+	}
+	if ff.FSNegotiated == nil {
+		ff.FSNegotiated = map[string]string{}
 	}
 	if ff.Downgrade == nil {
 		ff.Downgrade = map[string]int64{}
@@ -488,6 +577,13 @@ func (o *fsSendOutput) erase() {
 // The old chain key is overwritten; the caller must erase the returned
 // message key after sealing.
 func fsAdvanceSendLocked(sess *fsSession) (*fsSendOutput, error) {
+	// Issue #138: every DH/KDF operation dispatches through the
+	// session's negotiated suite — a future suite changes these
+	// primitives additively, without cross-cutting rewrites.
+	desc, err := fsSuiteDesc(sess)
+	if err != nil {
+		return nil, err
+	}
 	now := time.Now().Unix()
 	if sess.RekeyFlag || sess.SentSinceRotate >= fsRotateAfterMessages ||
 		now-sess.LastRotateAt >= fsRotateAfterSeconds {
@@ -499,7 +595,7 @@ func fsAdvanceSendLocked(sess *fsSession) (*fsSendOutput, error) {
 		if err != nil {
 			return nil, err
 		}
-		dh, err := crypto.FSX25519(priv, peerRPK)
+		dh, err := desc.DH(priv, peerRPK)
 		if err != nil {
 			crypto.Zero(priv[:])
 			return nil, err
@@ -510,7 +606,7 @@ func fsAdvanceSendLocked(sess *fsSession) (*fsSendOutput, error) {
 			crypto.Zero(dh[:])
 			return nil, err
 		}
-		newRoot, newSendChain := crypto.FSRootStep(root, dh)
+		newRoot, newSendChain := desc.RootStep(root, dh)
 		crypto.Zero(root[:])
 		crypto.Zero(dh[:])
 		oldSC, _ := fsDecode32(sess.SendChain)
@@ -533,7 +629,7 @@ func fsAdvanceSendLocked(sess *fsSession) (*fsSendOutput, error) {
 	if err != nil {
 		return nil, err
 	}
-	newChain, msgKey := crypto.FSChainStep(chain)
+	newChain, msgKey := desc.ChainStep(chain)
 	crypto.Zero(chain[:])
 	out := &fsSendOutput{
 		SID: sess.SID,
@@ -543,7 +639,7 @@ func fsAdvanceSendLocked(sess *fsSession) (*fsSendOutput, error) {
 	}
 	copy(out.MsgKey[:], msgKey[:])
 	crypto.Zero(msgKey[:])
-	out.WrapKey = crypto.FSAttachWrapKey(out.MsgKey)
+	out.WrapKey = desc.AttachWrapKey(out.MsgKey)
 	sess.SendChain = b64fs.EncodeToString(newChain[:])
 	crypto.Zero(newChain[:])
 	sess.SendN++
@@ -850,6 +946,10 @@ func (c *Client) sendFSInit(address string) error {
 		RK0:    b64fs.EncodeToString(rk0[:]),
 		EphPub: b64fs.EncodeToString(ephPub[:]),
 		RPub:   b64fs.EncodeToString(rPub[:]),
+		// Issue #138: offer the FS suites, most-preferred first. The
+		// responder selects its most-preferred overlap; the exact list
+		// is bound into the session root (downgrade resistance).
+		Suites: crypto.OfferedFSSuites(),
 	}
 	raw, err := json.Marshal(p)
 	if err != nil {
@@ -862,6 +962,7 @@ func (c *Client) sendFSInit(address string) error {
 			InitID: p.InitID, RK0: p.RK0, EphPriv: b64fs.EncodeToString(ephPriv[:]),
 			RatchetPriv: b64fs.EncodeToString(rPriv[:]),
 			RatchetPub:  b64fs.EncodeToString(rPub[:]),
+			Offered:     p.Suites,
 			CreatedAt:   now, LastRotateAt: now,
 			Skipped: map[string]string{},
 		}
@@ -938,13 +1039,41 @@ func (c *Client) handleFSInit(from string, p fsPayload) {
 			crypto.Zero(ephPriv[:])
 			return err
 		}
-		dh1, err := crypto.FSX25519(ephPriv, ephPub)
+		// Issue #138: negotiate the FS suite. The responder selects
+		// its most-preferred suite from the offer — never invents one.
+		// An init without an offer list is an older client: legacy v1
+		// handshake — unless the peer is pinned as negotiating, in
+		// which case the missing offer is a stripped-field downgrade
+		// attempt and the init is ignored.
+		var suite crypto.FSSuite
+		var negotiated bool
+		if len(p.Suites) == 0 {
+			if _, pinned := ff.FSNegotiated[from]; pinned {
+				return errFSIgnored
+			}
+			suite = crypto.FSSuiteV1
+		} else {
+			var ok bool
+			if suite, ok = fsSelectSuite(p.Suites); !ok {
+				// No common suite: fail closed, no handshake. The
+				// peer's refresh will keep retrying; a future suite we
+				// both implement is the only way forward.
+				return errFSIgnored
+			}
+			negotiated = true
+		}
+		desc, ok := crypto.FSDescriptor(suite)
+		if !ok {
+			// Cannot happen: selection above only returns valid suites.
+			return fmt.Errorf("fs: negotiated suite %q not implemented", suite)
+		}
+		dh1, err := desc.DH(ephPriv, ephPub)
 		if err != nil {
 			crypto.Zero(ephPriv[:])
 			crypto.Zero(rPriv[:])
 			return err
 		}
-		dh2, err := crypto.FSX25519(rPriv, rPub)
+		dh2, err := desc.DH(rPriv, rPub)
 		if err != nil {
 			crypto.Zero(ephPriv[:])
 			crypto.Zero(rPriv[:])
@@ -952,14 +1081,26 @@ func (c *Client) handleFSInit(from string, p fsPayload) {
 			return err
 		}
 		crypto.Zero(ephPriv[:])
-		root0 := crypto.FSHandshakeRoot(rk0, dh1, dh2, p.SID)
+		// The selection and the exact offered list are bound into the
+		// root. Anyone who tampers with the offer or relabels the
+		// selection derives a different root — the handshake fails
+		// closed instead of silently downgrading. A legacy (unoffered)
+		// init keeps the old root for interoperability with v0.11.x.
+		var root0 [32]byte
+		if negotiated {
+			t := crypto.FSHSTranscript{Suite: suite, OfferHash: crypto.FSOfferHash(p.Suites)}
+			root0 = desc.HandshakeRoot(rk0, dh1, dh2, p.SID, t)
+		} else {
+			root0 = crypto.FSHandshakeRoot(rk0, dh1, dh2, p.SID)
+		}
 		crypto.Zero(dh1[:])
 		crypto.Zero(dh2[:])
 		now := time.Now().Unix()
-		sendChain0 := crypto.FSInitChain(root0, false)
-		recvChain0 := crypto.FSInitChain(root0, true)
+		sendChain0 := desc.InitChain(root0, false)
+		recvChain0 := desc.InitChain(root0, true)
 		ff.Sessions[from] = &fsSession{
 			Peer: from, SID: p.SID, Initiator: false, Established: true,
+			Suite:     string(suite),
 			CreatedAt: now, LastRotateAt: now,
 			RootKey:        b64fs.EncodeToString(root0[:]),
 			SendChain:      b64fs.EncodeToString(sendChain0[:]),
@@ -984,11 +1125,19 @@ func (c *Client) handleFSInit(from string, p fsPayload) {
 		// is demonstrably back on FS.
 		fsPinCapabilityLocked(ff, from, now)
 		delete(ff.Downgrade, from)
+		if negotiated {
+			// Issue #138: TOFU suite pin — future handshakes with this
+			// peer must carry the offer/selection.
+			fsPinNegotiatedLocked(ff, from, suite)
+		}
 		acc := fsPayload{
 			Magic: fsMagic, Type: fsTypeAccept, Version: fsPayloadVersion,
 			SID: p.SID, InitID: p.InitID,
 			EphPub: b64fs.EncodeToString(ephPub2[:]),
 			RPub:   b64fs.EncodeToString(rPub2[:]),
+		}
+		if negotiated {
+			acc.Suite = string(suite)
 		}
 		accept, err = json.Marshal(acc)
 		return err
@@ -1017,6 +1166,32 @@ func (c *Client) handleFSAccept(from string, p fsPayload) {
 		if sess == nil || sess.Established || sess.InitID != p.InitID || sess.SID != p.SID {
 			return errFSIgnored
 		}
+		// Issue #138: validate the responder's selection against the
+		// offer. The selection must have been offered and be one this
+		// build implements — a tampered or mismatched selection aborts
+		// the handshake instead of establishing on a downgraded suite.
+		// A suitless accept is an older responder: legacy v1 — unless
+		// the peer is pinned as negotiating, in which case the missing
+		// selection is a stripped-field downgrade attempt.
+		var suite crypto.FSSuite
+		var negotiated bool
+		if p.Suite == "" {
+			if _, pinned := ff.FSNegotiated[from]; pinned {
+				return errFSIgnored
+			}
+			suite = crypto.FSSuiteV1
+		} else {
+			var err error
+			if suite, err = fsCheckSelectedSuite(p.Suite, sess.Offered); err != nil {
+				return errFSIgnored
+			}
+			negotiated = true
+		}
+		desc, ok := crypto.FSDescriptor(suite)
+		if !ok {
+			// Cannot happen: validation above only returns valid suites.
+			return fmt.Errorf("fs: selected suite %q not implemented", suite)
+		}
 		rk0, err := fsDecode32(sess.RK0)
 		if err != nil {
 			return err
@@ -1032,28 +1207,40 @@ func (c *Client) handleFSAccept(from string, p fsPayload) {
 			return err
 		}
 		defer crypto.Zero(rPriv[:])
-		dh1, err := crypto.FSX25519(ephPriv, ephPub)
+		dh1, err := desc.DH(ephPriv, ephPub)
 		if err != nil {
 			return err
 		}
 		defer crypto.Zero(dh1[:])
-		dh2, err := crypto.FSX25519(rPriv, rPub)
+		dh2, err := desc.DH(rPriv, rPub)
 		if err != nil {
 			return err
 		}
 		defer crypto.Zero(dh2[:])
-		root0 := crypto.FSHandshakeRoot(rk0, dh1, dh2, p.SID)
+		// Transcript binding mirrors the responder: the selection and
+		// the exact offered list are mixed into the root, so a
+		// middlebox that relabeled the selection on either leg yields
+		// divergent roots and the handshake fails closed.
+		var root0 [32]byte
+		if negotiated {
+			t := crypto.FSHSTranscript{Suite: suite, OfferHash: crypto.FSOfferHash(sess.Offered)}
+			root0 = desc.HandshakeRoot(rk0, dh1, dh2, p.SID, t)
+		} else {
+			root0 = crypto.FSHandshakeRoot(rk0, dh1, dh2, p.SID)
+		}
 		defer crypto.Zero(root0[:])
 		now := time.Now().Unix()
 		sess.Established = true
+		sess.Suite = string(suite)
 		sess.RootKey = b64fs.EncodeToString(root0[:])
-		sendChain0 := crypto.FSInitChain(root0, true)
-		recvChain0 := crypto.FSInitChain(root0, false)
+		sendChain0 := desc.InitChain(root0, true)
+		recvChain0 := desc.InitChain(root0, false)
 		sess.SendChain = b64fs.EncodeToString(sendChain0[:])
 		sess.RecvChain = b64fs.EncodeToString(recvChain0[:])
 		sess.PeerRatchetPub = p.RPub
 		sess.RK0 = ""
 		sess.EphPriv = ""
+		sess.Offered = nil
 		// Rotate the handshake ratchet key on the first send, so the
 		// DH ping-pong starts immediately (design §4.3d).
 		sess.RekeyFlag = true
@@ -1070,6 +1257,11 @@ func (c *Client) handleFSAccept(from string, p fsPayload) {
 		// capability and clears any downgrade marker.
 		fsPinCapabilityLocked(ff, from, now)
 		delete(ff.Downgrade, from)
+		if negotiated {
+			// Issue #138: TOFU suite pin — future handshakes with this
+			// peer must carry the offer/selection.
+			fsPinNegotiatedLocked(ff, from, suite)
+		}
 		return nil
 	})
 }
@@ -1105,6 +1297,11 @@ func fsSkippedCounter(k string) (int64, bool) {
 // sending chain. Old root, chains, ratchet private key, and skipped
 // keys older than the replaced chain are erased.
 func fsDHStepLocked(sess *fsSession, peerRPK [32]byte, pn int64) error {
+	// Issue #138: DH/KDF dispatches through the negotiated suite.
+	desc, err := fsSuiteDesc(sess)
+	if err != nil {
+		return err
+	}
 	now := time.Now().Unix()
 	oldRPKB64 := sess.PeerRatchetPub // the chain being replaced
 	// Drop skipped keys for chains older than the one being replaced;
@@ -1131,7 +1328,7 @@ func fsDHStepLocked(sess *fsSession, peerRPK [32]byte, pn int64) error {
 		}
 		for i := int64(0); i < gap; i++ {
 			var mk [32]byte
-			chain, mk = crypto.FSChainStep(chain)
+			chain, mk = desc.ChainStep(chain)
 			sess.Skipped[fsSkippedEntryKey(oldRPKB64, sess.RecvN+i)] = b64fs.EncodeToString(mk[:])
 			crypto.Zero(mk[:])
 		}
@@ -1141,7 +1338,7 @@ func fsDHStepLocked(sess *fsSession, peerRPK [32]byte, pn int64) error {
 	if err != nil {
 		return err
 	}
-	dh1, err := crypto.FSX25519(ratchetPriv, peerRPK)
+	dh1, err := desc.DH(ratchetPriv, peerRPK)
 	crypto.Zero(ratchetPriv[:])
 	if err != nil {
 		return err
@@ -1151,7 +1348,7 @@ func fsDHStepLocked(sess *fsSession, peerRPK [32]byte, pn int64) error {
 		crypto.Zero(dh1[:])
 		return err
 	}
-	newRoot, recvChain := crypto.FSRootStep(root, dh1)
+	newRoot, recvChain := desc.RootStep(root, dh1)
 	crypto.Zero(root[:])
 	crypto.Zero(dh1[:])
 	oldSC, _ := fsDecode32(sess.SendChain)
@@ -1164,14 +1361,14 @@ func fsDHStepLocked(sess *fsSession, peerRPK [32]byte, pn int64) error {
 		crypto.Zero(recvChain[:])
 		return err
 	}
-	dh2, err := crypto.FSX25519(newPriv, peerRPK)
+	dh2, err := desc.DH(newPriv, peerRPK)
 	if err != nil {
 		crypto.Zero(newRoot[:])
 		crypto.Zero(recvChain[:])
 		crypto.Zero(newPriv[:])
 		return err
 	}
-	newRoot2, sendChain := crypto.FSRootStep(newRoot, dh2)
+	newRoot2, sendChain := desc.RootStep(newRoot, dh2)
 	crypto.Zero(newRoot[:])
 	crypto.Zero(dh2[:])
 	sess.RootKey = b64fs.EncodeToString(newRoot2[:])
@@ -1222,6 +1419,11 @@ func fsTrimSkipped(sess *fsSession) {
 // Handles in-order, replay-from-skipped, and gap (out-of-order) cases.
 // The derived message key is written to msgKey; the caller zeroes it.
 func fsDecryptCurrentChain(sess *fsSession, p fsPayload, rpk [32]byte, msgKey *[32]byte) error {
+	// Issue #138: chain steps dispatch through the negotiated suite.
+	desc, err := fsSuiteDesc(sess)
+	if err != nil {
+		return err
+	}
 	rpkB64 := sess.PeerRatchetPub
 	switch {
 	case p.N < sess.RecvN:
@@ -1241,7 +1443,7 @@ func fsDecryptCurrentChain(sess *fsSession, p fsPayload, rpk [32]byte, msgKey *[
 		if err != nil {
 			return err
 		}
-		nc, mk := crypto.FSChainStep(chain)
+		nc, mk := desc.ChainStep(chain)
 		crypto.Zero(chain[:])
 		sess.RecvChain = b64fs.EncodeToString(nc[:])
 		crypto.Zero(nc[:])
@@ -1261,12 +1463,12 @@ func fsDecryptCurrentChain(sess *fsSession, p fsPayload, rpk [32]byte, msgKey *[
 		}
 		for i := sess.RecvN; i < p.N; i++ {
 			var mk [32]byte
-			chain, mk = crypto.FSChainStep(chain)
+			chain, mk = desc.ChainStep(chain)
 			sess.Skipped[fsSkippedEntryKey(rpkB64, i)] = b64fs.EncodeToString(mk[:])
 			crypto.Zero(mk[:])
 		}
 		fsTrimSkipped(sess)
-		nc, mk := crypto.FSChainStep(chain)
+		nc, mk := desc.ChainStep(chain)
 		crypto.Zero(chain[:])
 		sess.RecvChain = b64fs.EncodeToString(nc[:])
 		crypto.Zero(nc[:])
@@ -1366,7 +1568,12 @@ func (c *Client) fsDecryptMessage(from string, p fsPayload) (plain []byte, wrapK
 			return errFSDecrypt
 		}
 		plain = pt
-		wk = crypto.FSAttachWrapKey(msgKey)
+		// Issue #138: wrap-key derivation follows the session suite.
+		desc, err := fsSuiteDesc(sess)
+		if err != nil {
+			return err
+		}
+		wk = desc.AttachWrapKey(msgKey)
 		sess.MsgsRecvd++
 		return nil
 	})
@@ -1391,6 +1598,9 @@ type FSSessionInfo struct {
 	MsgsRecvd      int64
 	LastRotateAt   int64
 	SinceHandshake int64
+	// Issue #138: the negotiated FS suite (empty on pending sessions;
+	// legacy pre-negotiation sessions report the v1 suite id).
+	Suite string
 	// Issue #110: fail-closed policy, capability pin, downgrade state.
 	RequireFS          bool
 	Pinned             bool
@@ -1423,11 +1633,17 @@ func (c *Client) FSStatus(peer string) ([]FSSessionInfo, error) {
 		}
 		_, pinned := ff.FSPins[addr]
 		downgradeSince, downgrade := ff.Downgrade[addr]
+		suite := sess.Suite
+		if suite == "" {
+			// Legacy pre-negotiation session: always v1.
+			suite = string(crypto.FSSuiteV1)
+		}
 		out = append(out, FSSessionInfo{
 			Peer: addr, Established: sess.Established,
 			Initiator: sess.Initiator, Mode: mode,
 			MsgsSent: sess.MsgsSent, MsgsRecvd: sess.MsgsRecvd,
 			LastRotateAt: sess.LastRotateAt, SinceHandshake: sess.CreatedAt,
+			Suite:     suite,
 			RequireFS: ff.RequireFS[addr], Pinned: pinned,
 			DowngradeSuspected: downgrade, DowngradeSince: downgradeSince,
 		})
@@ -1597,9 +1813,12 @@ func (c *Client) FSForget(peer string) error {
 			ff.PeerModes = map[string]string{}
 		}
 		ff.PeerModes[address] = fsModeOff
-		// Explicit user action, not a downgrade: clear markers.
+		// Explicit user action, not a downgrade: clear markers, including
+		// the suite-negotiation pin (issue #138) so a later fresh
+		// handshake can renegotiate from scratch.
 		delete(ff.Downgrade, address)
 		delete(ff.DowngradeWarnedAt, address)
+		delete(ff.FSNegotiated, address)
 		return nil
 	})
 }

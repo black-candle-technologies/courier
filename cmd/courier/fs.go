@@ -137,8 +137,8 @@ func cmdFSStatus(c *client.Client, cfg *client.Config, peer string) error {
 		if in.Initiator {
 			role = "initiator"
 		}
-		fmt.Printf("%s\n  state: %s (%s), mode: %s\n  messages: %d sent, %d received\n  last rotation: %s\n",
-			name, state, role, in.Mode, in.MsgsSent, in.MsgsRecvd,
+		fmt.Printf("%s\n  state: %s (%s), mode: %s\n  suite: %s\n  messages: %d sent, %d received\n  last rotation: %s\n",
+			name, state, role, in.Mode, in.Suite, in.MsgsSent, in.MsgsRecvd,
 			fsTimeAgo(in.LastRotateAt))
 		// Issue #110: policy, pin, and downgrade state.
 		if in.RequireFS {
