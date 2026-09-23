@@ -2154,10 +2154,15 @@ Session tokens carry issuer/session/expiry/counterparty/boot id,
 mint with the same-or-stronger ceremony rule, verify against the
 receiver-local clock with ~5 minutes of skew tolerance, and are
 bound to the machine boot: each token embeds the kernel boot id
-(`/proc/sys/kernel/random/boot_id` on Linux), and a token whose
-boot id differs from the current one is rejected. Tokens therefore
-survive process restart but die on machine reboot, mirroring
-forward-secrecy session hygiene. A local process can still
+(`/proc/sys/kernel/random/boot_id` on Linux). The boot binding is
+issuer-side only: the issuer's keystore loader drops tokens whose
+boot id differs from the current boot, so pre-reboot tokens are
+never re-served — but a remote receiver cannot check the issuer's
+boot id, and the Tier 1 verification path checks lifetime, scope,
+signature, revocation, and replay only. It is not
+receiver-verifiable reboot revocation. Tokens therefore survive
+process restart but die on machine reboot for the issuer,
+mirroring forward-secrecy session hygiene. A local process can still
 mint tokens, so the boot id is an anti-theft-of-backup measure,
 not a hardware root of trust.
 
@@ -2174,6 +2179,18 @@ The replay set is keyed by attestation id and records the relay
 envelope id: re-evaluating the same envelope (e.g. a second inbox
 consumer) is allowed; reusing one attestation across two envelopes
 is a replay and the second is held.
+
+FIDO2 assertion replay. The WebAuthn challenge is the deterministic
+action hash by design — there is no receiver-issued challenge
+round-trip in this asynchronous protocol (issue #142), and
+what-you-sign-is-what-you-saw still holds because the challenge is
+the hash of the exact bytes the human reviewed. A captured
+assertion re-wrapped in a fresh attestation for the same body
+defeats the envelope-layer dedup above, so the defense is the
+authenticator's signature counter: it must strictly increase per
+enrolled credential (persisted alongside enrollment).
+Authenticators without a counter report 0, which is accepted only
+while the stored value is also 0, per the WebAuthn spec.
 
 Verdicts: `attested` (flagged `vhl_attested`), `missing-attestation`
 and `invalid-attestation` (flagged `vhl_unverified`, held for

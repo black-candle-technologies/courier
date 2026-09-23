@@ -40,8 +40,17 @@ func coseEncodeKey(t *testing.T, pub *ecdsa.PublicKey) []byte {
 // craftAssertion builds a real WebAuthn get-assertion for the test
 // credential: clientDataJSON with the given challenge and origin,
 // authenticatorData for rpID with the given flags, and a valid ECDSA
-// signature from priv.
+// signature from priv. The signature is over the digest
+// SHA-256(authData || SHA-256(clientDataJSON)), as WebAuthn ES256
+// requires.
 func craftAssertion(t *testing.T, priv *ecdsa.PrivateKey, challenge []byte, origin, rpID string, flags byte) string {
+	t.Helper()
+	return craftAssertionWithCount(t, priv, challenge, origin, rpID, flags, 1)
+}
+
+// craftAssertionWithCount is craftAssertion with an explicit
+// authenticator signature counter.
+func craftAssertionWithCount(t *testing.T, priv *ecdsa.PrivateKey, challenge []byte, origin, rpID string, flags byte, signCount uint32) string {
 	t.Helper()
 	clientData := map[string]string{
 		"type":      "webauthn.get",
@@ -57,12 +66,13 @@ func craftAssertion(t *testing.T, priv *ecdsa.PrivateKey, challenge []byte, orig
 	authData = append(authData, rpHash[:]...)
 	authData = append(authData, flags)
 	sc := make([]byte, 4)
-	binary.BigEndian.PutUint32(sc, 1)
+	binary.BigEndian.PutUint32(sc, signCount)
 	authData = append(authData, sc...)
 
 	cdHash := sha256.Sum256(cdJSON)
 	signed := append(append([]byte{}, authData...), cdHash[:]...)
-	r, s, err := ecdsa.Sign(rand.Reader, priv, signed)
+	digest := sha256.Sum256(signed)
+	r, s, err := ecdsa.Sign(rand.Reader, priv, digest[:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,6 +235,43 @@ func TestFIDO2VerificationRejects(t *testing.T) {
 				resignAttestation(t, a, idPriv)
 			},
 		},
+		{
+			name: "clientDataJSON swapped to a different challenge",
+			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey) {
+				// Keep the valid signature but swap the
+				// clientDataJSON for one carrying a different
+				// challenge: the signature no longer binds the
+				// presented client data, so it must be rejected.
+				raw, err := b64.DecodeString(a.Proof.Assertion)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var cred map[string]any
+				if err := json.Unmarshal(raw, &cred); err != nil {
+					t.Fatal(err)
+				}
+				resp, ok := cred["response"].(map[string]any)
+				if !ok {
+					t.Fatal("assertion has no response object")
+				}
+				other := MsgHashOf([]byte("something else"))
+				cdJSON, err := json.Marshal(map[string]string{
+					"type":      "webauthn.get",
+					"challenge": b64.EncodeToString(other[:]),
+					"origin":    "https://dashboard.test",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp["clientDataJSON"] = b64.EncodeToString(cdJSON)
+				raw2, err := json.Marshal(cred)
+				if err != nil {
+					t.Fatal(err)
+				}
+				a.Proof.Assertion = b64.EncodeToString(raw2)
+				resignAttestation(t, a, idPriv)
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -235,5 +282,85 @@ func TestFIDO2VerificationRejects(t *testing.T) {
 				t.Fatalf("verdict = %s (%s), want invalid", out.Verdict, out.Reason)
 			}
 		})
+	}
+}
+
+func TestFIDO2SignCountReplay(t *testing.T) {
+	// A captured assertion re-wrapped in a fresh attestation (new
+	// id, new envelope) defeats the envelope-layer replay dedup —
+	// the authenticator signature counter must catch it: the
+	// counter did not strictly increase.
+	body := []byte("transfer the funds")
+	v, _, idPriv, a := fido2TestSetup(t, body, PresenceFIDO2UV)
+	now := time.Now().Unix()
+	out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "r", Now: now, EnvelopeID: 1})
+	if out.Verdict != VerdictAttested {
+		t.Fatalf("first evaluation should attest, got %v (%s)", out.Verdict, out.Reason)
+	}
+	rewrapped, err := NewTier2Attestation(body, a.Approver, "req-2", ProofFIDO2, PresenceFIDO2UV,
+		Proof{CredentialID: a.Proof.CredentialID, Assertion: a.Proof.Assertion}, idPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out2 := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: rewrapped, Receiver: "r", Now: now, EnvelopeID: 2})
+	if out2.Verdict != VerdictInvalid {
+		t.Fatalf("re-wrapped assertion should be invalid, got %v (%s)", out2.Verdict, out2.Reason)
+	}
+}
+
+func TestFIDO2SignCountIncrease(t *testing.T) {
+	// A strictly increasing counter is accepted and persisted: the
+	// next assertion must beat the new stored value.
+	body := []byte("transfer the funds")
+	v, credPriv, idPriv, a := fido2TestSetup(t, body, PresenceFIDO2UV)
+	now := time.Now().Unix()
+	out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "r", Now: now, EnvelopeID: 1})
+	if out.Verdict != VerdictAttested {
+		t.Fatalf("first evaluation should attest, got %v (%s)", out.Verdict, out.Reason)
+	}
+	h := MsgHashOf(body)
+	next, err := NewTier2Attestation(body, a.Approver, "req-2", ProofFIDO2, PresenceFIDO2UV,
+		Proof{CredentialID: a.Proof.CredentialID, Assertion: craftAssertionWithCount(t, credPriv, h[:],
+			"https://dashboard.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified, 2)}, idPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out2 := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: next, Receiver: "r", Now: now, EnvelopeID: 2})
+	if out2.Verdict != VerdictAttested {
+		t.Fatalf("increased counter should attest, got %v (%s)", out2.Verdict, out2.Reason)
+	}
+}
+
+func TestFIDO2ZeroCounterAuthenticator(t *testing.T) {
+	// Authenticators without a counter report 0 forever; the
+	// WebAuthn spec permits 0 while the stored value is also 0.
+	body := []byte("transfer the funds")
+	v, credPriv, idPriv, setup := fido2TestSetup(t, body, PresenceFIDO2UV)
+	approver, credID := setup.Approver, setup.Proof.CredentialID
+	h := MsgHashOf(body)
+	now := time.Now().Unix()
+	for env := int64(1); env <= 2; env++ {
+		assertion := craftAssertionWithCount(t, credPriv, h[:],
+			"https://dashboard.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified, 0)
+		a, err := NewTier2Attestation(body, approver, "req-zero", ProofFIDO2, PresenceFIDO2UV,
+			Proof{CredentialID: credID, Assertion: assertion}, idPriv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "r", Now: now, EnvelopeID: env})
+		if out.Verdict != VerdictAttested {
+			t.Fatalf("zero-counter evaluation %d should attest, got %v (%s)", env, out.Verdict, out.Reason)
+		}
+	}
+}
+
+func TestCBORByteStringHugeLength(t *testing.T) {
+	// A byte string declaring a 0xffffffffffffffff length must fail
+	// with an error, not panic: the old bounds check computed
+	// uint64(off)+n, which wraps for huge n, and the int(n)
+	// conversion then went negative and panicked the slice.
+	malicious := []byte{0xa1, 0x01, 0x5b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	if _, err := parseCOSEKey(malicious); err == nil {
+		t.Fatal("huge byte-string length should fail, not panic")
 	}
 }

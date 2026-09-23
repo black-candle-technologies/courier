@@ -28,6 +28,15 @@ type Credential struct {
 	Device string `json:"device,omitempty"`
 	// AAGUID optionally records the authenticator model for audit.
 	AAGUID string `json:"aaguid,omitempty"`
+	// SignCount is the latest WebAuthn authenticator signature
+	// counter seen for this credential (webauthn credentials only).
+	// The verifier requires the counter to strictly increase per
+	// credential as the FIDO2 assertion-replay control (a captured
+	// assertion re-wrapped in a fresh attestation still carries the
+	// old counter and is rejected). Authenticators without a
+	// counter report 0 forever; 0 is only accepted when the stored
+	// value is also 0, per the WebAuthn spec.
+	SignCount uint32 `json:"sign_count,omitempty"`
 }
 
 // Approver is one enrolled human in the local registry.
@@ -85,6 +94,15 @@ func (r *Registry) Enroll(identity, name string, cred Credential, tier2HumanAppr
 	}
 	if name != "" {
 		a.Name = name
+	}
+	if a.Revoked {
+		// Re-enrolling a revoked approver starts from a clean
+		// slate: the old credentials were revoked as compromised
+		// (or at least untrusted), and silently resurrecting them
+		// would let KeysFor return a previously compromised key.
+		// Re-enrolling a non-revoked approver preserves existing
+		// credentials (the loop below replaces by id).
+		a.Credentials = nil
 	}
 	a.Revoked = false
 	if cred.EnrolledAt == 0 {
@@ -161,6 +179,24 @@ func (r *Registry) KeysFor(identity string) (edKeys [][]byte, webAuthn []Credent
 		return nil, nil, fmt.Errorf("approver %q has no usable credentials", identity)
 	}
 	return edKeys, webAuthn, nil
+}
+
+// NoteSignCount records the latest authenticator signature counter
+// seen for a WebAuthn credential. The caller must have already
+// decided the new count is acceptable (strictly increasing, or 0/0
+// for counter-less authenticators); this only persists the value so
+// the next assertion is checked against it.
+func (r *Registry) NoteSignCount(identity, credID string, n uint32) {
+	a := r.Approvers[identity]
+	if a == nil {
+		return
+	}
+	for i := range a.Credentials {
+		if a.Credentials[i].ID == credID {
+			a.Credentials[i].SignCount = n
+			return
+		}
+	}
 }
 
 // Enrolled reports whether identity is an enrolled, unrevoked approver.

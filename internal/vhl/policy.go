@@ -353,6 +353,16 @@ func (v *Verifier) VerifyTokenStandalone(tok *SessionToken, receiver string, now
 // in a Tier 2 fido2 proof: the credential must be enrolled for the
 // approver, and the assertion must be a genuine get-assertion over
 // the action hash from that credential.
+//
+// Challenge scheme (deliberate, issue #142): the challenge is the
+// deterministic action hash — what-you-sign-is-what-you-saw — not a
+// receiver-issued nonce. There is no challenge round-trip in this
+// asynchronous protocol, and a receiver-issued challenge would add
+// one. Replay of a captured assertion (re-wrapped in a fresh
+// attestation for the same body) is defeated at two layers instead:
+// the envelope-layer attestation-id dedup catches exact replays, and
+// the authenticator's signature counter below must strictly increase
+// per credential.
 func (v *Verifier) verifyFIDO2Proof(a *Attestation, actionHash []byte) error {
 	if a.Proof.CredentialID == "" {
 		return fmt.Errorf("missing credential id")
@@ -385,5 +395,18 @@ func (v *Verifier) verifyFIDO2Proof(a *Attestation, actionHash []byte) error {
 	// FIDO2UV (user verification) demands the UV flag; plain FIDO2
 	// presence needs the UP flag.
 	requireUV := a.Proof.Strength == PresenceFIDO2UV.String()
-	return verifyWebAuthnAssertion(credPub, a.Proof.Assertion, actionHash, v.WebAuthn, requireUV)
+	signCount, err := verifyWebAuthnAssertion(credPub, a.Proof.Assertion, actionHash, v.WebAuthn, requireUV)
+	if err != nil {
+		return err
+	}
+	// Standard WebAuthn replay control: the counter must strictly
+	// increase per credential. A counter-less authenticator reports
+	// 0 forever, which the spec permits only while the stored value
+	// is also 0.
+	if stored := enrolled.SignCount; signCount <= stored && (stored != 0 || signCount != 0) {
+		return fmt.Errorf("fido2: signature counter did not increase (got %d, want > %d)", signCount, stored)
+	}
+	// KeysFor returns copies, so persist against the registry itself.
+	v.Registry.NoteSignCount(a.Approver, enrolled.ID, signCount)
+	return nil
 }

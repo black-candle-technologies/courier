@@ -14,13 +14,20 @@ var b64 = base64.RawURLEncoding
 
 // Attestation wire version. Versioned so future proof kinds can extend
 // the schema without breaking old verifiers (unknown versions are
-// rejected loudly, never parsed optimistically).
-const attestationVersion = 1
+// rejected loudly, never parsed optimistically). Version 2
+// length-prefixes every variable field in the canonical bytes; v1
+// artifacts still verify (see attestationCanonical).
+const attestationVersion = 2
+
+// First-version artifacts (pre-length-prefix canonical form) still
+// verify: the canonical bytes for v1 are frozen.
+const attestationVersionV1 = 1
 
 // Domain separators keep VHL signatures distinct from every other use
 // of an approver's Ed25519 key: a signature for one can never validate
-// as another. The "-v1" suffix is the scheme version; v1 canonical
-// bytes are frozen.
+// as another. The "-v1" suffix is the scheme version; the separator is
+// shared across attestation versions because the version byte in the
+// canonical form already disambiguates them.
 var (
 	attestDomain = []byte("courier-vhl-attest-v1\x00")
 	tokenDomain  = []byte("courier-vhl-token-v1\x00")
@@ -45,11 +52,18 @@ const (
 	ProofPIN ProofKind = "pin"
 )
 
-// Strength maps a proof kind to its ceremony strength.
+// Strength maps a proof kind to the maximum ceremony strength that
+// kind can deliver. It is the ceiling for the claimed strength in
+// Attestation.Validate: a proof must never claim more than its kind
+// can prove (a PIN proof claiming fido2_uv would otherwise skip FIDO2
+// verification while the receiver trusts the claim). FIDO2 covers
+// both touch-only and user-verified ceremonies; the claimed strength
+// picks which, and the UV flag is cryptographically enforced when
+// fido2_uv is claimed.
 func (k ProofKind) Strength() PresenceStrength {
 	switch k {
 	case ProofFIDO2:
-		return PresenceFIDO2
+		return PresenceFIDO2UV
 	case ProofChallenge:
 		return PresenceChallenge
 	case ProofPIN:
@@ -111,11 +125,26 @@ func MsgHashOf(body []byte) [32]byte { return sha256.Sum256(body) }
 
 // attestationCanonical builds the signed bytes for an attestation.
 // Every field that matters to a verifier is covered; nothing is
-// left to unsigned JSON parsing.
+// left to unsigned JSON parsing. Version 1 artifacts verify with the
+// frozen v1 form; new artifacts use the v2 form, which
+// length-prefixes every variable-length field so field boundaries
+// are unambiguous (v1 concatenated some fields with no delimiter,
+// e.g. ChallengeID || RequestID).
 func attestationCanonical(a *Attestation) ([]byte, error) {
-	if a.Version != attestationVersion {
-		return nil, fmt.Errorf("attestation version %d (want %d)", a.Version, attestationVersion)
+	switch a.Version {
+	case attestationVersionV1:
+		return attestationCanonicalV1(a)
+	case attestationVersion:
+		return attestationCanonicalV2(a)
+	default:
+		return nil, fmt.Errorf("attestation version %d (want %d or %d)", a.Version, attestationVersionV1, attestationVersion)
 	}
+}
+
+// attestationCanonicalV1 is the frozen version-1 canonical form. Do
+// not change: existing v1 signatures verify against exactly these
+// bytes.
+func attestationCanonicalV1(a *Attestation) ([]byte, error) {
 	msgHash, err := b64.DecodeString(a.MsgHash)
 	if err != nil && a.MsgHash != "" {
 		return nil, fmt.Errorf("msg_hash: %w", err)
@@ -166,6 +195,69 @@ func attestationCanonical(a *Attestation) ([]byte, error) {
 		return nil, fmt.Errorf("unknown proof kind %q", a.Proof.Kind)
 	}
 	out = append(out, []byte(a.RequestID)...)
+	return out, nil
+}
+
+// lpField appends a length-prefixed field: an 8-byte big-endian
+// length followed by the bytes. Fixed-width fields (version, tier,
+// timestamps) need no prefix; everything variable-length gets one.
+func lpField(out, b []byte) []byte {
+	var l [8]byte
+	binary.BigEndian.PutUint64(l[:], uint64(len(b)))
+	out = append(out, l[:]...)
+	return append(out, b...)
+}
+
+// attestationCanonicalV2 is the current canonical form: every
+// variable-length field is length-prefixed so no two distinct field
+// tuples can sign identical bytes.
+func attestationCanonicalV2(a *Attestation) ([]byte, error) {
+	msgHash, err := b64.DecodeString(a.MsgHash)
+	if err != nil && a.MsgHash != "" {
+		return nil, fmt.Errorf("msg_hash: %w", err)
+	}
+	if a.MsgHash != "" && len(msgHash) != 32 {
+		return nil, fmt.Errorf("msg_hash: want 32 bytes, got %d", len(msgHash))
+	}
+	id, err := b64.DecodeString(a.ID)
+	if err != nil {
+		return nil, fmt.Errorf("id: %w", err)
+	}
+	out := make([]byte, 0, 256)
+	out = append(out, attestDomain...)
+	out = append(out, byte(a.Version))
+	out = append(out, byte(a.Tier))
+	out = lpField(out, id)
+	out = lpField(out, msgHash)
+	out = lpField(out, []byte(a.Approver))
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(a.IssuedAt))
+	out = append(out, b[:]...)
+	binary.BigEndian.PutUint64(b[:], uint64(a.ExpiresAt))
+	out = append(out, b[:]...)
+	out = lpField(out, []byte(a.Proof.Kind))
+	out = lpField(out, []byte(a.Proof.Strength))
+	switch a.Proof.Kind {
+	case ProofSession:
+		if a.Proof.Token == nil {
+			return nil, fmt.Errorf("session proof without token")
+		}
+		tc, err := a.Proof.Token.canonical()
+		if err != nil {
+			return nil, err
+		}
+		out = lpField(out, tc)
+	case ProofFIDO2:
+		out = lpField(out, []byte(a.Proof.CredentialID))
+		out = lpField(out, []byte(a.Proof.Assertion))
+	case ProofChallenge:
+		out = lpField(out, []byte(a.Proof.ChallengeID))
+	case ProofPIN:
+		// Presence is the ceremony; nothing further to bind.
+	default:
+		return nil, fmt.Errorf("unknown proof kind %q", a.Proof.Kind)
+	}
+	out = lpField(out, []byte(a.RequestID))
 	return out, nil
 }
 
@@ -294,8 +386,8 @@ const Tier2Expiry = 15 * time.Minute
 // Validate checks the attestation's structural invariants without
 // touching signatures or enrollment.
 func (a *Attestation) Validate() error {
-	if a.Version != attestationVersion {
-		return fmt.Errorf("attestation version %d (want %d)", a.Version, attestationVersion)
+	if a.Version != attestationVersionV1 && a.Version != attestationVersion {
+		return fmt.Errorf("attestation version %d (want %d or %d)", a.Version, attestationVersionV1, attestationVersion)
 	}
 	if a.Tier != 1 && a.Tier != 2 {
 		return fmt.Errorf("attestation tier %d (want 1 or 2)", a.Tier)
@@ -340,8 +432,25 @@ func (a *Attestation) Validate() error {
 	default:
 		return fmt.Errorf("unknown proof kind %q", a.Proof.Kind)
 	}
-	if _, err := ParsePresence(a.Proof.Strength); err != nil {
+	claimed, err := ParsePresence(a.Proof.Strength)
+	if err != nil {
 		return fmt.Errorf("proof strength: %w", err)
+	}
+	// The claimed strength must not exceed what the proof kind can
+	// deliver. Without this, a PIN proof could claim fido2_uv and
+	// the receiver would trust the claim while skipping FIDO2
+	// verification entirely.
+	if a.Proof.Kind == ProofSession {
+		// Session proofs are bound to the token: the claimed
+		// strength is exactly the strength at token mint.
+		if a.Proof.Token == nil {
+			return fmt.Errorf("session proof without token")
+		}
+		if a.Proof.Strength != a.Proof.Token.Presence {
+			return fmt.Errorf("session proof strength %q does not match token presence %q", a.Proof.Strength, a.Proof.Token.Presence)
+		}
+	} else if ceiling := a.Proof.Kind.Strength(); !ceiling.Valid() || claimed > ceiling {
+		return fmt.Errorf("proof strength %q exceeds %s proof maximum %q", a.Proof.Strength, a.Proof.Kind, ceiling)
 	}
 	return nil
 }

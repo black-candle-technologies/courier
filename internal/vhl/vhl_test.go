@@ -1,6 +1,7 @@
 package vhl
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"testing"
@@ -243,8 +244,11 @@ func TestTier1SessionFlow(t *testing.T) {
 			t.Fatalf("tier 1 message %q should attest, got %v (%s)", body, out.Verdict, out.Reason)
 		}
 	}
-	// Expired token fails: backdate both ends so the token is
-	// structurally valid but past its lifetime.
+	// Expired token fails: backdate the token so it is structurally
+	// valid but past its lifetime, then give the wrapping
+	// attestation a live lifetime and re-sign it, so evaluation
+	// reaches the token-expiry check (not the attestation-lifetime
+	// check).
 	old := *tok
 	old.IssuedAt = now - 7200
 	old.ExpiresAt = now - 3600
@@ -255,9 +259,14 @@ func TestTier1SessionFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.IssuedAt = now - 60
+	a.ExpiresAt = now + 600
+	if err := SignAttestation(a, priv); err != nil {
+		t.Fatal(err)
+	}
 	out := v.Evaluate(EvalInput{Tier: Tier1, Body: []byte("read file C"), Attestation: a, Receiver: receiver, Now: now})
-	if out.Verdict != VerdictInvalid {
-		t.Fatalf("expired token should fail, got %v", out.Verdict)
+	if out.Verdict != VerdictInvalid || out.Reason != "token-expired" {
+		t.Fatalf("expired token should fail with token-expired, got %v (%s)", out.Verdict, out.Reason)
 	}
 }
 
@@ -488,5 +497,131 @@ func TestFIDO2ProofSchema(t *testing.T) {
 		t.Fatal("fido2 proof without credential id should fail construction")
 	} else if bad != nil {
 		t.Fatal("failed construction should not return an attestation")
+	}
+}
+
+func TestReenrollRevokedApproverDropsCredentials(t *testing.T) {
+	r := NewRegistry()
+	addr, pub, _ := testIdentity(t)
+	oldKeyID := "old-key"
+	if err := r.Enroll(addr, "human", Credential{ID: oldKeyID, Kind: "ed25519", PublicKey: b64.EncodeToString(pub)}, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.RevokeApprover(addr); err != nil {
+		t.Fatal(err)
+	}
+	// Re-enrolling a revoked approver must not resurrect the
+	// compromised credentials: KeysFor must return only the new key.
+	pub2, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Enroll(addr, "human", Credential{ID: "new-key", Kind: "ed25519", PublicKey: b64.EncodeToString(pub2)}, true); err != nil {
+		t.Fatal(err)
+	}
+	keys, _, err := r.KeysFor(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1 || !bytes.Equal(keys[0], []byte(pub2)) {
+		t.Fatal("re-enrolling a revoked approver must drop the old credentials")
+	}
+	// Re-enrolling a non-revoked approver preserves credentials.
+	pub3, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Enroll(addr, "human", Credential{ID: "third-key", Kind: "ed25519", PublicKey: b64.EncodeToString(pub3)}, true); err != nil {
+		t.Fatal(err)
+	}
+	keys, _, err = r.KeysFor(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("non-revoked re-enroll should preserve credentials, got %d keys", len(keys))
+	}
+}
+
+func TestProofStrengthCeiling(t *testing.T) {
+	addr, _, priv := testIdentity(t)
+	body := []byte("high-stakes action")
+	// A PIN proof claiming fido2_uv must fail validation: the
+	// claim would otherwise skip FIDO2 verification while the
+	// receiver trusts it.
+	if _, err := NewTier2Attestation(body, addr, "req-test", ProofPIN, PresenceFIDO2UV, Proof{}, priv); err == nil {
+		t.Fatal("pin proof claiming fido2_uv should fail validation")
+	}
+	// A fido2 proof with strength fido2_uv validates (given valid
+	// fields): FIDO2 covers both touch-only and user-verified
+	// ceremonies, and the UV flag is enforced cryptographically at
+	// verification time.
+	a, err := NewTier2Attestation(body, addr, "req-test", ProofFIDO2, PresenceFIDO2UV,
+		Proof{CredentialID: "cred-abc", Assertion: "eyJ9"}, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatalf("fido2 proof with fido2_uv strength should validate: %v", err)
+	}
+	// A challenge proof claiming fido2 must fail: it exceeds the
+	// challenge kind's ceiling.
+	if _, err := NewTier2Attestation(body, addr, "req-test", ProofChallenge, PresenceFIDO2,
+		Proof{ChallengeID: "ch-1"}, priv); err == nil {
+		t.Fatal("challenge proof claiming fido2 should fail validation")
+	}
+	// A session proof's strength must equal the token's mint presence.
+	_, _, tokPriv := testIdentity(t)
+	tok, err := MintSessionToken(addr, "", PresenceFIDO2UV, DefaultSessionTTL, "boot-1", tokPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sa, err := NewTier1Attestation(tok, tokPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sa.Proof.Strength = PresencePIN.String()
+	if err := sa.Validate(); err == nil {
+		t.Fatal("session proof strength differing from token presence should fail validation")
+	}
+}
+
+func TestAttestationV1BackwardCompat(t *testing.T) {
+	addr, pub, priv := testIdentity(t)
+	body := []byte("sensitive action")
+	a, err := NewTier2Attestation(body, addr, "req-test", ProofPIN, PresencePIN, Proof{}, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A v1 attestation (frozen canonical form) still verifies under
+	// the current code.
+	a.Version = attestationVersionV1
+	if err := SignAttestation(a, priv); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatalf("v1 attestation should validate: %v", err)
+	}
+	if err := VerifyAttestationSignature(a, pub); err != nil {
+		t.Fatalf("v1 attestation signature should verify: %v", err)
+	}
+	// The v1 and v2 canonical bytes for the same fields differ:
+	// versions are domain-separated by the version byte.
+	c1, err := attestationCanonical(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Version = attestationVersion
+	c2, err := attestationCanonical(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(c1, c2) {
+		t.Fatal("v1 and v2 canonical bytes must differ")
+	}
+	// Sanity: the v1 bytes still carry the request id (the v2
+	// length-prefix fix changes framing, not content).
+	if !bytes.Contains(c1, []byte("req-test")) {
+		t.Fatal("v1 canonical should contain the request id")
 	}
 }

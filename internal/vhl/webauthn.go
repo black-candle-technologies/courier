@@ -12,8 +12,12 @@ package vhl
 //   - the origin is one the relying party expects,
 //   - the authenticator data names the relying party id and carries
 //     the user-presence (and user-verification, when required) flags,
-//   - the signature over (authenticatorData || SHA256(clientDataJSON))
-//     verifies under the enrolled credential public key.
+//   - the signature over the assertion verifies under the enrolled
+//     credential public key: SHA-256(authenticatorData ||
+//     SHA-256(clientDataJSON)) for ES256 (the digest, never the
+//     pre-image), the concatenation itself for EdDSA,
+//   - the authenticator's signature counter strictly increases per
+//     credential (the replay control; see policy.go).
 //
 // The ceremony that *produces* the assertion (the dashboard driving
 // navigator.credentials.get) is a separate follow-up; the schema is
@@ -28,7 +32,6 @@ import (
 	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/asn1"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -219,7 +222,10 @@ func (d *cborDecoder) readIntOrBytes() (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		if uint64(d.off)+n > uint64(len(d.buf)) {
+		// Bounds-check against the remaining buffer, not via
+		// off+n: a huge n would wrap uint64(off)+n and then go
+		// negative through int(n), panicking the slice below.
+		if n > uint64(len(d.buf)-d.off) {
 			return nil, fmt.Errorf("truncated byte string")
 		}
 		out := bytes.Clone(d.buf[d.off : d.off+int(n)])
@@ -276,49 +282,56 @@ const (
 // get-assertion. expectedChallenge is the action hash the human
 // reviewed; rp configures the relying party; requireUV demands the
 // user-verification flag (FIDO2UV) rather than presence alone.
-func verifyWebAuthnAssertion(credPub crypto.PublicKey, assertionB64 string, expectedChallenge []byte, rp WebAuthnRP, requireUV bool) error {
+//
+// On success it returns the authenticator's signature counter
+// (authData bytes 33..37): the caller enforces strict monotonicity
+// per credential as the replay control (see policy.go). ES256 signs
+// SHA-256(authData || SHA-256(clientDataJSON)) and Go's ecdsa package
+// takes that digest — passing the pre-image would silently verify
+// nothing. EdDSA signs the concatenation itself (no pre-hash).
+func verifyWebAuthnAssertion(credPub crypto.PublicKey, assertionB64 string, expectedChallenge []byte, rp WebAuthnRP, requireUV bool) (uint32, error) {
 	if rp.ID == "" || len(rp.Origins) == 0 {
-		return fmt.Errorf("fido2: no relying party configured")
+		return 0, fmt.Errorf("fido2: no relying party configured")
 	}
 	rawJSON, err := b64.DecodeString(assertionB64)
 	if err != nil {
-		return fmt.Errorf("fido2: assertion: %w", err)
+		return 0, fmt.Errorf("fido2: assertion: %w", err)
 	}
 	var as webauthnAssertion
 	if err := json.Unmarshal(rawJSON, &as); err != nil {
-		return fmt.Errorf("fido2: assertion json: %w", err)
+		return 0, fmt.Errorf("fido2: assertion json: %w", err)
 	}
 	if as.Type != "" && as.Type != "public-key" {
-		return fmt.Errorf("fido2: bad credential type %q", as.Type)
+		return 0, fmt.Errorf("fido2: bad credential type %q", as.Type)
 	}
 	authData, err := b64.DecodeString(as.Response.AuthenticatorData)
 	if err != nil {
-		return fmt.Errorf("fido2: authenticatorData: %w", err)
+		return 0, fmt.Errorf("fido2: authenticatorData: %w", err)
 	}
 	clientDataJSON, err := b64.DecodeString(as.Response.ClientDataJSON)
 	if err != nil {
-		return fmt.Errorf("fido2: clientDataJSON: %w", err)
+		return 0, fmt.Errorf("fido2: clientDataJSON: %w", err)
 	}
 	sig, err := b64.DecodeString(as.Response.Signature)
 	if err != nil {
-		return fmt.Errorf("fido2: signature: %w", err)
+		return 0, fmt.Errorf("fido2: signature: %w", err)
 	}
 
 	var cd webauthnClientData
 	if err := json.Unmarshal(clientDataJSON, &cd); err != nil {
-		return fmt.Errorf("fido2: clientData json: %w", err)
+		return 0, fmt.Errorf("fido2: clientData json: %w", err)
 	}
 	if cd.Type != "webauthn.get" {
-		return fmt.Errorf("fido2: clientData type %q (want webauthn.get)", cd.Type)
+		return 0, fmt.Errorf("fido2: clientData type %q (want webauthn.get)", cd.Type)
 	}
 	ch, err := b64.DecodeString(cd.Challenge)
 	if err != nil {
-		return fmt.Errorf("fido2: challenge: %w", err)
+		return 0, fmt.Errorf("fido2: challenge: %w", err)
 	}
 	// Constant-time: the challenge is the action hash — an
 	// exact-match value where prefix games must not pass.
 	if subtle.ConstantTimeCompare(ch, expectedChallenge) != 1 {
-		return fmt.Errorf("fido2: challenge is not the action hash")
+		return 0, fmt.Errorf("fido2: challenge is not the action hash")
 	}
 	originOK := false
 	for _, o := range rp.Origins {
@@ -328,24 +341,25 @@ func verifyWebAuthnAssertion(credPub crypto.PublicKey, assertionB64 string, expe
 		}
 	}
 	if !originOK {
-		return fmt.Errorf("fido2: origin %q not allowed", cd.Origin)
+		return 0, fmt.Errorf("fido2: origin %q not allowed", cd.Origin)
 	}
 
 	if len(authData) < 37 {
-		return fmt.Errorf("fido2: authenticatorData too short")
+		return 0, fmt.Errorf("fido2: authenticatorData too short")
 	}
 	rpIDHash := authData[:32]
 	wantRPIDHash := sha256.Sum256([]byte(rp.ID))
 	if subtle.ConstantTimeCompare(rpIDHash, wantRPIDHash[:]) != 1 {
-		return fmt.Errorf("fido2: rp id mismatch")
+		return 0, fmt.Errorf("fido2: rp id mismatch")
 	}
 	flags := authData[32]
 	if flags&authFlagUserPresent == 0 {
-		return fmt.Errorf("fido2: user-presence flag not set")
+		return 0, fmt.Errorf("fido2: user-presence flag not set")
 	}
 	if requireUV && flags&authFlagUserVerified == 0 {
-		return fmt.Errorf("fido2: user-verification flag not set")
+		return 0, fmt.Errorf("fido2: user-verification flag not set")
 	}
+	signCount := binary.BigEndian.Uint32(authData[33:37])
 
 	clientDataHash := sha256.Sum256(clientDataJSON)
 	signed := make([]byte, 0, len(authData)+32)
@@ -354,26 +368,21 @@ func verifyWebAuthnAssertion(credPub crypto.PublicKey, assertionB64 string, expe
 
 	switch k := credPub.(type) {
 	case *ecdsa.PublicKey:
-		var rs struct{ R, S *big.Int }
-		if _, err := asn1.Unmarshal(sig, &rs); err != nil {
-			return fmt.Errorf("fido2: signature der: %w", err)
+		// WebAuthn ES256 signs the digest, not the pre-image.
+		digest := sha256.Sum256(signed)
+		if !ecdsa.VerifyASN1(k, digest[:], sig) {
+			return 0, fmt.Errorf("fido2: signature invalid")
 		}
-		if rs.R == nil || rs.S == nil {
-			return fmt.Errorf("fido2: bad signature")
-		}
-		if !ecdsa.Verify(k, signed, rs.R, rs.S) {
-			return fmt.Errorf("fido2: signature invalid")
-		}
-		return nil
+		return signCount, nil
 	case ed25519.PublicKey:
 		if len(sig) != ed25519.SignatureSize {
-			return fmt.Errorf("fido2: bad ed25519 signature length")
+			return 0, fmt.Errorf("fido2: bad ed25519 signature length")
 		}
 		if !ed25519.Verify(k, signed, sig) {
-			return fmt.Errorf("fido2: signature invalid")
+			return 0, fmt.Errorf("fido2: signature invalid")
 		}
-		return nil
+		return signCount, nil
 	default:
-		return fmt.Errorf("fido2: unsupported credential key type %T", credPub)
+		return 0, fmt.Errorf("fido2: unsupported credential key type %T", credPub)
 	}
 }
