@@ -6,8 +6,10 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/black-candle-technologies/courier/internal/client"
 	"github.com/black-candle-technologies/courier/internal/vhl"
@@ -58,14 +60,59 @@ func cmdVHL(args []string) error {
 
 // confirmTyping prompts the human and requires them to type expect.
 // The typing itself is the local presence signal for PIN-grade
-// ceremonies; it must run on the human's own terminal.
+// ceremonies. It fails closed unless stdin is an interactive
+// terminal: a canned response piped into stdin would authorize
+// enrollment, minting, or approval signing with zero human
+// involvement, defeating the presence signal entirely. This stops
+// the trivial pipe attack — it does not stop a co-located adversary
+// driving a pty. PIN-grade ceremonies attest local presence only;
+// FIDO2 hardware and remote-approver flows are the strong paths.
 func confirmTyping(prompt, expect string) bool {
+	if !stdinIsTerminal() {
+		fmt.Fprintf(os.Stderr, "refusing: human confirmation requires an interactive terminal (stdin is not a terminal)\n")
+		return false
+	}
 	fmt.Fprintf(os.Stderr, "%s: ", prompt)
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil {
 		return false
 	}
 	return strings.TrimSpace(line) == expect
+}
+
+// stdinIsTerminal reports whether stdin is attached to an interactive
+// terminal. The presence signal above is meaningless otherwise.
+func stdinIsTerminal() bool {
+	st, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return st.Mode()&os.ModeCharDevice != 0
+}
+
+// sanitizeForTerminal escapes terminal control sequences in untrusted
+// text. Drafts arrive from external senders, and the approval views
+// below are a what-you-see-is-what-you-sign flow: a verbatim draft
+// could hide or alter the displayed action with ANSI escapes, title
+// changes, or other control bytes. Non-printable runes render as
+// visible Go escapes (e.g. \x1b); newline and tab are kept so drafts
+// stay readable, and printable Unicode passes through untouched.
+// Display only: request validation and the action hash still use the
+// raw draft bytes.
+func sanitizeForTerminal(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\n' || r == '\t':
+			b.WriteRune(r)
+		case unicode.IsPrint(r):
+			b.WriteRune(r)
+		default:
+			b.WriteString(strings.Trim(strconv.QuoteRune(r), "'"))
+		}
+	}
+	return b.String()
 }
 
 func cmdVHLEnroll(c *client.Client, args []string) error {
@@ -260,15 +307,16 @@ func cmdVHLRequest(c *client.Client, args []string) error {
 			return fmt.Errorf("usage: courier vhl request --tier 2 --message TEXT [--presence pin] [--to HUMAN-ADDRESS]")
 		}
 	}
-	if tierStr != "1" && tierStr != "2" {
-		return fmt.Errorf("--tier must be 1 or 2")
-	}
-	var tier vhl.Tier
+	// Tier 1 approvals are session-scoped: VHLApproveMint rejects
+	// them, so recording a Tier 1 request here would be a dead end.
+	// Point the user at session minting instead.
 	if tierStr == "1" {
-		tier = vhl.Tier1
-	} else {
-		tier = vhl.Tier2
+		return fmt.Errorf("tier 1 is session-scoped: mint a session token with `courier vhl session mint` instead of requesting an approval")
 	}
+	if tierStr != "2" {
+		return fmt.Errorf("--tier must be 2")
+	}
+	tier := vhl.Tier2
 	if strings.TrimSpace(message) == "" {
 		return fmt.Errorf("--message is required: the exact draft the human will review")
 	}
@@ -305,7 +353,7 @@ func cmdVHLRequests(c *client.Client) error {
 			q.ID, q.Tier, q.WantPresence, r.From,
 			time.Unix(q.ExpiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"))
 		fmt.Printf("  action hash: %x\n", vhl.MsgHashOf([]byte(q.Draft)))
-		fmt.Printf("  draft: %s\n", q.Draft)
+		fmt.Printf("  draft: %s\n", sanitizeForTerminal(q.Draft))
 	}
 	return nil
 }
@@ -346,7 +394,7 @@ func cmdVHLApprove(c *client.Client, args []string) error {
 	h := vhl.MsgHashOf([]byte(q.Draft))
 	fmt.Printf("request %s from %s — tier %d, wants %s ceremony\n", q.ID, rec.From, q.Tier, q.WantPresence)
 	fmt.Printf("action hash: %x\n", h)
-	fmt.Printf("draft:\n---\n%s\n---\n", q.Draft)
+	fmt.Printf("draft:\n---\n%s\n---\n", sanitizeForTerminal(q.Draft))
 
 	var proof vhl.Proof
 	switch presence {
@@ -368,6 +416,11 @@ func cmdVHLApprove(c *client.Client, args []string) error {
 		}
 		fmt.Printf("challenge %s minted for this action.\n", ch.ID)
 		fmt.Printf("one-time code (deliver OUT-OF-BAND, then enter it here): %s\n", code)
+		// The response models the human answering on the approving
+		// device; a piped code is not a human response.
+		if !stdinIsTerminal() {
+			return fmt.Errorf("refusing: the challenge ceremony requires an interactive terminal (stdin is not a terminal)")
+		}
 		fmt.Fprintf(os.Stderr, "enter code: ")
 		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 		if err != nil {

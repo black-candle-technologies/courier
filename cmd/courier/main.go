@@ -399,7 +399,10 @@ func cmdSend(args []string) error {
 	// Accept flags before or after the positional address/message, as the
 	// usage string documents: Go's flag package stops parsing at the first
 	// positional argument, so extract them manually first.
-	positional, fileVal, replyToVal, attachVals, ttlVal, tierVal, attestVal := splitSendArgs(noForce)
+	positional, fileVal, replyToVal, attachVals, ttlVal, tierVal, attestVal, splitErr := splitSendArgs(noForce)
+	if splitErr != nil {
+		return splitErr
+	}
 	if fileVal != "" {
 		*file = fileVal
 	}
@@ -545,7 +548,11 @@ func cmdSend(args []string) error {
 // positional arguments. Go's flag package stops parsing at the first
 // positional, but the usage string documents flags after the message,
 // so this keeps both working.
-func splitSendArgs(args []string) (positional []string, file, replyTo string, attach []string, ttl string, tier string, attestation string) {
+//
+// A bare --tier with no value, or --tier= with an empty value, is an
+// argument error rather than a silent Tier 0: the human asked for a
+// verification tier and must not get an unattested message instead.
+func splitSendArgs(args []string) (positional []string, file, replyTo string, attach []string, ttl string, tier string, attestation string, err error) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -572,8 +579,13 @@ func splitSendArgs(args []string) (positional []string, file, replyTo string, at
 		case a == "--tier" && i+1 < len(args):
 			tier = args[i+1]
 			i++
+		case a == "--tier":
+			return nil, "", "", nil, "", "", "", fmt.Errorf("--tier needs a value (1 or 2); refusing to send an unattested message")
 		case strings.HasPrefix(a, "--tier="):
 			tier = strings.TrimPrefix(a, "--tier=")
+			if tier == "" {
+				return nil, "", "", nil, "", "", "", fmt.Errorf("--tier needs a value (1 or 2); refusing to send an unattested message")
+			}
 		case a == "--attestation" && i+1 < len(args):
 			attestation = args[i+1]
 			i++
@@ -583,7 +595,7 @@ func splitSendArgs(args []string) (positional []string, file, replyTo string, at
 			positional = append(positional, a)
 		}
 	}
-	return positional, file, replyTo, attach, ttl, tier, attestation
+	return positional, file, replyTo, attach, ttl, tier, attestation, nil
 }
 
 // stringSliceFlag is a repeatable string flag (e.g. --attach a --attach b).

@@ -21,6 +21,7 @@ func TestSplitSendArgs(t *testing.T) {
 		wantTTL   string
 		wantTier  string
 		wantAttst string
+		wantErr   bool
 	}{
 		{
 			name:    "flags before positionals",
@@ -88,10 +89,29 @@ func TestSplitSendArgs(t *testing.T) {
 			wantPos:  []string{"ed25519:abc", "hello"},
 			wantTier: "1",
 		},
+		{
+			name:    "bare trailing --tier is an error, not a silent Tier 0",
+			args:    []string{"ed25519:abc", "hello", "--tier"},
+			wantErr: true,
+		},
+		{
+			name:    "empty --tier= is an error, not a silent Tier 0",
+			args:    []string{"ed25519:abc", "hello", "--tier="},
+			wantErr: true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pos, file, replyTo, att, ttl, tier, attest := splitSendArgs(tc.args)
+			pos, file, replyTo, att, ttl, tier, attest, err := splitSendArgs(tc.args)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("splitSendArgs(%v) = no error, want an argument error", tc.args)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("splitSendArgs(%v) = unexpected error: %v", tc.args, err)
+			}
 			if !reflect.DeepEqual(pos, tc.wantPos) {
 				t.Errorf("positional = %v, want %v", pos, tc.wantPos)
 			}
