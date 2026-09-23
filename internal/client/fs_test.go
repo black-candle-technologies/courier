@@ -113,6 +113,22 @@ func (h *fsHarness) aliceInbox(t *testing.T) []Message {
 	return msgs
 }
 
+// establishedSession loads this side's fs.json (call inside the matching
+// asAlice/asBob closure) and fails the test unless an established FS
+// session with peer exists.
+func (h *fsHarness) establishedSession(t *testing.T, peer string) *fsSession {
+	t.Helper()
+	ff, err := loadFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := ff.session(peer)
+	if sess == nil || !sess.Established {
+		t.Fatalf("no established FS session with %s", shortPeer(peer))
+	}
+	return sess
+}
+
 func (h *fsHarness) bobInbox(t *testing.T) []Message {
 	t.Helper()
 	var msgs []Message
@@ -135,8 +151,10 @@ func (h *fsHarness) bobInbox(t *testing.T) []Message {
 func (h *fsHarness) doHandshake(t *testing.T) {
 	t.Helper()
 	h.asAlice(func() {
-		if err := h.alice.FSSetPeerMode(h.bobCfg.Address, "on"); err != nil {
-			t.Fatalf("alice fs on: %v", err)
+		// Automatic initiation would also work (directory capability),
+		// but the test forces the init directly for determinism.
+		if err := h.alice.sendFSInit(h.bobCfg.Address); err != nil {
+			t.Fatalf("alice fs init: %v", err)
 		}
 	})
 	// Bob's inbox consumes the init and sends the accept (silently).
@@ -148,22 +166,10 @@ func (h *fsHarness) doHandshake(t *testing.T) {
 		t.Fatalf("alice inbox: got %d chat messages, want 0 (handshake is silent)", len(msgs))
 	}
 	h.asAlice(func() {
-		infos, err := h.alice.FSStatus(h.bobCfg.Address)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(infos) != 1 || !infos[0].Established {
-			t.Fatalf("alice session not established: %+v", infos)
-		}
+		h.establishedSession(t, h.bobCfg.Address)
 	})
 	h.asBob(func() {
-		infos, err := h.bob.FSStatus(h.aliceCfg.Address)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(infos) != 1 || !infos[0].Established {
-			t.Fatalf("bob session not established: %+v", infos)
-		}
+		h.establishedSession(t, h.aliceCfg.Address)
 	})
 }
 
@@ -204,9 +210,9 @@ func TestFSHandshakeAndMessaging(t *testing.T) {
 		t.Fatalf("bob inbox: got %d messages, want 5", len(msgs))
 	}
 	h.asBob(func() {
-		infos, _ := h.bob.FSStatus(h.aliceCfg.Address)
-		if len(infos) != 1 || infos[0].MsgsRecvd != 6 {
-			t.Fatalf("bob msgs received: %+v", infos)
+		sess := h.establishedSession(t, h.aliceCfg.Address)
+		if sess.MsgsRecvd != 6 {
+			t.Fatalf("bob msgs received: %d, want 6", sess.MsgsRecvd)
 		}
 	})
 }
@@ -293,13 +299,6 @@ func TestFSLegacyFallback(t *testing.T) {
 		t.Fatalf("bob inbox: %+v", msgs)
 	}
 	h.asAlice(func() {
-		infos, err := h.alice.FSStatus(h.bobCfg.Address)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(infos) != 0 {
-			t.Fatalf("unexpected FS session: %+v", infos)
-		}
 		if _, err := os.Stat(filepath.Join(h.aliceHome, ".courier", "fs.json")); err == nil {
 			// fs.json may exist (neg cache) but must hold no session.
 			ff, err := loadFS()
@@ -313,33 +312,8 @@ func TestFSLegacyFallback(t *testing.T) {
 	})
 }
 
-// TestFSOffDisablesAndErases: `fs off` erases the session and later
-// messages go legacy.
-func TestFSOffDisablesAndErases(t *testing.T) {
-	h := newFSHarness(t)
-	h.doHandshake(t)
-	h.asAlice(func() {
-		if err := h.alice.FSSetPeerMode(h.bobCfg.Address, "off"); err != nil {
-			t.Fatalf("fs off: %v", err)
-		}
-		infos, err := h.alice.FSStatus(h.bobCfg.Address)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(infos) != 0 {
-			t.Fatalf("session not erased: %+v", infos)
-		}
-		if _, err := h.alice.Send(h.bobCfg.Address, "back to legacy"); err != nil {
-			t.Fatalf("send: %v", err)
-		}
-	})
-	msgs := h.bobInbox(t)
-	if len(msgs) != 1 || msgs[0].Body != "back to legacy" {
-		t.Fatalf("bob inbox: %+v", msgs)
-	}
-}
-
-// TestFSForget: forget erases the session and pins the peer off.
+// TestFSForget: forget erases the session; there is no CLI surface —
+// it runs automatically on `courier contacts remove`.
 func TestFSForget(t *testing.T) {
 	h := newFSHarness(t)
 	h.doHandshake(t)
@@ -354,29 +328,36 @@ func TestFSForget(t *testing.T) {
 		if ff.session(h.bobCfg.Address) != nil {
 			t.Fatal("session survived forget")
 		}
-		if ff.PeerModes[h.bobCfg.Address] != "off" {
-			t.Fatalf("peer mode not pinned off: %q", ff.PeerModes[h.bobCfg.Address])
+		if _, ok := ff.Downgrade[h.bobCfg.Address]; ok {
+			t.Fatal("downgrade marker survived forget")
+		}
+		if _, ok := ff.FSNegotiated[h.bobCfg.Address]; ok {
+			t.Fatal("suite-negotiation pin survived forget")
 		}
 	})
 }
 
-// TestFSRekeyRotates: rekey forces a new ratchet key on the next send,
-// and the old chain key is no longer on disk.
-func TestFSRekeyRotates(t *testing.T) {
+// TestFSAutoRekeyRotates: the automatic-rekey policy (#146) rotates the
+// sender ratchet on the next send once 100 messages have gone out since
+// the last rotation, and the old chain key is no longer on disk.
+func TestFSAutoRekeyRotates(t *testing.T) {
 	h := newFSHarness(t)
 	h.doHandshake(t)
 	var beforePub, beforeChain string
 	h.asAlice(func() {
-		ff, err := loadFS()
-		if err != nil {
+		if err := updateFS(func(ff *fsFile) error {
+			sess := ff.session(h.bobCfg.Address)
+			if sess == nil || !sess.Established {
+				t.Fatal("no established session")
+			}
+			beforePub, beforeChain = sess.RatchetPub, sess.SendChain
+			// Trip the message-count leg of the automatic-rekey policy.
+			sess.SentSinceRotate = fsAutoRekeyAfterMessages
+			return nil
+		}); err != nil {
 			t.Fatal(err)
 		}
-		sess := ff.session(h.bobCfg.Address)
-		beforePub, beforeChain = sess.RatchetPub, sess.SendChain
-		if err := h.alice.FSRekey(h.bobCfg.Address); err != nil {
-			t.Fatalf("rekey: %v", err)
-		}
-		if _, err := h.alice.Send(h.bobCfg.Address, "after rekey"); err != nil {
+		if _, err := h.alice.Send(h.bobCfg.Address, "after auto rekey"); err != nil {
 			t.Fatalf("send: %v", err)
 		}
 		ff2, err := loadFS()
@@ -385,16 +366,89 @@ func TestFSRekeyRotates(t *testing.T) {
 		}
 		sess2 := ff2.session(h.bobCfg.Address)
 		if sess2.RatchetPub == beforePub {
-			t.Fatal("ratchet public key unchanged after rekey")
+			t.Fatal("ratchet public key unchanged after automatic rekey")
 		}
 		if sess2.SendChain == beforeChain {
-			t.Fatal("send chain unchanged after rekey")
+			t.Fatal("send chain unchanged after automatic rekey")
+		}
+		if sess2.SentSinceRotate != 1 {
+			t.Fatalf("SentSinceRotate = %d, want 1 (reset by rotation, then this send)", sess2.SentSinceRotate)
 		}
 	})
 	msgs := h.bobInbox(t)
-	if len(msgs) != 1 || msgs[0].Body != "after rekey" {
+	if len(msgs) != 1 || msgs[0].Body != "after auto rekey" {
 		t.Fatalf("bob inbox: %+v", msgs)
 	}
+}
+
+// TestFSAutoRekeyTimeBased: the 7-day leg of the automatic-rekey policy
+// rotates the ratchet even when few messages were sent.
+func TestFSAutoRekeyTimeBased(t *testing.T) {
+	h := newFSHarness(t)
+	h.doHandshake(t)
+	var beforePub string
+	h.asAlice(func() {
+		if err := updateFS(func(ff *fsFile) error {
+			sess := ff.session(h.bobCfg.Address)
+			if sess == nil || !sess.Established {
+				t.Fatal("no established session")
+			}
+			beforePub = sess.RatchetPub
+			// Age the session past the 7-day rotation window.
+			sess.LastRotateAt -= fsAutoRekeyAfterSeconds + 1
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.alice.Send(h.bobCfg.Address, "time-based rekey"); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+		ff2, err := loadFS()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sess2 := ff2.session(h.bobCfg.Address); sess2.RatchetPub == beforePub {
+			t.Fatal("ratchet public key unchanged after time-based automatic rekey")
+		}
+	})
+	msgs := h.bobInbox(t)
+	if len(msgs) != 1 || msgs[0].Body != "time-based rekey" {
+		t.Fatalf("bob inbox: %+v", msgs)
+	}
+}
+
+// TestFSActive: the "Forward secrecy: active/inactive" line in
+// `courier contacts show` reads established-session state (#146).
+func TestFSActive(t *testing.T) {
+	h := newFSHarness(t)
+	h.asAlice(func() {
+		active, err := h.alice.FSActive(h.bobCfg.Address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if active {
+			t.Fatal("FS reported active before any handshake")
+		}
+	})
+	h.doHandshake(t)
+	h.asAlice(func() {
+		active, err := h.alice.FSActive(h.bobCfg.Address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !active {
+			t.Fatal("FS not reported active after handshake")
+		}
+	})
+	h.asBob(func() {
+		active, err := h.bob.FSActive(h.aliceCfg.Address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !active {
+			t.Fatal("FS not reported active on bob's side after handshake")
+		}
+	})
 }
 
 // TestFSHandshakeNotInSentLog: init/accept frames are machine traffic
@@ -402,8 +456,8 @@ func TestFSRekeyRotates(t *testing.T) {
 func TestFSHandshakeNotInSentLog(t *testing.T) {
 	h := newFSHarness(t)
 	h.asAlice(func() {
-		if err := h.alice.FSSetPeerMode(h.bobCfg.Address, "on"); err != nil {
-			t.Fatalf("fs on: %v", err)
+		if err := h.alice.sendFSInit(h.bobCfg.Address); err != nil {
+			t.Fatalf("fs init: %v", err)
 		}
 	})
 	h.bobInbox(t)   // consumes init, sends accept
@@ -757,20 +811,19 @@ func TestFSSuiteNegotiatedV1(t *testing.T) {
 		{h.alice, h.asAlice, h.bobCfg.Address},
 		{h.bob, h.asBob, h.aliceCfg.Address},
 	} {
-		var infos []FSSessionInfo
 		tc.asWho(func() {
-			var err error
-			infos, err = tc.c.FSStatus(tc.peer)
+			ff, err := loadFS()
 			if err != nil {
 				t.Fatal(err)
 			}
+			sess := ff.session(tc.peer)
+			if sess == nil || !sess.Established {
+				t.Fatalf("session not established: %+v", sess)
+			}
+			if sess.Suite != fsV1ID {
+				t.Fatalf("negotiated suite = %q, want %q", sess.Suite, fsV1ID)
+			}
 		})
-		if len(infos) != 1 || !infos[0].Established {
-			t.Fatalf("session not established: %+v", infos)
-		}
-		if infos[0].Suite != fsV1ID {
-			t.Fatalf("negotiated suite = %q, want %q", infos[0].Suite, fsV1ID)
-		}
 		// The TOFU downgrade pin is set on both sides.
 		tc.asWho(func() {
 			ff, err := loadFS()

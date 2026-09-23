@@ -933,18 +933,17 @@ legacy client would display as chat garbage):
    results 10 minutes.
 2. **Handshake memory:** a previous successful handshake with the
    address — no re-probing, ever.
-3. **Explicit user intent:** `courier fs on <peer>` marks the peer
-   capable and initiates; `courier fs start <peer>` initiates when
-   capability is already known.
-4. **Inbound proof:** receiving a valid `fs-init` proves the peer
-   speaks FS; the client records it and answers.
+3. **Inbound proof:** receiving a valid `fs-init` proves the peer
+   speaks FS; the client records it and answers — automatically, with
+   no prompt.
 
 Peers with private handles (or no handle) cannot advertise `fs`
-through the directory; for them FS starts with `courier fs on`.
+through the directory; for them FS starts when they initiate (inbound
+proof) or once a handshake has been observed.
 
-**Opt-out:** `courier fs off <peer>` disables FS for a peer (legacy
-only). `courier fs forget <peer>` erases the session and sets the
-peer to off.
+There are no manual FS controls (#146): no opt-out, no per-peer
+modes. `courier contacts remove` erases the peer's FS session as part
+of contact removal.
 
 ### 15.3 Handshake (X3DH-shaped, no prekeys)
 The initiator generates `rk0` (32 random bytes), an ephemeral X25519
@@ -997,8 +996,8 @@ The rules are strict on both sides:
   (`fs.json` `fs_negotiated`). Later handshakes with that peer MUST
   carry the offer/selection — a missing `suites` on init or a
   missing `suite` on accept is treated as a stripped-field
-  downgrade attempt and ignored. The pin persists until
-  `courier fs forget <peer>` clears it.
+  downgrade attempt and ignored. The pin persists until contact
+  removal erases the peer's FS state.
 - **All DH/KDF dispatches through the negotiated suite's
   descriptor** (`crypto.FSSuiteDescriptor`): handshake DH, root
   derivation, chain steps, root steps, and attachment wrap keys. A
@@ -1039,23 +1038,20 @@ it without euphemism:
   **legacy**: the client sends `fs-init` (best-effort protocol DM)
   *and* delivers the message via legacy seal in the same call
   (`fsPrepareSend`, `internal/client/fs.go`). Only from the next
-  message is the session used. `courier fs start <peer>`
-  pre-establishes a session for conversations that must be FS from
-  message one.
+  message is the session used.
 - A failed or unanswered `fs-init` means the message (and later ones,
   until the next due init) go legacy. **A network attacker who
   suppresses `fs-init`/`fs-accept` traffic keeps the conversation on
   legacy encryption** — the relay is in exactly the position to do
   this (issue #110). This downgrade is silent at the protocol layer;
-  `courier fs status` shows whether a conversation is actually under
-  FS so users can verify. Per-contact enforcement exists (issue #110): `courier fs require <peer>`
-  opts a contact into fail-closed sends — `fsPrepareSend` refuses legacy
-  unless an FS session is established. Observed FS capability is pinned
-  per contact, so handshake pressure continues even when the relay
-  suppresses directory availability; a pinned peer suddenly reachable
-  only via legacy is flagged `DOWNGRADE SUSPECTED` in
-  `courier fs status` plus a rate-limited send-time warning.
-- Protocol DMs (group/channel/state/handshake traffic) stay
+  `courier contacts show <name>` reports `forward secrecy:
+  active/inactive` so users can verify. Observed FS capability is
+  pinned per contact, so handshake pressure continues even when the
+  relay suppresses directory availability; a pinned peer suddenly
+  reachable only via legacy raises a rate-limited send-time warning.
+  There is no fail-closed option (#146): sends never block on a
+  handshake round-trip.
+- Protocol DMs (group/handshake traffic) stay
   legacy-sealed by design: delivery reliability matters more for
   machine state, and the inbox pipeline decrypts FS before dispatch.
   FS applies only to human sends (`logSent=true`).
@@ -1078,7 +1074,7 @@ sent over FS, only their relay-side metadata (blob id, size, timing).
   under the config lock). It holds **only current keys**: root key,
   current send/recv chain keys + counters, current ratchet keypair,
   peer ratchet pub, bounded skipped keys (≤100), capability
-  mode/cache, handshake state. Superseded keys are overwritten on
+  cache, handshake state. Superseded keys are overwritten on
   every advance; message keys exist only in memory for one
   encrypt/decrypt, then zeroed. (`crypto.Zero` is best-effort memory
   hygiene — Go offers no locked-memory primitive, and the code says
@@ -1097,14 +1093,10 @@ sent over FS, only their relay-side metadata (blob id, size, timing).
 
 ### 15.8 CLI
 
-```
-courier fs status [<peer>]   show FS sessions (peer, established, negotiated suite, messages sent, last DH rotation, mode)
-courier fs start <peer>      initiate a handshake now (needs known capability or `fs on`)
-courier fs on <peer>         mark peer FS-capable and initiate
-courier fs off <peer>        disable FS for peer (legacy only from now on)
-courier fs rekey <peer>      force a DH rotation on next send
-courier fs forget <peer>     erase the session (implies off)
-```
+There are no `courier fs` commands (#146) — forward secrecy is fully
+automatic. `courier contacts show <name>` reports `forward secrecy:
+active/inactive` for the peer, and `courier contacts remove <name>`
+erases the peer's FS session as part of contact removal.
 
 ## 16. Group messaging (issue #32)
 
