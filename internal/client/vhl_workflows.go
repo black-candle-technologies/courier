@@ -10,7 +10,6 @@ package client
 import (
 	"crypto/ed25519"
 	"crypto/subtle"
-	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -21,72 +20,6 @@ import (
 	"github.com/black-candle-technologies/courier/internal/vhl"
 )
 
-// vhlStoreChallenges seals the challenge list into the keystore
-// (mirror of the token keystore: challenges are bearer-adjacent
-// secrets until consumed).
-func (c *Client) vhlStoreChallenges(chs []*vhl.Challenge) error {
-	key, err := c.vhlSealKey()
-	if err != nil {
-		return err
-	}
-	raw, err := json.Marshal(chs)
-	if err != nil {
-		return err
-	}
-	sealed, err := vhl.SealTokens(raw, key)
-	if err != nil {
-		return err
-	}
-	for i := range raw {
-		raw[i] = 0
-	}
-	return updateVHL(func(ff *vhlFile) error {
-		ff.SealedChall = b64.EncodeToString(sealed)
-		return nil
-	})
-}
-
-// vhlLoadChallenges opens the challenge store, dropping expired ones.
-func (c *Client) vhlLoadChallenges() ([]*vhl.Challenge, error) {
-	ff, err := loadVHL()
-	if err != nil {
-		return nil, err
-	}
-	if ff.SealedChall == "" {
-		return nil, nil
-	}
-	key, err := c.vhlSealKey()
-	if err != nil {
-		return nil, err
-	}
-	sealed, err := b64.DecodeString(ff.SealedChall)
-	if err != nil {
-		return nil, fmt.Errorf("challenge store: %w", err)
-	}
-	raw, err := vhl.OpenTokens(sealed, key)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		for i := range raw {
-			raw[i] = 0
-		}
-	}()
-	var chs []*vhl.Challenge
-	if err := json.Unmarshal(raw, &chs); err != nil {
-		return nil, fmt.Errorf("challenge store: %w", err)
-	}
-	now := time.Now().Unix()
-	var live []*vhl.Challenge
-	for _, ch := range chs {
-		if ch == nil || ch.Used || ch.ExpiresAt <= now {
-			continue
-		}
-		live = append(live, ch)
-	}
-	return live, nil
-}
-
 // VHLMintChallenge mints an out-of-band challenge bound to the exact
 // action bytes and returns the challenge plus its one-time code. The
 // code is shown once: deliver it to the approver over an
@@ -95,16 +28,30 @@ func (c *Client) VHLMintChallenge(action []byte) (*vhl.Challenge, string, error)
 	if len(action) == 0 {
 		return nil, "", fmt.Errorf("action bytes required")
 	}
+	key, err := c.vhlSealKey()
+	if err != nil {
+		return nil, "", err
+	}
 	ch, code, err := vhl.MintChallenge(action, 0)
 	if err != nil {
 		return nil, "", err
 	}
-	chs, err := c.vhlLoadChallenges()
-	if err != nil {
-		return nil, "", err
-	}
-	chs = append(chs, ch)
-	if err := c.vhlStoreChallenges(chs); err != nil {
+	// Open, append, and reseal inside one lock-protected critical
+	// section: two concurrent mints must not lose one another's
+	// challenge (issue #142 review).
+	if err := updateVHL(func(ff *vhlFile) error {
+		chs, err := openChallengesLocked(ff.SealedChall, key)
+		if err != nil {
+			return err
+		}
+		live := append(vhlLiveChallenges(chs, time.Now().Unix()), ch)
+		sealed, err := sealChallengesLocked(live, key)
+		if err != nil {
+			return err
+		}
+		ff.SealedChall = sealed
+		return nil
+	}); err != nil {
 		return nil, "", err
 	}
 	return ch, code, nil
@@ -114,28 +61,42 @@ func (c *Client) VHLMintChallenge(action []byte) (*vhl.Challenge, string, error)
 // success or failure — consumes the challenge (single-use, no
 // brute-force retries against the code).
 func (c *Client) VHLVerifyChallenge(challengeID, code string) error {
-	chs, err := c.vhlLoadChallenges()
+	key, err := c.vhlSealKey()
 	if err != nil {
 		return err
 	}
-	var found *vhl.Challenge
-	for _, ch := range chs {
-		if ch.ID == challengeID {
-			found = ch
-			break
+	var verr error
+	// The lookup, the single-use consume, and the reseal happen in
+	// one lock-protected critical section: two concurrent
+	// verifications of the same challenge cannot both succeed
+	// (issue #142 review). Only the seal key derivation happens
+	// outside the lock — never network I/O.
+	if err := updateVHL(func(ff *vhlFile) error {
+		chs, err := openChallengesLocked(ff.SealedChall, key)
+		if err != nil {
+			return err
 		}
-	}
-	if found == nil {
-		return fmt.Errorf("unknown or expired challenge")
-	}
-	verr := found.Verify(code, time.Now().Unix())
-	var rest []*vhl.Challenge
-	for _, ch := range chs {
-		if ch.ID != challengeID {
+		now := time.Now().Unix()
+		var found *vhl.Challenge
+		var rest []*vhl.Challenge
+		for _, ch := range vhlLiveChallenges(chs, now) {
+			if ch.ID == challengeID {
+				found = ch
+				continue
+			}
 			rest = append(rest, ch)
 		}
-	}
-	if err := c.vhlStoreChallenges(rest); err != nil {
+		if found == nil {
+			return fmt.Errorf("unknown or expired challenge")
+		}
+		sealed, err := sealChallengesLocked(rest, key)
+		if err != nil {
+			return err
+		}
+		ff.SealedChall = sealed
+		verr = found.Verify(code, now)
+		return nil
+	}); err != nil {
 		return err
 	}
 	return verr
@@ -467,25 +428,44 @@ func (c *Client) VHLMintSessionToken(scope string, ttl time.Duration, presence v
 	if err != nil {
 		return nil, fmt.Errorf("identity: %w", err)
 	}
-	toks, err := c.vhlLoadTokens()
+	key, err := c.vhlSealKey()
 	if err != nil {
 		return nil, err
 	}
-	// Same-or-stronger re-mint (issue #142): a token minted under a
-	// stronger ceremony must never be renewable with a weaker one —
-	// no downgrade path.
-	for _, t := range toks {
-		if !t.MayRemint(presence) {
-			cur, _ := t.MintPresence()
-			return nil, fmt.Errorf("cannot re-mint with %q: live token %s was minted with stronger ceremony %q", presence, t.ID, cur)
+	var tok *vhl.SessionToken
+	// Load, guard, mint, and reseal inside one lock-protected
+	// critical section: the same-or-stronger re-mint check and the
+	// keystore append must see each other's writes, or a concurrent
+	// mint slips past the ceremony-downgrade guard (issue #142
+	// review). Only local crypto and the seal key derivation run
+	// here — never network I/O.
+	if err := updateVHL(func(ff *vhlFile) error {
+		toks, err := openTokensLocked(ff.SealedTokens, key)
+		if err != nil {
+			return err
 		}
-	}
-	tok, err := vhl.MintSessionToken(c.cfg.Address, scope, presence, ttl, vhlBootIDNow(), id.EdPriv)
-	if err != nil {
-		return nil, err
-	}
-	toks = append(toks, tok)
-	if err := c.vhlStoreTokens(toks); err != nil {
+		live := vhlLiveTokens(toks)
+		// Same-or-stronger re-mint (issue #142): a token minted under a
+		// stronger ceremony must never be renewable with a weaker one —
+		// no downgrade path.
+		for _, t := range live {
+			if !t.MayRemint(presence) {
+				cur, _ := t.MintPresence()
+				return fmt.Errorf("cannot re-mint with %q: live token %s was minted with stronger ceremony %q", presence, t.ID, cur)
+			}
+		}
+		tok, err = vhl.MintSessionToken(c.cfg.Address, scope, presence, ttl, vhlBootIDNow(), id.EdPriv)
+		if err != nil {
+			return err
+		}
+		live = append(live, tok)
+		sealed, err := sealTokensLocked(live, key)
+		if err != nil {
+			return err
+		}
+		ff.SealedTokens = sealed
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	return tok, nil
@@ -501,49 +481,63 @@ func (c *Client) VHLSessionStatus() ([]*vhl.SessionToken, error) {
 // served again. When broadcast is set, the revocation is also sent
 // to every contact as a vhl-revoke frame.
 func (c *Client) VHLRevokeSessionToken(idOrPrefix string, broadcast bool) error {
-	toks, err := c.vhlLoadTokens()
-	if err != nil {
-		return err
-	}
-	var hit *vhl.SessionToken
-	for _, t := range toks {
-		if t.ID == idOrPrefix || strings.HasPrefix(t.ID, idOrPrefix) {
-			if hit != nil {
-				return fmt.Errorf("ambiguous token id prefix %q", idOrPrefix)
-			}
-			hit = t
-		}
-	}
-	if hit == nil {
-		return fmt.Errorf("no live session token %q", idOrPrefix)
-	}
 	id, err := c.cfg.Identity()
 	if err != nil {
 		return fmt.Errorf("identity: %w", err)
 	}
-	now := time.Now().Unix()
-	rv := &vhl.Revocation{
-		Version:  1,
-		Issuer:   c.cfg.Address,
-		IssuedAt: now,
-		TokenIDs: []string{hit.ID},
-	}
-	if err := vhl.SignRevocation(rv, id.EdPriv); err != nil {
+	key, err := c.vhlSealKey()
+	if err != nil {
 		return err
 	}
+	var rv *vhl.Revocation
+	// The revocation apply and the keystore drop happen in one
+	// lock-protected critical section: the old load-then-store
+	// split let a concurrent mint's token survive (or a concurrent
+	// revoke's store restore the just-revoked token), because each
+	// side overwrote the other's keystore write (issue #142
+	// review).
 	if err := updateVHL(func(ff *vhlFile) error {
+		toks, err := openTokensLocked(ff.SealedTokens, key)
+		if err != nil {
+			return err
+		}
+		live := vhlLiveTokens(toks)
+		var hit *vhl.SessionToken
+		for _, t := range live {
+			if t.ID == idOrPrefix || strings.HasPrefix(t.ID, idOrPrefix) {
+				if hit != nil {
+					return fmt.Errorf("ambiguous token id prefix %q", idOrPrefix)
+				}
+				hit = t
+			}
+		}
+		if hit == nil {
+			return fmt.Errorf("no live session token %q", idOrPrefix)
+		}
+		now := time.Now().Unix()
+		rv = &vhl.Revocation{
+			Version:  1,
+			Issuer:   c.cfg.Address,
+			IssuedAt: now,
+			TokenIDs: []string{hit.ID},
+		}
+		if err := vhl.SignRevocation(rv, id.EdPriv); err != nil {
+			return err
+		}
 		ff.Revoked.Apply(rv, now)
+		var rest []*vhl.SessionToken
+		for _, t := range live {
+			if t.ID != hit.ID {
+				rest = append(rest, t)
+			}
+		}
+		sealed, err := sealTokensLocked(rest, key)
+		if err != nil {
+			return err
+		}
+		ff.SealedTokens = sealed
 		return nil
 	}); err != nil {
-		return err
-	}
-	var rest []*vhl.SessionToken
-	for _, t := range toks {
-		if t.ID != hit.ID {
-			rest = append(rest, t)
-		}
-	}
-	if err := c.vhlStoreTokens(rest); err != nil {
 		return err
 	}
 	if broadcast {

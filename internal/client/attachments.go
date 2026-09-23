@@ -408,11 +408,14 @@ func (c *Client) FetchMessage(id int64) (Message, error) {
 		ReplyTo: rinfo.To, ReplyQuote: rinfo.Quote, Bridge: bmeta,
 		Bridged: bridged, Flags: flags,
 	}
-	// issue #142: the explicit fetch also reports the VHL status
-	// (read-only here: the inbox path is the policy enforcement
-	// point, and the verifier is built per call so the replay
-	// guard's envelope awareness keeps this from consuming the
-	// attestation out from under the inbox consumer).
+	// issue #142: the explicit fetch also reports the VHL status.
+	// This is strictly read-only: the inbox path is the policy
+	// enforcement point, so the attestation id is never persisted
+	// here — otherwise an explicit fetch of a replayed envelope B
+	// would mark the shared id and cause the inbox to hold the
+	// original envelope A as the replay instead. The verifier is
+	// built per call and discarded, so its fetch-local replay mark
+	// cannot leak out either.
 	if tier, att := parseVHLPayload(plain); tier != vhl.Tier0 || att != nil {
 		vfr, verr := c.vhlVerifier()
 		var out vhl.EvalOutcome
@@ -420,7 +423,6 @@ func (c *Client) FetchMessage(id int64) (Message, error) {
 			out = vhl.EvalOutcome{Verdict: vhl.VerdictInvalid, Tier: tier, Reason: "vhl-unavailable"}
 		} else {
 			out = c.vhlEvaluateInbound(vfr, tier, []byte(body), att, m.ID)
-			_ = vhlMergeSeen(vfr)
 		}
 		msg.VHL = &VHLStatus{
 			Tier: int(tier), Verdict: out.Verdict.String(),

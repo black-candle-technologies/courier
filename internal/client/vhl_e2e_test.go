@@ -243,7 +243,7 @@ func TestVHLReplayHeldAcrossEnvelopes(t *testing.T) {
 	if _, err := env.sender.VHLMintSessionToken("", 0, vhl.PresencePIN); err != nil {
 		t.Fatalf("mint session token: %v", err)
 	}
-	att, err := env.sender.vhlAttestForSend(vhl.Tier1, "rotate keys", nil)
+	att, err := env.sender.vhlAttestForSend(vhl.Tier1, "rotate keys", nil, env.recipCfg.Address)
 	if err != nil {
 		t.Fatalf("attest: %v", err)
 	}
@@ -445,7 +445,7 @@ func TestVHLTier0WithAttestationRejected(t *testing.T) {
 	if _, err := env.sender.VHLMintSessionToken("", 0, vhl.PresencePIN); err != nil {
 		t.Fatalf("mint: %v", err)
 	}
-	att, err := env.sender.vhlAttestForSend(vhl.Tier1, "hello", nil)
+	att, err := env.sender.vhlAttestForSend(vhl.Tier1, "hello", nil, env.recipCfg.Address)
 	if err != nil {
 		t.Fatalf("attest: %v", err)
 	}

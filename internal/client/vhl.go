@@ -231,46 +231,35 @@ func (c *Client) vhlSealKey() ([32]byte, error) {
 	return vhl.DeriveSealKey(id.Seed), nil
 }
 
-// vhlStoreTokens seals the token list into the keystore.
-func (c *Client) vhlStoreTokens(toks []*vhl.SessionToken) error {
-	key, err := c.vhlSealKey()
-	if err != nil {
-		return err
-	}
+// sealTokensLocked seals the token list into keystore bytes for
+// ff.SealedTokens. The plaintext JSON is erased before returning.
+// Callers hold the config lock via updateVHL: decrypt, modify, and
+// reseal must be one atomic critical section, never split
+// load/store steps (issue #142 review).
+func sealTokensLocked(toks []*vhl.SessionToken, key [32]byte) (string, error) {
 	raw, err := json.Marshal(toks)
 	if err != nil {
-		return err
+		return "", err
 	}
 	sealed, err := vhl.SealTokens(raw, key)
-	if err != nil {
-		return err
-	}
 	// Erase the plaintext copy.
 	for i := range raw {
 		raw[i] = 0
 	}
-	return updateVHL(func(ff *vhlFile) error {
-		ff.SealedTokens = b64.EncodeToString(sealed)
-		return nil
-	})
+	if err != nil {
+		return "", err
+	}
+	return b64.EncodeToString(sealed), nil
 }
 
-// vhlLoadTokens opens the keystore and returns the live tokens for
-// this boot. Expired tokens and tokens from a previous boot are
-// dropped (restart revokes by construction).
-func (c *Client) vhlLoadTokens() ([]*vhl.SessionToken, error) {
-	ff, err := loadVHL()
-	if err != nil {
-		return nil, err
-	}
-	if ff.SealedTokens == "" {
+// openTokensLocked opens the keystore bytes from ff.SealedTokens.
+// Empty input yields no tokens. The plaintext JSON is erased before
+// returning.
+func openTokensLocked(sealedB64 string, key [32]byte) ([]*vhl.SessionToken, error) {
+	if sealedB64 == "" {
 		return nil, nil
 	}
-	key, err := c.vhlSealKey()
-	if err != nil {
-		return nil, err
-	}
-	sealed, err := b64.DecodeString(ff.SealedTokens)
+	sealed, err := b64.DecodeString(sealedB64)
 	if err != nil {
 		return nil, fmt.Errorf("keystore: %w", err)
 	}
@@ -287,6 +276,56 @@ func (c *Client) vhlLoadTokens() ([]*vhl.SessionToken, error) {
 	if err := json.Unmarshal(raw, &toks); err != nil {
 		return nil, fmt.Errorf("keystore: %w", err)
 	}
+	return toks, nil
+}
+
+// sealChallengesLocked / openChallengesLocked mirror the token
+// keystore for the challenge store (challenges are bearer-adjacent
+// secrets until consumed).
+func sealChallengesLocked(chs []*vhl.Challenge, key [32]byte) (string, error) {
+	raw, err := json.Marshal(chs)
+	if err != nil {
+		return "", err
+	}
+	sealed, err := vhl.SealTokens(raw, key)
+	for i := range raw {
+		raw[i] = 0
+	}
+	if err != nil {
+		return "", err
+	}
+	return b64.EncodeToString(sealed), nil
+}
+
+func openChallengesLocked(sealedB64 string, key [32]byte) ([]*vhl.Challenge, error) {
+	if sealedB64 == "" {
+		return nil, nil
+	}
+	sealed, err := b64.DecodeString(sealedB64)
+	if err != nil {
+		return nil, fmt.Errorf("challenge store: %w", err)
+	}
+	raw, err := vhl.OpenTokens(sealed, key)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		for i := range raw {
+			raw[i] = 0
+		}
+	}()
+	var chs []*vhl.Challenge
+	if err := json.Unmarshal(raw, &chs); err != nil {
+		return nil, fmt.Errorf("challenge store: %w", err)
+	}
+	return chs, nil
+}
+
+// vhlLiveTokens filters a keystore token list down to the tokens
+// usable now: structurally valid, minted on this boot, and
+// unexpired. Previous-boot tokens are dropped — restart revokes by
+// construction (issue #142).
+func vhlLiveTokens(toks []*vhl.SessionToken) []*vhl.SessionToken {
 	now := time.Now().Unix()
 	boot := vhlBootIDNow()
 	var live []*vhl.SessionToken
@@ -302,20 +341,57 @@ func (c *Client) vhlLoadTokens() ([]*vhl.SessionToken, error) {
 		}
 		live = append(live, t)
 	}
-	return live, nil
+	return live
 }
 
-// vhlLiveToken returns the current live session token, if any.
-func (c *Client) vhlLiveToken() (*vhl.SessionToken, error) {
+// vhlLiveChallenges drops used and expired challenges.
+func vhlLiveChallenges(chs []*vhl.Challenge, now int64) []*vhl.Challenge {
+	var live []*vhl.Challenge
+	for _, ch := range chs {
+		if ch == nil || ch.Used || ch.ExpiresAt <= now {
+			continue
+		}
+		live = append(live, ch)
+	}
+	return live
+}
+
+// vhlLoadTokens opens the keystore and returns the live tokens for
+// this boot. Expired tokens and tokens from a previous boot are
+// dropped (restart revokes by construction).
+func (c *Client) vhlLoadTokens() ([]*vhl.SessionToken, error) {
+	key, err := c.vhlSealKey()
+	if err != nil {
+		return nil, err
+	}
+	ff, err := loadVHL()
+	if err != nil {
+		return nil, err
+	}
+	toks, err := openTokensLocked(ff.SealedTokens, key)
+	if err != nil {
+		return nil, err
+	}
+	return vhlLiveTokens(toks), nil
+}
+
+// vhlLiveToken returns the newest live session token usable for
+// recipient: the newest token with an empty scope or an exact scope
+// match. A token scoped to another counterparty must never attest a
+// message to this one — the receiver would (correctly) hold it as
+// token-scope (issue #142 review).
+func (c *Client) vhlLiveToken(recipient string) (*vhl.SessionToken, error) {
 	toks, err := c.vhlLoadTokens()
 	if err != nil {
 		return nil, err
 	}
-	if len(toks) == 0 {
-		return nil, nil
+	// Newest first: the keystore appends.
+	for i := len(toks) - 1; i >= 0; i-- {
+		if toks[i].Scope == "" || toks[i].Scope == recipient {
+			return toks[i], nil
+		}
 	}
-	// Newest first: the keystore appends, so take the last.
-	return toks[len(toks)-1], nil
+	return nil, nil
 }
 
 // vhlVerifier builds the receiver-side verifier from local state.
@@ -332,8 +408,14 @@ func (c *Client) vhlVerifier() (*vhl.Verifier, error) {
 }
 
 // vhlMergeSeen persists verifier mutations (consumed attestation ids,
-// applied revocations) after an inbox pass. The seen set only grows,
-// so a union merge under the lock is safe.
+// applied revocations, FIDO2 signature counters) after an inbox pass.
+// The seen set only grows, so a union merge under the lock is safe.
+// The registry merge is deliberately narrow — WebAuthn signature
+// counters only, advanced monotonically per credential. A wholesale
+// registry replace would clobber concurrent enrollments or
+// revocations made through updateVHL during the fetch; the counters
+// are the only registry field evaluation mutates (NoteSignCount),
+// and they only ever move forward.
 func vhlMergeSeen(vfr *vhl.Verifier) error {
 	if vfr == nil {
 		return nil
@@ -348,15 +430,36 @@ func vhlMergeSeen(vfr *vhl.Verifier) error {
 		for id, ts := range vfr.Revoked.Artifacts {
 			ff.Revoked.Artifacts[id] = ts
 		}
+		if vfr.Registry != nil && ff.Registry != nil {
+			for identity, appr := range vfr.Registry.Approvers {
+				pa := ff.Registry.Approvers[identity]
+				if pa == nil {
+					continue
+				}
+				for _, c := range appr.Credentials {
+					for i := range pa.Credentials {
+						if pa.Credentials[i].ID == c.ID && c.SignCount > pa.Credentials[i].SignCount {
+							pa.Credentials[i].SignCount = c.SignCount
+						}
+					}
+				}
+			}
+		}
 		return nil
 	})
 }
 
 // handleVHLFrame consumes an in-band VHL protocol frame. Frames are
-// E2E DMs, so `from` is the authenticated sender.
-func (c *Client) handleVHLFrame(from string, fr *vhl.Frame, envelopeID int64) {
+// E2E DMs, so `from` is the authenticated sender. vfr is the caller's
+// fetch-local verifier, if it has one: revocations applied to the
+// persisted set are merged into it immediately, so a revocation frame
+// and a later message using the revoked token in the same fetched
+// page are evaluated against the fresh revocation set (issue #142
+// review) — never the stale one the fetch started with.
+func (c *Client) handleVHLFrame(from string, fr *vhl.Frame, envelopeID int64, vfr *vhl.Verifier) {
 	now := time.Now().Unix()
-	_ = updateVHL(func(ff *vhlFile) error {
+	var applied *vhl.Revocation
+	err := updateVHL(func(ff *vhlFile) error {
 		switch fr.Type {
 		case vhl.FrameApprovalRequest:
 			r := fr.ApprovalRequest
@@ -422,9 +525,24 @@ func (c *Client) handleVHLFrame(from string, fr *vhl.Frame, envelopeID int64) {
 				return nil
 			}
 			ff.Revoked.Apply(rv, now)
+			// Remember the applied revocation so the fetch-local
+			// verifier can be brought up to date below.
+			applied = rv
 		}
 		return nil
 	})
+	// A revocation that reached the persisted set must also reach
+	// the live verifier before the fetch loop continues: without
+	// this, a message later in the same page that uses the revoked
+	// token would verify against the stale set and be delivered as
+	// attested. Only merge on a clean persist so the two cannot
+	// diverge.
+	if err == nil && applied != nil && vfr != nil {
+		if vfr.Revoked == nil {
+			vfr.Revoked = vhl.NewRevocationSet()
+		}
+		vfr.Revoked.Apply(applied, now)
+	}
 }
 
 // vhlEvaluateInbound runs the receiver-side VHL check for one
@@ -444,6 +562,28 @@ func (c *Client) vhlEvaluateInbound(vfr *vhl.Verifier, tier vhl.Tier, body []byt
 		Receiver: c.cfg.Address, Now: time.Now().Unix(),
 		EnvelopeID: envelopeID,
 	})
+}
+
+// vhlConsumeAttestation atomically checks and consumes an
+// attestation id in the persisted replay set: under one
+// read-modify-write it reports whether the id was already consumed in
+// a different envelope, and marks it in the current one. The inbox
+// loop's per-fetch verifier only sees its own page — two concurrent
+// fetches (two processes: inbox CLI vs. dashboard push) could
+// otherwise evaluate the same Tier 2 attestation against empty
+// snapshots and both verdict attested. Check-and-consume must be one
+// lock-protected operation (issue #142 review).
+func vhlConsumeAttestation(attID string, envelopeID int64) (bool, error) {
+	alreadySeen := false
+	err := updateVHL(func(ff *vhlFile) error {
+		if ff.Seen.Seen(attID, envelopeID) {
+			alreadySeen = true
+			return nil
+		}
+		ff.Seen.Mark(attID, envelopeID)
+		return nil
+	})
+	return alreadySeen, err
 }
 
 // VHLStatus is the receiver-side VHL evaluation surfaced on a
@@ -477,10 +617,13 @@ func (s *VHLStatus) Badge() string {
 
 // vhlAttestForSend builds the Tier 1 attestation for an outgoing
 // message from the live session token, or validates a caller-supplied
-// Tier 2 attestation against the exact body bytes. Tier 2 without an
+// Tier 2 attestation against the exact body bytes. recipient is the
+// resolved recipient address: the token must be usable for them
+// (empty scope or exact match) — a token scoped to another
+// counterparty is never wrapped for this recipient. Tier 2 without an
 // attestation fails closed: per-message human approval cannot be
 // minted by the sending agent.
-func (c *Client) vhlAttestForSend(tier vhl.Tier, body string, att *vhl.Attestation) (*vhl.Attestation, error) {
+func (c *Client) vhlAttestForSend(tier vhl.Tier, body string, att *vhl.Attestation, recipient string) (*vhl.Attestation, error) {
 	switch tier {
 	case vhl.Tier0:
 		if att != nil {
@@ -494,7 +637,7 @@ func (c *Client) vhlAttestForSend(tier vhl.Tier, body string, att *vhl.Attestati
 			}
 			return att, nil
 		}
-		tok, err := c.vhlLiveToken()
+		tok, err := c.vhlLiveToken(recipient)
 		if err != nil {
 			return nil, fmt.Errorf("session token: %w", err)
 		}

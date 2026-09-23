@@ -1132,16 +1132,21 @@ func (c *Client) sendProtocolDM(toOrName, body string) (int64, error) {
 }
 
 func (c *Client) send(toOrName, body string, attachPaths []string, replyTo int64, quote string, logSent bool, ttl time.Duration, tier vhl.Tier, att *vhl.Attestation) (int64, error) {
-	// issue #142: resolve the outgoing attestation before anything
-	// else — Tier 1 mints from the live session token, Tier 2
-	// requires a human approval attestation binding these exact
-	// bytes. A failure here fails the send: nothing unauthenticated
-	// ever goes out under a claimed tier.
-	att, err := c.vhlAttestForSend(tier, body, att)
+	// issue #142: resolve the recipient first. The outgoing
+	// attestation is built for a specific recipient, and a
+	// scope-bound session token only attests its own counterparty:
+	// resolving first lets the token selection (newest usable for
+	// this recipient) see who the message is actually for.
+	address, err := c.cfg.ResolveRecipient(toOrName)
 	if err != nil {
 		return 0, err
 	}
-	address, err := c.cfg.ResolveRecipient(toOrName)
+	// issue #142: resolve the outgoing attestation — Tier 1 mints
+	// from the live session token, Tier 2 requires a human approval
+	// attestation binding these exact bytes. A failure here fails
+	// the send: nothing unauthenticated ever goes out under a
+	// claimed tier.
+	att, err = c.vhlAttestForSend(tier, body, att, address)
 	if err != nil {
 		return 0, err
 	}
@@ -1978,10 +1983,22 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// frame parsing fall through as ordinary messages — never
 		// silently swallowed.
 		if vf, ok := vhl.ParseFrame(plain); ok {
-			c.handleVHLFrame(m.From, vf, m.ID)
-			seen[h] = true
-			newHashes = append(newHashes, h)
-			continue
+			// issue #142 review: VHL frames from a held or
+			// relay-reported sender are not applied to protocol
+			// state — a quarantined stranger must not stuff the
+			// bounded request/attestation queues and evict
+			// legitimate records (same gate as the shared-state
+			// path). Their frames fall through to normal
+			// delivery as held messages below. Revocation frames
+			// are the exception: they are self-verifying (the
+			// signature must come from an enrolled approver
+			// key), so they are always honored.
+			if vf.Type == vhl.FrameRevoke || (!c.cfg.HoldForReview(m.From) && !slices.Contains(m.SenderFlags, "reported")) {
+				c.handleVHLFrame(m.From, vf, m.ID, vfr)
+				seen[h] = true
+				newHashes = append(newHashes, h)
+				continue
+			}
 		}
 		// issue #39: introduction protocol DMs are consumed by the
 		// introduction layer and never surface as chat messages (same
@@ -2070,6 +2087,24 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// held for review (never acted on, never silently dropped).
 		if tier, att := parseVHLPayload(plain); tier != vhl.Tier0 || att != nil {
 			out := c.vhlEvaluateInbound(vfr, tier, []byte(body), att, m.ID)
+			// issue #142 review: make the Tier 2
+			// replay-check-and-consume atomic across processes.
+			// Evaluate marks only the fetch-local set; two
+			// concurrent fetches (inbox CLI vs. dashboard push)
+			// could otherwise evaluate the same attestation
+			// against empty snapshots and both verdict attested.
+			// A consume that finds the id already taken in a
+			// different envelope downgrades the verdict to a
+			// replay hold.
+			if out.Verdict == vhl.VerdictAttested && tier == vhl.Tier2 && att != nil {
+				if replayed, cerr := vhlConsumeAttestation(att.ID, m.ID); cerr == nil && replayed {
+					out.Verdict = vhl.VerdictInvalid
+					out.Reason = "replay"
+				}
+				// A consume failure is best effort: the
+				// fetch-local mark plus the end-of-fetch union
+				// merge still converge the persisted set.
+			}
 			msg.VHL = &VHLStatus{
 				Tier: int(tier), Verdict: out.Verdict.String(),
 				Approver: out.Approver, Reason: out.Reason,
