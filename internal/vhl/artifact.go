@@ -109,7 +109,15 @@ type Attestation struct {
 	ExpiresAt int64  `json:"expires_at"` // unix seconds; tier 2 is short-lived
 	Proof     Proof  `json:"proof"`
 	RequestID string `json:"request_id,omitempty"` // approval-request this answers, if any
-	Sig       string `json:"sig"`                  // base64url Ed25519 by the approver key
+	// ApprovalNonce is the base64url-encoded 32-byte fresh nonce
+	// for a Tier 2 FIDO2 approval (issue #142 review). The
+	// WebAuthn challenge is ApprovalChallenge(actionHash, nonce);
+	// the nonce is covered by the attestation signature and the
+	// receiver consumes it exactly once (see NonceSet), so a
+	// captured assertion re-wrapped in a fresh attestation is
+	// still a replay. Empty for non-FIDO2 proofs.
+	ApprovalNonce string `json:"approval_nonce,omitempty"`
+	Sig           string `json:"sig"` // base64url Ed25519 by the approver key
 }
 
 // MsgHashOf hashes the exact message body bytes the human reviewed.
