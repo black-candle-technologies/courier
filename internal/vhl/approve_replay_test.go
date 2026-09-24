@@ -202,7 +202,7 @@ func TestEvaluatedSetOnEveryPath(t *testing.T) {
 	body := []byte("do the thing")
 
 	freshPIN := func() *Attestation {
-		a, err := NewTier2Attestation(body, addr, "req-e", ProofPIN, PresencePIN, Proof{}, priv)
+		a, err := NewTier2Attestation(body, addr, "req-e", ProofPIN, PresencePIN, Proof{}, nil, priv)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -277,7 +277,7 @@ func TestTier2PINProofNeverAttests(t *testing.T) {
 	addr, pub, priv := testIdentity(t)
 	v := testVerifier(t, addr, pub)
 	body := []byte("spend 10 BTC")
-	a, err := NewTier2Attestation(body, addr, "req-pin", ProofPIN, PresencePIN, Proof{}, priv)
+	a, err := NewTier2Attestation(body, addr, "req-pin", ProofPIN, PresencePIN, Proof{}, nil, priv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestTier2ChallengeProofNeverAttests(t *testing.T) {
 	v := testVerifier(t, addr, pub)
 	body := []byte("release v0.14.0")
 	a, err := NewTier2Attestation(body, addr, "req-ch", ProofChallenge, PresenceChallenge,
-		Proof{ChallengeID: "ch-123"}, priv)
+		Proof{ChallengeID: "ch-123"}, nil, priv)
 	if err != nil {
 		t.Fatal(err)
 	}

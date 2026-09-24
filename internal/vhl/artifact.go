@@ -304,7 +304,15 @@ func NewTier1Attestation(tok *SessionToken, priv ed25519.PrivateKey) (*Attestati
 // ApprovalNonce to the base64url ceremony nonce, then call Validate
 // and SignAttestation. (Validate rejects fido2 proofs without a
 // valid 32-byte nonce, so this constructor fails closed for them.)
-func NewTier2Attestation(body []byte, approver string, requestID string, kind ProofKind, presence PresenceStrength, proofExtras Proof, priv ed25519.PrivateKey) (*Attestation, error) {
+// NewTier2Attestation mints a Tier 2 attestation for the exact body
+// bytes. kind selects the proof (fido2, challenge, or pin); the
+// proof itself rides in proofExtras. For ProofFIDO2, approvalNonce
+// must be the 32-byte ceremony nonce the WebAuthn challenge was
+// bound to (see ApprovalChallenge): it is embedded in the
+// attestation BEFORE signing so the signature covers it, and
+// Validate requires it. For other proof kinds approvalNonce must
+// be empty.
+func NewTier2Attestation(body []byte, approver string, requestID string, kind ProofKind, presence PresenceStrength, proofExtras Proof, approvalNonce []byte, priv ed25519.PrivateKey) (*Attestation, error) {
 	switch kind {
 	case ProofFIDO2, ProofChallenge, ProofPIN:
 	default:
@@ -331,6 +339,14 @@ func NewTier2Attestation(body []byte, approver string, requestID string, kind Pr
 		IssuedAt:  now,
 		ExpiresAt: now + int64(Tier2Expiry/time.Second),
 		Proof:     proofExtras,
+	}
+	if kind == ProofFIDO2 {
+		if len(approvalNonce) != 32 {
+			return nil, fmt.Errorf("tier 2 fido2 attestation without 32-byte approval nonce")
+		}
+		a.ApprovalNonce = b64.EncodeToString(approvalNonce)
+	} else if len(approvalNonce) != 0 {
+		return nil, fmt.Errorf("approval nonce is only valid for fido2 proofs")
 	}
 	if err := a.Validate(); err != nil {
 		return nil, err

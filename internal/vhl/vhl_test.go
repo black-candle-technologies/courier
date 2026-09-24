@@ -249,7 +249,7 @@ func TestAttestationBadSignature(t *testing.T) {
 	v := testVerifier(t, addr, pub)
 	body := []byte("spend 10 BTC")
 	// Signed by a key that is not enrolled.
-	a, err := NewTier2Attestation(body, addr, "req-test", ProofPIN, PresencePIN, Proof{}, evilPriv)
+	a, err := NewTier2Attestation(body, addr, "req-test", ProofPIN, PresencePIN, Proof{}, nil, evilPriv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestAttestationUnknownApprover(t *testing.T) {
 	addr, _, priv := testIdentity(t)
 	v := &Verifier{Registry: NewRegistry(), Seen: NewSeenSet(), Revoked: NewRevocationSet()}
 	body := []byte("do the thing")
-	a, err := NewTier2Attestation(body, addr, "req-test", ProofPIN, PresencePIN, Proof{}, priv)
+	a, err := NewTier2Attestation(body, addr, "req-test", ProofPIN, PresencePIN, Proof{}, nil, priv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +387,7 @@ func TestTier2ChallengeProofRejected(t *testing.T) {
 	v := testVerifier(t, addr, pub)
 	body := []byte("release v0.14.0")
 	a, err := NewTier2Attestation(body, addr, "req-test", ProofChallenge, PresenceChallenge,
-		Proof{ChallengeID: "ch-123"}, priv)
+		Proof{ChallengeID: "ch-123"}, nil, priv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,7 +436,7 @@ func TestFrames(t *testing.T) {
 	}
 	// Attest frame round-trip.
 	addr, _, priv := testIdentity(t)
-	a, err := NewTier2Attestation([]byte(draft), addr, "req-test", ProofPIN, PresencePIN, Proof{}, priv)
+	a, err := NewTier2Attestation([]byte(draft), addr, "req-test", ProofPIN, PresencePIN, Proof{}, nil, priv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -668,7 +668,7 @@ func TestProofStrengthCeiling(t *testing.T) {
 	// A PIN proof claiming fido2_uv must fail validation: the
 	// claim would otherwise skip FIDO2 verification while the
 	// receiver trusts it.
-	if _, err := NewTier2Attestation(body, addr, "req-test", ProofPIN, PresenceFIDO2UV, Proof{}, priv); err == nil {
+	if _, err := NewTier2Attestation(body, addr, "req-test", ProofPIN, PresenceFIDO2UV, Proof{}, nil, priv); err == nil {
 		t.Fatal("pin proof claiming fido2_uv should fail validation")
 	}
 	// A fido2 proof with strength fido2_uv validates (given valid
@@ -708,7 +708,7 @@ func TestProofStrengthCeiling(t *testing.T) {
 	// A challenge proof claiming fido2 must fail: it exceeds the
 	// challenge kind's ceiling.
 	if _, err := NewTier2Attestation(body, addr, "req-test", ProofChallenge, PresenceFIDO2,
-		Proof{ChallengeID: "ch-1"}, priv); err == nil {
+		Proof{ChallengeID: "ch-1"}, nil, priv); err == nil {
 		t.Fatal("challenge proof claiming fido2 should fail validation")
 	}
 	// A session proof's strength must equal the token's mint presence.

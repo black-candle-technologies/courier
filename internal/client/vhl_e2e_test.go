@@ -149,7 +149,10 @@ func TestVHLMissingAttestationHeld(t *testing.T) {
 
 // TestVHLTier2EndToEnd runs the whole Tier 2 loop: the sender's human
 // approves exact bytes locally, the attestation ships with the
-// message, and the recipient verifies it.
+// message, and the recipient verifies it. A PIN proof is not
+// cryptographically verifiable by the receiver (issue #142 review),
+// so the recipient must hold it as unverifiable rather than report
+// it attested — the fail-closed path is the assertion here.
 func TestVHLTier2EndToEnd(t *testing.T) {
 	env := newAttachTestEnv(t)
 	env.asRecipient()
@@ -183,8 +186,8 @@ func TestVHLTier2EndToEnd(t *testing.T) {
 		t.Fatalf("inbox: got %d messages, want 1", len(msgs))
 	}
 	m := msgs[0]
-	if m.VHL == nil || m.VHL.Verdict != "attested" || m.VHL.Tier != 2 {
-		t.Fatalf("VHL = %+v, want tier-2 attested", m.VHL)
+	if m.VHL == nil || m.VHL.Verdict != "invalid-attestation" || m.VHL.Tier != 2 {
+		t.Fatalf("VHL = %+v, want tier-2 invalid-attestation (PIN proof is unverifiable)", m.VHL)
 	}
 	if m.VHL.Approver != env.senderCfg.Address {
 		t.Fatalf("approver = %q, want sender", m.VHL.Approver)

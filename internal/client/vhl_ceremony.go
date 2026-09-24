@@ -306,7 +306,7 @@ func (c *Client) VHLEnrollWebAuthn(deviceLabel string, printf func(string, ...an
 	// touched their security key with user verification. That is the
 	// Tier 2 human approval for this enrollment.
 	if err := updateVHL(func(ff *vhlFile) error {
-		return ff.Registry.Enroll(c.cfg.Address, name, cred, true)
+		return ff.Registry.Enroll(c.cfg.Address, name, cred)
 	}); err != nil {
 		return nil, err
 	}

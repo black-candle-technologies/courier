@@ -7,8 +7,10 @@ package vhl
 // assertion fields present) proves nothing by itself. This file
 // verifies the assertion for real:
 //
-//   - the clientData challenge is the action hash
-//     (what-you-sign-is-what-you-saw),
+//   - the clientData challenge is the expected challenge — for
+//     Tier 2 approvals, ApprovalChallenge(actionHash, nonce)
+//     (what-you-sign-is-what-you-saw, bound to a fresh nonce so a
+//     captured assertion cannot be replayed),
 //   - the origin is one the relying party expects,
 //   - the authenticator data names the relying party id and carries
 //     the user-presence (and user-verification, when required) flags,
@@ -410,9 +412,12 @@ const (
 )
 
 // verifyWebAuthnAssertion cryptographically verifies a WebAuthn
-// get-assertion. expectedChallenge is the action hash the human
-// reviewed; rp configures the relying party; requireUV demands the
-// user-verification flag (FIDO2UV) rather than presence alone.
+// get-assertion. expectedChallenge is the challenge the human's
+// authenticator answered — for Tier 2 approvals,
+// ApprovalChallenge(actionHash, nonce); for session mints,
+// SessionMintChallenge(ctx); rp configures the relying party;
+// requireUV demands the user-verification flag (FIDO2UV) rather
+// than presence alone.
 //
 // On success it returns the authenticator's signature counter
 // (authData bytes 33..37): the caller enforces strict monotonicity
@@ -459,10 +464,10 @@ func verifyWebAuthnAssertion(credPub crypto.PublicKey, assertionB64 string, expe
 	if err != nil {
 		return 0, fmt.Errorf("fido2: challenge: %w", err)
 	}
-	// Constant-time: the challenge is the action hash — an
-	// exact-match value where prefix games must not pass.
+	// Constant-time: the challenge is an exact-match value where
+	// prefix games must not pass.
 	if subtle.ConstantTimeCompare(ch, expectedChallenge) != 1 {
-		return 0, fmt.Errorf("fido2: challenge is not the action hash")
+		return 0, fmt.Errorf("fido2: challenge mismatch")
 	}
 	originOK := false
 	for _, o := range rp.Origins {

@@ -290,12 +290,9 @@ func (c *Client) VHLApproveMint(requestID string, displayedHash [32]byte, displa
 		if err != nil || subtle.ConstantTimeCompare(h[:], wantHash) != 1 {
 			return fmt.Errorf("request draft does not match its recorded hash; refusing to approve")
 		}
-		a, err := vhl.NewTier2Attestation([]byte(req.Draft), c.cfg.Address, req.ID, proof.Kind, presence, proof, id.EdPriv)
+		a, err := vhl.NewTier2Attestation([]byte(req.Draft), c.cfg.Address, req.ID, proof.Kind, presence, proof, approvalNonce, id.EdPriv)
 		if err != nil {
 			return err
-		}
-		if proof.Kind == vhl.ProofFIDO2 {
-			a.ApprovalNonce = b64.EncodeToString(approvalNonce)
 		}
 		// The request is consumed: approvals are single-shot, and
 		// the consumption is atomic with the mint.

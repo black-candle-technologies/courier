@@ -243,7 +243,7 @@ func TestVHLCeremonyMintEndToEnd(t *testing.T) {
 	if err := updateVHL(func(ff *vhlFile) error {
 		// VHLSetRP already stored the RP id, origins, and
 		// attestation roots; only add the credential.
-		return ff.Registry.Enroll(env.senderCfg.Address, "sender", cred, true)
+		return ff.Registry.Enroll(env.senderCfg.Address, "sender", cred)
 	}); err != nil {
 		t.Fatalf("enroll mint credential: %v", err)
 	}
