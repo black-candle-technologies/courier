@@ -206,19 +206,22 @@ func TestSealRoundTrip(t *testing.T) {
 }
 
 func TestTier2AttestationVerify(t *testing.T) {
-	addr, pub, priv := testIdentity(t)
-	v := testVerifier(t, addr, pub)
+	// Tier 2 attests only on a cryptographically verified FIDO2
+	// assertion over the nonce-bound approval challenge (issue
+	// #142 review): PIN/challenge proofs fail closed, so the
+	// happy path here uses a genuine FIDO2 ceremony.
 	body := []byte("please merge PR #141")
-	a, err := NewTier2Attestation(body, addr, "req-test", ProofPIN, PresencePIN, Proof{}, priv)
-	if err != nil {
-		t.Fatal(err)
-	}
+	v, credPriv, idPriv, a, _ := fido2TestSetup(t, body, PresenceFIDO2UV)
+	approver, credID := a.Approver, a.Proof.CredentialID
 	out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "someone", Now: time.Now().Unix(), EnvelopeID: 7})
 	if out.Verdict != VerdictAttested {
 		t.Fatalf("want attested, got %v (%s)", out.Verdict, out.Reason)
 	}
-	if out.Approver != addr {
+	if out.Approver != approver {
 		t.Fatal("approver should be reported")
+	}
+	if !out.Evaluated {
+		t.Fatal("outcome must be marked evaluated")
 	}
 	// The same envelope re-evaluated (another consumer, e.g.
 	// dashboard push vs. inbox) is not a replay.
@@ -232,10 +235,8 @@ func TestTier2AttestationVerify(t *testing.T) {
 		t.Fatalf("replay should fail, got %v (%s)", out2.Verdict, out2.Reason)
 	}
 	// Tampered body fails the hash binding.
-	a2, err := NewTier2Attestation(body, addr, "req-test", ProofPIN, PresencePIN, Proof{}, priv)
-	if err != nil {
-		t.Fatal(err)
-	}
+	a2, _ := mintFIDO2Attestation(t, body, approver, "req-test", PresenceFIDO2UV,
+		credID, credPriv, nil, 2, idPriv)
 	out3 := v.Evaluate(EvalInput{Tier: Tier2, Body: []byte("please merge PR #999"), Attestation: a2, Receiver: "someone", Now: time.Now().Unix()})
 	if out3.Verdict != VerdictInvalid || out3.Reason != "hash-mismatch" {
 		t.Fatalf("bait-and-switch should fail, got %v (%s)", out3.Verdict, out3.Reason)
@@ -376,7 +377,12 @@ func TestChallengeFlow(t *testing.T) {
 	}
 }
 
-func TestChallengeProofAttestation(t *testing.T) {
+func TestTier2ChallengeProofRejected(t *testing.T) {
+	// Challenge proofs fail closed at Tier 2 (issue #142 review):
+	// only FIDO2 assertions are cryptographically verifiable, and
+	// the Ed25519 attestation signature alone is self-producible
+	// by the requesting agent. Construction still works — the
+	// rejection happens at evaluation.
 	addr, pub, priv := testIdentity(t)
 	v := testVerifier(t, addr, pub)
 	body := []byte("release v0.14.0")
@@ -386,8 +392,8 @@ func TestChallengeProofAttestation(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "x", Now: time.Now().Unix()})
-	if out.Verdict != VerdictAttested {
-		t.Fatalf("challenge-proof attestation should verify, got %v (%s)", out.Verdict, out.Reason)
+	if out.Verdict != VerdictInvalid || out.Reason != "unverifiable-proof" {
+		t.Fatalf("challenge-proof tier 2 attestation should be rejected, got %v (%s)", out.Verdict, out.Reason)
 	}
 }
 
@@ -521,13 +527,12 @@ func TestEnrollmentRules(t *testing.T) {
 }
 
 func TestAttestationExpiry(t *testing.T) {
-	addr, pub, priv := testIdentity(t)
-	v := testVerifier(t, addr, pub)
+	// Tier 2 happy path is FIDO2 (PIN no longer attests at Tier
+	// 2); the expiry checks sit before the proof gate, so they
+	// behave the same.
 	body := []byte("sensitive action")
-	a, err := NewTier2Attestation(body, addr, "req-test", ProofPIN, PresencePIN, Proof{}, priv)
-	if err != nil {
-		t.Fatal(err)
-	}
+	v, credPriv, idPriv, a, _ := fido2TestSetup(t, body, PresenceFIDO2UV)
+	approver, credID := a.Approver, a.Proof.CredentialID
 	now := time.Now().Unix()
 	// Within grace after expiry: still valid.
 	out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "x", Now: a.ExpiresAt + 60})
@@ -536,10 +541,8 @@ func TestAttestationExpiry(t *testing.T) {
 	}
 	_ = now
 	// Well past expiry: invalid.
-	a2, err := NewTier2Attestation(body, addr, "req-test", ProofPIN, PresencePIN, Proof{}, priv)
-	if err != nil {
-		t.Fatal(err)
-	}
+	a2, _ := mintFIDO2Attestation(t, body, approver, "req-test", PresenceFIDO2UV,
+		credID, credPriv, nil, 2, idPriv)
 	out2 := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a2, Receiver: "x", Now: a2.ExpiresAt + 3600})
 	if out2.Verdict != VerdictInvalid || out2.Reason != "expired" {
 		t.Fatalf("past grace should expire, got %v (%s)", out2.Verdict, out2.Reason)
@@ -551,23 +554,67 @@ func TestFIDO2ProofSchema(t *testing.T) {
 	// assertion cryptographically (see webauthn_test.go). The
 	// ceremony that *produces* assertions (dashboard driving
 	// navigator.credentials.get) is the follow-up. Structural
-	// validation must accept a well-formed fido2 proof and reject
-	// one without a credential id.
+	// validation must accept a well-formed fido2 proof — including
+	// its approval nonce — and reject one without a credential id
+	// or without a valid nonce.
 	addr, _, priv := testIdentity(t)
 	body := []byte("high-stakes action")
-	a, err := NewTier2Attestation(body, addr, "req-test", ProofFIDO2, PresenceFIDO2UV,
-		Proof{CredentialID: "cred-abc", Assertion: "eyJ9"}, priv)
+	h := MsgHashOf(body)
+	now := time.Now().Unix()
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
+	}
+	id, err := NewAttestationID()
 	if err != nil {
 		t.Fatal(err)
+	}
+	a := &Attestation{
+		Version:       attestationVersion,
+		ID:            id,
+		Tier:          2,
+		MsgHash:       b64.EncodeToString(h[:]),
+		Approver:      addr,
+		RequestID:     "req-test",
+		IssuedAt:      now,
+		ExpiresAt:     now + 900,
+		ApprovalNonce: b64.EncodeToString(nonce),
+		Proof: Proof{
+			Kind:         ProofFIDO2,
+			Strength:     PresenceFIDO2UV.String(),
+			CredentialID: "cred-abc",
+			Assertion:    "eyJ9",
+		},
 	}
 	if err := a.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	bad, err := NewTier2Attestation(body, addr, "req-test", ProofFIDO2, PresenceFIDO2UV, Proof{}, priv)
-	if err == nil {
-		t.Fatal("fido2 proof without credential id should fail construction")
-	} else if bad != nil {
-		t.Fatal("failed construction should not return an attestation")
+	if err := SignAttestation(a, priv); err != nil {
+		t.Fatal(err)
+	}
+	bad, err := NewAttestationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No credential id: rejected.
+	noCred := *a
+	noCred.ID = bad
+	noCred.Proof.CredentialID = ""
+	if err := noCred.Validate(); err == nil {
+		t.Fatal("fido2 proof without credential id should fail validation")
+	}
+	// No approval nonce: rejected — the challenge cannot be
+	// verified without it.
+	noNonce := *a
+	noNonce.ApprovalNonce = ""
+	if err := noNonce.Validate(); err == nil {
+		t.Fatal("fido2 proof without approval nonce should fail validation")
+	}
+	// Malformed approval nonce: rejected.
+	shortNonce := *a
+	shortNonce.ApprovalNonce = "short"
+	if err := shortNonce.Validate(); err == nil {
+		t.Fatal("fido2 proof with malformed approval nonce should fail validation")
 	}
 }
 
@@ -624,13 +671,35 @@ func TestProofStrengthCeiling(t *testing.T) {
 		t.Fatal("pin proof claiming fido2_uv should fail validation")
 	}
 	// A fido2 proof with strength fido2_uv validates (given valid
-	// fields): FIDO2 covers both touch-only and user-verified
-	// ceremonies, and the UV flag is enforced cryptographically at
-	// verification time.
-	a, err := NewTier2Attestation(body, addr, "req-test", ProofFIDO2, PresenceFIDO2UV,
-		Proof{CredentialID: "cred-abc", Assertion: "eyJ9"}, priv)
+	// fields, including the approval nonce): FIDO2 covers both
+	// touch-only and user-verified ceremonies, and the UV flag is
+	// enforced cryptographically at verification time.
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
+	}
+	fidoid, err := NewAttestationID()
 	if err != nil {
 		t.Fatal(err)
+	}
+	fh := MsgHashOf(body)
+	fnow := time.Now().Unix()
+	a := &Attestation{
+		Version:       attestationVersion,
+		ID:            fidoid,
+		Tier:          2,
+		MsgHash:       b64.EncodeToString(fh[:]),
+		Approver:      addr,
+		RequestID:     "req-test",
+		IssuedAt:      fnow,
+		ExpiresAt:     fnow + 900,
+		ApprovalNonce: b64.EncodeToString(nonce),
+		Proof: Proof{
+			Kind:         ProofFIDO2,
+			Strength:     PresenceFIDO2UV.String(),
+			CredentialID: "cred-abc",
+			Assertion:    "eyJ9",
+		},
 	}
 	if err := a.Validate(); err != nil {
 		t.Fatalf("fido2 proof with fido2_uv strength should validate: %v", err)

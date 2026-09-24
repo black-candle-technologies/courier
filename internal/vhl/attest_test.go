@@ -2,10 +2,18 @@ package vhl
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/base64"
 	"fmt"
+	"math/big"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/black-candle-technologies/courier/internal/vhltest"
 )
@@ -242,4 +250,193 @@ func FuzzCborDecoder(f *testing.F) {
 		_, _ = d.readInt()
 		_, _ = parseAttestationObject(data)
 	})
+}
+
+// profileLeaf builds a CA and a profile-satisfying attestation leaf
+// (mirroring the FIDO2 authenticator profile), applying mutate to
+// the leaf template/key so each negative case can break one
+// requirement. It returns the parsed leaf and the 16-byte AAGUID
+// baked into the leaf's AAGUID extension.
+func profileLeaf(t *testing.T, mutate func(tmpl *x509.Certificate, key **ecdsa.PrivateKey)) (*x509.Certificate, []byte) {
+	t.Helper()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aaguid := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject: pkix.Name{
+			CommonName:         "test authenticator",
+			OrganizationalUnit: []string{"Authenticator Attestation"},
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		ExtraExtensions: []pkix.Extension{
+			{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 45724, 1, 1, 4}, Value: aaguid},
+		},
+	}
+	if mutate != nil {
+		mutate(tmpl, &leafKey)
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(leafDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return leaf, aaguid
+}
+
+// profileAuthData returns minimal authenticator data with the AT
+// flag set and the given AAGUID, plus the corresponding no-AT
+// variant for the extension-present-without-attested-data case.
+func profileAuthData(aaguid []byte) (withAT, withoutAT []byte) {
+	mk := func(flags byte) []byte {
+		ad := make([]byte, 0, 53)
+		ad = append(ad, make([]byte, 32)...) // rpIdHash
+		ad = append(ad, flags)
+		ad = append(ad, 0, 0, 0, 1) // signCount
+		ad = append(ad, aaguid...)
+		return ad
+	}
+	return mk(authFlagUserPresent | authFlagAttestedData), mk(authFlagUserPresent)
+}
+
+func TestAttestationCertProfileHappyPath(t *testing.T) {
+	leaf, aaguid := profileLeaf(t, nil)
+	withAT, _ := profileAuthData(aaguid)
+	if err := checkAttestationCertProfile(leaf, withAT, -7); err != nil {
+		t.Fatalf("profile-satisfying leaf should pass: %v", err)
+	}
+}
+
+func TestAttestationCertProfileNoAAGUIDExtension(t *testing.T) {
+	// The AAGUID extension is optional (many real authenticators
+	// omit it); its absence must not break the happy path.
+	leaf, aaguid := profileLeaf(t, func(tmpl *x509.Certificate, key **ecdsa.PrivateKey) {
+		tmpl.ExtraExtensions = nil
+	})
+	withAT, _ := profileAuthData(aaguid)
+	if err := checkAttestationCertProfile(leaf, withAT, -7); err != nil {
+		t.Fatalf("leaf without AAGUID extension should pass: %v", err)
+	}
+}
+
+func TestAttestationCertProfileNegative(t *testing.T) {
+	_, wantAAGUID := profileLeaf(t, nil) // canonical AAGUID for authData construction
+	withAT, withoutAT := profileAuthData(wantAAGUID)
+
+	cases := []struct {
+		name    string
+		mutate  func(tmpl *x509.Certificate, key **ecdsa.PrivateKey)
+		auth    func() []byte
+		alg     int64
+		wantErr string
+	}{
+		{
+			name: "wrong OU",
+			mutate: func(tmpl *x509.Certificate, key **ecdsa.PrivateKey) {
+				tmpl.Subject.OrganizationalUnit = []string{"Web Server"}
+			},
+			auth:    func() []byte { return withAT },
+			alg:     -7,
+			wantErr: "OU",
+		},
+		{
+			name: "CA leaf",
+			mutate: func(tmpl *x509.Certificate, key **ecdsa.PrivateKey) {
+				tmpl.IsCA = true
+				tmpl.KeyUsage = x509.KeyUsageCertSign
+			},
+			auth:    func() []byte { return withAT },
+			alg:     -7,
+			wantErr: "CA",
+		},
+		{
+			name: "missing basic constraints",
+			mutate: func(tmpl *x509.Certificate, key **ecdsa.PrivateKey) {
+				tmpl.BasicConstraintsValid = false
+			},
+			auth:    func() []byte { return withAT },
+			alg:     -7,
+			wantErr: "end-entity",
+		},
+		{
+			name: "missing digitalSignature usage",
+			mutate: func(tmpl *x509.Certificate, key **ecdsa.PrivateKey) {
+				tmpl.KeyUsage = 0
+			},
+			auth:    func() []byte { return withAT },
+			alg:     -7,
+			wantErr: "digitalSignature",
+		},
+		{
+			name: "AAGUID mismatch",
+			mutate: func(tmpl *x509.Certificate, key **ecdsa.PrivateKey) {
+				tmpl.ExtraExtensions[0].Value = []byte{
+					0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88,
+					0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00,
+				}
+			},
+			auth:    func() []byte { return withAT },
+			alg:     -7,
+			wantErr: "AAGUID",
+		},
+		{
+			name:    "AAGUID extension without attested data",
+			mutate:  nil,
+			auth:    func() []byte { return withoutAT },
+			alg:     -7,
+			wantErr: "authenticator data has none",
+		},
+		{
+			name: "ES256 with P-384 key",
+			mutate: func(tmpl *x509.Certificate, key **ecdsa.PrivateKey) {
+				p384, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+				if err != nil {
+					t.Fatal(err)
+				}
+				*key = p384
+			},
+			auth:    func() []byte { return withAT },
+			alg:     -7,
+			wantErr: "P-256",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			leaf, _ := profileLeaf(t, tc.mutate)
+			if err := checkAttestationCertProfile(leaf, tc.auth(), tc.alg); err == nil {
+				t.Fatalf("%s: want profile rejection, got nil", tc.name)
+			} else if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("%s: want error containing %q, got %q", tc.name, tc.wantErr, err)
+			}
+		})
+	}
 }

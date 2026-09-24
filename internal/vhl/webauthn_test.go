@@ -98,11 +98,63 @@ func craftAssertionWithCount(t *testing.T, priv *ecdsa.PrivateKey, challenge []b
 	return b64.EncodeToString(raw)
 }
 
+// mintFIDO2Attestation is the test-side stand-in for the approval
+// ceremony + mint flow: it crafts a genuine WebAuthn assertion over
+// ApprovalChallenge(actionHash, nonce) and wraps it in a signed Tier
+// 2 attestation carrying the nonce — exactly the shape the real
+// mint flow produces (see NewTier2Attestation). A nil nonce mints a
+// fresh 32-byte one; the used nonce is returned so rewrap tests can
+// reuse it. signCount sets the authenticator's signature counter (0
+// models a counterless authenticator).
+func mintFIDO2Attestation(t *testing.T, body []byte, addr, requestID string, presence PresenceStrength, credID string, credPriv *ecdsa.PrivateKey, nonce []byte, signCount uint32, idPriv ed25519.PrivateKey) (*Attestation, []byte) {
+	t.Helper()
+	if nonce == nil {
+		nonce = make([]byte, 32)
+		if _, err := rand.Read(nonce); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := MsgHashOf(body)
+	challenge := ApprovalChallenge(h[:], nonce)
+	assertion := craftAssertionWithCount(t, credPriv, challenge[:],
+		"https://dashboard.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified, signCount)
+	id, err := NewAttestationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	a := &Attestation{
+		Version:       attestationVersion,
+		ID:            id,
+		Tier:          2,
+		MsgHash:       b64.EncodeToString(h[:]),
+		Approver:      addr,
+		RequestID:     requestID,
+		IssuedAt:      now,
+		ExpiresAt:     now + int64(Tier2Expiry/time.Second),
+		ApprovalNonce: b64.EncodeToString(nonce),
+		Proof: Proof{
+			Kind:         ProofFIDO2,
+			Strength:     presence.String(),
+			CredentialID: credID,
+			Assertion:    assertion,
+		},
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := SignAttestation(a, idPriv); err != nil {
+		t.Fatal(err)
+	}
+	return a, nonce
+}
+
 // fido2TestSetup enrolls a WebAuthn credential for addr and returns a
 // verifier configured with the test RP, the credential private key,
-// the identity private key (for re-signing mutated attestations), and
-// a valid attestation for body.
-func fido2TestSetup(t *testing.T, body []byte, presence PresenceStrength) (*Verifier, *ecdsa.PrivateKey, ed25519.PrivateKey, *Attestation) {
+// the identity private key (for re-signing mutated attestations), a
+// valid attestation for body, and the ceremony nonce the
+// attestation's assertion answers.
+func fido2TestSetup(t *testing.T, body []byte, presence PresenceStrength) (*Verifier, *ecdsa.PrivateKey, ed25519.PrivateKey, *Attestation, []byte) {
 	t.Helper()
 	addr, pub, idPriv := testIdentity(t)
 	credPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -133,16 +185,9 @@ func fido2TestSetup(t *testing.T, body []byte, presence PresenceStrength) (*Veri
 		t.Fatal(err)
 	}
 	rp := WebAuthnRP{ID: "dashboard.test", Origins: []string{"https://dashboard.test"}}
-	v := &Verifier{Registry: reg, Seen: NewSeenSet(), Revoked: NewRevocationSet(), WebAuthn: rp}
-
-	h := MsgHashOf(body)
-	assertion := craftAssertion(t, credPriv, h[:], "https://dashboard.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified)
-	a, err := NewTier2Attestation(body, addr, "req-1", ProofFIDO2, presence,
-		Proof{CredentialID: credID, Assertion: assertion}, idPriv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return v, credPriv, idPriv, a
+	v := &Verifier{Registry: reg, Seen: NewSeenSet(), Revoked: NewRevocationSet(), WebAuthn: rp, Nonces: NewNonceSet()}
+	a, nonce := mintFIDO2Attestation(t, body, addr, "req-1", presence, credID, credPriv, nil, 1, idPriv)
+	return v, credPriv, idPriv, a, nonce
 }
 
 // resignAttestation re-signs a mutated attestation with the
@@ -158,10 +203,13 @@ func resignAttestation(t *testing.T, a *Attestation, idPriv ed25519.PrivateKey) 
 
 func TestFIDO2VerificationAccepts(t *testing.T) {
 	body := []byte("transfer the funds")
-	v, _, _, a := fido2TestSetup(t, body, PresenceFIDO2UV)
+	v, _, _, a, _ := fido2TestSetup(t, body, PresenceFIDO2UV)
 	out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "r", Now: time.Now().Unix(), EnvelopeID: 1})
 	if out.Verdict != VerdictAttested {
 		t.Fatalf("verdict = %s (%s), want attested", out.Verdict, out.Reason)
+	}
+	if !out.Evaluated {
+		t.Fatal("outcome must be marked evaluated")
 	}
 }
 
@@ -172,7 +220,7 @@ func TestFIDO2VerificationAccepts(t *testing.T) {
 // pass already advanced the stored counter.
 func TestFIDO2SameEnvelopeReevaluation(t *testing.T) {
 	body := []byte("transfer the funds")
-	v, _, _, a := fido2TestSetup(t, body, PresenceFIDO2UV)
+	v, _, _, a, _ := fido2TestSetup(t, body, PresenceFIDO2UV)
 	in := EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "r", Now: time.Now().Unix(), EnvelopeID: 7}
 	first := v.Evaluate(in)
 	if first.Verdict != VerdictAttested {
@@ -189,11 +237,11 @@ func TestFIDO2VerificationRejects(t *testing.T) {
 	cases := []struct {
 		name       string
 		wantReason string // when set, the rejection must come from this check
-		mutate     func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey)
+		mutate     func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey, nonce []byte)
 	}{
 		{
 			name: "wrong challenge",
-			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey) {
+			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey, nonce []byte) {
 				other := MsgHashOf([]byte("something else"))
 				a.Proof.Assertion = craftAssertion(t, credPriv, other[:], "https://dashboard.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified)
 				resignAttestation(t, a, idPriv)
@@ -201,65 +249,70 @@ func TestFIDO2VerificationRejects(t *testing.T) {
 		},
 		{
 			name: "wrong origin",
-			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey) {
+			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey, nonce []byte) {
 				h := MsgHashOf(body)
-				a.Proof.Assertion = craftAssertion(t, credPriv, h[:], "https://evil.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified)
+				challenge := ApprovalChallenge(h[:], nonce)
+				a.Proof.Assertion = craftAssertion(t, credPriv, challenge[:], "https://evil.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified)
 				resignAttestation(t, a, idPriv)
 			},
 		},
 		{
 			name: "wrong rp id",
-			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey) {
+			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey, nonce []byte) {
 				h := MsgHashOf(body)
-				a.Proof.Assertion = craftAssertion(t, credPriv, h[:], "https://dashboard.test", "other.test", authFlagUserPresent|authFlagUserVerified)
+				challenge := ApprovalChallenge(h[:], nonce)
+				a.Proof.Assertion = craftAssertion(t, credPriv, challenge[:], "https://dashboard.test", "other.test", authFlagUserPresent|authFlagUserVerified)
 				resignAttestation(t, a, idPriv)
 			},
 		},
 		{
 			name: "missing user-presence flag",
-			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey) {
+			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey, nonce []byte) {
 				h := MsgHashOf(body)
-				a.Proof.Assertion = craftAssertion(t, credPriv, h[:], "https://dashboard.test", "dashboard.test", 0)
+				challenge := ApprovalChallenge(h[:], nonce)
+				a.Proof.Assertion = craftAssertion(t, credPriv, challenge[:], "https://dashboard.test", "dashboard.test", 0)
 				resignAttestation(t, a, idPriv)
 			},
 		},
 		{
 			name: "missing user-verification flag when UV required",
-			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey) {
+			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey, nonce []byte) {
 				h := MsgHashOf(body)
-				a.Proof.Assertion = craftAssertion(t, credPriv, h[:], "https://dashboard.test", "dashboard.test", authFlagUserPresent)
+				challenge := ApprovalChallenge(h[:], nonce)
+				a.Proof.Assertion = craftAssertion(t, credPriv, challenge[:], "https://dashboard.test", "dashboard.test", authFlagUserPresent)
 				resignAttestation(t, a, idPriv)
 			},
 		},
 		{
 			name: "unenrolled credential id",
-			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey) {
+			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey, nonce []byte) {
 				a.Proof.CredentialID = "not-enrolled"
 				resignAttestation(t, a, idPriv)
 			},
 		},
 		{
 			name: "unconfigured relying party",
-			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey) {
+			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey, nonce []byte) {
 				v.WebAuthn = WebAuthnRP{}
 			},
 		},
 		{
 			name: "assertion signed by a different key",
-			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey) {
+			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey, nonce []byte) {
 				evil, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 				if err != nil {
 					t.Fatal(err)
 				}
 				h := MsgHashOf(body)
-				a.Proof.Assertion = craftAssertion(t, evil, h[:], "https://dashboard.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified)
+				challenge := ApprovalChallenge(h[:], nonce)
+				a.Proof.Assertion = craftAssertion(t, evil, challenge[:], "https://dashboard.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified)
 				resignAttestation(t, a, idPriv)
 			},
 		},
 		{
 			name:       "clientDataJSON bytes changed, challenge kept",
 			wantReason: "fido2: signature invalid",
-			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey) {
+			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey, nonce []byte) {
 				// Keep the valid signature but swap the
 				// clientDataJSON for different bytes carrying the
 				// SAME challenge and origin: every field check
@@ -282,9 +335,10 @@ func TestFIDO2VerificationRejects(t *testing.T) {
 					t.Fatal("assertion has no response object")
 				}
 				h := MsgHashOf(body)
+				challenge := ApprovalChallenge(h[:], nonce)
 				cdJSON, err := json.Marshal(map[string]string{
 					"type":        "webauthn.get",
-					"challenge":   b64.EncodeToString(h[:]),
+					"challenge":   b64.EncodeToString(challenge[:]),
 					"origin":      "https://dashboard.test",
 					"crossOrigin": "false",
 				})
@@ -303,7 +357,7 @@ func TestFIDO2VerificationRejects(t *testing.T) {
 		{
 			name:       "authenticatorData bit flip",
 			wantReason: "fido2: signature invalid",
-			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey) {
+			mutate: func(t *testing.T, v *Verifier, a *Attestation, credPriv *ecdsa.PrivateKey, idPriv ed25519.PrivateKey, nonce []byte) {
 				// Flip a bit inside authenticatorData (in the
 				// signature-counter bytes; the UP/UV flags at
 				// byte 32 stay set): every field check passes, so
@@ -345,8 +399,8 @@ func TestFIDO2VerificationRejects(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			v, credPriv, idPriv, a := fido2TestSetup(t, body, PresenceFIDO2UV)
-			tc.mutate(t, v, a, credPriv, idPriv)
+			v, credPriv, idPriv, a, nonce := fido2TestSetup(t, body, PresenceFIDO2UV)
+			tc.mutate(t, v, a, credPriv, idPriv, nonce)
 			out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "r", Now: time.Now().Unix(), EnvelopeID: 1})
 			if out.Verdict != VerdictInvalid {
 				t.Fatalf("verdict = %s (%s), want invalid", out.Verdict, out.Reason)
@@ -360,44 +414,49 @@ func TestFIDO2VerificationRejects(t *testing.T) {
 
 func TestFIDO2SignCountReplay(t *testing.T) {
 	// A captured assertion re-wrapped in a fresh attestation (new
-	// id, new envelope) defeats the envelope-layer replay dedup —
-	// the authenticator signature counter must catch it: the
-	// counter did not strictly increase.
+	// id, new nonce, new envelope) defeats the envelope-layer
+	// replay dedup — but the assertion answers only its own
+	// ceremony's challenge, so the challenge check rejects it.
+	// (Re-wrapping with the SAME nonce is caught by the
+	// nonce-replay check instead; see approve_replay_test.go.)
 	body := []byte("transfer the funds")
-	v, _, idPriv, a := fido2TestSetup(t, body, PresenceFIDO2UV)
+	v, credPriv, idPriv, a, _ := fido2TestSetup(t, body, PresenceFIDO2UV)
 	now := time.Now().Unix()
 	out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "r", Now: now, EnvelopeID: 1})
 	if out.Verdict != VerdictAttested {
 		t.Fatalf("first evaluation should attest, got %v (%s)", out.Verdict, out.Reason)
 	}
-	rewrapped, err := NewTier2Attestation(body, a.Approver, "req-2", ProofFIDO2, PresenceFIDO2UV,
-		Proof{CredentialID: a.Proof.CredentialID, Assertion: a.Proof.Assertion}, idPriv)
-	if err != nil {
-		t.Fatal(err)
+	// Fresh nonce, but the captured assertion still answers the
+	// old ceremony's challenge.
+	rewrapped, _ := mintFIDO2Attestation(t, body, a.Approver, "req-2", PresenceFIDO2UV,
+		a.Proof.CredentialID, credPriv, nil, 1, idPriv)
+	if rewrapped.ApprovalNonce == a.ApprovalNonce {
+		t.Fatal("rewrap should use a fresh nonce")
 	}
+	rewrapped.Proof.Assertion = a.Proof.Assertion
+	resignAttestation(t, rewrapped, idPriv)
 	out2 := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: rewrapped, Receiver: "r", Now: now, EnvelopeID: 2})
 	if out2.Verdict != VerdictInvalid {
 		t.Fatalf("re-wrapped assertion should be invalid, got %v (%s)", out2.Verdict, out2.Reason)
+	}
+	if !strings.Contains(out2.Reason, "challenge") {
+		t.Fatalf("want a challenge rejection, got %q", out2.Reason)
 	}
 }
 
 func TestFIDO2SignCountIncrease(t *testing.T) {
 	// A strictly increasing counter is accepted and persisted: the
-	// next assertion must beat the new stored value.
+	// next assertion must beat the new stored value. Each approval
+	// is a fresh ceremony with its own nonce.
 	body := []byte("transfer the funds")
-	v, credPriv, idPriv, a := fido2TestSetup(t, body, PresenceFIDO2UV)
+	v, credPriv, idPriv, a, _ := fido2TestSetup(t, body, PresenceFIDO2UV)
 	now := time.Now().Unix()
 	out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "r", Now: now, EnvelopeID: 1})
 	if out.Verdict != VerdictAttested {
 		t.Fatalf("first evaluation should attest, got %v (%s)", out.Verdict, out.Reason)
 	}
-	h := MsgHashOf(body)
-	next, err := NewTier2Attestation(body, a.Approver, "req-2", ProofFIDO2, PresenceFIDO2UV,
-		Proof{CredentialID: a.Proof.CredentialID, Assertion: craftAssertionWithCount(t, credPriv, h[:],
-			"https://dashboard.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified, 2)}, idPriv)
-	if err != nil {
-		t.Fatal(err)
-	}
+	next, _ := mintFIDO2Attestation(t, body, a.Approver, "req-2", PresenceFIDO2UV,
+		a.Proof.CredentialID, credPriv, nil, 2, idPriv)
 	out2 := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: next, Receiver: "r", Now: now, EnvelopeID: 2})
 	if out2.Verdict != VerdictAttested {
 		t.Fatalf("increased counter should attest, got %v (%s)", out2.Verdict, out2.Reason)
@@ -407,19 +466,16 @@ func TestFIDO2SignCountIncrease(t *testing.T) {
 func TestFIDO2ZeroCounterAuthenticator(t *testing.T) {
 	// Authenticators without a counter report 0 forever; the
 	// WebAuthn spec permits 0 while the stored value is also 0.
+	// Each approval is a fresh ceremony with its own nonce, so
+	// both attest — the nonce, not the counter, is the replay
+	// control for counterless authenticators.
 	body := []byte("transfer the funds")
-	v, credPriv, idPriv, setup := fido2TestSetup(t, body, PresenceFIDO2UV)
+	v, credPriv, idPriv, setup, _ := fido2TestSetup(t, body, PresenceFIDO2UV)
 	approver, credID := setup.Approver, setup.Proof.CredentialID
-	h := MsgHashOf(body)
 	now := time.Now().Unix()
 	for env := int64(1); env <= 2; env++ {
-		assertion := craftAssertionWithCount(t, credPriv, h[:],
-			"https://dashboard.test", "dashboard.test", authFlagUserPresent|authFlagUserVerified, 0)
-		a, err := NewTier2Attestation(body, approver, "req-zero", ProofFIDO2, PresenceFIDO2UV,
-			Proof{CredentialID: credID, Assertion: assertion}, idPriv)
-		if err != nil {
-			t.Fatal(err)
-		}
+		a, _ := mintFIDO2Attestation(t, body, approver, "req-zero", PresenceFIDO2UV,
+			credID, credPriv, nil, 0, idPriv)
 		out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "r", Now: now, EnvelopeID: env})
 		if out.Verdict != VerdictAttested {
 			t.Fatalf("zero-counter evaluation %d should attest, got %v (%s)", env, out.Verdict, out.Reason)
