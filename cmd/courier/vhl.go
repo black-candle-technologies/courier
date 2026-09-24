@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"strconv"
@@ -17,7 +18,7 @@ import (
 
 func cmdVHL(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: courier vhl <enroll|enroll-webauthn|approvers|unenroll|rp|session|request|requests|approve|attestations|challenge> [args]")
+		return fmt.Errorf("usage: courier vhl <enroll|enroll-webauthn|approvers|unenroll|rp|session|request|requests|approve|attestations|challenge|policy> [args]")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
@@ -52,13 +53,15 @@ func cmdVHL(args []string) error {
 	case "requests":
 		return cmdVHLRequests(c)
 	case "approve":
-		return cmdVHLApprove(c, args[1:])
+		return cmdVHLApprove(cfg, c, args[1:])
 	case "attestations":
 		return cmdVHLAttestations(c)
 	case "challenge":
 		return cmdVHLChallenge(c, args[1:])
+	case "policy":
+		return cmdVHLPolicy(c, args[1:])
 	default:
-		return fmt.Errorf("usage: courier vhl <enroll|enroll-webauthn|approvers|unenroll|rp|session|request|requests|approve|attestations|challenge> [args]")
+		return fmt.Errorf("usage: courier vhl <enroll|enroll-webauthn|approvers|unenroll|rp|session|request|requests|approve|attestations|challenge|policy> [args]")
 	}
 }
 
@@ -138,13 +141,20 @@ func cmdVHLEnroll(c *client.Client, args []string) error {
 		return fmt.Errorf("usage: courier vhl enroll <address> [--name NAME]")
 	}
 	address := rest[0]
-	// Enrollment is a Tier 2 human-approved event (issue #142): the
-	// human at this terminal explicitly confirms, and the event is
-	// recorded in the registry for audit.
-	if !confirmTyping(fmt.Sprintf("enroll %s as a VHL approver (type ENROLL to confirm)", address), "ENROLL") {
-		return fmt.Errorf("cancelled")
+	// Enrollment is a human-controlled cryptographic ceremony
+	// (issue #142 review): typed confirmation could be driven by a
+	// compromised process on a PTY, so the human approves the
+	// pairing in their browser with their enrolled security key,
+	// and the resulting artifact — not the typing — authorizes the
+	// enrollment. The human sees WHAT they are enrolling here and
+	// again on the ceremony page (approver + agent addresses).
+	printf := func(format string, a ...any) { fmt.Printf(format, a...) }
+	fmt.Printf("enrolling %s as a VHL approver — complete the security-key ceremony in your browser to authorize it.\n", address)
+	art, err := c.VHLEnrollApproverCeremony(address, printf)
+	if err != nil {
+		return err
 	}
-	if err := c.VHLEnrollApprover(address, name, "cli-interactive-enrollment"); err != nil {
+	if err := c.VHLEnrollApprover(address, name, art); err != nil {
 		return err
 	}
 	fmt.Println("approver enrolled")
@@ -450,7 +460,7 @@ func cmdVHLRequests(c *client.Client) error {
 	return nil
 }
 
-func cmdVHLApprove(c *client.Client, args []string) error {
+func cmdVHLApprove(cfg *client.Config, c *client.Client, args []string) error {
 	var presenceStr string
 	var rest []string
 	for i := 0; i < len(args); i++ {
@@ -464,7 +474,7 @@ func cmdVHLApprove(c *client.Client, args []string) error {
 		}
 	}
 	if len(rest) < 1 {
-		return fmt.Errorf("usage: courier vhl approve <request-id> [--presence pin|challenge]")
+		return fmt.Errorf("usage: courier vhl approve <request-id> [--presence pin|challenge|fido2|fido2_uv]")
 	}
 	presence := vhl.PresencePIN
 	if presenceStr != "" {
@@ -489,6 +499,7 @@ func cmdVHLApprove(c *client.Client, args []string) error {
 	fmt.Printf("draft:\n---\n%s\n---\n", sanitizeForTerminal(q.Draft))
 
 	var proof vhl.Proof
+	var approvalNonce []byte
 	switch presence {
 	case vhl.PresencePIN:
 		// The PIN-grade ceremony: the human types the approval at
@@ -522,10 +533,31 @@ func cmdVHLApprove(c *client.Client, args []string) error {
 			return fmt.Errorf("challenge failed: %w", err)
 		}
 		proof = vhl.Proof{Kind: vhl.ProofChallenge, ChallengeID: ch.ID}
+	case vhl.PresenceFIDO2, vhl.PresenceFIDO2UV:
+		// The FIDO2 ceremony: a fresh 32-byte nonce binds this
+		// approval's WebAuthn challenge (see
+		// vhl.ApprovalChallenge), and the human completes the
+		// ceremony in their browser with their enrolled security
+		// key. The returned proof carries the assertion; the nonce
+		// is embedded in the attestation so the receiver can
+		// consume it exactly once (the replay control).
+		var nonce [32]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return fmt.Errorf("approval nonce: %w", err)
+		}
+		printf := func(format string, a ...any) { fmt.Printf(format, a...) }
+		p, err := c.VHLApproveFIDO2Ceremony(nonce[:], h[:], q.ID, cfg.Address, q.Draft, printf)
+		if err != nil {
+			return err
+		}
+		proof, approvalNonce = p, nonce[:]
 	default:
-		return fmt.Errorf("the CLI performs the pin and challenge ceremonies; use the dashboard for %q", presence)
+		return fmt.Errorf("unknown presence %q", presence)
 	}
-	att, err := c.VHLApproveMint(q.ID, proof, presence)
+	// displayedHash and displayedFrom are the action hash and sender
+	// printed above: VHLApproveMint re-checks them against the stored
+	// request inside one atomic critical section before minting.
+	att, err := c.VHLApproveMint(q.ID, h, rec.From, proof, presence, approvalNonce)
 	if err != nil {
 		return err
 	}
@@ -548,6 +580,45 @@ func cmdVHLAttestations(c *client.Client) error {
 		fmt.Printf("%s  tier=%d approver=%.20s… proof=%s expires=%s\n", a.ID, a.Tier, a.Approver, a.Proof.Kind,
 			time.Unix(a.ExpiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"))
 	}
+	return nil
+}
+
+// cmdVHLPolicy manages the receiver's VHL tier policy: `courier vhl
+// policy` prints the current required-tier floor; `courier vhl policy
+// --require-tier 0|1|2` sets it. Messages below the floor are held
+// for human review instead of being delivered as attested.
+func cmdVHLPolicy(c *client.Client, args []string) error {
+	var tierStr string
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--require-tier" && i+1 < len(args):
+			tierStr, i = args[i+1], i+1
+		case strings.HasPrefix(args[i], "--require-tier="):
+			tierStr = strings.TrimPrefix(args[i], "--require-tier=")
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	if len(rest) > 0 {
+		return fmt.Errorf("usage: courier vhl policy [--require-tier 0|1|2]")
+	}
+	if tierStr == "" {
+		tier, err := c.VHLGetRequiredTier()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("required tier: %d\n", tier)
+		return nil
+	}
+	tier, err := strconv.Atoi(tierStr)
+	if err != nil || tier < 0 || tier > 2 {
+		return fmt.Errorf("--require-tier must be 0, 1, or 2")
+	}
+	if err := c.VHLSetRequiredTier(tier); err != nil {
+		return err
+	}
+	fmt.Printf("required tier set to %d\n", tier)
 	return nil
 }
 

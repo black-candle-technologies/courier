@@ -22,9 +22,7 @@ func TestVHLRevocationAppliesWithinSamePage(t *testing.T) {
 	if err := env.recipient.PublishKey(); err != nil {
 		t.Fatalf("publish key: %v", err)
 	}
-	if err := env.recipient.VHLEnrollApprover(env.senderCfg.Address, "sender", "test-enrollment"); err != nil {
-		t.Fatalf("enroll approver: %v", err)
-	}
+	testEnrollApprover(t, env.senderCfg.Address, "sender")
 
 	env.asSender()
 	if err := env.sender.PublishKey(); err != nil {
@@ -82,9 +80,7 @@ func TestVHLTier1ScopedTokenSelection(t *testing.T) {
 	if err := env.recipient.PublishKey(); err != nil {
 		t.Fatalf("publish key: %v", err)
 	}
-	if err := env.recipient.VHLEnrollApprover(env.senderCfg.Address, "sender", "test-enrollment"); err != nil {
-		t.Fatalf("enroll approver: %v", err)
-	}
+	testEnrollApprover(t, env.senderCfg.Address, "sender")
 
 	env.asSender()
 	fix := setupMintFixture(t, env)
@@ -137,9 +133,7 @@ func TestVHLExplicitFetchDoesNotConsumeReplay(t *testing.T) {
 	if err := env.recipient.PublishKey(); err != nil {
 		t.Fatalf("publish key: %v", err)
 	}
-	if err := env.recipient.VHLEnrollApprover(env.senderCfg.Address, "sender", "test-enrollment"); err != nil {
-		t.Fatalf("enroll approver: %v", err)
-	}
+	testEnrollApprover(t, env.senderCfg.Address, "sender")
 
 	env.asSender()
 	fix := setupMintFixture(t, env)
@@ -198,9 +192,7 @@ func TestVHLHeldSenderFramesGated(t *testing.T) {
 		t.Fatalf("dm policy: %v", err)
 	}
 	// Enrollment is the VHL trust root — independent of contacts.
-	if err := env.recipient.VHLEnrollApprover(env.senderCfg.Address, "sender", "test-enrollment"); err != nil {
-		t.Fatalf("enroll approver: %v", err)
-	}
+	testEnrollApprover(t, env.senderCfg.Address, "sender")
 
 	env.asSender()
 	if err := env.sender.PublishKey(); err != nil {

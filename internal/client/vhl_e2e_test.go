@@ -3,9 +3,36 @@ package client
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/black-candle-technologies/courier/internal/vhl"
 )
+
+// testEnrollApprover enrolls address as an approver directly in the
+// local registry, bypassing the WebAuthn enrollment ceremony. Tests
+// are ceremony-validated by construction: the enrollment ceremony
+// itself is exercised in the vhl package tests (see
+// TestEnrollWithArtifact), and the client half (artifact production)
+// belongs to the ceremony worker. Callers run under the identity's
+// HOME (asRecipient/asSender), which is where vhl.json lives.
+func testEnrollApprover(t *testing.T, address, name string) {
+	t.Helper()
+	credID, pub, err := vhlCredentialIDForAddress(address)
+	if err != nil {
+		t.Fatalf("credential id: %v", err)
+	}
+	if err := updateVHL(func(ff *vhlFile) error {
+		return ff.Registry.Enroll(address, name, vhl.Credential{
+			ID:         credID,
+			Kind:       "ed25519",
+			PublicKey:  b64.EncodeToString(pub),
+			EnrolledAt: time.Now().Unix(),
+			Device:     "courier-identity",
+		})
+	}); err != nil {
+		t.Fatalf("enroll approver: %v", err)
+	}
+}
 
 // TestVHLTier1EndToEnd exercises the full Tier 1 loop against a live
 // relay: the recipient enrolls the sender, the sender mints a session
@@ -19,9 +46,7 @@ func TestVHLTier1EndToEnd(t *testing.T) {
 	}
 	// The receiver enrolls the sender as an approver; that enrollment
 	// is the trust root.
-	if err := env.recipient.VHLEnrollApprover(env.senderCfg.Address, "sender", "test-enrollment"); err != nil {
-		t.Fatalf("enroll approver: %v", err)
-	}
+	testEnrollApprover(t, env.senderCfg.Address, "sender")
 
 	env.asSender()
 	fix := setupMintFixture(t, env)
@@ -89,9 +114,7 @@ func TestVHLMissingAttestationHeld(t *testing.T) {
 	if err := env.recipient.PublishKey(); err != nil {
 		t.Fatalf("publish key: %v", err)
 	}
-	if err := env.recipient.VHLEnrollApprover(env.senderCfg.Address, "sender", "test-enrollment"); err != nil {
-		t.Fatalf("enroll approver: %v", err)
-	}
+	testEnrollApprover(t, env.senderCfg.Address, "sender")
 
 	env.asSender()
 	plain, err := encodeMessageBodyVHL("wipe the database", nil, 0, "", 0, vhl.Tier2, nil)
@@ -133,16 +156,14 @@ func TestVHLTier2EndToEnd(t *testing.T) {
 	if err := env.recipient.PublishKey(); err != nil {
 		t.Fatalf("publish key: %v", err)
 	}
-	if err := env.recipient.VHLEnrollApprover(env.senderCfg.Address, "sender", "test-enrollment"); err != nil {
-		t.Fatalf("enroll approver: %v", err)
-	}
+	testEnrollApprover(t, env.senderCfg.Address, "sender")
 
 	env.asSender()
 	req, err := env.sender.VHLRequestApproval("", vhl.Tier2, "merge PR #142", vhl.PresencePIN)
 	if err != nil {
 		t.Fatalf("request approval: %v", err)
 	}
-	att, err := env.sender.VHLApproveMint(req.ID, vhl.Proof{Kind: vhl.ProofPIN}, vhl.PresencePIN)
+	att, err := env.sender.VHLApproveMint(req.ID, vhl.MsgHashOf([]byte("merge PR #142")), env.senderCfg.Address, vhl.Proof{Kind: vhl.ProofPIN}, vhl.PresencePIN, nil)
 	if err != nil {
 		t.Fatalf("approve: %v", err)
 	}
@@ -180,16 +201,14 @@ func TestVHLTier2BaitAndSwitch(t *testing.T) {
 	if err := env.recipient.PublishKey(); err != nil {
 		t.Fatalf("publish key: %v", err)
 	}
-	if err := env.recipient.VHLEnrollApprover(env.senderCfg.Address, "sender", "test-enrollment"); err != nil {
-		t.Fatalf("enroll approver: %v", err)
-	}
+	testEnrollApprover(t, env.senderCfg.Address, "sender")
 
 	env.asSender()
 	req, err := env.sender.VHLRequestApproval("", vhl.Tier2, "review README", vhl.PresencePIN)
 	if err != nil {
 		t.Fatalf("request approval: %v", err)
 	}
-	att, err := env.sender.VHLApproveMint(req.ID, vhl.Proof{Kind: vhl.ProofPIN}, vhl.PresencePIN)
+	att, err := env.sender.VHLApproveMint(req.ID, vhl.MsgHashOf([]byte("review README")), env.senderCfg.Address, vhl.Proof{Kind: vhl.ProofPIN}, vhl.PresencePIN, nil)
 	if err != nil {
 		t.Fatalf("approve: %v", err)
 	}
@@ -234,9 +253,7 @@ func TestVHLReplayHeldAcrossEnvelopes(t *testing.T) {
 	if err := env.recipient.PublishKey(); err != nil {
 		t.Fatalf("publish key: %v", err)
 	}
-	if err := env.recipient.VHLEnrollApprover(env.senderCfg.Address, "sender", "test-enrollment"); err != nil {
-		t.Fatalf("enroll approver: %v", err)
-	}
+	testEnrollApprover(t, env.senderCfg.Address, "sender")
 
 	env.asSender()
 	fix := setupMintFixture(t, env)
@@ -279,9 +296,7 @@ func TestVHLApprovalRequestFrame(t *testing.T) {
 	if err := env.recipient.PublishKey(); err != nil {
 		t.Fatalf("publish key: %v", err)
 	}
-	if err := env.recipient.VHLEnrollApprover(env.senderCfg.Address, "sender", "test-enrollment"); err != nil {
-		t.Fatalf("enroll approver: %v", err)
-	}
+	testEnrollApprover(t, env.senderCfg.Address, "sender")
 
 	// Both sides publish their encryption keys: VHL frames are E2E
 	// DMs and must be decryptable by the peer (the address-derived
@@ -311,7 +326,7 @@ func TestVHLApprovalRequestFrame(t *testing.T) {
 	// The human approves; VHLApproveMint returns the frame to the
 	// agent over the native attestation frame, whose inbox stores
 	// it for later use.
-	if _, err := env.recipient.VHLApproveMint(reqs[0].Request.ID, vhl.Proof{Kind: vhl.ProofPIN}, vhl.PresencePIN); err != nil {
+	if _, err := env.recipient.VHLApproveMint(reqs[0].Request.ID, vhl.MsgHashOf([]byte("shut down the relay")), env.senderCfg.Address, vhl.Proof{Kind: vhl.ProofPIN}, vhl.PresencePIN, nil); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 	env.asSender()
@@ -343,9 +358,7 @@ func TestVHLSessionRevocationBroadcast(t *testing.T) {
 	if err := env.recipient.PublishKey(); err != nil {
 		t.Fatalf("publish key: %v", err)
 	}
-	if err := env.recipient.VHLEnrollApprover(env.senderCfg.Address, "sender", "test-enrollment"); err != nil {
-		t.Fatalf("enroll approver: %v", err)
-	}
+	testEnrollApprover(t, env.senderCfg.Address, "sender")
 
 	env.asSender()
 	if err := env.sender.PublishKey(); err != nil {
@@ -433,9 +446,7 @@ func TestVHLTier0WithAttestationRejected(t *testing.T) {
 	if err := env.recipient.PublishKey(); err != nil {
 		t.Fatalf("publish key: %v", err)
 	}
-	if err := env.recipient.VHLEnrollApprover(env.senderCfg.Address, "sender", "test-enrollment"); err != nil {
-		t.Fatalf("enroll approver: %v", err)
-	}
+	testEnrollApprover(t, env.senderCfg.Address, "sender")
 
 	env.asSender()
 	fix := setupMintFixture(t, env)
@@ -480,9 +491,7 @@ func TestVHLPersistenceAcrossRestart(t *testing.T) {
 	if err := env.recipient.PublishKey(); err != nil {
 		t.Fatalf("publish key: %v", err)
 	}
-	if err := env.recipient.VHLEnrollApprover(env.senderCfg.Address, "sender", "test-enrollment"); err != nil {
-		t.Fatalf("enroll approver: %v", err)
-	}
+	testEnrollApprover(t, env.senderCfg.Address, "sender")
 	env.asSender()
 	fix := setupMintFixture(t, env)
 	fix.mint(t, env, "")

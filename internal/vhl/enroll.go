@@ -1,6 +1,7 @@
 package vhl
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"time"
 )
@@ -65,15 +66,14 @@ func NewRegistry() *Registry {
 	return &Registry{Approvers: map[string]*Approver{}}
 }
 
-// Enroll adds or updates an approver. tier2HumanApproved must be true:
+// Enroll adds or updates an approver. Callers are ceremony-validated:
 // enrollment is a Tier 2 human-approved event (during pairing, that is
-// the human operator running the command themselves).
-func (r *Registry) Enroll(identity, name string, cred Credential, tier2HumanApproved bool) error {
+// the human operator completing the WebAuthn enrollment ceremony
+// themselves — see EnrollWithArtifact), so the approval gate lives at
+// the call site, not in this method.
+func (r *Registry) Enroll(identity, name string, cred Credential) error {
 	if identity == "" {
 		return fmt.Errorf("cannot enroll an empty identity")
-	}
-	if !tier2HumanApproved {
-		return fmt.Errorf("enrollment requires a Tier 2 human-approved event")
 	}
 	if cred.ID == "" || cred.PublicKey == "" {
 		return fmt.Errorf("credential needs an id and a public key")
@@ -122,6 +122,91 @@ func (r *Registry) Enroll(identity, name string, cred Credential, tier2HumanAppr
 	}
 	a.Credentials = append(a.Credentials, cred)
 	return nil
+}
+
+// EnrollWithArtifact enrolls identity as an approver on the strength
+// of a human-completed approver-enrollment ceremony (issue #142
+// review). Typed-confirmation enrollment could be driven by a
+// compromised process on a PTY, so this is the only path that enrolls
+// a trust root: it requires the artifact — a WebAuthn assertion over
+// ApproverEnrollmentChallenge(agentAddress, identity, issuedAt),
+// signed by a WebAuthn credential the local human already enrolled
+// (their security key, e.g. via the registration ceremony). The
+// assertion is verified with user verification required: enrollment
+// is high-value. The authenticator signature counter advances under
+// the same strict-increase rule as the verifier (see policy.go), so a
+// captured enrollment assertion cannot mint a second enrollment.
+//
+// cred is the credential enrolled for the new approver (their ed25519
+// identity key); art.CredentialID names the human's local ceremony
+// credential, which must already be enrolled, unrevoked, and
+// Kind "webauthn".
+func (r *Registry) EnrollWithArtifact(identity, name string, cred Credential, agentAddress string, art *EnrollmentArtifact, rp WebAuthnRP, now int64) error {
+	if art == nil {
+		return fmt.Errorf("enrollment requires an approver-enrollment ceremony artifact")
+	}
+	if art.Address != identity {
+		return fmt.Errorf("enrollment artifact is for %q, not %q", art.Address, identity)
+	}
+	if art.AgentAddress != agentAddress {
+		return fmt.Errorf("enrollment artifact was authorized by %q, not this agent %q", art.AgentAddress, agentAddress)
+	}
+	wantChallenge := ApproverEnrollmentChallenge(agentAddress, identity, art.IssuedAt)
+	gotChallenge, err := b64.DecodeString(art.Challenge)
+	if err != nil || subtle.ConstantTimeCompare(gotChallenge, wantChallenge[:]) != 1 {
+		return fmt.Errorf("enrollment artifact challenge does not match the ceremony context")
+	}
+	skew := now - art.IssuedAt
+	if skew < 0 {
+		skew = -skew
+	}
+	if skew > 300 {
+		return fmt.Errorf("enrollment artifact expired (issued %d, now %d: want |skew| <= 300s)", art.IssuedAt, now)
+	}
+	// The assertion must verify under a WebAuthn credential the local
+	// human already enrolled — their security key, the thing they
+	// touched in the browser ceremony.
+	var holder *Approver
+	var enrolled *Credential
+	for _, a := range r.Approvers {
+		if a.Revoked {
+			continue
+		}
+		for i := range a.Credentials {
+			if a.Credentials[i].ID == art.CredentialID {
+				holder, enrolled = a, &a.Credentials[i]
+				break
+			}
+		}
+		if enrolled != nil {
+			break
+		}
+	}
+	if enrolled == nil {
+		return fmt.Errorf("enrollment ceremony credential %q is not enrolled", art.CredentialID)
+	}
+	if enrolled.Kind != "webauthn" {
+		return fmt.Errorf("enrollment ceremony credential %q is %q, want a webauthn ceremony credential", art.CredentialID, enrolled.Kind)
+	}
+	rawKey, err := b64.DecodeString(enrolled.PublicKey)
+	if err != nil {
+		return fmt.Errorf("enrollment ceremony credential key: %w", err)
+	}
+	credPub, err := credentialKey(rawKey)
+	if err != nil {
+		return fmt.Errorf("enrollment ceremony credential key: %w", err)
+	}
+	signCount, err := verifyWebAuthnAssertion(credPub, art.Assertion, wantChallenge[:], rp, true)
+	if err != nil {
+		return fmt.Errorf("enrollment assertion: %w", err)
+	}
+	// Same replay control as the verifier: the counter must strictly
+	// increase per credential (0/0 for counter-less authenticators).
+	if stored := enrolled.SignCount; signCount <= stored && (stored != 0 || signCount != 0) {
+		return fmt.Errorf("enrollment assertion signature counter did not increase (got %d, want > %d)", signCount, stored)
+	}
+	r.NoteSignCount(holder.Identity, enrolled.ID, signCount)
+	return r.Enroll(identity, name, cred)
 }
 
 // RevokeCredential surgically revokes one credential of an approver.
