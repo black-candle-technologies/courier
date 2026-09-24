@@ -209,7 +209,7 @@ func usage() {
   courier fs off <peer>                  disable FS for a peer (erases session)
   courier fs rekey <peer>                rotate the FS ratchet on next send
   courier fs forget <peer>               erase the FS session for a peer
-  courier vhl enroll <address> [--name N]
+  courier vhl approver add <address> [--name N]
                                          enroll a human approver (interactive confirm)
   courier vhl enroll-webauthn [--device LABEL]
                                          enroll a WebAuthn credential via the
@@ -217,22 +217,22 @@ func usage() {
   courier vhl rp set --id DOMAIN --origin https://DOMAIN --attestation-root CERT_FILE [...]
                                          configure the WebAuthn relying party
   courier vhl rp show                    show the relying-party config
-  courier vhl approvers                  list enrolled approvers
-  courier vhl unenroll <address|name>    revoke an approver
+  courier vhl approver list              list enrolled approvers
+  courier vhl approver remove <address|name>
+                                         revoke an approver
   courier vhl session mint [--scope ADDRESS] [--ttl DURATION]
                                          mint a tier-1 session token via the
                                          relay-hosted WebAuthn ceremony
   courier vhl session status             show live session tokens
   courier vhl session revoke <id> [--broadcast]
                                          revoke a session token
-  courier vhl request --tier 2 --message TEXT [--presence pin] [--to ADDR]
+  courier vhl request new --tier 2 --message TEXT [--presence pin] [--to ADDR]
                                          ask a human to approve exact bytes
-  courier vhl requests                   list pending approval requests
+  courier vhl request list               list pending approval requests
   courier vhl approve <request-id> [--presence pin|challenge]
                                          review and approve exact bytes (interactive)
   courier vhl attestations               list received attestations
-  courier vhl challenge mint --action TEXT
-                                         mint an out-of-band challenge code
+  courier vhl challenge --action TEXT    mint an out-of-band challenge code
   courier backup create [--output f]     write an encrypted identity backup
                                          (seed + live keys, passphrase-protected)
   courier backup restore [--force] <file>

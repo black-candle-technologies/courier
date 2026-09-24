@@ -32,6 +32,12 @@ type vhlRequestRecord struct {
 	EnvelopeID int64                `json:"envelope_id"`
 }
 
+// VHLRequestRecord is the exported alias of vhlRequestRecord. The
+// CLI dispatch layer's narrow test seam names this type in an
+// interface, and unexported types cannot be named from another
+// package; the alias changes nothing about the stored form.
+type VHLRequestRecord = vhlRequestRecord
+
 // vhlFile is the local VHL state: the enrollment registry (the trust
 // root), the sealed session-token keystore, the sealed challenge
 // store, the seen-artifact replay set, the revocation set, pending
