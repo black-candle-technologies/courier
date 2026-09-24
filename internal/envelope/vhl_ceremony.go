@@ -19,17 +19,26 @@ var vhlEnrollmentAnnounceDomain = []byte("courier-vhl-enrollment-announce-v1\x00
 
 // VHLCeremonyCreate returns the exact bytes covered by a ceremony
 // creation signature: the agent's address, the ceremony type
-// ("enroll" or "mint"), the challenge the authenticator must answer
-// (already base64url-encoded by the caller), and the unix timestamp.
-// The timestamp lets the relay reject replays outside its
+// ("enroll", "mint", "approve", or "enroll-approver"), the challenge
+// the authenticator must answer (already base64url-encoded by the
+// caller), the ceremony context JSON the human reviews in the
+// browser (the canonical mint/approve/enrollment context; empty for
+// "enroll", which carries no context), and the unix timestamp. The
+// context is signed so the relay cannot substitute different values
+// (e.g. a wider scope or longer TTL) than the human saw: the page
+// recomputes the challenge from the displayed context, and the agent
+// verifies the signature covers the same context bytes. The
+// timestamp lets the relay reject replays outside its
 // signed-request age bound.
-func VHLCeremonyCreate(addressEd25519 []byte, ceremonyType, challenge string, ts int64) []byte {
-	out := make([]byte, 0, len(vhlCeremonyCreateDomain)+32+len(ceremonyType)+len(challenge)+8)
+func VHLCeremonyCreate(addressEd25519 []byte, ceremonyType, challenge, contextJSON string, ts int64) []byte {
+	out := make([]byte, 0, len(vhlCeremonyCreateDomain)+32+len(ceremonyType)+len(challenge)+len(contextJSON)+8)
 	out = append(out, vhlCeremonyCreateDomain...)
 	out = append(out, addressEd25519...) // 32 bytes Ed25519 (address key)
 	out = append(out, ceremonyType...)
 	out = append(out, 0x00)
 	out = append(out, challenge...)
+	out = append(out, 0x00)
+	out = append(out, contextJSON...)
 	out = append(out, 0x00)
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], uint64(ts))
@@ -56,11 +65,15 @@ func VHLCeremonyResult(addressEd25519 []byte, code string, ts int64) []byte {
 // VHLEnrollmentAnnounce returns the exact bytes covered by a VHL
 // enrollment publication signature: the identity address, the
 // WebAuthn credential id, the credential public key (base64url COSE),
-// the relying party id, and the monotonic epoch. The epoch must
+// the relying party id, the monotonic epoch, and the revocation
+// flag. The revoked flag is bound so a malicious relay cannot flip
+// a live binding to revoked (denial of enrollment) or a revocation
+// back to live (resurrection): either flip invalidates the
+// signature and the publication is rejected. The epoch must
 // strictly increase, so a captured old announcement cannot be
 // replayed to resurrect a revoked credential.
-func VHLEnrollmentAnnounce(addressEd25519 []byte, credentialID, credentialPub, rpID string, epoch int64) []byte {
-	out := make([]byte, 0, len(vhlEnrollmentAnnounceDomain)+32+len(credentialID)+len(credentialPub)+len(rpID)+8)
+func VHLEnrollmentAnnounce(addressEd25519 []byte, credentialID, credentialPub, rpID string, epoch int64, revoked bool) []byte {
+	out := make([]byte, 0, len(vhlEnrollmentAnnounceDomain)+32+len(credentialID)+len(credentialPub)+len(rpID)+8+1)
 	out = append(out, vhlEnrollmentAnnounceDomain...)
 	out = append(out, addressEd25519...) // 32 bytes Ed25519 (address key)
 	out = append(out, credentialID...)
@@ -72,5 +85,10 @@ func VHLEnrollmentAnnounce(addressEd25519 []byte, credentialID, credentialPub, r
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], uint64(epoch))
 	out = append(out, b[:]...)
+	if revoked {
+		out = append(out, 0x01)
+	} else {
+		out = append(out, 0x00)
+	}
 	return out
 }

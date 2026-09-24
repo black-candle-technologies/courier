@@ -197,8 +197,17 @@ func TestAdoptLegacyDatabase(t *testing.T) {
 		t.Fatalf("ledger has %d rows, want %d (all adopted)", len(ledger), len(migrations))
 	}
 	for _, m := range migrations {
-		if src := ledger[m.version]; src != "adopted" {
-			t.Fatalf("migration %d source = %q, want %q", m.version, src, "adopted")
+		want := "adopted"
+		if m.version == 26 {
+			// v26 converts the legacy single-row enrollment table
+			// to the per-credential shape: its effects are not
+			// already present in a legacy database, so it
+			// genuinely runs (and the destructive flag takes a
+			// pre-migration backup first).
+			want = "ran"
+		}
+		if src := ledger[m.version]; src != want {
+			t.Fatalf("migration %d source = %q, want %q", m.version, src, want)
 		}
 	}
 	// Seeded data survived.
@@ -849,5 +858,89 @@ func TestSuiteMigrationsUpgradeFromV22(t *testing.T) {
 	}
 	if envSuite != wantSuite {
 		t.Fatalf("envelopes.suite backfill = %q, want %q", envSuite, wantSuite)
+	}
+}
+
+// Migration 26 upgrades the v25 vhl_enrollments table (PRIMARY KEY
+// on address, one credential per identity) to per-credential
+// publication: PRIMARY KEY (address, credential_id) plus a revoked
+// flag. The old single row migrates into (address, credential_id)
+// form with revoked=0; no data is lost.
+func TestMigration26VHLEnrollmentsPerCredential(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v25.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a database that stopped at v25: rebuild the
+	// vhl_enrollments table in the old shape (address-only primary
+	// key, no revoked column) and drop the v26 ledger row, so the
+	// re-open below exercises the real upgrade path.
+	for _, ddl := range []string{
+		`CREATE TABLE vhl_enrollments_old(
+			address        TEXT PRIMARY KEY,
+			credential_id  TEXT NOT NULL,
+			credential_pub TEXT NOT NULL,
+			rp_id          TEXT NOT NULL,
+			aaguid         TEXT NOT NULL DEFAULT '',
+			epoch          INTEGER NOT NULL,
+			signature      TEXT NOT NULL,
+			published_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')))`,
+		`INSERT INTO vhl_enrollments_old
+			(address, credential_id, credential_pub, rp_id, aaguid, epoch, signature, published_at)
+			SELECT address, credential_id, credential_pub, rp_id, aaguid, epoch, signature, published_at
+			FROM vhl_enrollments`,
+		`DROP TABLE vhl_enrollments`,
+		`ALTER TABLE vhl_enrollments_old RENAME TO vhl_enrollments`,
+		`DELETE FROM schema_migrations WHERE version = 26`,
+	} {
+		if _, err := s.db.Exec(ddl); err != nil {
+			s.Close()
+			t.Fatalf("cannot simulate v25 schema: %v", err)
+		}
+	}
+	// A v25-style row, written exactly as the old code wrote it.
+	if _, err := s.db.Exec(
+		`INSERT INTO vhl_enrollments (address, credential_id, credential_pub, rp_id, aaguid, epoch, signature)
+		 VALUES ('ed25519:alice', 'cred-1', 'pub-1', 'example.com', '1234', 1000, 'sig-1')`,
+	); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	s.Close()
+
+	// Re-open: migration 26 must run (not be skipped) and migrate
+	// the row into per-credential form.
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("re-open after v25: %v", err)
+	}
+	defer s2.Close()
+	if src := ledgerRows(t, s2)[26]; src != "ran" {
+		t.Fatalf("migration 26 source = %q, want %q (must run, not be skipped)", src, "ran")
+	}
+	// The row survived with revoked=0.
+	all, err := s2.GetVHLEnrollment("ed25519:alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].CredentialID != "cred-1" || all[0].Epoch != 1000 || all[0].Revoked {
+		t.Fatalf("migrated row wrong: %+v", all)
+	}
+	// The new shape accepts a second credential for the same
+	// address — the old single-row primary key is gone.
+	ok, err := s2.SaveVHLEnrollment(&VHLEnrollment{
+		Address: "ed25519:alice", CredentialID: "cred-2", CredentialPub: "pub-2",
+		RPID: "example.com", Epoch: 1001, Sig: "sig-2",
+	})
+	if err != nil || !ok {
+		t.Fatalf("second credential save: ok=%v err=%v", ok, err)
+	}
+	all, err = s2.GetVHLEnrollment("ed25519:alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("want 2 bindings after upgrade, got %d", len(all))
 	}
 }

@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -208,13 +207,13 @@ func TestVHLCeremonyEnrollEndToEnd(t *testing.T) {
 		t.Fatalf("credential id = %q, want %q", out.cred.ID, wantCredID)
 	}
 
-	// The signed enrollment is published for discovery.
-	entry, err := env.sender.VHLLookupEnrollment(env.senderCfg.Address)
+	// The signed enrollment is published for discovery as a list.
+	bindings, err := env.sender.VHLLookupEnrollment(env.senderCfg.Address)
 	if err != nil {
 		t.Fatalf("lookup enrollment: %v", err)
 	}
-	if fmt.Sprint(entry["credential_id"]) != wantCredID {
-		t.Fatalf("published credential_id = %v, want %s", entry["credential_id"], wantCredID)
+	if len(bindings) != 1 || bindings[0].CredentialID != wantCredID || bindings[0].Revoked {
+		t.Fatalf("published bindings = %+v, want one active %s", bindings, wantCredID)
 	}
 }
 
