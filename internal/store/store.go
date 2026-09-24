@@ -663,9 +663,15 @@ var migrations = []migration{
 			// Preserve every published binding; old rows predate
 			// revocation and migrate as not revoked. Column lists
 			// are explicit so the copy is exact either way.
-			if has, err := columnExists(q, "vhl_enrollments", "revoked"); err != nil {
+			// NOTE: `has` is declared with := but `err` reuses the
+			// outer variable — declaring err in the if-init would
+			// scope it to the if/else chain and silently drop the
+			// INSERT errors below (staticcheck SA4006).
+			has, err := columnExists(q, "vhl_enrollments", "revoked")
+			if err != nil {
 				return err
-			} else if has {
+			}
+			if has {
 				_, err = e.Exec(`INSERT OR IGNORE INTO vhl_enrollments_new
 					(address, credential_id, credential_pub, rp_id, aaguid, epoch, signature, published_at, revoked)
 					SELECT address, credential_id, credential_pub, rp_id, aaguid, epoch, signature, published_at, revoked
