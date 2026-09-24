@@ -413,7 +413,7 @@ func cmdVHLRequest(c *client.Client, args []string) error {
 	// them, so recording a Tier 1 request here would be a dead end.
 	// Point the user at session minting instead.
 	if tierStr == "1" {
-		return fmt.Errorf("tier 1 is session-scoped: session tokens are minted through the WebAuthn mint ceremony (no ceremony transport in this CLI yet), not through approval requests")
+		return fmt.Errorf("tier 1 is session-scoped: mint a session token with `courier vhl session mint` instead of filing an approval request")
 	}
 	if tierStr != "2" {
 		return fmt.Errorf("--tier must be 2")

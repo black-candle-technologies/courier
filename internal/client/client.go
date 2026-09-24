@@ -2085,7 +2085,10 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// stripped nor upgraded in transit. An attested message is
 		// flagged; a claimed tier without a valid attestation is
 		// held for review (never acted on, never silently dropped).
-		if tier, att := parseVHLPayload(plain); tier != vhl.Tier0 || att != nil {
+		// The required-tier floor applies to every DM, including
+		// untagged Tier 0: without this a sender could omit the
+		// tier tag to dodge the floor (issue #142 review).
+		if tier, att := parseVHLPayload(plain); tier != vhl.Tier0 || att != nil || (vfr != nil && vfr.RequiredTier > vhl.Tier0) {
 			out := c.vhlEvaluateInbound(vfr, tier, []byte(body), att, m.ID)
 			// issue #142 review: make the Tier 2
 			// replay-check-and-consume atomic across processes.
@@ -2093,11 +2096,11 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			// concurrent fetches (inbox CLI vs. dashboard push)
 			// could otherwise evaluate the same attestation
 			// against empty snapshots and both verdict attested.
-			// A consume that finds the id already taken in a
-			// different envelope downgrades the verdict to a
-			// replay hold.
+			// A consume that finds the id or the approval nonce
+			// already taken in a different envelope downgrades the
+			// verdict to a replay hold.
 			if out.Verdict == vhl.VerdictAttested && tier == vhl.Tier2 && att != nil {
-				replayed, cerr := vhlConsumeAttestation(att.ID, m.ID)
+				replayed, cerr := vhlConsumeAttestation(att.ID, att.Approver, att.ApprovalNonce, m.ID)
 				switch {
 				case cerr != nil:
 					// Fail closed: without a committed replay mark,

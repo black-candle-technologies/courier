@@ -428,7 +428,14 @@ func (c *Client) vhlVerifier() (*vhl.Verifier, error) {
 	// empty and fido2 proofs — including session-token mint
 	// assertions — fail closed ("no relying party configured").
 	// The schema alone never counts as verified presence.
-	return &vhl.Verifier{Registry: ff.Registry, Seen: ff.Seen, Revoked: ff.Revoked, WebAuthn: ff.RP, Nonces: ff.Nonces}, nil
+	//
+	// The required-tier floor is read once here, from the same
+	// loaded state, so every message in the fetch is evaluated
+	// against one consistent floor (issue #142 review). A load
+	// failure fails the whole verifier build (the caller fails
+	// closed); there is no per-message re-read that could silently
+	// drop the requirement.
+	return &vhl.Verifier{Registry: ff.Registry, Seen: ff.Seen, Revoked: ff.Revoked, WebAuthn: ff.RP, Nonces: ff.Nonces, RequiredTier: vhl.Tier(vhlClampTier(ff.RequiredTier))}, nil
 }
 
 // vhlMergeSeen persists verifier mutations (consumed attestation ids,
@@ -598,19 +605,8 @@ func (c *Client) vhlEvaluateInbound(vfr *vhl.Verifier, tier vhl.Tier, body []byt
 		Tier: tier, Body: body, Attestation: att,
 		Receiver: c.cfg.Address, Now: time.Now().Unix(),
 		EnvelopeID:   envelopeID,
-		RequiredTier: vhl.Tier(vhlClampTier(vhlRequiredTier())),
+		RequiredTier: vfr.RequiredTier,
 	})
-}
-
-// vhlRequiredTier reads the receiver's persisted required-tier floor
-// for inbound evaluation. A read failure yields 0 (no requirement,
-// the current behavior); a persisted value outside 0..2 is clamped.
-func vhlRequiredTier() int {
-	ff, err := loadVHL()
-	if err != nil {
-		return 0
-	}
-	return vhlClampTier(ff.RequiredTier)
 }
 
 // vhlClampTier clamps a persisted tier floor to the valid 0..2 range.
@@ -649,20 +645,38 @@ func (c *Client) VHLSetRequiredTier(tier int) error {
 }
 
 // vhlConsumeAttestation atomically checks and consumes an
-// attestation id in the persisted replay set: under one
-// read-modify-write it reports whether the id was already consumed in
-// a different envelope, and marks it in the current one. The inbox
-// loop's per-fetch verifier only sees its own page — two concurrent
-// fetches (two processes: inbox CLI vs. dashboard push) could
-// otherwise evaluate the same Tier 2 attestation against empty
-// snapshots and both verdict attested. Check-and-consume must be one
-// lock-protected operation (issue #142 review).
-func vhlConsumeAttestation(attID string, envelopeID int64) (bool, error) {
+// attestation id AND the approver's approval nonce in the persisted
+// replay sets: under one read-modify-write it reports whether the
+// id or the nonce was already consumed in a different envelope, and
+// marks both in the current one. The inbox loop's per-fetch verifier
+// only sees its own page — two concurrent fetches (two processes:
+// inbox CLI vs. dashboard push) could otherwise evaluate the same
+// Tier 2 attestation against empty snapshots and both verdict
+// attested. Check-and-consume must be one lock-protected operation
+// (issue #142 review).
+//
+// The nonce half matters because the approval nonce is bound to the
+// WebAuthn challenge and is identical across every re-wrapping of
+// one captured assertion: a holder of the approver identity key can
+// mint two attestations with different IDs over the same nonce. The
+// attestation-ID check alone would accept both. Consuming the nonce
+// atomically with the ID closes the concurrent-verifier rewrap
+// replay (PROTOCOL.md §30.3–§30.4). PIN/challenge proofs carry no
+// nonce (nonceB64 == "") and keep the ID-only check.
+func vhlConsumeAttestation(attID, approver, nonceB64 string, envelopeID int64) (bool, error) {
 	alreadySeen := false
 	err := updateVHL(func(ff *vhlFile) error {
 		if ff.Seen.Seen(attID, envelopeID) {
 			alreadySeen = true
 			return nil
+		}
+		if nonceB64 != "" {
+			key := vhl.ApprovalNonceKey(approver, nonceB64)
+			if ff.Nonces.Consumed(key, envelopeID) {
+				alreadySeen = true
+				return nil
+			}
+			ff.Nonces.Consume(key, envelopeID)
 		}
 		ff.Seen.Mark(attID, envelopeID)
 		return nil

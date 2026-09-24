@@ -2182,9 +2182,13 @@ so a process holding the issuer's identity key cannot mint Tier 1
 tokens on its own: the receiver re-verifies the embedded assertion
 independently of the issuer signature, and a forged or
 transplanted assertion fails there even though the issuer
-signature is valid. The mint challenge is the SHA-256 of the
-token's canonical bytes with assertion and credential id zeroed,
-so an assertion cannot be transplanted onto a token with different
+signature is valid. The mint challenge is
+`SHA256("courier-vhl-mint-challenge-v1" || 0x00 || 0x00 || ctx)`,
+where `ctx` is the canonical MintContext JSON (issuer, scope,
+token_id, session_id, issued_at, expires_at, presence; see
+`internal/vhl/mint_context.go`). BootID and the token version are
+covered by the issuer signature, not the challenge — so an
+assertion cannot be transplanted onto a token with different
 scope, lifetime, or ids. Tokens verify against the receiver-local
 clock with ~5 minutes of skew tolerance, and are bound to the
 machine boot: each token embeds the kernel boot id

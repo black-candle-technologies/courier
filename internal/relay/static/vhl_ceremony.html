@@ -152,8 +152,13 @@ async function verifyMintContext(ctx) {
 // verifyApproveContext recomputes the approval challenge from the
 // displayed (action_hash, nonce_b64): SHA-256 over
 // utf8("courier-vhl-approve-v1") || 0x00 || 0x00 || actionHashBytes
-// || nonceBytes.
+// || nonceBytes. The displayed draft summary is hashed first and
+// must equal the action hash: the human approves what they read,
+// so a relay that swaps the summary while keeping the hash and
+// nonce must not enable the key.
 async function verifyApproveContext(ctx) {
+  const draftHash = await sha256Bytes([ctx.draft_summary]);
+  if (bytesToB64url(draftHash) !== ctx.action_hash) return false;
   const digest = await sha256Bytes([
     "courier-vhl-approve-v1", new Uint8Array([0, 0]),
     b64urlToBytes(ctx.action_hash), b64urlToBytes(ctx.nonce_b64),
@@ -181,6 +186,12 @@ async function verifyEnrollApproverContext(ctx) {
 
 function tamperError() {
   ctxEl.innerHTML = "";
+  // The enroll-approver confirmation checkbox lives in confirmEl,
+  // outside the cleared context: without this, checking the box
+  // after a tamper error would re-enable the key on a rejected
+  // context via the checkbox listener installed by renderContext.
+  confirmEl.innerHTML = "";
+  confirmedEnrollApprover = false;
   setStatus("Security error: the ceremony context does not match the " +
     "challenge your agent signed. The relay may be showing you different " +
     "values than your agent approved. Do NOT touch your security key — " +

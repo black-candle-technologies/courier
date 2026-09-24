@@ -198,12 +198,10 @@ func TestAdoptLegacyDatabase(t *testing.T) {
 	}
 	for _, m := range migrations {
 		want := "adopted"
-		if m.version == 26 {
-			// v26 converts the legacy single-row enrollment table
-			// to the per-credential shape: its effects are not
-			// already present in a legacy database, so it
-			// genuinely runs (and the destructive flag takes a
-			// pre-migration backup first).
+		if m.version == 25 || m.version == 26 {
+			// VHL tables postdate the pre-ledger code: a real legacy
+			// database has no vhl_enrollments, so v25 creates it and
+			// v26 reshapes it — both genuinely run on adoption.
 			want = "ran"
 		}
 		if src := ledger[m.version]; src != want {
@@ -765,22 +763,10 @@ func legacyMigrate(db *sql.DB) error {
 	if err := addColumn(`ALTER TABLE dashboard_users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
-	// issue #142: VHL enrollment directory. One row per Courier
-	// address: the signed identity→credential binding the agent
-	// published after its WebAuthn enrollment ceremony. The epoch is
-	// strictly increasing per address so stale re-publications are
-	// no-ops (same pattern as the key directory).
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS vhl_enrollments(
-		address        TEXT PRIMARY KEY,
-		credential_id  TEXT NOT NULL,
-		credential_pub TEXT NOT NULL,
-		rp_id          TEXT NOT NULL,
-		aaguid         TEXT NOT NULL DEFAULT '',
-		epoch          INTEGER NOT NULL,
-		signature      TEXT NOT NULL,
-		published_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')))`); err != nil {
-		return err
-	}
+	// NOTE: no vhl_enrollments here. legacyMigrate is a verbatim
+	// copy of the pre-ledger migrate(), which predates VHL (issue
+	// #142): no real legacy database has the table. The v25/v26
+	// migrations genuinely run on adoption.
 	return nil
 }
 

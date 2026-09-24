@@ -1,6 +1,7 @@
 package client
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -253,17 +254,54 @@ func TestVHLHeldSenderFramesGated(t *testing.T) {
 func TestVHLConsumeAttestationAtomic(t *testing.T) {
 	env := newAttachTestEnv(t)
 	env.asRecipient()
-	seen, err := vhlConsumeAttestation("att-atomic-1", 100)
+	seen, err := vhlConsumeAttestation("att-atomic-1", "ed25519:approver", "", 100)
 	if err != nil || seen {
 		t.Fatalf("first consume: seen=%v err=%v, want false, nil", seen, err)
 	}
-	seen, err = vhlConsumeAttestation("att-atomic-1", 100)
+	seen, err = vhlConsumeAttestation("att-atomic-1", "ed25519:approver", "", 100)
 	if err != nil || seen {
 		t.Fatalf("same envelope: seen=%v err=%v, want false, nil", seen, err)
 	}
-	seen, err = vhlConsumeAttestation("att-atomic-1", 101)
+	seen, err = vhlConsumeAttestation("att-atomic-1", "ed25519:approver", "", 101)
 	if err != nil || !seen {
 		t.Fatalf("different envelope: seen=%v err=%v, want true, nil", seen, err)
+	}
+}
+
+// testApprovalNonceB64 returns a fixed 32-byte approval nonce,
+// base64url-encoded like Attestation.ApprovalNonce.
+func testApprovalNonceB64() string {
+	var nonce [32]byte
+	for i := range nonce {
+		nonce[i] = byte(i + 1)
+	}
+	return b64.EncodeToString(nonce[:])
+}
+
+// TestVHLConsumeAttestationNonceAtomic pins the nonce half of the
+// check-and-consume primitive (issue #142 review): two attestations
+// with different IDs but the same approval nonce are a rewrap
+// replay — the second consume, in a different envelope, is flagged
+// even though its attestation ID was never seen.
+func TestVHLConsumeAttestationNonceAtomic(t *testing.T) {
+	env := newAttachTestEnv(t)
+	env.asRecipient()
+	nonceB64 := testApprovalNonceB64()
+	seen, err := vhlConsumeAttestation("att-nonce-1", "ed25519:approver", nonceB64, 100)
+	if err != nil || seen {
+		t.Fatalf("first consume: seen=%v err=%v, want false, nil", seen, err)
+	}
+	// Same nonce, different attestation ID, different envelope: the
+	// rewrap replay the ID-only check would miss.
+	seen, err = vhlConsumeAttestation("att-nonce-2", "ed25519:approver", nonceB64, 101)
+	if err != nil || !seen {
+		t.Fatalf("rewrapped nonce: seen=%v err=%v, want true, nil", seen, err)
+	}
+	// A different approver's identical nonce bytes are a different
+	// key — approvers never collide.
+	seen, err = vhlConsumeAttestation("att-nonce-3", "ed25519:other", nonceB64, 102)
+	if err != nil || seen {
+		t.Fatalf("other approver: seen=%v err=%v, want false, nil", seen, err)
 	}
 }
 
@@ -286,7 +324,7 @@ func TestVHLConsumeAttestationConcurrent(t *testing.T) {
 		go func(envelope int64) {
 			defer wg.Done()
 			<-start
-			seen, err := vhlConsumeAttestation("att-race", envelope)
+			seen, err := vhlConsumeAttestation("att-race", "ed25519:approver", "", envelope)
 			if err != nil {
 				errs <- err
 				return
@@ -295,6 +333,49 @@ func TestVHLConsumeAttestationConcurrent(t *testing.T) {
 				fresh <- envelope
 			}
 		}(int64(100 + i))
+	}
+	close(start)
+	wg.Wait()
+	close(fresh)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("consume error: %v", err)
+	}
+	if got := len(fresh); got != 1 {
+		t.Fatalf("fresh consumes = %d, want exactly 1", got)
+	}
+}
+
+// TestVHLConsumeAttestationNonceConcurrent pins the nonce half of
+// the primitive under real concurrency (issue #142 review): N
+// goroutines racing to consume distinct attestation IDs that share
+// one approval nonce — the concurrent-verifier rewrap replay — must
+// agree on exactly one winner (seen=false once).
+func TestVHLConsumeAttestationNonceConcurrent(t *testing.T) {
+	env := newAttachTestEnv(t)
+	env.asRecipient()
+	nonceB64 := testApprovalNonceB64()
+	const n = 8
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	fresh := make(chan int64, n)
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			seen, err := vhlConsumeAttestation(
+				fmt.Sprintf("att-nonce-race-%d", i),
+				"ed25519:approver", nonceB64, int64(200+i))
+			if err != nil {
+				errs <- err
+				return
+			}
+			if !seen {
+				fresh <- int64(i)
+			}
+		}(i)
 	}
 	close(start)
 	wg.Wait()
@@ -376,5 +457,79 @@ func TestVHLMergeSeenPersistsSignCount(t *testing.T) {
 	}
 	if got := ff.Registry.Approvers[env.senderCfg.Address]; got.Credentials[0].SignCount != 12 {
 		t.Fatalf("sign count rewound to %d, want 12", got.Credentials[0].SignCount)
+	}
+}
+
+// TestVHLRequiredTierHoldsUntagged is the regression test for the
+// untagged-bypass finding (issue #142 review): with
+// --require-tier 2, a plain Tier 0 DM (no tier tag, no attestation)
+// must be held for review with below-required-tier — the sender
+// cannot dodge the floor by omitting the tag. With the default
+// floor 0 the same message is delivered normally.
+func TestVHLRequiredTierHoldsUntagged(t *testing.T) {
+	env := newAttachTestEnv(t)
+	env.asRecipient()
+	if err := env.recipient.PublishKey(); err != nil {
+		t.Fatalf("publish key: %v", err)
+	}
+	if err := env.recipient.VHLSetRequiredTier(2); err != nil {
+		t.Fatalf("set required tier: %v", err)
+	}
+
+	env.asSender()
+	if _, err := env.sender.Send(env.recipCfg.Address, "plain hello"); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	env.asRecipient()
+	msgs, _, _, _, err := env.recipient.Inbox(0, 50)
+	if err != nil {
+		t.Fatalf("inbox: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("inbox: got %d messages, want 1", len(msgs))
+	}
+	m := msgs[0]
+	if !m.Request {
+		t.Fatalf("untagged message with require-tier 2 was delivered, want held for review")
+	}
+	if m.VHL == nil || m.VHL.Verdict != "invalid-attestation" || m.VHL.Reason != "below-required-tier" {
+		t.Fatalf("VHL = %+v, want invalid-attestation/below-required-tier", m.VHL)
+	}
+
+	// Floor back to 0: the same untagged message shape is delivered
+	// normally again (no behavior change for the default policy).
+	if err := env.recipient.VHLSetRequiredTier(0); err != nil {
+		t.Fatalf("clear required tier: %v", err)
+	}
+	env.asSender()
+	if _, err := env.sender.Send(env.recipCfg.Address, "plain hello again"); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	env.asRecipient()
+	msgs, _, _, _, err = env.recipient.Inbox(0, 50)
+	if err != nil {
+		t.Fatalf("inbox: %v", err)
+	}
+	// The first message is still held (held messages are never
+	// marked seen, so review re-derives them); the new one must
+	// be delivered normally.
+	if len(msgs) != 2 {
+		t.Fatalf("inbox: got %d messages, want 2 (held + new)", len(msgs))
+	}
+	var fresh *Message
+	for i := range msgs {
+		if msgs[i].Body == "plain hello again" {
+			fresh = &msgs[i]
+		}
+	}
+	if fresh == nil {
+		t.Fatalf("second message missing from inbox")
+	}
+	if fresh.Request {
+		t.Fatalf("untagged message with require-tier 0 was held, want delivered")
+	}
+	if fresh.VHL != nil {
+		t.Fatalf("VHL = %+v, want nil (untagged, floor 0: never evaluated)", fresh.VHL)
 	}
 }

@@ -554,13 +554,17 @@ func verifyFidoU2FAttestation(attObj *attestationObject, authData, clientDataHas
 		return err
 	}
 	// fido-u2f registration signatures are ECDSA P-256/SHA-256
-	// (ES256, COSE alg -7).
-	if err := checkAttestationCertProfile(leaf, authData, -7); err != nil {
-		return err
-	}
+	// (ES256, COSE alg -7). The fido-u2f format only constrains the
+	// leaf key: unlike packed, real U2F attestation certificates
+	// often carry no basic-constraints extension and no
+	// "Authenticator Attestation" OU, so the packed certificate
+	// profile must not apply here.
 	pub, ok := leaf.PublicKey.(*ecdsa.PublicKey)
-	if !ok {
-		return fmt.Errorf("enrollment: fido-u2f attestation with non-ECDSA leaf key %T", leaf.PublicKey)
+	if !ok || pub.Curve != elliptic.P256() {
+		return fmt.Errorf("enrollment: fido-u2f attestation leaf key is not P-256")
+	}
+	if leaf.IsCA {
+		return fmt.Errorf("enrollment: fido-u2f attestation leaf must not be a CA")
 	}
 	// Rebuild the U2F signed bytes from the attested credential
 	// data: 0x00 || rpIdHash || clientDataHash || credentialId ||

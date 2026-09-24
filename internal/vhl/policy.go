@@ -108,6 +108,13 @@ type Verifier struct {
 	// replay protection; the check-and-consume must be atomic
 	// with persistence by the caller.
 	Nonces *NonceSet
+	// RequiredTier is the receiver's minimum-tier floor for inbound
+	// evaluation (issue #142 review). The tier tag is
+	// sender-asserted, so the floor must apply to every message —
+	// including untagged Tier 0 — or a sender could omit the tag
+	// to dodge it. Loaded once with the rest of the verifier
+	// state; the zero value (Tier0) means no requirement.
+	RequiredTier Tier
 }
 
 // maxSeenArtifacts bounds the replay set; the message-hash binding
