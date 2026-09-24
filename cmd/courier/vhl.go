@@ -16,6 +16,27 @@ import (
 	"github.com/black-candle-technologies/courier/internal/vhl"
 )
 
+// Narrow client surfaces for the VHL command groups. The dispatch
+// functions below depend on these interfaces rather than the
+// concrete *client.Client, so CLI routing is testable hermetically
+// — without a live relay, local config, or handler side effects
+// (issue #146 review). *client.Client satisfies all three.
+type vhlApproverClient interface {
+	VHLEnrollApproverCeremony(approverAddress string, printf func(string, ...any)) (*vhl.EnrollmentArtifact, error)
+	VHLEnrollApprover(address, name string, art *vhl.EnrollmentArtifact) error
+	VHLApprovers() ([]client.ApproverInfo, error)
+	VHLUnenrollApprover(addrOrName string) error
+}
+
+type vhlRequestClient interface {
+	VHLRequestApproval(humanAddr string, tier vhl.Tier, body string, presence vhl.PresenceStrength) (*vhl.ApprovalRequest, error)
+	VHLPendingRequests() ([]*client.VHLRequestRecord, error)
+}
+
+type vhlChallengeClient interface {
+	VHLMintChallenge(action []byte) (*vhl.Challenge, string, error)
+}
+
 func cmdVHL(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: courier vhl <approver|enroll-webauthn|rp|session|request|approve|attestations|challenge|policy> [args]")
@@ -52,7 +73,7 @@ func cmdVHL(args []string) error {
 // cmdVHLApprover dispatches the approver subcommand group: add, list,
 // and remove replace the old top-level enroll/approvers/unenroll
 // commands (issue #146).
-func cmdVHLApprover(c *client.Client, args []string) error {
+func cmdVHLApprover(c vhlApproverClient, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: courier vhl approver <add|list|remove> [args]")
 	}
@@ -87,7 +108,11 @@ func cmdVHLApprover(c *client.Client, args []string) error {
 // the trivial pipe attack — it does not stop a co-located adversary
 // driving a pty. PIN-grade ceremonies attest local presence only;
 // FIDO2 hardware and remote-approver flows are the strong paths.
-func confirmTyping(prompt, expect string) bool {
+//
+// Declared as a variable (not a func) so CLI dispatch tests can stub
+// the human-confirmation step hermetically; production always uses
+// this implementation.
+var confirmTyping = func(prompt, expect string) bool {
 	if !stdinIsTerminal() {
 		fmt.Fprintf(os.Stderr, "refusing: human confirmation requires an interactive terminal (stdin is not a terminal)\n")
 		return false
@@ -135,7 +160,7 @@ func sanitizeForTerminal(s string) string {
 	return b.String()
 }
 
-func cmdVHLApproverAdd(c *client.Client, args []string) error {
+func cmdVHLApproverAdd(c vhlApproverClient, args []string) error {
 	var name string
 	var rest []string
 	for i := 0; i < len(args); i++ {
@@ -274,7 +299,7 @@ func cmdVHLRPSet(c *client.Client, args []string) error {
 	return nil
 }
 
-func cmdVHLApproverList(c *client.Client) error {
+func cmdVHLApproverList(c vhlApproverClient) error {
 	approvers, err := c.VHLApprovers()
 	if err != nil {
 		return err
@@ -400,7 +425,7 @@ func cmdVHLSessionRevoke(c *client.Client, args []string) error {
 
 // cmdVHLRequest dispatches the request subcommand group: new files an
 // approval request and list shows the pending queue (issue #146).
-func cmdVHLRequest(c *client.Client, args []string) error {
+func cmdVHLRequest(c vhlRequestClient, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: courier vhl request <new|list> [args]")
 	}
@@ -414,7 +439,7 @@ func cmdVHLRequest(c *client.Client, args []string) error {
 	}
 }
 
-func cmdVHLRequestNew(c *client.Client, args []string) error {
+func cmdVHLRequestNew(c vhlRequestClient, args []string) error {
 	var tierStr, message, presenceStr, human string
 	for i := 0; i < len(args); i++ {
 		switch {
@@ -469,7 +494,7 @@ func cmdVHLRequestNew(c *client.Client, args []string) error {
 	return nil
 }
 
-func cmdVHLRequestList(c *client.Client) error {
+func cmdVHLRequestList(c vhlRequestClient) error {
 	reqs, err := c.VHLPendingRequests()
 	if err != nil {
 		return err
@@ -655,7 +680,7 @@ func cmdVHLPolicy(c *client.Client, args []string) error {
 // (issue #146): `courier vhl challenge --action TEXT`. There is no
 // verify subcommand on this branch — challenge verification happens
 // inside `courier vhl approve --presence challenge`.
-func cmdVHLChallenge(c *client.Client, args []string) error {
+func cmdVHLChallenge(c vhlChallengeClient, args []string) error {
 	var action string
 	for i := 0; i < len(args); i++ {
 		switch {

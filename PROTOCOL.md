@@ -2385,7 +2385,7 @@ the VHL layer, never surfaced as chat):
   attests the attacker's "approvals" faithfully — VHL verifies
   *human review happened*, not *which human* beyond enrollment.
   Enrollment itself must be a human-controlled cryptographic
-  ceremony: `courier vhl enroll` requires a WebAuthn assertion
+  ceremony: `courier vhl approver add <address> [--name N]` requires a WebAuthn assertion
   from the operator's enrolled security key over the
   approver-binding challenge; typed confirmation is not accepted.
   The relay's enrollment-publication directory is per-credential
