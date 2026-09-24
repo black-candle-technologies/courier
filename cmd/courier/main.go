@@ -32,6 +32,7 @@ import (
 	"github.com/black-candle-technologies/courier/internal/store"
 	"github.com/black-candle-technologies/courier/internal/update"
 	"github.com/black-candle-technologies/courier/internal/version"
+	"github.com/black-candle-technologies/courier/internal/vhl"
 	"github.com/mattn/go-isatty"
 )
 
@@ -92,6 +93,8 @@ func main() {
 		err = cmdRotate(os.Args[2:])
 	case "fs":
 		err = cmdFS(os.Args[2:])
+	case "vhl":
+		err = cmdVHL(os.Args[2:])
 	case "publish-key":
 		err = cmdPublishKey()
 	case "backup":
@@ -129,6 +132,8 @@ func usage() {
       [--attach <file>]...               attach files (E2E encrypted, 25 MiB max each)
       [--reply-to <id>]                  reply to message #id (quotes it, threads the view)
       [--ttl <duration>]                 disappearing message: local delete after duration (e.g. 10m, 2h)
+      [--tier 1|2] [--attestation <id>]  VHL: tier-1 attests via your session token
+                                         (tier-2 needs an approval attestation id)
   courier inbox [--all] [--limit N] [--follow [--interval 5s]] [--requests]
       [--attachments-dir <dir>]          download verified attachments into dir
                                          --requests lists held message requests instead
@@ -204,6 +209,30 @@ func usage() {
   courier fs off <peer>                  disable FS for a peer (erases session)
   courier fs rekey <peer>                rotate the FS ratchet on next send
   courier fs forget <peer>               erase the FS session for a peer
+  courier vhl enroll <address> [--name N]
+                                         enroll a human approver (interactive confirm)
+  courier vhl enroll-webauthn [--device LABEL]
+                                         enroll a WebAuthn credential via the
+                                         relay-hosted browser ceremony
+  courier vhl rp set --id DOMAIN --origin https://DOMAIN --attestation-root CERT_FILE [...]
+                                         configure the WebAuthn relying party
+  courier vhl rp show                    show the relying-party config
+  courier vhl approvers                  list enrolled approvers
+  courier vhl unenroll <address|name>    revoke an approver
+  courier vhl session mint [--scope ADDRESS] [--ttl DURATION]
+                                         mint a tier-1 session token via the
+                                         relay-hosted WebAuthn ceremony
+  courier vhl session status             show live session tokens
+  courier vhl session revoke <id> [--broadcast]
+                                         revoke a session token
+  courier vhl request --tier 2 --message TEXT [--presence pin] [--to ADDR]
+                                         ask a human to approve exact bytes
+  courier vhl requests                   list pending approval requests
+  courier vhl approve <request-id> [--presence pin|challenge]
+                                         review and approve exact bytes (interactive)
+  courier vhl attestations               list received attestations
+  courier vhl challenge mint --action TEXT
+                                         mint an out-of-band challenge code
   courier backup create [--output f]     write an encrypted identity backup
                                          (seed + live keys, passphrase-protected)
   courier backup restore [--force] <file>
@@ -377,7 +406,10 @@ func cmdSend(args []string) error {
 	// Accept flags before or after the positional address/message, as the
 	// usage string documents: Go's flag package stops parsing at the first
 	// positional argument, so extract them manually first.
-	positional, fileVal, replyToVal, attachVals, ttlVal := splitSendArgs(noForce)
+	positional, fileVal, replyToVal, attachVals, ttlVal, tierVal, attestVal, splitErr := splitSendArgs(noForce)
+	if splitErr != nil {
+		return splitErr
+	}
 	if fileVal != "" {
 		*file = fileVal
 	}
@@ -460,7 +492,42 @@ func cmdSend(args []string) error {
 			return fmt.Errorf("--ttl must be a positive duration (e.g. 30s, 10m, 2h)")
 		}
 	}
-	id, err := cl.SendFull(address, body, attach, replyTo, ttl)
+	// issue #142: VHL tiered send. --tier 1 attests via the live
+	// session token (minted through the WebAuthn mint ceremony once
+	// a ceremony transport exists); --tier 2
+	// needs a human approval attestation from `courier vhl approve`.
+	// Tiered sends refuse attachments: the approval hash binds the
+	// body bytes, and an unattested attachment would bypass review.
+	var tier vhl.Tier
+	switch tierVal {
+	case "":
+		tier = vhl.Tier0
+	case "1":
+		tier = vhl.Tier1
+	case "2":
+		tier = vhl.Tier2
+	default:
+		return fmt.Errorf("--tier must be 1 or 2")
+	}
+	var id int64
+	if tier == vhl.Tier0 {
+		if attestVal != "" {
+			return fmt.Errorf("--attestation needs --tier 1 or --tier 2")
+		}
+		id, err = cl.SendFull(address, body, attach, replyTo, ttl)
+	} else {
+		if len(attach) > 0 {
+			return fmt.Errorf("--tier %d does not support --attach: the approval hash binds the body bytes only", int(tier))
+		}
+		var att *vhl.Attestation
+		if attestVal != "" {
+			att, err = cl.VHLGetAttestation(attestVal)
+			if err != nil {
+				return err
+			}
+		}
+		id, err = cl.SendFullTiered(address, body, replyTo, ttl, tier, att)
+	}
 	if err != nil {
 		return err
 	}
@@ -489,7 +556,11 @@ func cmdSend(args []string) error {
 // positional arguments. Go's flag package stops parsing at the first
 // positional, but the usage string documents flags after the message,
 // so this keeps both working.
-func splitSendArgs(args []string) (positional []string, file, replyTo string, attach []string, ttl string) {
+//
+// A bare --tier with no value, or --tier= with an empty value, is an
+// argument error rather than a silent Tier 0: the human asked for a
+// verification tier and must not get an unattested message instead.
+func splitSendArgs(args []string) (positional []string, file, replyTo string, attach []string, ttl string, tier string, attestation string, err error) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -513,11 +584,29 @@ func splitSendArgs(args []string) (positional []string, file, replyTo string, at
 			i++
 		case strings.HasPrefix(a, "--ttl="):
 			ttl = strings.TrimPrefix(a, "--ttl=")
+		case a == "--tier" && i+1 < len(args):
+			tier = args[i+1]
+			if tier == "" {
+				return nil, "", "", nil, "", "", "", fmt.Errorf("--tier needs a value (1 or 2); refusing to send an unattested message")
+			}
+			i++
+		case a == "--tier":
+			return nil, "", "", nil, "", "", "", fmt.Errorf("--tier needs a value (1 or 2); refusing to send an unattested message")
+		case strings.HasPrefix(a, "--tier="):
+			tier = strings.TrimPrefix(a, "--tier=")
+			if tier == "" {
+				return nil, "", "", nil, "", "", "", fmt.Errorf("--tier needs a value (1 or 2); refusing to send an unattested message")
+			}
+		case a == "--attestation" && i+1 < len(args):
+			attestation = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--attestation="):
+			attestation = strings.TrimPrefix(a, "--attestation=")
 		default:
 			positional = append(positional, a)
 		}
 	}
-	return positional, file, replyTo, attach, ttl
+	return positional, file, replyTo, attach, ttl, tier, attestation, nil
 }
 
 // stringSliceFlag is a repeatable string flag (e.g. --attach a --attach b).
@@ -541,6 +630,12 @@ func printMessages(msgs []client.Message) {
 			flagStr += fmt.Sprintf(" [expires %s]", time.Unix(m.ExpiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"))
 		}
 		fmt.Printf("[#%d] from %s at %s%s\n", m.ID, m.From, ts, flagStr)
+		// issue #142: VHL attestation status renders as a typed badge,
+		// not body text — an unverified claim must look unverified,
+		// never like a reviewed message.
+		if m.VHL != nil {
+			fmt.Printf("%s\n", m.VHL.Badge())
+		}
 		// issues #96/#97: bridged messages are untrusted input. The
 		// marker renders from the typed flag — not the body banner —
 		// so attribution shows even when it comes from the pinned

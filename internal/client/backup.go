@@ -147,6 +147,14 @@ func RestoreBackup(passphrase, raw []byte, force bool) (*Config, error) {
 		// cannot reconstruct them; keeping stale sessions would only
 		// let this device read peers' FS messages it should no longer
 		// see.
+		//
+		// issue #142: likewise erase VHL state — enrollments,
+		// session tokens, challenges, the replay set, and
+		// revocations all belong to the old device. Approval
+		// authority must be re-enrolled on the new device.
+		if err := removeVHLState(); err != nil {
+			return err
+		}
 		return removeFSState()
 	})
 	if err != nil {

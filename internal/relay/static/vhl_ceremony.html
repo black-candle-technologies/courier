@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Courier VHL ceremony</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 34rem;
+         margin: 3rem auto; padding: 0 1.25rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; }
+  .card { border: 1px solid #8884; border-radius: 0.75rem; padding: 1.25rem;
+          margin: 1rem 0; }
+  #status { min-height: 3rem; }
+  button { font-size: 1.05rem; padding: 0.6rem 1.4rem; border-radius: 0.5rem;
+           border: 1px solid #888; background: #2a7; color: #fff; cursor: pointer; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  .err { color: #c22; }
+  .ok { color: #2a7; font-weight: 600; }
+  input[type=text] { font-size: 1rem; padding: 0.4rem; width: 12rem;
+                     font-family: ui-monospace, monospace; }
+  .mono { font-family: ui-monospace, monospace; font-size: 0.9rem;
+          word-break: break-all; }
+  .hint { color: #888; font-size: 0.9rem; }
+  table.ctx { border-collapse: collapse; margin: 0.75rem 0; width: 100%; }
+  table.ctx th { text-align: left; color: #888; font-weight: 600;
+                 font-size: 0.85rem; padding: 0.25rem 0.5rem 0.25rem 0;
+                 vertical-align: top; white-space: nowrap; }
+  table.ctx td { padding: 0.25rem 0; vertical-align: top;
+                 word-break: break-all; font-size: 0.95rem; }
+  .warn { border: 1px solid #c22; border-radius: 0.5rem; padding: 0.75rem;
+          margin: 0.75rem 0; }
+  .confirm { margin: 0.75rem 0; }
+  .confirm label { display: flex; gap: 0.5rem; align-items: flex-start;
+                   cursor: pointer; }
+</style>
+</head>
+<body>
+<h1>Courier VHL ceremony</h1>
+<div class="card">
+  <div id="ceremony-info"><span class="hint">Loading ceremony…</span></div>
+  <div id="ceremony-context"></div>
+  <div id="ceremony-confirm"></div>
+</div>
+<div class="card" id="code-card" hidden>
+  <label for="code">Ceremony code:</label>
+  <input type="text" id="code" autocomplete="off" spellcheck="false">
+  <button id="load">Load</button>
+</div>
+<div class="card">
+  <div id="status" role="status"></div>
+  <p><button id="go" disabled>Begin</button></p>
+  <p class="hint" id="expiry"></p>
+</div>
+<script>
+"use strict";
+// CSRF synchronizer token injected by the relay's page handler.
+const CSRF_TOKEN = "<!--CSRF_TOKEN-->";
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status"), goBtn = $("go"), expiryEl = $("expiry"),
+      infoEl = $("ceremony-info"), ctxEl = $("ceremony-context"),
+      confirmEl = $("ceremony-confirm"), codeCard = $("code-card");
+
+function setStatus(html, cls) {
+  statusEl.innerHTML = html;
+  statusEl.className = cls || "";
+}
+
+function b64urlToBytes(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = s.length % 4;
+  if (pad) s += "=".repeat(4 - pad);
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function bytesToB64url(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  return escapeHtml(d.toLocaleString()) +
+    ' <span class="hint mono">' + escapeHtml(d.toISOString()) + "</span>";
+}
+
+function ctxRow(label, valueHtml) {
+  return "<tr><th>" + escapeHtml(label) + "</th><td>" + valueHtml + "</td></tr>";
+}
+
+// activeCode is the ceremony code the page actually loaded: the
+// attestation POST must use the code the human's ceremony was loaded
+// with, not whatever happens to be in the URL bar now. It is set on
+// a successful loadCeremony and cleared on any failed load, so a
+// manually typed code (no ?code= in the URL) submits correctly and
+// a stale code is never reused.
+let activeCode = null;
+let details = null;
+let expiryTimer = null;
+let confirmedEnrollApprover = false;
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || ("HTTP " + res.status));
+  return body;
+}
+
+function codeFromURL() {
+  const m = new URLSearchParams(location.search).get("code");
+  return (m || "").trim().toLowerCase();
+}
+
+async function sha256Bytes(parts) {
+  let len = 0;
+  const bufs = parts.map((p) => {
+    const b = typeof p === "string" ? new TextEncoder().encode(p) : p;
+    len += b.length;
+    return b;
+  });
+  const out = new Uint8Array(len);
+  let off = 0;
+  for (const b of bufs) { out.set(b, off); off += b.length; }
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", out));
+}
+
+// verifyMintContext recomputes the session-mint challenge from the
+// displayed context, exactly per the Go layout: SHA-256 over
+// utf8("courier-vhl-mint-challenge-v1") || 0x00 || 0x00 || the
+// canonical mint-context JSON bytes. The context string the relay
+// served is already the canonical JSON (JSON string round-trips
+// byte-exact), so its UTF-8 bytes are the canonical bytes.
+async function verifyMintContext(ctx) {
+  const digest = await sha256Bytes([
+    "courier-vhl-mint-challenge-v1", new Uint8Array([0, 0]),
+    new TextEncoder().encode(details.context),
+  ]);
+  return bytesToB64url(digest) === details.challenge;
+}
+
+// verifyApproveContext recomputes the approval challenge from the
+// displayed (action_hash, nonce_b64): SHA-256 over
+// utf8("courier-vhl-approve-v1") || 0x00 || 0x00 || actionHashBytes
+// || nonceBytes. The displayed draft summary is hashed first and
+// must equal the action hash: the human approves what they read,
+// so a relay that swaps the summary while keeping the hash and
+// nonce must not enable the key.
+async function verifyApproveContext(ctx) {
+  const draftHash = await sha256Bytes([ctx.draft_summary]);
+  if (bytesToB64url(draftHash) !== ctx.action_hash) return false;
+  const digest = await sha256Bytes([
+    "courier-vhl-approve-v1", new Uint8Array([0, 0]),
+    b64urlToBytes(ctx.action_hash), b64urlToBytes(ctx.nonce_b64),
+  ]);
+  return bytesToB64url(digest) === details.challenge;
+}
+
+// verifyEnrollApproverContext recomputes the enrollment challenge
+// from the displayed addresses and timestamp, exactly per the Go
+// layout in vhl.ApproverEnrollmentChallenge: SHA-256 over
+// utf8("courier-vhl-enroll-approver-v1") || 0x00 || 0x00 ||
+// agentAddress || 0x00 || approverAddress || 0x00 ||
+// big-endian-uint64(issued_at).
+async function verifyEnrollApproverContext(ctx) {
+  const ts = new Uint8Array(8);
+  new DataView(ts.buffer).setBigUint64(0, BigInt(ctx.issued_at));
+  const digest = await sha256Bytes([
+    "courier-vhl-enroll-approver-v1", new Uint8Array([0, 0]),
+    ctx.agent_address, new Uint8Array([0]),
+    ctx.approver_address, new Uint8Array([0]),
+    ts,
+  ]);
+  return bytesToB64url(digest) === details.challenge;
+}
+
+function tamperError() {
+  ctxEl.innerHTML = "";
+  // The enroll-approver confirmation checkbox lives in confirmEl,
+  // outside the cleared context: without this, checking the box
+  // after a tamper error would re-enable the key on a rejected
+  // context via the checkbox listener installed by renderContext.
+  confirmEl.innerHTML = "";
+  confirmedEnrollApprover = false;
+  setStatus("Security error: the ceremony context does not match the " +
+    "challenge your agent signed. The relay may be showing you different " +
+    "values than your agent approved. Do NOT touch your security key — " +
+    "close this tab and ask your agent for a new ceremony.", "err");
+  goBtn.disabled = true;
+}
+
+async function renderContext() {
+  ctxEl.innerHTML = "";
+  confirmEl.innerHTML = "";
+  confirmedEnrollApprover = false;
+  const type = details.type;
+  if (type === "enroll" || !details.context) return true;
+
+  let ctx;
+  try {
+    ctx = JSON.parse(details.context);
+  } catch (e) {
+    tamperError();
+    return false;
+  }
+
+  if (type === "mint") {
+    ctxEl.innerHTML =
+      '<table class="ctx">' +
+      ctxRow("Granting", "a session token for") +
+      ctxRow("Issuer", '<span class="mono">' + escapeHtml(ctx.issuer) + "</span>") +
+      ctxRow("Scope", '<span class="mono">' + escapeHtml(ctx.scope) + "</span>") +
+      ctxRow("Token ID", '<span class="mono">' + escapeHtml(ctx.token_id) + "</span>") +
+      ctxRow("Session ID", '<span class="mono">' + escapeHtml(ctx.session_id) + "</span>") +
+      ctxRow("Valid from", fmtTime(ctx.issued_at)) +
+      ctxRow("Expires", fmtTime(ctx.expires_at)) +
+      ctxRow("Ceremony strength", '<span class="mono">' + escapeHtml(ctx.presence) + "</span>") +
+      "</table>" +
+      '<p class="hint">Review the authority above carefully: approving mints ' +
+      "a bearer session token with exactly this scope and lifetime.</p>";
+    if (!(await verifyMintContext(ctx))) { tamperError(); return false; }
+    return true;
+  }
+
+  if (type === "approve") {
+    ctxEl.innerHTML =
+      '<table class="ctx">' +
+      ctxRow("Request", '<span class="mono">' + escapeHtml(ctx.request_id) + "</span>") +
+      ctxRow("Approver", '<span class="mono">' + escapeHtml(ctx.approver) + "</span>") +
+      ctxRow("Action hash", '<span class="mono">' + escapeHtml(ctx.action_hash) + "</span>") +
+      ctxRow("Summary", escapeHtml(ctx.draft_summary)) +
+      "</table>" +
+      '<p class="hint">This approves exactly the action above. The action ' +
+      "hash binds the full message your agent showed you.</p>";
+    if (!(await verifyApproveContext(ctx))) { tamperError(); return false; }
+    return true;
+  }
+
+  if (type === "enroll-approver") {
+    ctxEl.innerHTML =
+      '<div class="warn">You are enrolling a new <strong>trust root</strong>: ' +
+      "after this, the identity below is trusted to approve actions.</div>" +
+      '<table class="ctx">' +
+      ctxRow("Approver address", '<span class="mono">' + escapeHtml(ctx.approver_address) + "</span>") +
+      ctxRow("Authorized by agent", '<span class="mono">' + escapeHtml(ctx.agent_address) + "</span>") +
+      "</table>";
+    confirmEl.innerHTML =
+      '<div class="confirm"><label>' +
+      '<input type="checkbox" id="confirm-enroll-approver"> ' +
+      "<span>I confirm enrolling this approver as a trust root.</span>" +
+      "</label></div>";
+    $("confirm-enroll-approver").addEventListener("change", (e) => {
+      confirmedEnrollApprover = e.target.checked;
+      goBtn.disabled = !confirmedEnrollApprover;
+      if (confirmedEnrollApprover)
+        setStatus("Confirmed. Your security key will be asked for.");
+    });
+    if (!(await verifyEnrollApproverContext(ctx))) { tamperError(); return false; }
+    return true;
+  }
+
+  return true;
+}
+
+async function loadCeremony(code) {
+  setStatus("Loading ceremony…");
+  goBtn.disabled = true;
+  ctxEl.innerHTML = "";
+  confirmEl.innerHTML = "";
+  try {
+    details = await api("/v1/vhl/ceremonies/" + encodeURIComponent(code));
+  } catch (e) {
+    activeCode = null;
+    details = null;
+    setStatus("Could not load ceremony: " + escapeHtml(e.message), "err");
+    codeCard.hidden = false;
+    return;
+  }
+  activeCode = code;
+  codeCard.hidden = true;
+  const kind = {
+    enroll: "Register a security key",
+    mint: "Approve a session-token mint",
+    approve: "Approve an action",
+    "enroll-approver": "Enroll an approver",
+  }[details.type] || "Unknown ceremony";
+  infoEl.innerHTML =
+    "<strong>" + escapeHtml(kind) + "</strong><br>" +
+    '<span class="hint">Identity</span> <span class="mono">' +
+    escapeHtml(details.address) + "</span><br>" +
+    '<span class="hint">Relying party</span> <span class="mono">' +
+    escapeHtml(details.rp_id) + "</span>";
+  goBtn.textContent = {
+    enroll: "Register my security key",
+    mint: "Approve with my security key",
+    approve: "Approve with my security key",
+    "enroll-approver": "Enroll this approver",
+  }[details.type] || "Begin";
+  if (details.completed) {
+    setStatus("This ceremony was already completed.", "ok");
+    return;
+  }
+  if (!(await renderContext())) return; // tamper or parse error already reported
+  if (details.type === "enroll-approver") {
+    setStatus("Review the trust-root enrollment above, then confirm to continue.");
+    goBtn.disabled = true; // enabled by the confirmation checkbox
+  } else {
+    setStatus("Ready. Your security key will be asked for.");
+    goBtn.disabled = false;
+  }
+  startExpiryCountdown();
+}
+
+function startExpiryCountdown() {
+  clearInterval(expiryTimer);
+  function tick() {
+    const left = Math.max(0, details.expires_at - Math.floor(Date.now() / 1000));
+    if (left <= 0) {
+      expiryEl.textContent = "This ceremony code has expired. Ask your agent for a new one.";
+      goBtn.disabled = true;
+      activeCode = null;
+      clearInterval(expiryTimer);
+      return;
+    }
+    const m = Math.floor(left / 60), s = left % 60;
+    expiryEl.textContent = "Code expires in " + m + ":" + String(s).padStart(2, "0");
+  }
+  tick();
+  expiryTimer = setInterval(tick, 1000);
+}
+
+function credToJSON(cred, isCreate) {
+  const response = {
+    clientDataJSON: bytesToB64url(cred.response.clientDataJSON),
+  };
+  if (isCreate) {
+    response.attestationObject = bytesToB64url(cred.response.attestationObject);
+  } else {
+    response.authenticatorData = bytesToB64url(cred.response.authenticatorData);
+    response.signature = bytesToB64url(cred.response.signature);
+    if (cred.response.userHandle)
+      response.userHandle = bytesToB64url(cred.response.userHandle);
+  }
+  return {
+    type: cred.type,
+    id: cred.id,
+    rawId: bytesToB64url(cred.rawId),
+    response,
+  };
+}
+
+async function runCeremony() {
+  goBtn.disabled = true;
+  setStatus("Waiting for your security key… touch it when it blinks.");
+  const isCreate = details.type === "enroll";
+  try {
+    let options;
+    if (isCreate) {
+      options = {
+        challenge: b64urlToBytes(details.challenge),
+        rp: { name: "Courier", id: details.rp_id },
+        user: {
+          id: new TextEncoder().encode(details.address),
+          name: details.address,
+          displayName: details.address,
+        },
+        pubKeyCredParams: [
+          { type: "public-key", alg: -7 },
+          { type: "public-key", alg: -8 },
+        ],
+        attestation: "direct",
+        authenticatorSelection: { userVerification: "required" },
+        timeout: 120000,
+      };
+    } else {
+      options = {
+        challenge: b64urlToBytes(details.challenge),
+        rpId: details.rp_id,
+        allowCredentials: (details.credential_ids || []).map((id) => ({
+          type: "public-key",
+          id: b64urlToBytes(id),
+        })),
+        userVerification: "required",
+        timeout: 120000,
+      };
+    }
+    const cred = isCreate
+      ? await navigator.credentials.create({ publicKey: options })
+      : await navigator.credentials.get({ publicKey: options });
+    if (!cred) throw new Error("no credential returned");
+
+    setStatus("Key ceremony complete — sending proof back…");
+    const payload = credToJSON(cred, isCreate);
+    // Use the code the ceremony was loaded with (activeCode): the
+    // URL query string is empty for manually entered codes, and may
+    // be stale otherwise.
+    const code = activeCode || codeFromURL();
+    if (!code) throw new Error("ceremony code lost; reload the page");
+    await api("/v1/vhl/ceremonies/" + encodeURIComponent(code) + "/attestation", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        attestation: bytesToB64url(new TextEncoder().encode(JSON.stringify(payload))),
+        csrf_token: CSRF_TOKEN,
+      }),
+    });
+    clearInterval(expiryTimer);
+    expiryEl.textContent = "";
+    activeCode = null;
+    setStatus("Done. You can close this tab and return to your terminal.", "ok");
+  } catch (e) {
+    let msg = e && e.message ? e.message : String(e);
+    if (e && e.name === "NotAllowedError")
+      msg = "Ceremony cancelled or timed out. Click Begin to try again.";
+    else if (e && e.name === "InvalidStateError")
+      msg = "This security key is already registered here.";
+    else if (e && e.name === "NotSupportedError")
+      msg = "This browser does not support security keys (WebAuthn).";
+    setStatus("Ceremony failed: " + escapeHtml(msg), "err");
+    goBtn.disabled = false;
+  }
+}
+
+$("load").addEventListener("click", () => {
+  const code = $("code").value.trim().toLowerCase();
+  if (code) loadCeremony(code);
+});
+$("code").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("load").click();
+});
+goBtn.addEventListener("click", runCeremony);
+
+if (!window.PublicKeyCredential) {
+  setStatus("This browser does not support WebAuthn security keys.", "err");
+} else {
+  const code = codeFromURL();
+  if (code) loadCeremony(code);
+  else { codeCard.hidden = false; setStatus("Enter the ceremony code from your terminal."); }
+}
+</script>
+</body>
+</html>
