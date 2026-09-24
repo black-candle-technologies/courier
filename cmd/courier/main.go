@@ -5,7 +5,7 @@
 //
 //	courier init [--relay URL] [--force]   create your identity
 //	courier address                      print your address (public key)
-//	courier send <address> <message|-> [--attach file]... [--reply-to id] [--ttl 10m]
+//	courier send <address> <message|-> [--file path] [--attach file]... [--reply-to id] [--ttl 10m]
 //	courier inbox [--all] [--limit N] [--follow] [--attachments-dir dir]
 //	courier attachments fetch --message <id> --attachments-dir <dir>
 //	courier backup create|restore|export-sync|import-sync
@@ -129,6 +129,7 @@ func usage() {
   courier send <address|contact|@handle> <msg>
                                          send a message ("-" reads stdin); --force confirms
                                          first-contact or contacts-policy handle sends
+      [--file <path>]                      read message body from file instead of an argument
       [--attach <file>]...               attach files (E2E encrypted, 25 MiB max each)
       [--reply-to <id>]                  reply to message #id (quotes it, threads the view)
       [--ttl <duration>]                 disappearing message: local delete after duration (e.g. 10m, 2h)
