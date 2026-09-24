@@ -36,8 +36,11 @@ const (
 	// ProofSession references a session token (Tier 1). The signed
 	// token is embedded — never a bare token id.
 	ProofSession ProofKind = "session"
-	// ProofFIDO2 carries a WebAuthn assertion. The challenge is the
-	// action hash (what-you-sign-is-what-you-saw).
+	// ProofFIDO2 carries a WebAuthn assertion. The challenge is
+	// ApprovalChallenge(actionHash, nonce) — the action hash
+	// (what-you-sign-is-what-you-saw) bound to the fresh
+	// per-approval nonce in ApprovalNonce — and the nonce is
+	// consumed exactly once by the receiver (see NonceSet).
 	ProofFIDO2 ProofKind = "fido2"
 	// ProofChallenge references a challenge-response ceremony: the
 	// one-time code was minted and verified on the human's own device,
@@ -81,8 +84,9 @@ type Proof struct {
 	// the receiver verifies the issuer signature offline.
 	Token *SessionToken `json:"token,omitempty"`
 	// FIDO2: enrolled credential id plus the base64url WebAuthn
-	// assertion JSON. The assertion challenge must be the action
-	// hash. (Ceremony/dashboard flow: follow-up; the schema is
+	// assertion JSON. The assertion challenge must be
+	// ApprovalChallenge(actionHash, nonce) for the nonce in
+	// ApprovalNonce. (Ceremony/dashboard flow: follow-up; the schema is
 	// stable now so artifacts stay forward-compatible.)
 	CredentialID string `json:"credential_id,omitempty"`
 	Assertion    string `json:"assertion,omitempty"`
@@ -200,6 +204,12 @@ func attestationCanonicalV2(a *Attestation) ([]byte, error) {
 		return nil, fmt.Errorf("unknown proof kind %q", a.Proof.Kind)
 	}
 	out = lpField(out, []byte(a.RequestID))
+	// The approval nonce is covered by the signature: the WebAuthn
+	// challenge the assertion answers is ApprovalChallenge of the
+	// action hash and this nonce, so the nonce cannot be swapped
+	// (or stripped) without invalidating the attestation
+	// signature. Empty for non-FIDO2 proofs.
+	out = lpField(out, []byte(a.ApprovalNonce))
 	return out, nil
 }
 
@@ -283,6 +293,17 @@ func NewTier1Attestation(tok *SessionToken, priv ed25519.PrivateKey) (*Attestati
 // happened; kind selects the proof shape (fido2, challenge, or pin).
 // requestID binds the approval to the request that carried the draft;
 // it is part of the signed bytes, so it must be set before signing.
+//
+// FIDO2 callers: this constructor cannot mint fido2 proofs, and it
+// deliberately does not generate an approval nonce. The approval
+// ceremony generates the ceremony nonce before the attestation
+// exists — the assertion's WebAuthn challenge is
+// ApprovalChallenge(actionHash, nonce) — and the attestation must
+// carry that same nonce; auto-generating one here would desync the
+// two. For fido2, construct the Attestation directly, set
+// ApprovalNonce to the base64url ceremony nonce, then call Validate
+// and SignAttestation. (Validate rejects fido2 proofs without a
+// valid 32-byte nonce, so this constructor fails closed for them.)
 func NewTier2Attestation(body []byte, approver string, requestID string, kind ProofKind, presence PresenceStrength, proofExtras Proof, priv ed25519.PrivateKey) (*Attestation, error) {
 	switch kind {
 	case ProofFIDO2, ProofChallenge, ProofPIN:
@@ -365,8 +386,17 @@ func (a *Attestation) Validate() error {
 		if a.MsgHash == "" {
 			return fmt.Errorf("tier 2 attestation without message hash")
 		}
-		if a.Proof.Kind == ProofFIDO2 && a.Proof.CredentialID == "" {
-			return fmt.Errorf("fido2 proof without credential id")
+		if a.Proof.Kind == ProofFIDO2 {
+			if a.Proof.CredentialID == "" {
+				return fmt.Errorf("fido2 proof without credential id")
+			}
+			// The nonce binds the WebAuthn challenge
+			// (ApprovalChallenge) and is consumed exactly once
+			// by the receiver; without a valid nonce the
+			// assertion is unverifiable, so fail closed.
+			if _, err := DecodeApprovalNonce(a.ApprovalNonce); err != nil {
+				return fmt.Errorf("fido2 proof without valid approval nonce: %w", err)
+			}
 		}
 		if a.Proof.Kind == ProofChallenge && a.Proof.ChallengeID == "" {
 			return fmt.Errorf("challenge proof without challenge id")

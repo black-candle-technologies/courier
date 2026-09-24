@@ -36,10 +36,12 @@ package vhl
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -432,6 +434,71 @@ func verifyAttestationChain(x5c [][]byte, rp WebAuthnRP, now time.Time) (*x509.C
 	return leaf, nil
 }
 
+// aaguidExtensionOID is the FIDO AAGUID extension found in
+// authenticator attestation certificates.
+var aaguidExtensionOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 45724, 1, 1, 4}
+
+// checkAttestationCertProfile enforces the attestation certificate
+// profile (issue #142 review). Chain validation alone accepts any
+// certificate chaining to a trust anchor — including CA certificates
+// and non-authenticator leaves — so both attestation formats call
+// this after the chain check. The profile requires:
+//   - X.509 v3,
+//   - a non-CA end entity (BasicConstraintsValid && !IsCA),
+//   - digitalSignature key usage,
+//   - subject OU "Authenticator Attestation",
+//   - when the AAGUID extension (OID 1.3.6.1.4.1.45724.1.1.4) is
+//     present, its value equals the 16-byte AAGUID in authData,
+//   - for ES256 (alg -7): a P-256 public key (the existing
+//     key-type/curve check).
+//
+// Anything outside the profile fails closed: a certificate the
+// profile rejects proves nothing about the authenticator.
+func checkAttestationCertProfile(leaf *x509.Certificate, authData []byte, alg int64) error {
+	if leaf.Version != 3 {
+		return fmt.Errorf("enrollment: attestation leaf is not X.509 v3 (got v%d)", leaf.Version)
+	}
+	if !leaf.BasicConstraintsValid || leaf.IsCA {
+		return fmt.Errorf("enrollment: attestation leaf must be a non-CA end-entity certificate")
+	}
+	if leaf.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		return fmt.Errorf("enrollment: attestation leaf lacks digitalSignature key usage")
+	}
+	ouOK := false
+	for _, ou := range leaf.Subject.OrganizationalUnit {
+		if ou == "Authenticator Attestation" {
+			ouOK = true
+			break
+		}
+	}
+	if !ouOK {
+		return fmt.Errorf("enrollment: attestation leaf subject lacks OU \"Authenticator Attestation\"")
+	}
+	for _, ext := range leaf.Extensions {
+		if !ext.Id.Equal(aaguidExtensionOID) {
+			continue
+		}
+		// The extension value must be exactly the AAGUID bytes
+		// from the authenticator data: rpIdHash[32] ||
+		// flags[1] || signCount[4] || aaguid[16]. Without
+		// attested credential data there is no AAGUID to compare
+		// against — fail closed.
+		if len(authData) < 53 || authData[32]&authFlagAttestedData == 0 {
+			return fmt.Errorf("enrollment: attestation leaf carries an AAGUID but authenticator data has none")
+		}
+		if subtle.ConstantTimeCompare(ext.Value, authData[37:53]) != 1 {
+			return fmt.Errorf("enrollment: attestation leaf AAGUID does not match authenticator data")
+		}
+	}
+	if alg == -7 { // ES256
+		pub, ok := leaf.PublicKey.(*ecdsa.PublicKey)
+		if !ok || pub.Curve != elliptic.P256() {
+			return fmt.Errorf("enrollment: attestation leaf key is not P-256 for ES256")
+		}
+	}
+	return nil
+}
+
 // verifyPackedAttestation verifies a "packed" attestation statement:
 // the leaf certificate must chain to a trust anchor, and its
 // signature over authenticatorData || SHA-256(clientDataJSON) must
@@ -446,6 +513,9 @@ func verifyPackedAttestation(attObj *attestationObject, authData, clientDataHash
 	}
 	leaf, err := verifyAttestationChain(x5c, rp, now)
 	if err != nil {
+		return err
+	}
+	if err := checkAttestationCertProfile(leaf, authData, alg); err != nil {
 		return err
 	}
 	signed := make([]byte, 0, len(authData)+len(clientDataHash))
@@ -481,6 +551,11 @@ func verifyFidoU2FAttestation(attObj *attestationObject, authData, clientDataHas
 	}
 	leaf, err := verifyAttestationChain(x5c, rp, now)
 	if err != nil {
+		return err
+	}
+	// fido-u2f registration signatures are ECDSA P-256/SHA-256
+	// (ES256, COSE alg -7).
+	if err := checkAttestationCertProfile(leaf, authData, -7); err != nil {
 		return err
 	}
 	pub, ok := leaf.PublicKey.(*ecdsa.PublicKey)

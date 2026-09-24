@@ -66,10 +66,24 @@ func NewPKI(t *testing.T) *PKI {
 	}
 	leafTmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(2),
-		Subject:      pkix.Name{CommonName: "vhltest authenticator"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
+		Subject: pkix.Name{
+			CommonName:         "vhltest authenticator",
+			OrganizationalUnit: []string{"Authenticator Attestation"},
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		// The FIDO AAGUID extension, carrying the same zero
+		// AAGUID the synthetic authData below uses, so the
+		// attestation certificate profile check (see vhl's
+		// checkAttestationCertProfile) exercises its match path.
+		ExtraExtensions: []pkix.Extension{
+			{
+				Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 45724, 1, 1, 4},
+				Value: make([]byte, 16),
+			},
+		},
 	}
 	rootCert, err := x509.ParseCertificate(rootDER)
 	if err != nil {

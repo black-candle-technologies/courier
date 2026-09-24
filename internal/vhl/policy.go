@@ -50,6 +50,15 @@ func (v Verdict) String() string {
 type EvalInput struct {
 	// Tier is the tier tag from inside the E2E plaintext (0 when absent).
 	Tier Tier
+	// RequiredTier is the minimum tier the receiver's policy
+	// demands for this message (issue #142 review). The tier tag
+	// is sender-asserted and Tier 0 short-circuits evaluation, so
+	// without this a sender could self-label Tier 0 and get
+	// normal delivery even when the receiver requires Tier 2. A
+	// message below the required tier is VerdictInvalid — never
+	// actionable. Zero value (Tier0) means no requirement, which
+	// preserves the historical behavior.
+	RequiredTier Tier
 	// Body is the decrypted message body bytes (for hash binding).
 	Body []byte
 	// Attestation is the inline attestation, if the sender attached one.
@@ -71,6 +80,11 @@ type EvalOutcome struct {
 	Tier     Tier
 	Approver string // attesting approver identity, when verified
 	Reason   string // machine-readable detail for logs
+	// Evaluated is true when this outcome came out of Evaluate.
+	// It lets downstream distinguish "explicitly evaluated as
+	// Tier 0" from "never evaluated" (e.g. a fallback outcome
+	// constructed without running the verifier).
+	Evaluated bool
 }
 
 // Verifier evaluates VHL tier tags and attestations. It is built on
@@ -85,6 +99,15 @@ type Verifier struct {
 	// verification. When empty, fido2 proofs fail closed — the
 	// schema alone never counts as verified presence.
 	WebAuthn WebAuthnRP
+	// Nonces is the consumed-approval-nonce set for Tier 2 FIDO2
+	// approval replay (issue #142 review). Nil-safe: a nil set
+	// records nothing and the nonce-replay check is skipped — the
+	// assertion is still cryptographically verified against the
+	// nonce-bound challenge and the authenticator sign counter is
+	// still enforced. Wire a persisted NonceSet for the full
+	// replay protection; the check-and-consume must be atomic
+	// with persistence by the caller.
+	Nonces *NonceSet
 }
 
 // maxSeenArtifacts bounds the replay set; the message-hash binding
@@ -194,23 +217,40 @@ func (r *RevocationSet) Apply(rev *Revocation, now int64) {
 
 // Evaluate verifies one message's VHL tier tag and attestation.
 //
-// The checks, in order: tier tag valid; tier 0 → unattested; higher
-// tiers require an attestation (missing → VerdictMissing); the
-// attestation validates structurally, its signer key is enrolled for
-// the claimed approver, the signature verifies, the id is neither
-// seen nor revoked, the lifetime covers now (receiver-local, with
-// grace), and the tier-specific binding holds (tier 2: message hash
-// matches; tier 1: session token live, scope covers this receiver,
-// presence recorded).
+// The checks, in order: tier tag valid; receiver-required minimum
+// tier (a sender-asserted Tier 0 never satisfies a higher
+// requirement); tier 0 → unattested; higher tiers require an
+// attestation (missing → VerdictMissing); the attestation validates
+// structurally, its signer key is enrolled for the claimed approver,
+// the signature verifies, the id is neither seen nor revoked, the
+// lifetime covers now (receiver-local, with grace), and the
+// tier-specific binding holds (tier 2: message hash matches and the
+// proof is a cryptographically verified FIDO2 assertion over the
+// nonce-bound approval challenge; tier 1: session token live, scope
+// covers this receiver, presence recorded).
 //
 // A single failure yields VerdictInvalid with a machine-readable
 // reason. The message itself is never dropped here — the caller's
 // policy maps the verdict to delivery (attested), hold-for-review
 // (missing/invalid), or plain delivery (unattested tier 0).
-func (v *Verifier) Evaluate(in EvalInput) EvalOutcome {
+// Every return path sets Evaluated on the outcome.
+func (v *Verifier) Evaluate(in EvalInput) (out EvalOutcome) {
+	// Evaluated marks every outcome that came out of this
+	// function, so downstream can tell "explicitly evaluated as
+	// Tier 0" from "never evaluated". The defer covers every
+	// return path — including ones added later.
+	defer func() { out.Evaluated = true }()
 	tier := in.Tier
 	if !tier.Valid() {
 		return EvalOutcome{Verdict: VerdictInvalid, Tier: tier, Reason: "bad-tier-tag"}
+	}
+	// Receiver-enforced minimum tier (issue #142 review): the tier
+	// tag is sender-asserted and Tier 0 short-circuits below, so
+	// without this check a sender could self-label Tier 0 to get
+	// normal delivery when the receiver requires Tier 2. Below
+	// the requirement the message is invalid, never actionable.
+	if tier < in.RequiredTier {
+		return EvalOutcome{Verdict: VerdictInvalid, Tier: tier, Reason: "below-required-tier"}
 	}
 	if tier == Tier0 {
 		// A Tier 0 message must not carry an attestation: an
@@ -269,22 +309,31 @@ func (v *Verifier) Evaluate(in EvalInput) EvalOutcome {
 		if err != nil || subtle.ConstantTimeCompare(h[:], want) != 1 {
 			return EvalOutcome{Verdict: VerdictInvalid, Tier: tier, Approver: a.Approver, Reason: "hash-mismatch"}
 		}
+		// Only FIDO2 proofs are cryptographically verifiable at
+		// Tier 2 (issue #142 review): PIN and challenge proofs
+		// pass on the Ed25519 attestation signature alone, which
+		// the requesting agent itself can produce — that is
+		// self-attestation, not human presence. Fail closed.
+		// (ProofSession cannot appear on Tier 2: Validate
+		// rejects it.)
+		if a.Proof.Kind != ProofFIDO2 {
+			return EvalOutcome{Verdict: VerdictInvalid, Tier: tier, Approver: a.Approver, Reason: "unverifiable-proof"}
+		}
 		// FIDO2 proofs are cryptographically verified here — the
-		// assertion must be a real WebAuthn get-assertion over the
-		// action hash, signed by the enrolled credential. Presence
-		// of the assertion fields alone never suffices.
-		if a.Proof.Kind == ProofFIDO2 {
-			// Same-envelope re-evaluation (e.g. the inbox CLI and
-			// the dashboard push deriving the same message): the
-			// first evaluation already advanced the stored
-			// signature counter, so the counter-increase check is
-			// skipped — otherwise a valid attestation would flip
-			// to invalid on re-check. The assertion itself is
-			// still fully verified cryptographically.
-			skipCounter := v.Seen.SeenInEnvelope(a.ID, in.EnvelopeID)
-			if err := v.verifyFIDO2Proof(a, h[:], skipCounter); err != nil {
-				return EvalOutcome{Verdict: VerdictInvalid, Tier: tier, Approver: a.Approver, Reason: err.Error()}
-			}
+		// assertion must be a real WebAuthn get-assertion over
+		// the nonce-bound approval challenge, signed by the
+		// enrolled credential. Presence of the assertion fields
+		// alone never suffices.
+		// Same-envelope re-evaluation (e.g. the inbox CLI and
+		// the dashboard push deriving the same message): the
+		// first evaluation already advanced the stored
+		// signature counter, so the counter-increase check is
+		// skipped — otherwise a valid attestation would flip
+		// to invalid on re-check. The assertion itself is
+		// still fully verified cryptographically.
+		skipCounter := v.Seen.SeenInEnvelope(a.ID, in.EnvelopeID)
+		if err := v.verifyFIDO2Proof(a, h[:], in.EnvelopeID, skipCounter); err != nil {
+			return EvalOutcome{Verdict: VerdictInvalid, Tier: tier, Approver: a.Approver, Reason: err.Error()}
 		}
 	case Tier1:
 		tok := a.Proof.Token
@@ -415,32 +464,40 @@ func (v *Verifier) verifyMintAssertion(tok *SessionToken) error {
 }
 
 // verifyFIDO2Proof cryptographically verifies the WebAuthn assertion
-// in a Tier 2 fido2 proof: the credential must be enrolled for the
-// approver, and the assertion must be a genuine get-assertion over
-// the action hash from that credential.
-//
-// Challenge scheme (deliberate, issue #142): the challenge is the
-// deterministic action hash — what-you-sign-is-what-you-saw — not a
-// receiver-issued nonce. There is no challenge round-trip in this
-// asynchronous protocol, and a receiver-issued challenge would add
-// one. Replay of a captured assertion (re-wrapped in a fresh
-// attestation for the same body) is defeated at two layers instead:
-// the envelope-layer attestation-id dedup catches exact replays, and
-// the authenticator's signature counter below must strictly increase
-// per credential.
-// verifyFIDO2Proof cryptographically verifies the WebAuthn assertion
 // for a Tier 2 attestation. When skipCounterCheck is set (a
 // re-evaluation of an envelope this attestation was already
 // recorded against), the signature-counter increase check is
 // skipped — the first evaluation already advanced the counter —
 // but the assertion itself is still fully verified.
-func (v *Verifier) verifyFIDO2Proof(a *Attestation, actionHash []byte, skipCounterCheck bool) error {
+//
+// Challenge scheme (issue #142 review): the challenge is
+// ApprovalChallenge(actionHash, nonce) — the action hash bound to a
+// fresh per-approval nonce — not the bare action hash. The nonce
+// rides in the attestation, covered by the attestation signature,
+// and the receiver consumes it exactly once (see NonceSet). A
+// captured assertion answers only its own ceremony's challenge, so
+// re-wrapping it in a fresh attestation (new id, new envelope) is
+// still a replay: the nonce is already consumed. This defeats
+// replay against counterless authenticators (counter stuck at 0)
+// and concurrent verifiers, where the sign-counter check alone
+// cannot. The counter check stays as defense in depth.
+func (v *Verifier) verifyFIDO2Proof(a *Attestation, actionHash []byte, envelopeID int64, skipCounterCheck bool) error {
 	if a.Proof.CredentialID == "" {
 		return fmt.Errorf("missing credential id")
 	}
 	if a.Proof.Assertion == "" {
 		return fmt.Errorf("missing assertion")
 	}
+	// Decode the ceremony nonce first: without a valid nonce the
+	// expected challenge cannot be computed, so fail closed. (The
+	// nonce is covered by the attestation signature — verified
+	// before this runs — so it cannot be swapped without
+	// invalidating the attestation.)
+	nonce, err := DecodeApprovalNonce(a.ApprovalNonce)
+	if err != nil {
+		return fmt.Errorf("fido2: approval nonce: %w", err)
+	}
+	expectedChallenge := ApprovalChallenge(actionHash, nonce)
 	_, webAuthn, err := v.Registry.KeysFor(a.Approver)
 	if err != nil {
 		return fmt.Errorf("no credentials: %w", err)
@@ -466,9 +523,26 @@ func (v *Verifier) verifyFIDO2Proof(a *Attestation, actionHash []byte, skipCount
 	// FIDO2UV (user verification) demands the UV flag; plain FIDO2
 	// presence needs the UP flag.
 	requireUV := a.Proof.Strength == PresenceFIDO2UV.String()
-	signCount, err := verifyWebAuthnAssertion(credPub, a.Proof.Assertion, actionHash, v.WebAuthn, requireUV)
+	signCount, err := verifyWebAuthnAssertion(credPub, a.Proof.Assertion, expectedChallenge[:], v.WebAuthn, requireUV)
 	if err != nil {
 		return err
+	}
+	// Consume the nonce exactly once. The assertion's challenge is
+	// bound to this nonce, so a captured assertion re-wrapped in a
+	// fresh attestation still carries the same nonce — the second
+	// delivery in a different envelope is a replay. Same-envelope
+	// re-evaluation is not a replay: Consumed only reports a
+	// *different* envelope, and re-consuming the same envelope is
+	// a no-op. A nil NonceSet records nothing (nil-safe); the
+	// assertion is still cryptographically verified above.
+	// Check-and-consume must be atomic with persistence by the
+	// caller.
+	if v.Nonces != nil {
+		key := ApprovalNonceKey(a.Approver, a.ApprovalNonce)
+		if v.Nonces.Consumed(key, envelopeID) {
+			return fmt.Errorf("fido2: replay: approval nonce already consumed")
+		}
+		v.Nonces.Consume(key, envelopeID)
 	}
 	// Standard WebAuthn replay control: the counter must strictly
 	// increase per credential. A counter-less authenticator reports
