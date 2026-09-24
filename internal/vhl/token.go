@@ -122,18 +122,27 @@ func (p *PendingSessionMint) tokenForChallenge() *SessionToken {
 }
 
 // Challenge returns the bytes the authenticator must sign: the
-// SHA-256 of the token's canonical form with assertion and
-// credential id zeroed. Binding the challenge to the full token
-// bytes means the assertion cannot be transplanted onto a token
-// with different scope, lifetime, or ids.
+// session-mint challenge over the canonical mint context
+// (SessionMintChallenge). The challenge binds every
+// security-relevant mint parameter the human reviews in the browser
+// ceremony — issuer, scope, token/session ids, lifetime, presence —
+// so the browser can recompute it from the displayed context and
+// detect relay tampering, and so a mint assertion cannot be
+// transplanted onto a token with different values. BootID is not in
+// the ceremony challenge: it is covered by the issuer's Ed25519
+// signature over the canonical token bytes instead (a restarted
+// issuer's old tokens are rejected by boot-id mismatch at the
+// receiver), and the token version is a protocol constant.
 func (p *PendingSessionMint) Challenge() []byte {
-	canon, err := p.tokenForChallenge().canonical()
-	if err != nil {
-		// tokenForChallenge is built from BeginSessionMint's own
-		// validated fields; canonical cannot fail here.
-		panic(fmt.Sprintf("vhl: mint challenge: %v", err))
-	}
-	sum := sha256.Sum256(canon)
+	sum := SessionMintChallenge(MintContext{
+		Issuer:    p.Issuer,
+		Scope:     p.Scope,
+		TokenID:   p.ID,
+		SessionID: p.SessionID,
+		IssuedAt:  p.IssuedAt,
+		ExpiresAt: p.ExpiresAt,
+		Presence:  PresenceFIDO2UV.String(),
+	})
 	return sum[:]
 }
 
@@ -203,21 +212,21 @@ func (t *SessionToken) verifyMintAssertion(cred *Credential, rp WebAuthnRP) erro
 }
 
 // mintChallenge recomputes the challenge this token's assertion must
-// be over: the SHA-256 of the canonical bytes with assertion and
-// credential id zeroed. A receiver uses it to verify the embedded
-// assertion independently of the issuer signature.
+// be over: the session-mint challenge over the canonical mint
+// context rebuilt from the token's own fields. A receiver uses it to
+// verify the embedded assertion independently of the issuer
+// signature. BootID is covered by the issuer's token signature, not
+// the ceremony challenge (see Challenge).
 func (t *SessionToken) mintChallenge() []byte {
-	blank := *t
-	blank.Assertion = ""
-	blank.CredentialID = ""
-	canon, err := blank.canonical()
-	if err != nil {
-		// The token's own fields produced the canonical form when
-		// minted; a failure here means the token is malformed and
-		// will be rejected by Validate before this matters.
-		return nil
-	}
-	sum := sha256.Sum256(canon)
+	sum := SessionMintChallenge(MintContext{
+		Issuer:    t.Issuer,
+		Scope:     t.Scope,
+		TokenID:   t.ID,
+		SessionID: t.SessionID,
+		IssuedAt:  t.IssuedAt,
+		ExpiresAt: t.ExpiresAt,
+		Presence:  t.Presence,
+	})
 	return sum[:]
 }
 

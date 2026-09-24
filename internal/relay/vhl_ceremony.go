@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
 	"github.com/black-candle-technologies/courier/internal/store"
+	"github.com/black-candle-technologies/courier/internal/vhl"
 )
 
 // VHL WebAuthn ceremony transport (issue #142).
@@ -36,11 +38,16 @@ import (
 //     the agent prints the full ceremony URL for the human.
 //  3. The human opens the URL in their browser (logged into the
 //     dashboard), and the page runs navigator.credentials.create()
-//     (enrollment) or .get() (session mint) with the agent's
-//     challenge. The browser POSTs the attestation/assertion back
-//     through the relay. Browser endpoints are gated on the shared
-//     dashboard session cookie, and the session's Courier address
-//     must match the address that created the ceremony.
+//     (enrollment) or .get() (session mint, action approval,
+//     approver enrollment) with the agent's challenge. For mint,
+//     approve, and enroll-approver the page first displays the
+//     human-reviewed ceremony context (what authority is being
+//     granted) and recomputes the challenge from the displayed
+//     context, refusing to proceed on mismatch. The browser POSTs
+//     the attestation/assertion back through the relay. Browser
+//     endpoints are gated on the shared dashboard session cookie,
+//     and the session's Courier address must match the address
+//     that created the ceremony.
 //  4. The agent polls GET /v1/vhl/ceremonies/{code}/result (signed
 //     request, same identity) until the attestation arrives, then
 //     independently verifies it against its own RP config: exact
@@ -81,20 +88,58 @@ const vhlCodeAlphabet = "23456789abcdefghjkmnpqrstuvwxyz"
 // kilobytes; this leaves wide headroom while bounding relay memory.
 const vhlMaxAttestationBytes = 16 * 1024
 
-// vhlCeremonyTypeEnroll and vhlCeremonyTypeMint are the two ceremony
-// kinds, enforced end to end (the page, the agent, and the verifier
-// all agree on which WebAuthn call to make).
+// vhlMaxCeremonies caps the transient ceremony registry (issue #142
+// review): the per-address creation limiter is Sybil-able (an
+// attacker mints identities), so the registry itself needs a global
+// bound. When full, creation purges expired records once more and
+// then fails closed with 503 instead of growing without bound.
+const vhlMaxCeremonies = 1024
+
+// vhlMaxCeremonyAttestationBytes caps the total stored
+// ceremony-response bytes across the whole registry (issue #142
+// review): 8 MiB is 512 max-size attestations, far above any
+// legitimate burst of human-paced ceremonies, and it bounds relay
+// memory independently of the record-count cap.
+const vhlMaxCeremonyAttestationBytes = 8 * 1024 * 1024
+
+// vhlCeremonyGlobalBurst / vhlCeremonyGlobalRatePerSec tune the
+// registry-global (non-identity) ceremony-creation limiter (issue
+// #142 review): ceremony creation is human-paced — one per
+// enrollment, mint, or approval — so a burst of 32 with 4/sec
+// sustained is invisible to legitimate use and blunts a Sybil flood
+// that the per-address limiter cannot see. It is defense in depth
+// behind the registry caps, not a replacement for them.
+const vhlCeremonyGlobalBurst = 32
+const vhlCeremonyGlobalRatePerSec = 4.0
+
+// vhlMaxContextJSONBytes caps the agent-supplied ceremony context
+// JSON: the context is displayed verbatim to the human (a draft
+// summary can be a paragraph), but it must stay small enough to
+// render and to sign cheaply.
+const vhlMaxContextJSONBytes = 16 * 1024
+
+// vhlCeremonyTypeEnroll, vhlCeremonyTypeMint,
+// vhlCeremonyTypeApprove, and vhlCeremonyTypeEnrollApprover are the
+// ceremony kinds, enforced end to end (the page, the agent, and the
+// verifier all agree on which WebAuthn call to make). "enroll" is a
+// registration ceremony (navigator.credentials.create); "mint",
+// "approve", and "enroll-approver" are assertion ceremonies
+// (navigator.credentials.get) over a human-reviewed context the
+// page displays before the key is touched.
 const (
-	vhlCeremonyTypeEnroll = "enroll"
-	vhlCeremonyTypeMint   = "mint"
+	vhlCeremonyTypeEnroll         = "enroll"
+	vhlCeremonyTypeMint           = "mint"
+	vhlCeremonyTypeApprove        = "approve"
+	vhlCeremonyTypeEnrollApprover = "enroll-approver"
 )
 
 // vhlCeremony is one in-flight WebAuthn ceremony record.
 type vhlCeremony struct {
 	Code          string
-	Type          string // enroll | mint
+	Type          string // enroll | mint | approve | enroll-approver
 	Address       string // creator identity address
 	ChallengeB64  string // base64url challenge the authenticator answers
+	ContextJSON   string // human-reviewed ceremony context (mint/approve/enroll-approver)
 	RPID          string // RP id echoed to the browser page
 	CredentialIDs []string
 	CreatedAt     time.Time
@@ -106,24 +151,64 @@ type vhlCeremony struct {
 	AttestationB64 string
 }
 
+// errVHLCeremoniesFull reports a registry at its global record cap.
+var errVHLCeremoniesFull = fmt.Errorf("ceremony registry full")
+
+// errVHLCeremonyBytesFull reports a registry at its global
+// attestation-byte cap.
+var errVHLCeremonyBytesFull = fmt.Errorf("ceremony attestation storage full")
+
 // vhlCeremonies is the relay's transient ceremony registry.
 type vhlCeremonies struct {
 	mu     sync.Mutex
 	byCode map[string]*vhlCeremony
+	// attBytes tracks the total stored attestation-response bytes
+	// across all records, against vhlMaxCeremonyAttestationBytes.
+	attBytes int64
+	// globalLimiter is the non-identity ceremony-creation rate
+	// limiter, keyed on the single shared key
+	// "vhl-ceremony-global" so every identity draws from one
+	// bucket. Kept alongside the per-address limiter as defense in
+	// depth: the per-address limiter cannot see a Sybil flood.
+	globalLimiter *Limiter
 }
 
 // newVHLCeremonies returns an empty ceremony registry.
 func newVHLCeremonies() *vhlCeremonies {
-	return &vhlCeremonies{byCode: make(map[string]*vhlCeremony)}
+	return &vhlCeremonies{
+		byCode:        make(map[string]*vhlCeremony),
+		globalLimiter: NewLimiter(vhlCeremonyGlobalBurst, vhlCeremonyGlobalRatePerSec),
+	}
+}
+
+// deleteLocked removes one record, releasing its attestation bytes.
+// Callers must hold c.mu.
+func (c *vhlCeremonies) deleteLocked(code string) {
+	if cer, ok := c.byCode[code]; ok {
+		c.attBytes -= int64(len(cer.AttestationB64))
+		if c.attBytes < 0 {
+			c.attBytes = 0
+		}
+		delete(c.byCode, code)
+	}
 }
 
 // create draws a fresh code and inserts the ceremony atomically.
 // The code draw and the insert share one lock hold so two
-// concurrent creates can never land on the same code.
+// concurrent creates can never land on the same code. The registry
+// is globally capped at vhlMaxCeremonies: when full, expired
+// records are purged once more and creation then fails closed with
+// errVHLCeremoniesFull rather than growing without bound.
 func (c *vhlCeremonies) create(cer *vhlCeremony) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.purgeLocked()
+	if len(c.byCode) >= vhlMaxCeremonies {
+		c.purgeLocked()
+		if len(c.byCode) >= vhlMaxCeremonies {
+			return "", errVHLCeremoniesFull
+		}
+	}
 	for {
 		var rnd [vhlCeremonyCodeLen]byte
 		if _, err := rand.Read(rnd[:]); err != nil {
@@ -157,11 +242,11 @@ func (c *vhlCeremonies) get(code string) *vhlCeremony {
 	}
 	now := time.Now()
 	if now.After(cer.ExpiresAt) && cer.CompletedAt.IsZero() {
-		delete(c.byCode, code)
+		c.deleteLocked(code)
 		return nil
 	}
 	if !cer.CompletedAt.IsZero() && now.After(cer.CompletedAt.Add(vhlCompletedGrace)) {
-		delete(c.byCode, code)
+		c.deleteLocked(code)
 		return nil
 	}
 	cp := *cer
@@ -171,16 +256,24 @@ func (c *vhlCeremonies) get(code string) *vhlCeremony {
 // complete records the browser's attestation for a pending ceremony.
 // It fails when the code is unknown, expired, or already completed
 // (single-use: the first submission wins and the code dies with it).
+// Stored attestation bytes are globally capped at
+// vhlMaxCeremonyAttestationBytes: expired records are purged first,
+// then a still-full registry fails closed with
+// errVHLCeremonyBytesFull.
 func (c *vhlCeremonies) complete(code, attestationB64 string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.purgeLocked()
+	if c.attBytes+int64(len(attestationB64)) > vhlMaxCeremonyAttestationBytes {
+		return errVHLCeremonyBytesFull
+	}
 	cer, ok := c.byCode[code]
 	if !ok {
 		return fmt.Errorf("unknown ceremony")
 	}
 	now := time.Now()
 	if now.After(cer.ExpiresAt) {
-		delete(c.byCode, code)
+		c.deleteLocked(code)
 		return fmt.Errorf("ceremony expired")
 	}
 	if !cer.CompletedAt.IsZero() {
@@ -188,21 +281,23 @@ func (c *vhlCeremonies) complete(code, attestationB64 string) error {
 	}
 	cer.AttestationB64 = attestationB64
 	cer.CompletedAt = now
+	c.attBytes += int64(len(attestationB64))
 	return nil
 }
 
-// purgeLocked drops expired records. Callers must hold c.mu.
+// purgeLocked drops expired records, releasing their attestation
+// bytes. Callers must hold c.mu.
 func (c *vhlCeremonies) purgeLocked() {
 	now := time.Now()
 	for code, cer := range c.byCode {
 		if cer.CompletedAt.IsZero() {
 			if now.After(cer.ExpiresAt) {
-				delete(c.byCode, code)
+				c.deleteLocked(code)
 			}
 			continue
 		}
 		if now.After(cer.CompletedAt.Add(vhlCompletedGrace)) {
-			delete(c.byCode, code)
+			c.deleteLocked(code)
 		}
 	}
 }
@@ -256,19 +351,119 @@ func writeVHLJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // vhlCeremonyCreateReq is the agent's signed ceremony creation
-// request. The signature covers address, type, challenge, and ts
-// (see envelope.VHLCeremonyCreate); credential_ids and rp_id are
-// echoed to the browser page and verified independently by the
+// request. The signature covers address, type, challenge, context,
+// and ts (see envelope.VHLCeremonyCreate); credential_ids and rp_id
+// are echoed to the browser page and verified independently by the
 // agent against its own RP config, so relay tampering there fails
-// closed at attestation verification.
+// closed at attestation verification. The context is the
+// human-reviewed ceremony context (required for mint, approve, and
+// enroll-approver; the page displays it and recomputes the challenge
+// from it), also covered by the signature so the relay cannot
+// substitute values the human never saw.
 type vhlCeremonyCreateReq struct {
 	Address       string   `json:"address"`
 	Type          string   `json:"type"`
 	Challenge     string   `json:"challenge"`
+	Context       string   `json:"context,omitempty"`
 	CredentialIDs []string `json:"credential_ids,omitempty"`
 	RPID          string   `json:"rp_id"`
 	Ts            int64    `json:"ts"`
 	Sig           string   `json:"sig"`
+}
+
+// vhlValidateCeremonyContext checks the agent-supplied ceremony
+// context for the types that carry one. The context is what the
+// human reviews in the browser before touching their key, so it
+// must be present and structurally sound; the page recomputes the
+// challenge from the displayed context and refuses to proceed on
+// mismatch, and the agent's signature covers the same bytes.
+func vhlValidateCeremonyContext(ceremonyType, contextJSON, address string) error {
+	if len(contextJSON) > vhlMaxContextJSONBytes {
+		return fmt.Errorf("context too large")
+	}
+	switch ceremonyType {
+	case vhlCeremonyTypeEnroll:
+		// Enrollment carries no context: the ceremony binds the
+		// agent address and RP id only.
+		return nil
+	case vhlCeremonyTypeMint:
+		if contextJSON == "" {
+			return fmt.Errorf("context required for mint ceremonies")
+		}
+		var mc vhl.MintContext
+		if err := json.Unmarshal([]byte(contextJSON), &mc); err != nil {
+			return fmt.Errorf("bad mint context: %w", err)
+		}
+		if mc.Issuer != address {
+			return fmt.Errorf("mint context issuer does not match creator")
+		}
+		// Empty scope is valid: it is wildcard authority in the
+		// existing session-token semantics (vhl.Token), so the
+		// relay must not narrow it here. Token/session ids and a
+		// sane lifetime are still required.
+		if mc.TokenID == "" || mc.SessionID == "" {
+			return fmt.Errorf("mint context missing token/session ids")
+		}
+		if mc.IssuedAt <= 0 || mc.ExpiresAt <= mc.IssuedAt {
+			return fmt.Errorf("mint context has invalid lifetime")
+		}
+		if _, err := vhl.ParsePresence(mc.Presence); err != nil {
+			return fmt.Errorf("mint context presence: %w", err)
+		}
+		return nil
+	case vhlCeremonyTypeApprove:
+		if contextJSON == "" {
+			return fmt.Errorf("context required for approve ceremonies")
+		}
+		var ac struct {
+			RequestID    string `json:"request_id"`
+			ActionHash   string `json:"action_hash"`
+			Approver     string `json:"approver"`
+			DraftSummary string `json:"draft_summary"`
+			NonceB64     string `json:"nonce_b64"`
+		}
+		if err := json.Unmarshal([]byte(contextJSON), &ac); err != nil {
+			return fmt.Errorf("bad approve context: %w", err)
+		}
+		if ac.RequestID == "" || ac.Approver == "" {
+			return fmt.Errorf("approve context missing request_id/approver")
+		}
+		ah, err := base64.RawURLEncoding.DecodeString(ac.ActionHash)
+		if err != nil || len(ah) != 32 {
+			return fmt.Errorf("approve context action_hash must be 32 bytes base64url")
+		}
+		nonce, err := base64.RawURLEncoding.DecodeString(ac.NonceB64)
+		if err != nil || len(nonce) != 32 {
+			return fmt.Errorf("approve context nonce_b64 must be 32 bytes base64url")
+		}
+		return nil
+	case vhlCeremonyTypeEnrollApprover:
+		if contextJSON == "" {
+			return fmt.Errorf("context required for enroll-approver ceremonies")
+		}
+		var ec struct {
+			ApproverAddress string `json:"approver_address"`
+			AgentAddress    string `json:"agent_address"`
+			IssuedAt        int64  `json:"issued_at"`
+			ChallengeB64    string `json:"challenge_b64"`
+		}
+		if err := json.Unmarshal([]byte(contextJSON), &ec); err != nil {
+			return fmt.Errorf("bad enroll-approver context: %w", err)
+		}
+		if _, err := parseAddress(ec.ApproverAddress); err != nil {
+			return fmt.Errorf("enroll-approver context: bad approver_address")
+		}
+		if ec.AgentAddress != address {
+			return fmt.Errorf("enroll-approver context agent_address does not match creator")
+		}
+		ch, err := base64.RawURLEncoding.DecodeString(ec.ChallengeB64)
+		if err != nil || len(ch) != 32 {
+			return fmt.Errorf("enroll-approver context challenge_b64 must be 32 bytes base64url")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown ceremony type %q", ceremonyType)
+	}
 }
 
 // handleVHLCeremonyCreate is POST /v1/vhl/ceremonies: the agent's
@@ -280,8 +475,10 @@ func (s *Server) handleVHLCeremonyCreate(w http.ResponseWriter, r *http.Request)
 		writeVHLJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	if req.Type != vhlCeremonyTypeEnroll && req.Type != vhlCeremonyTypeMint {
-		writeVHLJSON(w, http.StatusBadRequest, map[string]string{"error": "type must be enroll or mint"})
+	switch req.Type {
+	case vhlCeremonyTypeEnroll, vhlCeremonyTypeMint, vhlCeremonyTypeApprove, vhlCeremonyTypeEnrollApprover:
+	default:
+		writeVHLJSON(w, http.StatusBadRequest, map[string]string{"error": "type must be one of enroll, mint, approve, enroll-approver"})
 		return
 	}
 	addr, err := parseAddress(req.Address)
@@ -296,6 +493,10 @@ func (s *Server) handleVHLCeremonyCreate(w http.ResponseWriter, r *http.Request)
 	chal, err := base64.RawURLEncoding.DecodeString(req.Challenge)
 	if err != nil || len(chal) != 32 {
 		writeVHLJSON(w, http.StatusBadRequest, map[string]string{"error": "challenge must be 32 bytes base64url"})
+		return
+	}
+	if err := vhlValidateCeremonyContext(req.Type, req.Context, req.Address); err != nil {
+		writeVHLJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	if len(req.CredentialIDs) > 8 {
@@ -318,8 +519,17 @@ func (s *Server) handleVHLCeremonyCreate(w http.ResponseWriter, r *http.Request)
 		writeVHLJSON(w, http.StatusBadRequest, map[string]string{"error": "bad sig encoding"})
 		return
 	}
-	if !crypto.Verify(addr[:], envelope.VHLCeremonyCreate(addr[:], req.Type, req.Challenge, req.Ts), sigBytes) {
+	if !crypto.Verify(addr[:], envelope.VHLCeremonyCreate(addr[:], req.Type, req.Challenge, req.Context, req.Ts), sigBytes) {
 		writeVHLJSON(w, http.StatusUnauthorized, map[string]string{"error": "bad signature"})
+		return
+	}
+	// Global (non-identity) creation rate limit: the per-address
+	// limiter below is Sybil-able, so a shared bucket bounds total
+	// creation rate across all identities. Checked after signature
+	// verification so unauthenticated garbage cannot burn the
+	// shared budget and deny service to legitimate creators.
+	if !s.ceremonies.globalLimiter.Allow("vhl-ceremony-global") {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
 	if !s.limiter.Allow("vhl-ceremony:" + req.Address) {
@@ -332,12 +542,17 @@ func (s *Server) handleVHLCeremonyCreate(w http.ResponseWriter, r *http.Request)
 		Type:          req.Type,
 		Address:       req.Address,
 		ChallengeB64:  req.Challenge,
+		ContextJSON:   req.Context,
 		RPID:          req.RPID,
 		CredentialIDs: req.CredentialIDs,
 		CreatedAt:     now,
 		ExpiresAt:     now.Add(vhlCeremonyTTL),
 	})
 	if err != nil {
+		if errors.Is(err, errVHLCeremoniesFull) {
+			writeVHLJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ceremony registry full"})
+			return
+		}
 		writeVHLJSON(w, http.StatusInternalServerError, map[string]string{"error": "code generation failed"})
 		return
 	}
@@ -374,6 +589,7 @@ func (s *Server) handleVHLCeremonyDetails(w http.ResponseWriter, r *http.Request
 	writeVHLJSON(w, http.StatusOK, map[string]any{
 		"type":           cer.Type,
 		"challenge":      cer.ChallengeB64,
+		"context":        cer.ContextJSON,
 		"rp_id":          cer.RPID,
 		"credential_ids": cer.CredentialIDs,
 		"address":        cer.Address,
@@ -439,7 +655,12 @@ func (s *Server) handleVHLCeremonyAttest(w http.ResponseWriter, r *http.Request)
 	}
 	if err := s.ceremonies.complete(code, req.Attestation); err != nil {
 		// complete() only fails on expiry/double-submit races that
-		// get() already screened; report without leaking internals.
+		// get() already screened, or on a full attestation store;
+		// report without leaking internals.
+		if errors.Is(err, errVHLCeremonyBytesFull) {
+			writeVHLJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
+		}
 		writeVHLJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
@@ -552,7 +773,9 @@ func (s *Server) handleVHLCeremonyPage(w http.ResponseWriter, r *http.Request) {
 // vhlEnrollmentPublishReq is the agent's signed enrollment
 // publication. The signature covers address, credential id, public
 // key, RP id, and epoch (envelope.VHLEnrollmentAnnounce); only a
-// strictly greater epoch is applied.
+// strictly greater epoch per (address, credential_id) is applied.
+// revoked=1 at a higher epoch revokes that binding independently of
+// the identity's other credentials.
 type vhlEnrollmentPublishReq struct {
 	Address       string `json:"address"`
 	CredentialID  string `json:"credential_id"`
@@ -560,6 +783,7 @@ type vhlEnrollmentPublishReq struct {
 	RPID          string `json:"rp_id"`
 	AAGUID        string `json:"aaguid,omitempty"`
 	Epoch         int64  `json:"epoch"`
+	Revoked       bool   `json:"revoked,omitempty"`
 	Sig           string `json:"sig"`
 }
 
@@ -601,7 +825,7 @@ func (s *Server) handleVHLEnrollmentPublish(w http.ResponseWriter, r *http.Reque
 		writeVHLJSON(w, http.StatusBadRequest, map[string]string{"error": "bad sig encoding"})
 		return
 	}
-	if !crypto.Verify(addr[:], envelope.VHLEnrollmentAnnounce(addr[:], req.CredentialID, req.CredentialPub, req.RPID, req.Epoch), sigBytes) {
+	if !crypto.Verify(addr[:], envelope.VHLEnrollmentAnnounce(addr[:], req.CredentialID, req.CredentialPub, req.RPID, req.Epoch, req.Revoked), sigBytes) {
 		writeVHLJSON(w, http.StatusUnauthorized, map[string]string{"error": "bad signature"})
 		return
 	}
@@ -616,6 +840,7 @@ func (s *Server) handleVHLEnrollmentPublish(w http.ResponseWriter, r *http.Reque
 		RPID:          req.RPID,
 		AAGUID:        req.AAGUID,
 		Epoch:         req.Epoch,
+		Revoked:       req.Revoked,
 		Sig:           req.Sig,
 	})
 	if err != nil {
@@ -630,7 +855,12 @@ func (s *Server) handleVHLEnrollmentPublish(w http.ResponseWriter, r *http.Reque
 }
 
 // handleVHLEnrollmentLookup is GET /v1/vhl/enrollments/{address}:
-// the public discovery read for a published enrollment binding.
+// the public discovery read for an identity's published enrollment
+// bindings. It serves the full credential set as a JSON list —
+// every binding with its revoked flag — so consumers learn about
+// revocations instead of silently missing them. The local registry
+// stays the trust root: a directory entry can never override a
+// local enrollment.
 func (s *Server) handleVHLEnrollmentLookup(w http.ResponseWriter, r *http.Request) {
 	address := r.PathValue("code")
 	// The route registers {code} for ceremony paths; enrollments use
@@ -642,7 +872,7 @@ func (s *Server) handleVHLEnrollmentLookup(w http.ResponseWriter, r *http.Reques
 		writeVHLJSON(w, http.StatusBadRequest, map[string]string{"error": "bad address"})
 		return
 	}
-	e, err := s.store.GetVHLEnrollment(address)
+	all, err := s.store.GetVHLEnrollment(address)
 	if err == sql.ErrNoRows {
 		writeVHLJSON(w, http.StatusNotFound, map[string]string{"error": "no published enrollment"})
 		return
@@ -651,14 +881,19 @@ func (s *Server) handleVHLEnrollmentLookup(w http.ResponseWriter, r *http.Reques
 		writeVHLJSON(w, http.StatusInternalServerError, map[string]string{"error": "store failed"})
 		return
 	}
-	writeVHLJSON(w, http.StatusOK, map[string]any{
-		"address":        e.Address,
-		"credential_id":  e.CredentialID,
-		"credential_pub": e.CredentialPub,
-		"rp_id":          e.RPID,
-		"aaguid":         e.AAGUID,
-		"epoch":          e.Epoch,
-		"sig":            e.Sig,
-		"published_at":   e.PublishedAt,
-	})
+	out := make([]map[string]any, 0, len(all))
+	for _, e := range all {
+		out = append(out, map[string]any{
+			"address":        e.Address,
+			"credential_id":  e.CredentialID,
+			"credential_pub": e.CredentialPub,
+			"rp_id":          e.RPID,
+			"aaguid":         e.AAGUID,
+			"epoch":          e.Epoch,
+			"revoked":        e.Revoked,
+			"sig":            e.Sig,
+			"published_at":   e.PublishedAt,
+		})
+	}
+	writeVHLJSON(w, http.StatusOK, out)
 }

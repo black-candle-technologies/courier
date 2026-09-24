@@ -46,23 +46,29 @@ func (c *Client) CeremonyURL(cer *VHLCeremony) string {
 }
 
 // VHLCreateCeremony creates a relay ceremony of the given type
-// ("enroll" or "mint") for the given base64url challenge. For mint,
-// credentialIDs lists the enrolled WebAuthn credential ids the
-// browser may use. rpID is echoed to the ceremony page (the agent
-// verifies the attestation against its own RP config afterwards, so
-// relay tampering with the echoed values fails closed).
-func (c *Client) VHLCreateCeremony(ceremonyType, challengeB64 string, credentialIDs []string, rpID string) (*VHLCeremony, error) {
+// ("enroll", "mint", "approve", or "enroll-approver") for the given
+// base64url challenge. contextJSON is the human-reviewed ceremony
+// context the page displays before the key is touched — required
+// for mint, approve, and enroll-approver, empty for enroll — and is
+// covered by the creation signature so the relay cannot substitute
+// values the human never saw. For mint and approve, credentialIDs
+// lists the enrolled WebAuthn credential ids the browser may use.
+// rpID is echoed to the ceremony page (the agent verifies the
+// attestation against its own RP config afterwards, so relay
+// tampering with the echoed values fails closed).
+func (c *Client) VHLCreateCeremony(ceremonyType, challengeB64 string, credentialIDs []string, rpID, contextJSON string) (*VHLCeremony, error) {
 	id, err := c.cfg.Identity()
 	if err != nil {
 		return nil, err
 	}
 	ts := time.Now().Unix()
-	canon := envelope.VHLCeremonyCreate(id.EdPub[:], ceremonyType, challengeB64, ts)
+	canon := envelope.VHLCeremonyCreate(id.EdPub[:], ceremonyType, challengeB64, contextJSON, ts)
 	sig := id.Sign(canon)
 	data, code, err := c.post("/v1/vhl/ceremonies", map[string]any{
 		"address":        c.cfg.Address,
 		"type":           ceremonyType,
 		"challenge":      challengeB64,
+		"context":        contextJSON,
 		"credential_ids": credentialIDs,
 		"rp_id":          rpID,
 		"ts":             ts,
@@ -269,7 +275,7 @@ func (c *Client) VHLEnrollWebAuthn(deviceLabel string, printf func(string, ...an
 	if err != nil {
 		return nil, err
 	}
-	cer, err := c.VHLCreateCeremony("enroll", base64.RawURLEncoding.EncodeToString(challenge), nil, rp.ID)
+	cer, err := c.VHLCreateCeremony("enroll", base64.RawURLEncoding.EncodeToString(challenge), nil, rp.ID, "")
 	if err != nil {
 		return nil, err
 	}
@@ -324,7 +330,9 @@ func (c *Client) VHLPublishEnrollment(cred *vhl.Credential, rpID string) error {
 		return err
 	}
 	epoch := time.Now().Unix()
-	canon := envelope.VHLEnrollmentAnnounce(id.EdPub[:], cred.ID, cred.PublicKey, rpID, epoch)
+	// A fresh publication is never revoked; the flag is bound by
+	// the signature so the relay cannot flip it later.
+	canon := envelope.VHLEnrollmentAnnounce(id.EdPub[:], cred.ID, cred.PublicKey, rpID, epoch, false)
 	sig := id.Sign(canon)
 	data, code, err := c.post("/v1/vhl/enrollments", map[string]any{
 		"address":        c.cfg.Address,
@@ -344,10 +352,29 @@ func (c *Client) VHLPublishEnrollment(cred *vhl.Credential, rpID string) error {
 	return nil
 }
 
-// VHLLookupEnrollment fetches another identity's published enrollment
-// binding for discovery. The local registry stays the trust root:
-// a directory entry can never override a local enrollment.
-func (c *Client) VHLLookupEnrollment(address string) (map[string]any, error) {
+// VHLPublishedEnrollment is one published identity→credential
+// binding from the relay's VHL enrollment directory, for
+// discovery. The local registry stays the trust root: a directory
+// entry can never override a local enrollment.
+type VHLPublishedEnrollment struct {
+	Address       string `json:"address"`
+	CredentialID  string `json:"credential_id"`
+	CredentialPub string `json:"credential_pub"`
+	RPID          string `json:"rp_id"`
+	AAGUID        string `json:"aaguid"`
+	Epoch         int64  `json:"epoch"`
+	Revoked       bool   `json:"revoked"`
+	Sig           string `json:"sig"`
+	PublishedAt   int64  `json:"published_at"`
+}
+
+// VHLLookupEnrollment fetches another identity's published
+// enrollment bindings for discovery: the full credential set, each
+// with its revoked flag. Callers filter out revoked bindings
+// themselves — a revoked row still listed is how the directory
+// reports a revocation. The local registry stays the trust root: a
+// directory entry can never override a local enrollment.
+func (c *Client) VHLLookupEnrollment(address string) ([]*VHLPublishedEnrollment, error) {
 	hc, err := c.httpClient()
 	if err != nil {
 		return nil, err
@@ -361,7 +388,7 @@ func (c *Client) VHLLookupEnrollment(address string) (map[string]any, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, relayErr(data)
 	}
-	var out map[string]any
+	var out []*VHLPublishedEnrollment
 	if err := json.Unmarshal(data, &out); err != nil {
 		return nil, fmt.Errorf("bad enrollment response: %w", err)
 	}
@@ -401,7 +428,20 @@ func (c *Client) VHLSessionMintCeremony(scope string, ttl time.Duration, printf 
 	if len(credIDs) == 0 {
 		return nil, fmt.Errorf("no WebAuthn credential enrolled for this identity: run `courier vhl enroll-webauthn` first")
 	}
-	cer, err := c.VHLCreateCeremony("mint", base64.RawURLEncoding.EncodeToString(pending.Challenge()), credIDs, rp.ID)
+	// The human reviews exactly this context in the browser before
+	// touching their key: the page displays it and recomputes the
+	// challenge from it, and the creation signature covers the same
+	// bytes so the relay cannot substitute values.
+	mintCtx := vhl.MintContext{
+		Issuer:    pending.Issuer,
+		Scope:     pending.Scope,
+		TokenID:   pending.ID,
+		SessionID: pending.SessionID,
+		IssuedAt:  pending.IssuedAt,
+		ExpiresAt: pending.ExpiresAt,
+		Presence:  vhl.PresenceFIDO2UV.String(),
+	}
+	cer, err := c.VHLCreateCeremony("mint", base64.RawURLEncoding.EncodeToString(pending.Challenge()), credIDs, rp.ID, string(mintCtx.Canonical()))
 	if err != nil {
 		return nil, err
 	}
@@ -413,15 +453,172 @@ func (c *Client) VHLSessionMintCeremony(scope string, ttl time.Duration, printf 
 	// The ceremony used whichever enrolled credential the browser
 	// picked: bind the finish to the credential the assertion
 	// actually names.
+	credID, err := vhlAssertionCredentialID(assertionB64)
+	if err != nil {
+		return nil, err
+	}
+	return c.VHLFinishSessionMint(pending, credID, assertionB64)
+}
+
+// vhlAssertionCredentialID extracts the credential id naming the
+// assertion: the browser may use any enrolled credential, so the
+// agent binds verification to the credential the assertion actually
+// names.
+func vhlAssertionCredentialID(assertionB64 string) (string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(assertionB64)
+	if err != nil {
+		return "", fmt.Errorf("bad assertion encoding: %w", err)
+	}
 	var outer struct {
 		ID string `json:"id"`
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(assertionB64)
-	if err != nil {
-		return nil, fmt.Errorf("bad assertion encoding: %w", err)
-	}
 	if err := json.Unmarshal(raw, &outer); err != nil || outer.ID == "" {
-		return nil, fmt.Errorf("bad assertion: missing credential id")
+		return "", fmt.Errorf("bad assertion: missing credential id")
 	}
-	return c.VHLFinishSessionMint(pending, outer.ID, assertionB64)
+	return outer.ID, nil
+}
+
+// vhlFindCredential returns the enrolled WebAuthn credential with
+// the given id for the given approver identity, or nil.
+func vhlFindCredential(ff *vhlFile, identity, credentialID string) *vhl.Credential {
+	a := ff.Registry.Approvers[identity]
+	if a == nil {
+		return nil
+	}
+	for i := range a.Credentials {
+		if a.Credentials[i].ID == credentialID {
+			return &a.Credentials[i]
+		}
+	}
+	return nil
+}
+
+// vhlCredentialIDs returns the enrolled WebAuthn credential ids for
+// an identity, for a ceremony's allowCredentials list.
+func vhlCredentialIDs(ff *vhlFile, identity string) []string {
+	var ids []string
+	if a := ff.Registry.Approvers[identity]; a != nil {
+		for _, cred := range a.Credentials {
+			if cred.Kind == "webauthn" {
+				ids = append(ids, cred.ID)
+			}
+		}
+	}
+	return ids
+}
+
+// VHLApproveFIDO2Ceremony runs the full relay-backed Tier 2
+// approval ceremony: it builds the nonce-bound approval challenge
+// (vhl.ApprovalChallenge), creates an "approve" relay ceremony whose
+// context carries the request id, action hash, approver, draft
+// summary, and nonce for the human to review, waits for the human
+// to approve it with their security key in the browser, and
+// verifies the returned assertion against the enrolled credential
+// and the relying party config before returning the proof. The
+// proof's assertion answers the nonce-bound challenge, so the
+// receiver can enforce per-nonce replay protection.
+func (c *Client) VHLApproveFIDO2Ceremony(nonce []byte, actionHash []byte, requestID, approver, draftSummary string, printf func(string, ...any)) (vhl.Proof, error) {
+	rp, err := c.vhlRPConfig()
+	if err != nil {
+		return vhl.Proof{}, err
+	}
+	if len(nonce) != 32 {
+		return vhl.Proof{}, fmt.Errorf("approval nonce must be 32 bytes")
+	}
+	if len(actionHash) != 32 {
+		return vhl.Proof{}, fmt.Errorf("action hash must be 32 bytes")
+	}
+	challenge := vhl.ApprovalChallenge(actionHash, nonce)
+	ctxJSON, err := json.Marshal(map[string]any{
+		"request_id":    requestID,
+		"action_hash":   base64.RawURLEncoding.EncodeToString(actionHash),
+		"approver":      approver,
+		"draft_summary": draftSummary,
+		"nonce_b64":     base64.RawURLEncoding.EncodeToString(nonce),
+	})
+	if err != nil {
+		return vhl.Proof{}, fmt.Errorf("approve context: %w", err)
+	}
+	ff, err := loadVHL()
+	if err != nil {
+		return vhl.Proof{}, err
+	}
+	cer, err := c.VHLCreateCeremony("approve", base64.RawURLEncoding.EncodeToString(challenge[:]), vhlCredentialIDs(ff, approver), rp.ID, string(ctxJSON))
+	if err != nil {
+		return vhl.Proof{}, err
+	}
+	printf("Approve the action in your browser (logged into the dashboard):\n\n  %s\n\nCode: %s (expires in %d seconds)\n", c.CeremonyURL(cer), cer.Code, cer.ExpiresIn)
+	assertionB64, err := c.VHLPollCeremonyResult(cer.Code, 6*time.Minute)
+	if err != nil {
+		return vhl.Proof{}, err
+	}
+	credID, err := vhlAssertionCredentialID(assertionB64)
+	if err != nil {
+		return vhl.Proof{}, err
+	}
+	cred := vhlFindCredential(ff, approver, credID)
+	if cred == nil {
+		return vhl.Proof{}, fmt.Errorf("approval refused: credential %q is not enrolled for approver %s", credID, approver)
+	}
+	if cred.Kind != "webauthn" {
+		return vhl.Proof{}, fmt.Errorf("approval refused: credential %q is %s (want webauthn)", credID, cred.Kind)
+	}
+	if _, err := vhl.VerifyAssertionForChallenge(cred, assertionB64, challenge[:], rp, true); err != nil {
+		return vhl.Proof{}, fmt.Errorf("approval assertion verification failed: %w", err)
+	}
+	return vhl.Proof{Kind: vhl.ProofFIDO2, CredentialID: credID, Assertion: assertionB64}, nil
+}
+
+// VHLEnrollApproverCeremony runs the relay-backed approver
+// enrollment ceremony: the human approves enrolling approverAddress
+// as a trust root with their security key in the browser. It
+// creates an "enroll-approver" relay ceremony over
+// vhl.ApproverEnrollmentChallenge (binding both addresses and the
+// timestamp), prints the ceremony URL, waits for the human to
+// complete it, and returns the enrollment artifact. The registry
+// validates the artifact — the challenge recomputes from the
+// claimed addresses and timestamp, and the assertion verifies
+// against the human's enrolled credential — before the identity is
+// trusted.
+func (c *Client) VHLEnrollApproverCeremony(approverAddress string, printf func(string, ...any)) (*vhl.EnrollmentArtifact, error) {
+	rp, err := c.vhlRPConfig()
+	if err != nil {
+		return nil, err
+	}
+	issuedAt := time.Now().Unix()
+	challenge := vhl.ApproverEnrollmentChallenge(c.cfg.Address, approverAddress, issuedAt)
+	ctxJSON, err := json.Marshal(map[string]any{
+		"approver_address": approverAddress,
+		"agent_address":    c.cfg.Address,
+		"issued_at":        issuedAt,
+		"challenge_b64":    base64.RawURLEncoding.EncodeToString(challenge[:]),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("enroll-approver context: %w", err)
+	}
+	ff, err := loadVHL()
+	if err != nil {
+		return nil, err
+	}
+	cer, err := c.VHLCreateCeremony("enroll-approver", base64.RawURLEncoding.EncodeToString(challenge[:]), vhlCredentialIDs(ff, c.cfg.Address), rp.ID, string(ctxJSON))
+	if err != nil {
+		return nil, err
+	}
+	printf("Enroll %s as an approver in your browser (logged into the dashboard):\n\n  %s\n\nCode: %s (expires in %d seconds)\n", approverAddress, c.CeremonyURL(cer), cer.Code, cer.ExpiresIn)
+	assertionB64, err := c.VHLPollCeremonyResult(cer.Code, 6*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	credID, err := vhlAssertionCredentialID(assertionB64)
+	if err != nil {
+		return nil, err
+	}
+	return &vhl.EnrollmentArtifact{
+		Address:      approverAddress,
+		AgentAddress: c.cfg.Address,
+		CredentialID: credID,
+		Challenge:    base64.RawURLEncoding.EncodeToString(challenge[:]),
+		Assertion:    assertionB64,
+		IssuedAt:     issuedAt,
+	}, nil
 }

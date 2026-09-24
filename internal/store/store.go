@@ -601,6 +601,91 @@ var migrations = []migration{
 			signature      TEXT NOT NULL,
 			published_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')))`,
 	),
+	{
+		// v26 (issue #142 review): per-credential enrollment
+		// publication. The v25 table keyed the whole publication on
+		// (address), so publishing a second credential replaced the
+		// first — one credential per identity, and revocation was
+		// all-or-nothing. The new primary key is
+		// (address, credential_id): each binding carries its own
+		// strictly increasing epoch and its own revoked flag, so
+		// credentials are published, rotated, and revoked
+		// independently. Existing single rows migrate into
+		// (address, credential_id) form with revoked=0. The old table
+		// is dropped and renamed, so this migration is marked
+		// destructive (the framework takes a pre-migration backup)
+		// even though rows are preserved.
+		version:     26,
+		destructive: true,
+		name:        "vhl_enrollments per-credential publication (issue #142)",
+		complete: func(q querier) (bool, error) {
+			return vhlEnrollmentsPerCredential(q)
+		},
+		up: func(e execer, q querier) error {
+			done, err := vhlEnrollmentsPerCredential(q)
+			if err != nil {
+				return err
+			}
+			if done {
+				return nil
+			}
+			if ok, err := tableExists(q, "vhl_enrollments"); err != nil {
+				return err
+			} else if !ok {
+				// No table at all (v25 never ran): create the new
+				// shape directly.
+				_, err := e.Exec(`CREATE TABLE IF NOT EXISTS vhl_enrollments(
+					address        TEXT NOT NULL,
+					credential_id  TEXT NOT NULL,
+					credential_pub TEXT NOT NULL,
+					rp_id          TEXT NOT NULL,
+					aaguid         TEXT NOT NULL DEFAULT '',
+					epoch          INTEGER NOT NULL,
+					signature      TEXT NOT NULL,
+					published_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+					revoked        INTEGER NOT NULL DEFAULT 0,
+					PRIMARY KEY (address, credential_id))`)
+				return err
+			}
+			if _, err := e.Exec(`CREATE TABLE IF NOT EXISTS vhl_enrollments_new(
+				address        TEXT NOT NULL,
+				credential_id  TEXT NOT NULL,
+				credential_pub TEXT NOT NULL,
+				rp_id          TEXT NOT NULL,
+				aaguid         TEXT NOT NULL DEFAULT '',
+				epoch          INTEGER NOT NULL,
+				signature      TEXT NOT NULL,
+				published_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+				revoked        INTEGER NOT NULL DEFAULT 0,
+				PRIMARY KEY (address, credential_id))`); err != nil {
+				return err
+			}
+			// Preserve every published binding; old rows predate
+			// revocation and migrate as not revoked. Column lists
+			// are explicit so the copy is exact either way.
+			if has, err := columnExists(q, "vhl_enrollments", "revoked"); err != nil {
+				return err
+			} else if has {
+				_, err = e.Exec(`INSERT OR IGNORE INTO vhl_enrollments_new
+					(address, credential_id, credential_pub, rp_id, aaguid, epoch, signature, published_at, revoked)
+					SELECT address, credential_id, credential_pub, rp_id, aaguid, epoch, signature, published_at, revoked
+					FROM vhl_enrollments`)
+			} else {
+				_, err = e.Exec(`INSERT OR IGNORE INTO vhl_enrollments_new
+					(address, credential_id, credential_pub, rp_id, aaguid, epoch, signature, published_at, revoked)
+					SELECT address, credential_id, credential_pub, rp_id, aaguid, epoch, signature, published_at, 0
+					FROM vhl_enrollments`)
+			}
+			if err != nil {
+				return err
+			}
+			if _, err := e.Exec(`DROP TABLE vhl_enrollments`); err != nil {
+				return err
+			}
+			_, err = e.Exec(`ALTER TABLE vhl_enrollments_new RENAME TO vhl_enrollments`)
+			return err
+		},
+	},
 }
 
 // latestSchemaVersion is the newest migration version this build knows.
