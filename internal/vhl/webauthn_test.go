@@ -171,7 +171,7 @@ func fido2TestSetup(t *testing.T, body []byte, presence PresenceStrength) (*Veri
 		PublicKey:  b64.EncodeToString(pub),
 		EnrolledAt: time.Now().Unix(),
 		Device:     "courier-identity",
-	}, true); err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
 	credID := "test-cred-1"
@@ -181,7 +181,7 @@ func fido2TestSetup(t *testing.T, body []byte, presence PresenceStrength) (*Veri
 		PublicKey:  b64.EncodeToString(coseEncodeKey(t, &credPriv.PublicKey)),
 		EnrolledAt: time.Now().Unix(),
 		Device:     "yubikey",
-	}, true); err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
 	rp := WebAuthnRP{ID: "dashboard.test", Origins: []string{"https://dashboard.test"}}

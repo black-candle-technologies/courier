@@ -31,7 +31,7 @@ func testRegistry(t *testing.T, addr string, pub []byte) *Registry {
 		Kind:      "ed25519",
 		PublicKey: b64.EncodeToString(pub),
 		Device:    "test-device",
-	}, true)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func newMintCeremony(t *testing.T, reg *Registry, addr string) *mintCeremony {
 		EnrolledAt: time.Now().Unix(),
 		Device:     "test-yubikey",
 	}
-	if err := reg.Enroll(addr, "test-human", *mc.cred, true); err != nil {
+	if err := reg.Enroll(addr, "test-human", *mc.cred); err != nil {
 		t.Fatal(err)
 	}
 	return mc
@@ -496,18 +496,19 @@ func TestRevocation(t *testing.T) {
 func TestEnrollmentRules(t *testing.T) {
 	r := NewRegistry()
 	addr, pub, _ := testIdentity(t)
-	// Enrollment without the Tier 2 human-approved event fails.
-	err := r.Enroll(addr, "", Credential{ID: addr, Kind: "ed25519", PublicKey: b64.EncodeToString(pub)}, false)
-	if err == nil {
-		t.Fatal("enrollment without tier2 approval should fail")
+	// The boolean gate is gone: enrollment is ceremony-gated at the
+	// call site (see EnrollWithArtifact / TestEnrollWithArtifact), so
+	// Enroll itself only checks structural validity.
+	if err := r.Enroll("", "", Credential{ID: addr, Kind: "ed25519", PublicKey: b64.EncodeToString(pub)}); err == nil {
+		t.Fatal("enrollment with an empty identity should fail")
 	}
 	// Unknown credential kind fails.
-	err = r.Enroll(addr, "", Credential{ID: "x", Kind: "magic", PublicKey: "eA"}, true)
+	err := r.Enroll(addr, "", Credential{ID: "x", Kind: "magic", PublicKey: "eA"})
 	if err == nil {
 		t.Fatal("unknown credential kind should fail")
 	}
 	// Happy path.
-	if err := r.Enroll(addr, "riley", Credential{ID: addr, Kind: "ed25519", PublicKey: b64.EncodeToString(pub), Device: "yubikey"}, true); err != nil {
+	if err := r.Enroll(addr, "riley", Credential{ID: addr, Kind: "ed25519", PublicKey: b64.EncodeToString(pub), Device: "yubikey"}); err != nil {
 		t.Fatal(err)
 	}
 	if !r.Enrolled(addr) {
@@ -622,7 +623,7 @@ func TestReenrollRevokedApproverDropsCredentials(t *testing.T) {
 	r := NewRegistry()
 	addr, pub, _ := testIdentity(t)
 	oldKeyID := "old-key"
-	if err := r.Enroll(addr, "human", Credential{ID: oldKeyID, Kind: "ed25519", PublicKey: b64.EncodeToString(pub)}, true); err != nil {
+	if err := r.Enroll(addr, "human", Credential{ID: oldKeyID, Kind: "ed25519", PublicKey: b64.EncodeToString(pub)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.RevokeApprover(addr); err != nil {
@@ -634,7 +635,7 @@ func TestReenrollRevokedApproverDropsCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Enroll(addr, "human", Credential{ID: "new-key", Kind: "ed25519", PublicKey: b64.EncodeToString(pub2)}, true); err != nil {
+	if err := r.Enroll(addr, "human", Credential{ID: "new-key", Kind: "ed25519", PublicKey: b64.EncodeToString(pub2)}); err != nil {
 		t.Fatal(err)
 	}
 	keys, _, err := r.KeysFor(addr)
@@ -649,7 +650,7 @@ func TestReenrollRevokedApproverDropsCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Enroll(addr, "human", Credential{ID: "third-key", Kind: "ed25519", PublicKey: b64.EncodeToString(pub3)}, true); err != nil {
+	if err := r.Enroll(addr, "human", Credential{ID: "third-key", Kind: "ed25519", PublicKey: b64.EncodeToString(pub3)}); err != nil {
 		t.Fatal(err)
 	}
 	keys, _, err = r.KeysFor(addr)

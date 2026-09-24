@@ -41,11 +41,17 @@ type vhlFile struct {
 	Registry     *vhl.Registry                `json:"registry"`
 	Seen         *vhl.SeenSet                 `json:"seen"`
 	Revoked      *vhl.RevocationSet           `json:"revoked"`
+	Nonces       *vhl.NonceSet                `json:"nonces,omitempty"`
 	RP           vhl.WebAuthnRP               `json:"rp,omitempty"`
 	SealedTokens string                       `json:"sealed_tokens,omitempty"`
 	SealedChall  string                       `json:"sealed_challenges,omitempty"`
 	Requests     map[string]*vhlRequestRecord `json:"requests,omitempty"`
 	Attestations map[string]*vhl.Attestation  `json:"attestations,omitempty"`
+	// RequiredTier is the receiver's required VHL tier floor
+	// (issue #142 review): messages below this tier are held for
+	// human review. 0 (the default) keeps the current behavior —
+	// no requirement.
+	RequiredTier int `json:"required_tier,omitempty"`
 }
 
 // maxVHLPending bounds the human-facing queues; the wire already
@@ -65,6 +71,7 @@ func newVHLFile() *vhlFile {
 		Registry:     vhl.NewRegistry(),
 		Seen:         vhl.NewSeenSet(),
 		Revoked:      vhl.NewRevocationSet(),
+		Nonces:       vhl.NewNonceSet(),
 		Requests:     map[string]*vhlRequestRecord{},
 		Attestations: map[string]*vhl.Attestation{},
 	}
@@ -94,6 +101,9 @@ func loadVHLLocked() (*vhlFile, error) {
 	}
 	if ff.Revoked == nil {
 		ff.Revoked = vhl.NewRevocationSet()
+	}
+	if ff.Nonces == nil {
+		ff.Nonces = vhl.NewNonceSet()
 	}
 	if ff.Requests == nil {
 		ff.Requests = map[string]*vhlRequestRecord{}
@@ -418,7 +428,7 @@ func (c *Client) vhlVerifier() (*vhl.Verifier, error) {
 	// empty and fido2 proofs — including session-token mint
 	// assertions — fail closed ("no relying party configured").
 	// The schema alone never counts as verified presence.
-	return &vhl.Verifier{Registry: ff.Registry, Seen: ff.Seen, Revoked: ff.Revoked, WebAuthn: ff.RP}, nil
+	return &vhl.Verifier{Registry: ff.Registry, Seen: ff.Seen, Revoked: ff.Revoked, WebAuthn: ff.RP, Nonces: ff.Nonces}, nil
 }
 
 // vhlMergeSeen persists verifier mutations (consumed attestation ids,
@@ -438,6 +448,11 @@ func vhlMergeSeen(vfr *vhl.Verifier) error {
 		for id, env := range vfr.Seen.IDs {
 			ff.Seen.Mark(id, env)
 		}
+		// The approval-nonce set merges the same way as the seen
+		// set: union under the lock, earliest envelope id per key
+		// (see NonceSet.Merge), so a consumed nonce is never
+		// resurrected by a concurrent fetch (issue #142 review).
+		ff.Nonces.Merge(vfr.Nonces)
 		for id, ts := range vfr.Revoked.Tokens {
 			ff.Revoked.Tokens[id] = ts
 		}
@@ -485,6 +500,14 @@ func (c *Client) handleVHLFrame(from string, fr *vhl.Frame, envelopeID int64, vf
 				if rec.Request.ExpiresAt <= now {
 					delete(ff.Requests, id)
 				}
+			}
+			// Keep the first request seen for an id: sender and body
+			// are immutable once recorded, so a later frame carrying
+			// the same id with different content is dropped rather
+			// than overwriting the human's review queue (issue #142
+			// review).
+			if _, exists := ff.Requests[r.ID]; exists {
+				return nil
 			}
 			for len(ff.Requests) >= maxVHLPending {
 				// Drop the oldest.
@@ -574,7 +597,54 @@ func (c *Client) vhlEvaluateInbound(vfr *vhl.Verifier, tier vhl.Tier, body []byt
 	return vfr.Evaluate(vhl.EvalInput{
 		Tier: tier, Body: body, Attestation: att,
 		Receiver: c.cfg.Address, Now: time.Now().Unix(),
-		EnvelopeID: envelopeID,
+		EnvelopeID:   envelopeID,
+		RequiredTier: vhl.Tier(vhlClampTier(vhlRequiredTier())),
+	})
+}
+
+// vhlRequiredTier reads the receiver's persisted required-tier floor
+// for inbound evaluation. A read failure yields 0 (no requirement,
+// the current behavior); a persisted value outside 0..2 is clamped.
+func vhlRequiredTier() int {
+	ff, err := loadVHL()
+	if err != nil {
+		return 0
+	}
+	return vhlClampTier(ff.RequiredTier)
+}
+
+// vhlClampTier clamps a persisted tier floor to the valid 0..2 range.
+func vhlClampTier(t int) int {
+	if t < 0 {
+		return 0
+	}
+	if t > int(vhl.Tier2) {
+		return int(vhl.Tier2)
+	}
+	return t
+}
+
+// VHLGetRequiredTier returns the receiver's required VHL tier floor:
+// messages below this tier are held for human review. 0 (the
+// default) means no requirement.
+func (c *Client) VHLGetRequiredTier() (int, error) {
+	ff, err := loadVHL()
+	if err != nil {
+		return 0, err
+	}
+	return vhlClampTier(ff.RequiredTier), nil
+}
+
+// VHLSetRequiredTier sets the receiver's required VHL tier floor to
+// 0, 1, or 2. The value persists in vhl.json and applies to inbound
+// evaluation from the next fetch.
+func (c *Client) VHLSetRequiredTier(tier int) error {
+	if tier < 0 || tier > int(vhl.Tier2) {
+		return fmt.Errorf("require-tier must be 0, 1, or 2")
+	}
+	return updateVHL(func(ff *vhlFile) error {
+		ff.RequiredTier = tier
+		return nil
 	})
 }
 

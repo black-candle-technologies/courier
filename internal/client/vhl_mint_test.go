@@ -59,14 +59,14 @@ func setupMintFixture(t *testing.T, env *attachTestEnv) *mintFixture {
 	env.asSender()
 	if err := updateVHL(func(ff *vhlFile) error {
 		ff.RP = testMintRP
-		return ff.Registry.Enroll(env.senderCfg.Address, "sender", cred, true)
+		return ff.Registry.Enroll(env.senderCfg.Address, "sender", cred)
 	}); err != nil {
 		t.Fatalf("enroll mint credential (sender): %v", err)
 	}
 	env.asRecipient()
 	if err := updateVHL(func(ff *vhlFile) error {
 		ff.RP = testMintRP
-		return ff.Registry.Enroll(env.senderCfg.Address, "sender", cred, true)
+		return ff.Registry.Enroll(env.senderCfg.Address, "sender", cred)
 	}); err != nil {
 		t.Fatalf("enroll mint credential (recipient): %v", err)
 	}
