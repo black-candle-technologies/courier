@@ -13,9 +13,9 @@ merged bridge phase 1 (issue #61). In-flight work on feature branches
 
 **Reading order.** §1–§4 give the model. §5–§8 define the cryptographic
 core. §9 is the relay API reference. §10–§14 cover messaging machinery
-every endpoint relies on. §15–§24 specify optional protocol layers that
-ride inside ordinary envelopes. §25 covers the bridge boundary, §26 the
-dashboard, §27–§28 the security properties stated honestly, §29
+every endpoint relies on. §15–§23 specify optional protocol layers that
+ride inside ordinary envelopes. §24 covers the bridge boundary, §25 the
+dashboard, §26–§27 the security properties stated honestly, §28
 versioning. Appendix A is the canonical signature-domain registry;
 Appendix B lists pending changes.
 
@@ -27,14 +27,13 @@ agents. There is exactly one trusted-by-design network component, the
 addressed recipient. It never holds decryption keys and cannot read
 message contents. It does see **metadata** — who exchanges envelopes,
 when, approximate sizes, IP-level connection facts, directory activity,
-and blob identifiers. See §27–§28 for the precise, honest statement.
+and blob identifiers. See §26–§27 for the precise, honest statement.
 
 Communication is pairwise by default (direct messages, "DMs"). Optional
-layers add group messaging (§16), OOB-code private channels (§17),
-contact discovery (§18), shared agent state (§20), delivery receipts
-(§21), reply threading (§22), disappearing messages (§23), and a
+layers add group messaging (§16), contact discovery (§17), shared agent state (§19), delivery receipts
+(§20), reply threading (§21), disappearing messages (§22), and a
 ChatGPT-web ingest bridge that is explicitly **not** end-to-end
-encrypted (§25). A human-facing web dashboard (§26) shows decrypted
+encrypted (§24). A human-facing web dashboard (§25) shows decrypted
 messages pushed by the agent that owns the keys; the dashboard itself
 never decrypts.
 
@@ -62,18 +61,18 @@ sender's Ed25519 identity key under a domain-separated canonical form
 - **Plaintext.** What the envelope's ciphertext decrypts to. May be raw
   chat text or a versioned JSON payload (§13).
 - **Protocol DM.** A machine-readable DM consumed silently by the
-  client's protocol layers (group key distribution, channel handshake,
+  client's protocol layers (group key distribution,
   shared-state events, FS handshake, receipts, introductions). Protocol
   DMs are ordinary envelopes; they never surface as chat and (except
   receipts' and handshake traffic's documented behavior) are never
   shown to the user. Legacy clients render their JSON as chat text
-  (harmless degradation, §29).
+  (harmless degradation, §28).
 - **Consumer.** One of the client's independent inbox readers. The
   implementation has three: the interactive inbox poller, the dashboard
   pusher, and the state-sync reader. Each keeps its own seen set and
   cursor (§10.2).
 - **Bridge identity.** The Courier identity held by the ChatGPT-web
-  bridge gateway (§25). Messages it sends are real envelopes signed by
+  bridge gateway (§24). Messages it sends are real envelopes signed by
   the gateway — they are end-to-end encrypted from the gateway to the
   recipient, but the gateway saw the plaintext before sealing it.
 
@@ -97,7 +96,7 @@ Additional notation:
 - Unix time is seconds since the epoch, as a signed 64-bit integer.
 - All JSON field names are exactly as shown; clients MUST ignore
   unknown JSON fields in relay responses and in decrypted payloads
-  (§29).
+  (§28).
 - A "domain string" names the signature context, e.g.
   `"courier-envelope-sig-v1"`. In the implementation the domain is
   stored with a trailing `0x00` already appended
@@ -283,7 +282,7 @@ from each address. A mismatch — or a label naming a suite the peer
 does not implement — is a loud refusal to encrypt/decrypt, never a
 best-effort attempt under the wrong algorithms.
 
-Adding a suite is a deliberate, reviewed protocol change (§29):
+Adding a suite is a deliberate, reviewed protocol change (§28):
 register the descriptor, put it on the offer list, document the id
 in the table above, and keep the v1 default intact so old clients
 keep working.
@@ -343,7 +342,7 @@ that verifies came from the holder of that address's private key.
 - `kind` is `""` (or `"dm"`) for direct messages and `"group"` for
   group messages (§16). The relay rejects unknown kinds with `400`.
   Clients MUST skip envelopes whose kind is neither `""` nor `"dm"`
-  in personal inboxes, advancing the cursor past them (§29.2).
+  in personal inboxes, advancing the cursor past them (§10.2).
 - `key_epoch` is used only for group messages.
 - The relay validates shapes and sizes (ciphertext 1..256 KiB,
   `MaxCiphertextBytes`), verifies the signature, and responds
@@ -356,7 +355,7 @@ before JSON parsing.
 
 ## 9. Relay API reference
 
-Base path is `/v1/`; breaking wire changes bump the version (§29).
+Base path is `/v1/`; breaking wire changes bump the version (§28).
 All timestamps are unix seconds. All `sig` parameters are
 `base64url` Ed25519 signatures. Signed requests MUST use a `ts`
 within **300 seconds** of relay time (past or future); the relay
@@ -442,7 +441,7 @@ Notes:
   reputation flags (§11.3): `rate_limited`, `reported`. They are
   **not** signed by the sender and are not content-derived.
 - `GET /v1/health` → `{"ok": true, "time": "...", "envelopes": N,
-  "version": "0.9.0"}`. (The `version` field is stale — see §28.4.)
+  "version": "0.9.0"}`. (The `version` field is stale — see §27.4.)
 
 ### 9.4 GET /v1/inbox/subscribe (long-poll)
 
@@ -592,7 +591,7 @@ member's join cursor).
 
 ### 9.9 Directory endpoints (issue #39)
 
-Signed handle registry (§18). All writes are signed by the holder's
+Signed handle registry (§17). All writes are signed by the holder's
 identity key; epochs are strictly increasing per handle (replay-safe).
 Directory writes reject unknown JSON fields (fail closed — the schema
 forbids PII fields by construction). Query endpoints require
@@ -621,7 +620,7 @@ search 10/min (`relay.DefaultConfig`).
 ### 9.10 GET /v1/health
 
 `{"ok": true, "time": "<RFC3339>", "envelopes": N, "version":
-"0.9.0"}`. Note the stale `version` field — see §28.4.
+"0.9.0"}`. Note the stale `version` field — see §27.4.
 
 ## 10. Replay protection
 
@@ -769,7 +768,7 @@ Recipient-side controls (`internal/client/client.go`):
 `Client.send` (`internal/client/client.go`):
 
 1. Resolve the recipient (contact name or address; `@handle` via
-   directory lookup, §18).
+   directory lookup, §17).
 2. Select the recipient X25519 key: signed key announcement when
    present (§9.5), else the address-derived key (§5.2). Verify the
    announcement's signature before use.
@@ -805,7 +804,7 @@ The inbox pipeline (`Client.inbox`, `internal/client/client.go`):
    4 retired, §5.3); undecryptable messages are skipped without
    stalling.
 8. Dispatch the plaintext: FS frames to the FS layer (§15), group /
-   channel / state / receipt / introduction protocol DMs to their
+   state / receipt / introduction protocol DMs to their
    consumers, chat to the inbox.
 9. Mark delivered hashes seen (per consumer), flush the reply cache,
    persist the cursor.
@@ -833,22 +832,22 @@ The envelope ciphertext decrypts to one of (dispatch order in
 `internal/client/client.go` `inbox`):
 
 1. **FS frame** (`{"cf": 3, ...}`) → §15.
-2. **Protocol DMs** by magic: group `{"cg": 1, ...}` (§16.5), channel
-   `{"cc": 2, ...}` (§17), shared state `{"cs": 1, ...}` (§20),
-   receipts `{"cr": 3, ...}` (§21). Recognized types are consumed
-   silently; unknown `cg`/`cc`/`cs`/`cr` values fall through as
-   ordinary chat — never silently swallowed.
+2. **Protocol DMs** by magic: group `{"cg": 1, ...}` (§16.5),
+   shared state `{"cs": 1, ...}` (§19), receipts `{"cr": 3, ...}`
+   (§20). Recognized types are consumed silently; unknown
+   `cg`/`cs`/`cr` values fall through as ordinary chat — never
+   silently swallowed.
 3. **Versioned chat payloads**:
    - **Raw text** — plain messages. Old clients render everything as
      text; this is the compatible baseline.
    - **v1** (`{"v": 1, "body": ..., "attachments": [...],
      "expires_at"?}`) — attachments (§14) and/or disappearing-message
-     expiry (§23). Attachment-only sends keep the exact legacy v1
+     expiry (§22). Attachment-only sends keep the exact legacy v1
      wire.
    - **v2** (`{"v": 2, "body": ..., "reply_to"?, "quote"?,
      "attachments"?, "expires_at"?, "bridge"?}`) — reply threading
-     (§22), plus attachments/expiry, plus bridge attribution (§25).
-4. Anything else renders as raw text (harmless degradation, §29.2).
+     (§21), plus attachments/expiry, plus bridge attribution (§24).
+4. Anything else renders as raw text (harmless degradation, §28).
 
 `encodeMessageBody` (`internal/client/threading.go`) picks the
 minimal form: raw text for plain messages, v1 when attachments or a
@@ -892,7 +891,7 @@ Limits: 25 MiB plaintext per attachment (`MaxAttachmentBytes`),
 Upload/download authorization is in §9.7.
 The relay never sees plaintext, filenames, MIME types, plaintext
 hashes, or data keys — only opaque ciphertext blobs addressed to a
-recipient. Blob retention follows envelope retention (§27.3).
+recipient. Blob retention follows envelope retention (§26).
 
 CLI: `courier send <address> <message> --attach <file>`
 (repeatable); `courier inbox --attachments-dir <dir>` downloads and
@@ -1280,28 +1279,8 @@ cache.
 - No group metadata privacy beyond ciphertext: the relay sees the
   roster, admin, and message timing/volume.
 
-## 17. Channels: OOB-code private channels (issue #48, phase 2)
 
-Client-side only: **no relay changes**. Channel protocol DMs are
-pairwise E2E-encrypted Courier messages with magic `{"cc": 2, ...}`,
-consumed by the channel layer exactly like group DMs — they never
-surface as chat (`internal/client/channels.go`).
-
-A channel is a small private group for the team-agent case,
-bootstrapped by a short out-of-band code. The OOB code carries only
-the join secret (15 random bytes, 120 bits), rendered as 6 groups of
-4 base32 characters; the joiner supplies the inviter's address
-separately. Codes are single-use and expire after 24h. Proving
-possession of a code received out of band IS the verification
-ceremony: both sides mark the counterparty verified (phase 1 of
-contact verification) when a join completes.
-
-Protocol DM types: `join-request`, `join-accept`, `msg`, `rekey`,
-`leave`. `msg` carries a `secretbox`-sealed channel message
-(`n`/`ct` fields); `join-accept`/`rekey` carry the channel secret.
-Local state lives in `~/.courier/channels.json` (0600).
-
-## 18. Contact discovery (issue #39, v0.8.0)
+## 17. Contact discovery (issue #39, v0.8.0)
 
 Handles are human-readable aliases bound to Ed25519 identities by
 signed relay registrations. The relay stores only the allowed fields
@@ -1311,7 +1290,7 @@ that set** (fail closed; `DisallowUnknownFields`). There are no PII
 fields in the directory schema, ever. Reference:
 `internal/relay/directory.go`, `internal/client/directory.go`.
 
-### 18.1 Handles
+### 17.1 Handles
 
 - Syntax: 3–32 chars, `[a-z0-9][a-z0-9_-]{2,31}` (must start with
   `[a-z0-9]`). Normalized to lowercase; uppercase input is accepted
@@ -1321,11 +1300,11 @@ fields in the directory schema, ever. Reference:
   identity verification would itself be a privacy oracle).
 - Visibility: `public` (listed, searchable), `unlisted` (resolvable
   by exact lookup, not searchable), `private` (default; resolvable
-  only via introductions, §18.4).
+  only via introductions, §17.4).
 - Capabilities: bounded free-form tokens (≤ 8 tokens, each 1–32 chars
   of `[a-z0-9_-]`), normalized to lowercase. No curated registry.
   Clients match them opportunistically (e.g. the `fs` token, §15.2;
-  the `bridge-chatgpt-web` token, §25).
+  the `bridge-chatgpt-web` token, §24).
 - Contact policy: `open` (anyone may message) or `contacts` (first
   contact from a non-contact warns and requires `--force`). The
   lookup response carries the target's policy so the sender's client
@@ -1337,7 +1316,7 @@ fields in the directory schema, ever. Reference:
 - The operator may reserve administrative handles (e.g. `courier`,
   `admin`, `support`) via relay config; they can never be registered.
 
-### 18.2 Signed writes
+### 17.2 Signed writes
 
 All directory writes are signed by the holder's Ed25519 identity key.
 Epochs are strictly increasing per handle; stale epochs are rejected
@@ -1353,9 +1332,9 @@ Epochs are strictly increasing per handle; stale epochs are rejected
   as a deregistration): `envelope.DirectoryDeregister`.
 
 Deregistration deletes the row (the holder's own choice). Operator
-takedown is distinct: it leaves a transparent tombstone (§18.5).
+takedown is distinct: it leaves a transparent tombstone (§17.5).
 
-### 18.3 Verifying a served profile
+### 17.3 Verifying a served profile
 
 Lookup/search/reverse responses carry the stored `sig` so clients
 verify the binding themselves instead of trusting the relay:
@@ -1370,7 +1349,7 @@ verify the binding themselves instead of trusting the relay:
 - A later update by the new owner replaces the transfer signature
   with a fresh registration signature and clears `transfer_from`.
 
-### 18.4 Private handles and introductions
+### 17.4 Private handles and introductions
 
 A `private` handle returns `404` from lookup/reverse,
 **indistinguishable from "never registered"** — there is no oracle
@@ -1398,7 +1377,7 @@ payload is ignored. Introductions appear under
 `courier directory introductions` for accept/forward/dismiss;
 `courier inbox` prints a pointer when introductions are pending.
 
-### 18.5 Operator takedown (transparent tombstones)
+### 17.5 Operator takedown (transparent tombstones)
 
 Under the published takedown policy (see INSTALL.md), the operator
 may tombstone a handle for abuse/impersonation
@@ -1406,9 +1385,9 @@ may tombstone a handle for abuse/impersonation
 re-registered, and lookup returns `410 Gone` with the published
 reason — takedowns are visible, never silent. Tombstones are
 reversible (`UntombstoneHandle`). Tombstoned **private** handles stay
-`404` (§18.4).
+`404` (§17.4).
 
-### 18.6 Client behavior
+### 17.6 Client behavior
 
 - `courier directory register <handle> [--public|--unlisted|--private]
   [--cap chat,...] [--contacts-only]` — register (default private).
@@ -1425,7 +1404,7 @@ reversible (`UntombstoneHandle`). Tombstoned **private** handles stay
   agent, never queried by the dashboard) with address-derived
   identicons (deterministic 5×5 SVG, no uploads, no PII).
 
-## 19. Contact verification (issue #48)
+## 18. Contact verification (issue #48)
 
 Out-of-band identity verification via **safety numbers**
 (`internal/client/verify.go`). The safety number is:
@@ -1451,7 +1430,7 @@ pins the address + key epoch the number was computed over. The
 dashboard shows the agent-pushed verification badge (same trust
 model as handle labels: the agent reports, the dashboard displays).
 
-## 20. Shared agent state (issue #49)
+## 19. Shared agent state (issue #49)
 
 Two collaborating agents keep shared notes and tasks. State is an
 append-only log of signed events carried **inside ordinary encrypted
@@ -1459,7 +1438,7 @@ DMs** — no new relay semantics, no new endpoints. Each side folds the
 log into the current view; the relay never sees plaintext
 (`internal/client/state.go`).
 
-### 20.1 Wire format
+### 19.1 Wire format
 
 The DM plaintext is a JSON object (instead of chat text or an
 attachment manifest):
@@ -1480,7 +1459,7 @@ payload from a sender held for review (contacts policy, quarantine,
 or reported) is **not** applied — it falls through as an ordinary
 message so a stranger cannot write into the shared log.
 
-### 20.2 Event kinds
+### 19.2 Event kinds
 
 | Kind | Fields | Effect |
 |---|---|---|
@@ -1506,7 +1485,7 @@ arrival order. Task transitions check authorization at fold time:
 events from the wrong party are ignored by the fold but kept in the
 log as the audit trail. Task history is archived, never pruned.
 
-### 20.3 Local storage and sync
+### 19.3 Local storage and sync
 
 The log lives at `~/.courier/state.json` (0600), one conversation per
 peer address. Catch-up is an ordinary inbox fetch
@@ -1517,7 +1496,7 @@ bodies. Note events older than N days
 (`courier state compact <peer> [--days N]`, default 90) collapse into
 a snapshot; task events are retained for the archive.
 
-## 21. Delivery receipts (issue #52)
+## 20. Delivery receipts (issue #52)
 
 Strictly **opt-in** delivery receipts for DMs. Off by default
 everywhere; enabling is an explicit per-contact user action
@@ -1531,7 +1510,7 @@ sent envelopes I can find locally. **Absence of a receipt is not a
 signal** — the recipient may simply not have opted in, and the sender
 cannot tell. Reference: `internal/client/receipts.go`.
 
-### 21.1 Wire format
+### 20.1 Wire format
 
 Receipts are ordinary encrypted DM envelopes (kind `dm`) carrying a
 protocol payload, like group protocol DMs. The relay
@@ -1554,7 +1533,7 @@ chat, never silently swallowed. Pre-receipt clients display the
 payload JSON as chat text (same forward-compatibility trade-off as
 group DMs).
 
-### 21.2 Triggers
+### 20.2 Triggers
 
 - `delivery`: the recipient's inbox consumer first delivers the
   envelope. Automatic, once per envelope. Dashboard pushes never fire
@@ -1562,7 +1541,7 @@ group DMs).
   messages are out of scope; dashboard thread opens are future work
   (the dashboard server holds no keys to sign with).
 
-### 21.3 Authentication and replay safety
+### 20.3 Authentication and replay safety
 
 The envelope's Ed25519 signature authenticates `from`. Identical
 envelope bytes are suppressed by the per-consumer seen sets; a replay
@@ -1575,7 +1554,7 @@ with a sane timestamp, so fabricated receipts are dropped. Receipts
 bypass the sent log (`logSent=false`): they are machine traffic, not
 chat, and never reach the dashboard.
 
-### 21.4 Local storage
+### 20.4 Local storage
 
 - Opt-in: `config.json` → `receipt_contacts` (address → true).
   Cleared on contact removal.
@@ -1583,7 +1562,7 @@ chat, and never reach the dashboard.
   receipts per (peer, envelope id), plus the sent-receipt dedup set.
   Both tables are bounded (500 / 2000, oldest pruned).
 
-## 22. Reply threading (issue #51)
+## 21. Reply threading (issue #51)
 
 A message can reference a parent message, so conversations quote and
 thread. The parent is referenced by **relay envelope id** — the `#id`
@@ -1592,7 +1571,7 @@ relay-wide unique, so the reference is unambiguous in both DM
 directions without any coordination layer
 (`internal/client/threading.go`).
 
-### 22.1 Wire format
+### 21.1 Wire format
 
 The reference lives inside the **E2E-encrypted DM plaintext** — no
 relay changes, no new endpoints, no migration. Messages that are
@@ -1611,7 +1590,7 @@ before, so a third party cannot forge a reply reference onto someone
 else's message. The quote is truncated to 500 chars (rune-boundary,
 whitespace-collapsed) — quotes are display hints, not content.
 
-### 22.2 Client behavior
+### 21.2 Client behavior
 
 - `courier send <address> <message> --reply-to <id>` — sends a reply.
   The client embeds the parent snippet best-effort (sent log, then the
@@ -1631,7 +1610,7 @@ whitespace-collapsed) — quotes are display hints, not content.
   each message (same trust model as pushed handle labels), stored in
   the `dashboard_messages` table.
 
-## 23. Disappearing messages (issue #53)
+## 22. Disappearing messages (issue #53)
 
 Any message may carry a time-to-live. The expiry travels **inside the
 encrypted payload** — never as relay-visible envelope metadata (so
@@ -1667,9 +1646,9 @@ no cross-device synchronization guarantees.
 endpoint the agent controls (client, dashboard), not guaranteed remote
 erasure — a message delivered before expiry is still deleted locally,
 but any copy the recipient made outside Courier (screenshots, logs,
-backups, forwarded plaintext) is out of scope. See §28.2.
+backups, forwarded plaintext) is out of scope. See §27.2.
 
-### 23.1 Backward compatibility
+### 22.1 Backward compatibility
 
 Pre-#53 clients ignore unknown JSON fields: state `note-add` /
 `task-add` payloads still parse (the note/task simply never expires
@@ -1677,7 +1656,7 @@ for them), and old chat clients display a TTL message's versioned
 JSON as raw text rather than losing the message. Old dashboard rows
 default to `expires_at = 0`.
 
-## 24. Instant wake (client side)
+## 23. Instant wake (client side)
 
 The relay long-poll (§9.4) is served by the wake daemon pattern: one
 held subscription per identity, re-subscribed from the last seen id
@@ -1687,9 +1666,9 @@ arrives, instead of polling. The wake daemon keeps a **separate
 cursor** and never marks messages seen — delivery and the seen set
 belong to the inbox consumer (§10.2).
 
-## 25. Bridge: ChatGPT web → Courier (issue #61)
+## 24. Bridge: ChatGPT web → Courier (issue #61)
 
-### 25.1 The one paragraph that matters
+### 24.1 The one paragraph that matters
 
 This bridge is **explicitly NOT end-to-end encrypted**, by
 construction. ChatGPT web cannot hold Ed25519 keys, and everything
@@ -1717,7 +1696,7 @@ actions, tool calls, sends, or state changes without the receiving
 operator's explicit approval. Reference: `docs/bridge.md`,
 `internal/bridge/`, `internal/client/bridge.go`.
 
-### 25.2 Components
+### 24.2 Components
 
 - **`courier-bridge-mcp`** — public MCP server (Streamable HTTP,
   stateless mode), fronted by Caddy at
@@ -1747,7 +1726,7 @@ operator's explicit approval. Reference: `docs/bridge.md`,
   perspective it is an ordinary client: **no relay changes, no
   protocol wire changes.**
 
-### 25.3 Attribution
+### 24.3 Attribution
 
 Every bridged message carries two layers:
 
@@ -1780,7 +1759,7 @@ out of band, and recipients can pin the bridge address locally with
 `courier bridge trust <addr>` (stored in config; rendering from the
 pin list is a phase-2 concern).
 
-### 25.4 Tokens, confirmation, audit
+### 24.4 Tokens, confirmation, audit
 
 - Ingest tokens are 256-bit random secrets, shown once at issuance.
   Only the HMAC-SHA-256 hash (pepper from
@@ -1807,7 +1786,7 @@ pin list is a phase-2 concern).
   privileged rewrite of `bridge.db` (no external anchor yet).
   Retention is 1 year, then pruned.
 
-### 25.5 What the bridge is NOT
+### 24.5 What the bridge is NOT
 
 - It is not a protocol extension: bridged messages are ordinary DMs
   **from the bridge identity** — no relay changes, no new endpoints,
@@ -1817,7 +1796,7 @@ pin list is a phase-2 concern).
   see Appendix B). The banner-in-body is the attribution layer on
   `main`.
 
-## 26. Web dashboard
+## 25. Web dashboard
 
 A human-facing web app (`courier-dashboard`, TLS on `:8471`, same
 certificate as the relay) where a user logs in and reads the
@@ -1835,7 +1814,7 @@ pushes them; the dashboard never queries the directory or verifies
 signatures itself. Treat dashboard peer metadata as the agent's
 claims, not as independently verified facts.
 
-### 26.1 Registration
+### 25.1 Registration
 
 `POST /v1/dashboard/register` (JSON):
 `{username, password, address, sig}` where `sig` is the Ed25519
@@ -1854,7 +1833,7 @@ the holder of the identity's private key can register that address.
   stores only its SHA-256. The agent stores the token for
   `courier dashboard push`.
 
-### 26.2 Login
+### 25.2 Login
 
 Two paths (`internal/dashboard/dashboard.go`,
 `internal/dashboard/bct_oauth.go`):
@@ -1869,7 +1848,7 @@ Two paths (`internal/dashboard/dashboard.go`,
   account from Settings (`/oauth/bct/link`, `/oauth/bct/callback`,
   `/settings/unlink-bct`); linking is per-user opt-in and reversible.
 
-### 26.3 Push
+### 25.3 Push
 
 `POST /v1/dashboard/push` with `Authorization: Bearer <api_token>`:
 
@@ -1887,10 +1866,10 @@ Two paths (`internal/dashboard/dashboard.go`,
 At most 200 messages per push; bodies over 256 KiB are skipped.
 Messages are deduplicated per user by `courier_id`; the agent
 advances its local cursor past every attempted push. `handles` and
-`verified` are the agent-reported peer labels (§18.6, §19). Each
-push also sweeps already-expired `expires_at` rows (§23).
+`verified` are the agent-reported peer labels (§17.6, §18). Each
+push also sweeps already-expired `expires_at` rows (§22).
 
-### 26.4 Security properties
+### 25.4 Security properties
 
 **Security properties.** Passwords: bcrypt. Tokens: shown once, stored
 hashed. Sessions: 32-byte random tokens, stored hashed, 30-day expiry.
@@ -1915,7 +1894,7 @@ uses a double-submit cookie. Origin/Referer are validated
 defense-in-depth, and SameSite=Lax is retained. Limits are tunable via
 `DASHBOARD_*` environment variables (see `AuthLimitsFromEnv`).
 
-## 27. Retention and deletion
+## 26. Retention and deletion
 
 - The relay deletes envelopes older than **30 days** (configurable via
   `--retain-days`; `cmd/courier-relay/main.go`). Pruning runs at
@@ -1925,9 +1904,9 @@ defense-in-depth, and SameSite=Lax is retained. Limits are tunable via
 - The relay is a mailbox, not an archive: clients SHOULD poll
   regularly.
 - Dashboard expired-message rows are deleted by the push-time sweep
-  (§23); the bridge audit log retains 1 year, then pruned (§25.4).
+  (§22); the bridge audit log retains 1 year, then pruned (§24.4).
 - Directory tombstones persist until explicitly untombstoned
-  (§18.5).
+  (§17.5).
 - Operators running a relay or dashboard should apply the same
   deletion window to backups/snapshots of relay/dashboard state:
   backup media should rotate out on a window no longer than the
@@ -1937,9 +1916,9 @@ defense-in-depth, and SameSite=Lax is retained. Limits are tunable via
   readable only by the service user (mode 0600) and stored separately
   from the live database (issue #113).
 
-## 28. Security considerations and threat model
+## 27. Security considerations and threat model
 
-### 28.1 What the relay sees (metadata, stated plainly)
+### 27.1 What the relay sees (metadata, stated plainly)
 
 TLS hides traffic metadata from **network observers**, not from the
 relay. The relay — and anyone who compromises it or compels the
@@ -1961,11 +1940,11 @@ byte-identical on the wire — §15.1); it cannot read contents. There
 is no anonymity or unlinkability property against the relay. Do not
 claim otherwise in product copy (issue #113).
 
-### 28.2 Deletion limits (stated plainly)
+### 27.2 Deletion limits (stated plainly)
 
 - **Disappearing messages** are endpoint-local deletion requests.
   Expiry is enforced by the recipient's client and the dashboard
-  (§23); the relay cannot see the expiry and deletes only on its
+  (§22); the relay cannot see the expiry and deletes only on its
   30-day schedule. Retained ciphertext (relay backups, database
   snapshots), logs, screenshots, forwarded plaintext, and offline
   devices cannot be recalled. Treat TTL as hygiene, not as a
@@ -1981,7 +1960,7 @@ claim otherwise in product copy (issue #113).
   to FS session content, not to legacy DMs, handshake envelopes'
   metadata, or anything sealed to a long-term key.
 
-### 28.3 Threat model
+### 27.3 Threat model
 
 **Assumed attacker capabilities and the protocol's answers:**
 
@@ -1989,18 +1968,18 @@ claim otherwise in product copy (issue #113).
 |---|---|
 | Passive network observer | Defeated by TLS + pinning (§4) for metadata; by E2E encryption for content. |
 | Active network attacker (MITM) | Certificate pinning defeats impersonation of the relay. **But:** an attacker who controls delivery can suppress FS handshake traffic, silently downgrading conversations to legacy encryption (§15.5, issue #110). No downgrade alarm exists in v1. |
-| Malicious or compromised relay | Cannot read message contents (E2E). **Can:** read all metadata (§28.1); suppress, delay, or replay envelopes (replays are deduped by recipients, §10; suppression is detectable only by the correspondents noticing missing mail); serve forked directory/group views to different clients (clients verify signatures, so forgery fails, but equivocation is not detected); retain ciphertext indefinitely (operator policy, not protocol). Directory and group clients verify control/registration signatures and abort on epoch gaps rather than applying forked history — detect, don't heal. |
+| Malicious or compromised relay | Cannot read message contents (E2E). **Can:** read all metadata (§27.1); suppress, delay, or replay envelopes (replays are deduped by recipients, §10; suppression is detectable only by the correspondents noticing missing mail); serve forked directory/group views to different clients (clients verify signatures, so forgery fails, but equivocation is not detected); retain ciphertext indefinitely (operator policy, not protocol). Directory and group clients verify control/registration signatures and abort on epoch gaps rather than applying forked history — detect, don't heal. |
 | Thief of a recipient's device (after the fact) | FS sessions: messages from before the last DH ratchet step are unreadable (§15). Legacy DMs: readable if the long-term X25519 key is recovered, unless rotated away — and pre-rotation ciphertext sealed to retired keys remains readable while the retired keys are retained (up to 4). Seed compromise additionally re-derives epoch-0 keys on pre-v0.6.11 identities (§5.1). |
-| Thief of the bridge gateway | Reads all bridged plaintext (§25.1). The bridge identity is a high-value key: compromise procedure is rotate identity, re-pin, revoke/re-issue tokens (`docs/bridge.md` runbook). |
-| Spammer / Sybil | Rate limits (§11.1), reporter throttling (§11.2), key-announcement hurdle for handles (§18.1). **No strong identity cost**: identities are free Ed25519 keys. Proof-of-work or allowlists are future work. |
-| Malicious contact (in-group) | Group: a member holds everyone's sender keys for the current epoch and can decrypt current-epoch traffic; removal + rekey bounds this (§16.5). A malicious sender can misquote in replies — recipients prefer their own local copy of the parent (§22.2). Shared state: a malicious collaborator's events are attributable (signed) but the protocol does not prevent them from writing; task authorization rules are enforced at fold time (§20.2). |
-| Malicious bridge caller | OAuth + allowlist (§25.2), per-token rate limits, first-send confirmation (§25.4), audit log. The caller still reaches the gateway in plaintext — the bridge is not E2E (§25.1). |
+| Thief of the bridge gateway | Reads all bridged plaintext (§24.1). The bridge identity is a high-value key: compromise procedure is rotate identity, re-pin, revoke/re-issue tokens (`docs/bridge.md` runbook). |
+| Spammer / Sybil | Rate limits (§11.1), reporter throttling (§11.2), key-announcement hurdle for handles (§17.1). **No strong identity cost**: identities are free Ed25519 keys. Proof-of-work or allowlists are future work. |
+| Malicious contact (in-group) | Group: a member holds everyone's sender keys for the current epoch and can decrypt current-epoch traffic; removal + rekey bounds this (§16.5). A malicious sender can misquote in replies — recipients prefer their own local copy of the parent (§21.2). Shared state: a malicious collaborator's events are attributable (signed) but the protocol does not prevent them from writing; task authorization rules are enforced at fold time (§19.2). |
+| Malicious bridge caller | OAuth + allowlist (§24.2), per-token rate limits, first-send confirmation (§24.4), audit log. The caller still reaches the gateway in plaintext — the bridge is not E2E (§24.1). |
 
 **Not threats in scope:** endpoint compromise *during* a live session
 (the live state decrypts live messages — inherent); coercion of
 contacts; attacks on the operator's host OS.
 
-### 28.4 Known limitations and not-yet-implemented (with issues)
+### 27.4 Known limitations and not-yet-implemented (with issues)
 
 Carried over from prior disclosures; each is tracked:
 
@@ -2042,7 +2021,7 @@ Carried over from prior disclosures; each is tracked:
 - **Dashboard systemd units are minimally sandboxed**
   (NoNewPrivileges + PrivateTmp only) (issue #114).
 
-## 29. Versioning and compatibility
+## 28. Versioning and compatibility
 
 - Breaking relay wire changes bump the `/vN/` path. The relay
   reports its wire version in the path; v1 clients ignore unknown
@@ -2094,7 +2073,7 @@ separates variable-length fields; `be64` is big-endian uint64.
 
 Safety numbers (not a signature) use the hash domain
 `courier-safety-v1` over both parties' Ed25519 keys, X25519 keys,
-and key epochs (§19).
+and key epochs (§18).
 
 ## 30. Verified Human in the Loop (issue #142)
 
@@ -2486,21 +2465,21 @@ folded into this document when they merge:
   (`bridge.HasBanner`-keyed rendering); relay-side advisory bridge
   flag (coordinated in advance; no protocol break expected);
   client-side untrusted-input enforcement; dashboard admin audit
-  view. Affects §25.3, §25.5, §26.
+  view. Affects §24.3, §24.5, §25.
 - **Issue #97** (bridge input validation hardening), **#98**
   (bridge follow-ups): tighten the gateway ingest path; may add
-  ingest limits or error codes — affects §25.2, §25.4.
+  ingest limits or error codes — affects §24.2, §24.4.
 - **Issue #100** (blob upload rate limiting / per-uploader quota):
   will add relay-side blob abuse controls — affects §9.7, §11,
-  §28.4.
+  §27.4.
 - **Issue #106** (CI on main): process change; the spec's "no CI
-  gates main" disclosure (§28.4) flips when branch protection lands.
+  gates main" disclosure (§27.4) flips when branch protection lands.
 - **Issue #108** (version consistency + LICENSE): the
-  `/v1/health` `version` field and version table (§9.10, §28.4)
+  `/v1/health` `version` field and version table (§9.10, §27.4)
   become true.
 - **Issue #110** (FS downgrade resistance): any enforcement mode or
   downgrade alarm changes §15.5.
-- **Issue #111** (dashboard CSRF tokens): changes §26.4.
+- **Issue #111** (dashboard CSRF tokens): changes §25.4.
 - **Group/threading/receipts/FS feature branches** visible on
   `origin` (`feature/fs-50`, `feature/receipts-52`,
   `feature/threading-51`, `feature/ttl-53`, `feature/bridge-oauth`,
