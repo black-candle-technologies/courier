@@ -2357,7 +2357,8 @@ the VHL layer, never surfaced as chat):
   hash, UP/UV flags, attested credential data, and the
   authenticator's attestation chain or assertion signature)
   against the locally configured relying party. Enrollment
-  accepts only `packed` (x5c) and `fido-u2f` attestations chained
+  accepts only `packed` (x5c), `fido-u2f`, and `apple` (Apple
+  Anonymous Attestation, WebAuthn §8.8) attestations chained
   to operator-provisioned attestation roots; `none` and self
   attestations are rejected outright, and enrollment fails closed
   when no roots are configured — anyone holding the ceremony

@@ -34,6 +34,10 @@ type PKI struct {
 	// AttestKey signs attestation statements (the authenticator's
 	// attestation private key).
 	AttestKey *ecdsa.PrivateKey
+	// RootKey is the test CA's private key, for issuing additional
+	// leaves (e.g. the apple-format leaf, which is issued for the
+	// credential key rather than the authenticator attestation key).
+	RootKey *ecdsa.PrivateKey
 	// AttestDER is the DER-encoded attestation leaf certificate.
 	AttestDER []byte
 	// RootDER is the DER-encoded self-signed CA certificate.
@@ -93,7 +97,7 @@ func NewPKI(t *testing.T) *PKI {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &PKI{AttestKey: attestKey, AttestDER: attestDER, RootDER: rootDER}
+	return &PKI{AttestKey: attestKey, RootKey: rootKey, AttestDER: attestDER, RootDER: rootDER}
 }
 
 // WriteRootFile writes the CA certificate to a temp file and returns
@@ -241,6 +245,110 @@ func (p *PKI) enrollPacked(t *testing.T, rpID, origin string, challenge []byte, 
 	attObj := cborMap(
 		cborTstr("fmt"), cborTstr("packed"),
 		cborTstr("attStmt"), attStmt,
+		cborTstr("authData"), cborBstr(authData),
+	)
+	return &Enrollment{
+		OuterB64: p.outer(t, credID, clientData, attObj),
+		AuthData: authData,
+		CredKey:  credKey,
+		CredID:   credID,
+	}
+}
+
+// appleAttestationNonceOID is the Apple anonymous-attestation nonce
+// extension (WebAuthn §8.8): its value is a DER SEQUENCE holding the
+// SHA-256 of authenticatorData || clientDataHash as a [1]-tagged
+// OCTET STRING.
+var appleAttestationNonceOID = asn1.ObjectIdentifier{1, 2, 840, 113635, 100, 8, 2}
+
+// AppleEnrollOpts tweaks the synthetic apple-format enrollment for
+// negative tests.
+type AppleEnrollOpts struct {
+	// NoNonceExt omits the nonce extension from the attestation leaf.
+	NoNonceExt bool
+	// WrongNonce embeds a garbage nonce instead of the real one.
+	WrongNonce bool
+	// KeyMismatch issues the attestation leaf for a different key
+	// than the credential key in authenticator data.
+	KeyMismatch bool
+}
+
+// EnrollApple builds an "apple" (Apple Anonymous Attestation,
+// WebAuthn §8.8) enrollment ceremony: the attestation statement
+// carries only an x5c chain whose leaf is issued for the credential
+// public key and embeds the SHA-256(authData || clientDataHash)
+// nonce — the shape Touch ID / Face ID / iCloud Keychain produce
+// when the ceremony requests attestation "direct".
+func (p *PKI) EnrollApple(t *testing.T, rpID, origin string, challenge []byte) *Enrollment {
+	t.Helper()
+	return p.EnrollAppleWith(t, rpID, origin, challenge, AppleEnrollOpts{})
+}
+
+// EnrollAppleWith is EnrollApple with negative-test tweaks.
+func (p *PKI) EnrollAppleWith(t *testing.T, rpID, origin string, challenge []byte, opts AppleEnrollOpts) *Enrollment {
+	t.Helper()
+	credKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credID := make([]byte, 32)
+	if _, err := rand.Read(credID); err != nil {
+		t.Fatal(err)
+	}
+	authData := p.authData(t, rpID, credID, &credKey.PublicKey)
+	clientData := `{"type":"webauthn.create","challenge":"` + b64.EncodeToString(challenge) + `","origin":"` + origin + `"}`
+	cdHash := sha256.Sum256([]byte(clientData))
+
+	// The attestation leaf is issued for the credential public key
+	// (WebAuthn §8.8 step 5 binds the leaf's subject key to the
+	// enrolled credential); the mismatch variant issues it for an
+	// unrelated key instead.
+	leafKey := &credKey.PublicKey
+	if opts.KeyMismatch {
+		other, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leafKey = &other.PublicKey
+	}
+	var extraExt []pkix.Extension
+	if !opts.NoNonceExt {
+		nonceInput := append(append([]byte{}, authData...), cdHash[:]...)
+		nonce := sha256.Sum256(nonceInput)
+		if opts.WrongNonce {
+			nonce = sha256.Sum256([]byte("not the ceremony nonce"))
+		}
+		nonceVal, err := asn1.Marshal(struct {
+			Nonce []byte `asn1:"tag:1,explicit"`
+		}{Nonce: nonce[:]})
+		if err != nil {
+			t.Fatal(err)
+		}
+		extraExt = []pkix.Extension{{Id: appleAttestationNonceOID, Value: nonceVal}}
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject: pkix.Name{
+			OrganizationalUnit: []string{"AAA Certification"},
+			Organization:       []string{"Apple Inc."},
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		ExtraExtensions:       extraExt,
+	}
+	rootCert, err := x509.ParseCertificate(p.RootDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, rootCert, leafKey, p.RootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attObj := cborMap(
+		cborTstr("fmt"), cborTstr("apple"),
+		cborTstr("attStmt"), cborMap(cborTstr("x5c"), cborArray(cborBstr(leafDER))),
 		cborTstr("authData"), cborBstr(authData),
 	)
 	return &Enrollment{

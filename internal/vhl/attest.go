@@ -29,9 +29,10 @@ package vhl
 // Enrollment therefore fails closed with no trust anchors
 // configured, and rejects "none" and self attestations outright.
 //
-// Supported formats: "packed" (x5c only) and "fido-u2f". Anything
-// else — "tpm", "android-key", "apple", "none" — is rejected with a
-// clear error, never silently accepted.
+// Supported formats: "packed" (x5c only), "fido-u2f", and "apple"
+// (Apple Anonymous Attestation, WebAuthn §8.8 — Touch ID / Face ID /
+// iCloud Keychain). Anything else — "tpm", "android-key", "none" —
+// is rejected with a clear error, never silently accepted.
 
 import (
 	"bytes"
@@ -364,16 +365,19 @@ func isZeroAAGUID(aaguid []byte) bool {
 
 // verifyAttestationStatement verifies the attestation statement for
 // a registration ceremony. Only formats with a certificate chain to
-// a configured trust anchor are accepted: "packed" with x5c, and
-// "fido-u2f". "none" carries no proof and self attestations are
-// signed by the enrolled key itself — both are forgeable by anyone
-// holding the ceremony challenge, so both fail closed.
+// a configured trust anchor are accepted: "packed" with x5c,
+// "fido-u2f", and "apple" (Apple Anonymous Attestation). "none"
+// carries no proof and self attestations are signed by the enrolled
+// key itself — both are forgeable by anyone holding the ceremony
+// challenge, so both fail closed.
 func verifyAttestationStatement(attObj *attestationObject, authData, clientDataHash, coseKey []byte, rp WebAuthnRP, now time.Time) error {
 	switch attObj.Format {
 	case "packed":
 		return verifyPackedAttestation(attObj, authData, clientDataHash, rp, now)
 	case "fido-u2f":
 		return verifyFidoU2FAttestation(attObj, authData, clientDataHash, rp, now)
+	case "apple":
+		return verifyAppleAttestation(attObj, authData, clientDataHash, coseKey, rp, now)
 	case "none":
 		return fmt.Errorf("enrollment: attestation format %q carries no authenticator proof — refusing (request attestation \"direct\" in the ceremony)", attObj.Format)
 	default:
@@ -602,6 +606,115 @@ func verifyFidoU2FAttestation(attObj *attestationObject, authData, clientDataHas
 	digest := sha256.Sum256(signed)
 	if !ecdsa.VerifyASN1(pub, digest[:], sig) {
 		return fmt.Errorf("enrollment: fido-u2f attestation signature invalid")
+	}
+	return nil
+}
+
+// appleAttestationNonceOID is the Apple anonymous-attestation nonce
+// extension (WebAuthn §8.8): its value is a DER SEQUENCE holding the
+// SHA-256 of authenticatorData || clientDataHash as a [1]-tagged
+// OCTET STRING.
+var appleAttestationNonceOID = asn1.ObjectIdentifier{1, 2, 840, 113635, 100, 8, 2}
+
+// appleAttestationExtension is the decoded form of the nonce
+// extension's value.
+type appleAttestationExtension struct {
+	Nonce []byte `asn1:"tag:1,explicit"`
+}
+
+// verifyAppleAttestation verifies an "apple" (Apple Anonymous
+// Attestation, WebAuthn §8.8) statement — what Touch ID, Face ID,
+// and iCloud Keychain passkeys produce when the ceremony requests
+// attestation "direct". The statement carries no signature of its
+// own; trust comes from three independent bindings instead:
+// (a) the leaf chains to an operator-configured trust anchor (the
+// Apple WebAuthn Root CA),
+// (b) the leaf's nonce extension binds it to this exact ceremony
+// (SHA-256(authenticatorData || clientDataHash)), and
+// (c) the leaf's subject public key matches the enrolled credential
+// key, so the attestation is about the key being enrolled.
+func verifyAppleAttestation(attObj *attestationObject, authData, clientDataHash, coseKey []byte, rp WebAuthnRP, now time.Time) error {
+	x5c, _ := attObj.Stmt["x5c"].([][]byte)
+	leaf, err := verifyAttestationChain(x5c, rp, now)
+	if err != nil {
+		return err
+	}
+	if err := checkAppleAttestationCertProfile(leaf); err != nil {
+		return err
+	}
+	var extValue []byte
+	for _, ext := range leaf.Extensions {
+		if ext.Id.Equal(appleAttestationNonceOID) {
+			extValue = ext.Value
+			break
+		}
+	}
+	if len(extValue) == 0 {
+		return fmt.Errorf("enrollment: apple attestation leaf lacks the nonce extension (1.2.840.113635.100.8.2)")
+	}
+	var decoded appleAttestationExtension
+	if _, err := asn1.Unmarshal(extValue, &decoded); err != nil {
+		return fmt.Errorf("enrollment: apple attestation nonce extension: %w", err)
+	}
+	nonceInput := make([]byte, 0, len(authData)+len(clientDataHash))
+	nonceInput = append(nonceInput, authData...)
+	nonceInput = append(nonceInput, clientDataHash...)
+	wantNonce := sha256.Sum256(nonceInput)
+	if subtle.ConstantTimeCompare(decoded.Nonce, wantNonce[:]) != 1 {
+		return fmt.Errorf("enrollment: apple attestation nonce mismatch — the leaf is not bound to this ceremony")
+	}
+	if err := appleAttestationKeyMatch(leaf, coseKey); err != nil {
+		return err
+	}
+	return nil
+}
+
+// checkAppleAttestationCertProfile enforces the Apple attestation
+// leaf profile: X.509 v3, a non-CA end entity, digitalSignature key
+// usage, and a P-256 public key. Apple's leaves look different from
+// FIDO leaves (subject OU "AAA Certification", short-lived), so the
+// packed certificate profile does not apply — but the chain still
+// has to terminate at an operator-configured trust anchor, which
+// the caller verifies before this runs.
+func checkAppleAttestationCertProfile(leaf *x509.Certificate) error {
+	if leaf.Version != 3 {
+		return fmt.Errorf("enrollment: apple attestation leaf is not X.509 v3 (got v%d)", leaf.Version)
+	}
+	if !leaf.BasicConstraintsValid || leaf.IsCA {
+		return fmt.Errorf("enrollment: apple attestation leaf must be a non-CA end-entity certificate")
+	}
+	if leaf.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		return fmt.Errorf("enrollment: apple attestation leaf lacks digitalSignature key usage")
+	}
+	pub, ok := leaf.PublicKey.(*ecdsa.PublicKey)
+	if !ok || pub.Curve != elliptic.P256() {
+		return fmt.Errorf("enrollment: apple attestation leaf key is not P-256")
+	}
+	return nil
+}
+
+// appleAttestationKeyMatch checks the WebAuthn §8.8 step 5 binding:
+// the credential public key in the attested COSE key must equal the
+// attestation leaf's subject public key. Without this, a valid Apple
+// leaf for one credential could vouch for a different,
+// attacker-chosen key.
+func appleAttestationKeyMatch(leaf *x509.Certificate, coseKey []byte) error {
+	pub, ok := leaf.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return fmt.Errorf("enrollment: apple attestation leaf key is not ECDSA")
+	}
+	fields, err := parseCOSEKey(coseKey)
+	if err != nil {
+		return fmt.Errorf("enrollment: apple attestation credential key: %w", err)
+	}
+	xb, _ := fields[-2].([]byte)
+	yb, _ := fields[-3].([]byte)
+	if len(xb) != 32 || len(yb) != 32 {
+		return fmt.Errorf("enrollment: apple attestation credential key is not P-256")
+	}
+	if subtle.ConstantTimeCompare(xb, pub.X.FillBytes(make([]byte, 32))) != 1 ||
+		subtle.ConstantTimeCompare(yb, pub.Y.FillBytes(make([]byte, 32))) != 1 {
+		return fmt.Errorf("enrollment: apple attestation leaf public key does not match the enrolled credential key")
 	}
 	return nil
 }

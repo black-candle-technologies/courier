@@ -106,6 +106,57 @@ func TestVerifyRegistrationFidoU2FHappyPath(t *testing.T) {
 	}
 }
 
+func TestVerifyRegistrationAppleHappyPath(t *testing.T) {
+	pki := vhltest.NewPKI(t)
+	chal := freshChallenge(t)
+	cer := pki.EnrollApple(t, "example.com", "https://example.com", chal)
+	res, err := VerifyRegistrationAttestation(cer.OuterB64, chal, testRP(pki, "example.com"))
+	if err != nil {
+		t.Fatalf("apple happy path failed: %v", err)
+	}
+	if res.CredentialID != attestB64.EncodeToString(cer.CredID) {
+		t.Fatalf("credential id mismatch: %q", res.CredentialID)
+	}
+	fields, err := parseCOSEKey(res.PublicKey)
+	if err != nil {
+		t.Fatalf("returned public key does not parse: %v", err)
+	}
+	if alg, _ := fields[3].(int64); alg != -7 {
+		t.Fatalf("alg = %v, want -7", alg)
+	}
+}
+
+func TestVerifyRegistrationAppleRejects(t *testing.T) {
+	cases := []struct {
+		name string
+		opts vhltest.AppleEnrollOpts
+	}{
+		{"missing nonce extension", vhltest.AppleEnrollOpts{NoNonceExt: true}},
+		{"wrong nonce", vhltest.AppleEnrollOpts{WrongNonce: true}},
+		{"leaf key does not match credential key", vhltest.AppleEnrollOpts{KeyMismatch: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pki := vhltest.NewPKI(t)
+			chal := freshChallenge(t)
+			cer := pki.EnrollAppleWith(t, "example.com", "https://example.com", chal, tc.opts)
+			if _, err := VerifyRegistrationAttestation(cer.OuterB64, chal, testRP(pki, "example.com")); err == nil {
+				t.Fatalf("apple enrollment with %s was accepted", tc.name)
+			}
+		})
+	}
+	// A leaf chaining to a different root must also fail closed.
+	t.Run("untrusted root", func(t *testing.T) {
+		pki := vhltest.NewPKI(t)
+		other := vhltest.NewPKI(t)
+		chal := freshChallenge(t)
+		cer := pki.EnrollApple(t, "example.com", "https://example.com", chal)
+		if _, err := VerifyRegistrationAttestation(cer.OuterB64, chal, testRP(other, "example.com")); err == nil {
+			t.Fatal("apple enrollment chaining to an unconfigured root was accepted")
+		}
+	})
+}
+
 func TestVerifyRegistrationRejectsWrongChallenge(t *testing.T) {
 	pki := vhltest.NewPKI(t)
 	chal := freshChallenge(t)
