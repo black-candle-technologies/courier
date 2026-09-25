@@ -157,6 +157,32 @@ func TestVerifyRegistrationAppleRejects(t *testing.T) {
 	})
 }
 
+// TestVerifyRegistrationAppleRejectsNonconforming covers the
+// statement-strictness findings: the apple attestation statement is
+// exactly { x5c: [...] }, so duplicates, extra fields, and a nonce
+// extension that is not exactly the nonce DER must all fail closed.
+func TestVerifyRegistrationAppleRejectsNonconforming(t *testing.T) {
+	cases := []struct {
+		name string
+		opts vhltest.AppleEnrollOpts
+	}{
+		{"duplicate x5c field", vhltest.AppleEnrollOpts{DupX5C: true}},
+		{"extra alg field", vhltest.AppleEnrollOpts{ExtraStmtField: "alg"}},
+		{"unknown attStmt field", vhltest.AppleEnrollOpts{ExtraStmtField: "unexpected"}},
+		{"trailing junk after nonce DER", vhltest.AppleEnrollOpts{NonceTrailingJunk: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pki := vhltest.NewPKI(t)
+			chal := freshChallenge(t)
+			cer := pki.EnrollAppleWith(t, "example.com", "https://example.com", chal, tc.opts)
+			if _, err := VerifyRegistrationAttestation(cer.OuterB64, chal, testRP(pki, "example.com")); err == nil {
+				t.Fatalf("apple enrollment with %s was accepted", tc.name)
+			}
+		})
+	}
+}
+
 func TestVerifyRegistrationRejectsWrongChallenge(t *testing.T) {
 	pki := vhltest.NewPKI(t)
 	chal := freshChallenge(t)

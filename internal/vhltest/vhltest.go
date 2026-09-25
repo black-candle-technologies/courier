@@ -271,6 +271,15 @@ type AppleEnrollOpts struct {
 	// KeyMismatch issues the attestation leaf for a different key
 	// than the credential key in authenticator data.
 	KeyMismatch bool
+	// DupX5C emits the attStmt map with the x5c key twice.
+	DupX5C bool
+	// ExtraStmtField adds a non-x5c field to the attStmt map.
+	// "alg" exercises a known extra key; any other non-empty value
+	// exercises an unknown one.
+	ExtraStmtField string
+	// NonceTrailingJunk appends junk bytes after the nonce DER in
+	// the extension value.
+	NonceTrailingJunk bool
 }
 
 // EnrollApple builds an "apple" (Apple Anonymous Attestation,
@@ -324,6 +333,9 @@ func (p *PKI) EnrollAppleWith(t *testing.T, rpID, origin string, challenge []byt
 		if err != nil {
 			t.Fatal(err)
 		}
+		if opts.NonceTrailingJunk {
+			nonceVal = append(nonceVal, 0xde, 0xad, 0xbe, 0xef)
+		}
 		extraExt = []pkix.Extension{{Id: appleAttestationNonceOID, Value: nonceVal}}
 	}
 	leafTmpl := &x509.Certificate{
@@ -346,9 +358,25 @@ func (p *PKI) EnrollAppleWith(t *testing.T, rpID, origin string, challenge []byt
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The apple statement is exactly { x5c: [...] }; the negative
+	// variants below build nonconforming statements on purpose.
+	x5cVal := cborArray(cborBstr(leafDER))
+	stmtFields := [][]byte{cborTstr("x5c"), x5cVal}
+	if opts.DupX5C {
+		stmtFields = append(stmtFields, cborTstr("x5c"), x5cVal)
+	}
+	if opts.ExtraStmtField != "" {
+		var v []byte
+		if opts.ExtraStmtField == "alg" {
+			v = cborNeg(-7)
+		} else {
+			v = cborTstr("unexpected")
+		}
+		stmtFields = append(stmtFields, cborTstr(opts.ExtraStmtField), v)
+	}
 	attObj := cborMap(
 		cborTstr("fmt"), cborTstr("apple"),
-		cborTstr("attStmt"), cborMap(cborTstr("x5c"), cborArray(cborBstr(leafDER))),
+		cborTstr("attStmt"), cborMap(stmtFields...),
 		cborTstr("authData"), cborBstr(authData),
 	)
 	return &Enrollment{

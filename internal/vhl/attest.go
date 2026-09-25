@@ -107,6 +107,11 @@ type attestationObject struct {
 	Format   string
 	AuthData []byte
 	Stmt     map[string]any // "alg" int64, "sig" []byte, "x5c" [][]byte
+	// StmtKeys is the attStmt key set in wire order (duplicates are
+	// rejected at decode). Unknown keys are skipped but still
+	// recorded, so format verifiers can enforce their closed CDDL
+	// map exactly.
+	StmtKeys []string
 }
 
 // parseAttestationObject decodes the CBOR attestation object:
@@ -141,11 +146,22 @@ func parseAttestationObject(raw []byte) (*attestationObject, error) {
 			if err != nil {
 				return nil, fmt.Errorf("attestation attStmt: %w", err)
 			}
+			// Attestation statement maps are closed per format
+			// (WebAuthn §6.4): a duplicate key is ambiguous, so
+			// fail closed instead of last-wins. This tightens
+			// packed and fido-u2f too — their CDDL maps are also
+			// closed, so a conforming authenticator is unaffected.
+			seen := map[string]struct{}{}
 			for j := 0; j < m; j++ {
 				sk, err := d.readTstr()
 				if err != nil {
 					return nil, fmt.Errorf("attStmt key: %w", err)
 				}
+				if _, dup := seen[sk]; dup {
+					return nil, fmt.Errorf("attestation attStmt: duplicate key %q", sk)
+				}
+				seen[sk] = struct{}{}
+				out.StmtKeys = append(out.StmtKeys, sk)
 				switch sk {
 				case "alg":
 					v, err := d.readInt()
@@ -634,6 +650,13 @@ type appleAttestationExtension struct {
 // (c) the leaf's subject public key matches the enrolled credential
 // key, so the attestation is about the key being enrolled.
 func verifyAppleAttestation(attObj *attestationObject, authData, clientDataHash, coseKey []byte, rp WebAuthnRP, now time.Time) error {
+	// WebAuthn §8.8 defines the apple statement as exactly
+	// { x5c: [...] }. Any other key — alg, sig, or unknown — is a
+	// nonconforming statement from a misbehaving or hostile
+	// authenticator; reject it instead of ignoring the extras.
+	if len(attObj.StmtKeys) != 1 || attObj.StmtKeys[0] != "x5c" {
+		return fmt.Errorf("enrollment: apple attestation statement must be exactly { x5c: [...] } (got keys %q)", attObj.StmtKeys)
+	}
 	x5c, _ := attObj.Stmt["x5c"].([][]byte)
 	leaf, err := verifyAttestationChain(x5c, rp, now)
 	if err != nil {
@@ -653,8 +676,15 @@ func verifyAppleAttestation(attObj *attestationObject, authData, clientDataHash,
 		return fmt.Errorf("enrollment: apple attestation leaf lacks the nonce extension (1.2.840.113635.100.8.2)")
 	}
 	var decoded appleAttestationExtension
-	if _, err := asn1.Unmarshal(extValue, &decoded); err != nil {
+	rest, err := asn1.Unmarshal(extValue, &decoded)
+	if err != nil {
 		return fmt.Errorf("enrollment: apple attestation nonce extension: %w", err)
+	}
+	// The extension value must be exactly the nonce DER: trailing
+	// junk after a valid prefix is not the claimed structure, so
+	// fail closed on it.
+	if len(rest) != 0 {
+		return fmt.Errorf("enrollment: apple attestation nonce extension has %d trailing bytes", len(rest))
 	}
 	nonceInput := make([]byte, 0, len(authData)+len(clientDataHash))
 	nonceInput = append(nonceInput, authData...)
