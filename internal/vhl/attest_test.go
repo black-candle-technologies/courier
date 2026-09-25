@@ -487,6 +487,10 @@ func TestVerifyRegistrationAndroidKeyRejectsNonconforming(t *testing.T) {
 		{"bad signature", vhltest.AndroidEnrollOpts{BadSig: true}, "signature invalid"},
 		{"wrong alg", vhltest.AndroidEnrollOpts{WrongAlg: true}, "unsupported alg"},
 		{"no purpose SIGN", vhltest.AndroidEnrollOpts{NoPurpose: true}, "does not grant purpose SIGN"},
+		{"purpose only in software list", vhltest.AndroidEnrollOpts{PurposeSWOnly: true}, "does not grant purpose SIGN"},
+		{"allApplications present", vhltest.AndroidEnrollOpts{AllApplications: true}, "allApplications"},
+		{"origin not generated", vhltest.AndroidEnrollOpts{WrongOrigin: true}, "not generated on-device"},
+		{"origin missing", vhltest.AndroidEnrollOpts{NoOrigin: true}, "not generated on-device"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -502,3 +506,133 @@ func TestVerifyRegistrationAndroidKeyRejectsNonconforming(t *testing.T) {
 		})
 	}
 }
+
+func TestParseAndroidAuthList(t *testing.T) {
+	// Hand-built AuthorizationList DER. Field encodings:
+	//   purpose  = A1 05 31 03 02 01 02        ([1] EXPLICIT SET { INTEGER 2 })
+	//   origin   = BF 85 3E 03 02 01 00        ([702] EXPLICIT INTEGER 0)
+	//   allApps  = BF 84 58 02 05 00           ([600] EXPLICIT NULL)
+	purpose := []byte{0xA1, 0x05, 0x31, 0x03, 0x02, 0x01, 0x02}
+	origin := []byte{0xBF, 0x85, 0x3E, 0x03, 0x02, 0x01, 0x00}
+	allApps := []byte{0xBF, 0x84, 0x58, 0x02, 0x05, 0x00}
+	seq := func(fields ...[]byte) []byte {
+		var c []byte
+		for _, f := range fields {
+			c = append(c, f...)
+		}
+		return append([]byte{0x30, byte(len(c))}, c...)
+	}
+	cases := []struct {
+		name    string
+		der     []byte
+		wantErr string
+		check   func(*androidAuthList) error
+	}{
+		{
+			name: "valid purpose and origin",
+			der:  seq(purpose, origin),
+			check: func(l *androidAuthList) error {
+				if !l.purposePresent || len(l.purposes) != 1 || l.purposes[0] != 2 {
+					return errTest("purposes not parsed")
+				}
+				if !l.originPresent || l.origin != 0 {
+					return errTest("origin not parsed")
+				}
+				if l.allApplications {
+					return errTest("spurious allApplications")
+				}
+				return nil
+			},
+		},
+		{
+			name: "unknown field skipped",
+			der:  seq(purpose, origin, []byte{0xA2, 0x03, 0x02, 0x01, 0x05}),
+			check: func(l *androidAuthList) error {
+				if !l.purposePresent || !l.originPresent {
+					return errTest("known fields lost")
+				}
+				return nil
+			},
+		},
+		{
+			name:    "duplicate purpose rejected",
+			der:     seq(purpose, purpose),
+			wantErr: "duplicate field",
+		},
+		{
+			name:    "allApplications detected",
+			der:     seq(purpose, origin, allApps),
+			wantErr: "",
+			check: func(l *androidAuthList) error {
+				if !l.allApplications {
+					return errTest("allApplications not detected")
+				}
+				return nil
+			},
+		},
+		{
+			name:    "non-minimal length rejected",
+			der:     append([]byte{0x30, 0x81, 0x0D}, seq(purpose, origin)[2:]...),
+			wantErr: "non-minimal",
+		},
+		{
+			name:    "truncated list rejected",
+			der:     []byte{0x30, 0x0D, 0xA1, 0x05},
+			wantErr: "length exceeds",
+		},
+		{
+			name:    "SET instead of SEQUENCE rejected",
+			der:     []byte{0x31, 0x00},
+			wantErr: "not a SEQUENCE",
+		},
+		{
+			name:    "purpose as SEQUENCE rejected",
+			der:     seq([]byte{0xA1, 0x04, 0x30, 0x02, 0x02, 0x01, 0x02}),
+			wantErr: "want SET",
+		},
+		{
+			name:    "trailing bytes after SET rejected",
+			der:     seq([]byte{0xA1, 0x06, 0x31, 0x03, 0x02, 0x01, 0x02, 0x00}),
+			wantErr: "trailing bytes",
+		},
+		{
+			name:    "negative origin rejected",
+			der:     seq(purpose, []byte{0xBF, 0x85, 0x3E, 0x03, 0x02, 0x01, 0xFF}),
+			wantErr: "negative INTEGER",
+		},
+		{
+			name:    "non-minimal INTEGER rejected",
+			der:     seq(purpose, []byte{0xBF, 0x85, 0x3E, 0x04, 0x02, 0x02, 0x00, 0x00}),
+			wantErr: "non-minimal INTEGER",
+		},
+		{
+			name:    "empty input rejected",
+			der:     []byte{},
+			wantErr: "not a SEQUENCE",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			l, err := parseAndroidAuthList(tc.der)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("want error containing %q, got nil", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("want error containing %q, got %q", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tc.check != nil {
+				if cerr := tc.check(l); cerr != nil {
+					t.Fatal(cerr)
+				}
+			}
+		})
+	}
+}
+
+func errTest(s string) error { return fmt.Errorf("%s", s) }

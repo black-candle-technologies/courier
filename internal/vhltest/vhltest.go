@@ -399,7 +399,8 @@ const (
 // AndroidEnrollOpts tunes the synthetic android-key enrollment for
 // negative tests. The zero value is the happy path: StrongBox
 // security level, correct challenge, matching key, trusted root,
-// valid signature.
+// valid signature, origin GENERATED and purpose SIGN in the
+// TEE-enforced list.
 type AndroidEnrollOpts struct {
 	// SecurityLevel overrides the KeyDescription
 	// attestationSecurityLevel. It applies only when
@@ -410,7 +411,11 @@ type AndroidEnrollOpts struct {
 	SecurityLevelSet bool
 	WrongChallenge   bool // KeyDescription carries the wrong challenge
 	KeyMismatch      bool // leaf cert holds a different key than the credential
-	NoPurpose        bool // omit purpose SIGN from the authorization lists
+	NoPurpose        bool // omit purpose SIGN from the TEE authorization list
+	PurposeSWOnly    bool // purpose SIGN only in the software list, not TEE
+	AllApplications  bool // allApplications present in the TEE list
+	NoOrigin         bool // omit origin from the TEE list
+	WrongOrigin      bool // origin IMPORTED instead of GENERATED
 	WrongRoot        bool // leaf signed by a throwaway CA, not the test root
 	BadSig           bool // corrupt the attestation signature
 	WrongAlg         bool // attStmt alg -257 instead of -7
@@ -419,18 +424,64 @@ type AndroidEnrollOpts struct {
 	TrailingJunk     bool // junk bytes appended after the KeyDescription DER
 }
 
+// androidAuthListContent concatenates AuthorizationList field
+// elements into the SEQUENCE content bytes.
+func androidAuthListContent(fields ...[]byte) []byte {
+	var content []byte
+	for _, f := range fields {
+		content = append(content, f...)
+	}
+	return content
+}
+
+// androidExplicitField wraps a value TLV in a context-specific
+// constructed EXPLICIT tag, encoding the tag number in
+// high-tag-number form when needed (e.g. 600, 702).
+func androidExplicitField(tagNo int, value []byte) []byte {
+	var tag []byte
+	if tagNo < 31 {
+		tag = []byte{0xA0 | byte(tagNo)}
+	} else {
+		tag = []byte{0xBF, 0x80 | byte(tagNo>>7), byte(tagNo & 0x7F)}
+	}
+	out := append(tag, byte(len(value)))
+	return append(out, value...)
+}
+
 // androidKeyDescriptionDER builds a minimal but structurally valid
 // KeyDescription ASN.1 record. The purpose field is encoded as
-// [1] EXPLICIT SET OF INTEGER, matching real Android devices
-// (Go's asn1 would emit a SEQUENCE instead).
-func androidKeyDescriptionDER(t *testing.T, challenge []byte, securityLevel int, withPurpose bool) []byte {
+// [1] EXPLICIT SET OF INTEGER and origin as [702] EXPLICIT
+// INTEGER, matching real Android devices (Go's asn1 would emit
+// SEQUENCE instead of SET for the former).
+func androidKeyDescriptionDER(t *testing.T, challenge []byte, securityLevel int, opts AndroidEnrollOpts) []byte {
 	t.Helper()
-	var teeContent []byte
-	if withPurpose {
+	var teeFields [][]byte
+	if !opts.NoPurpose && !opts.PurposeSWOnly {
 		// [1] EXPLICIT SET { INTEGER 2 }  (purpose SIGN)
 		set := []byte{0x31, 0x03, 0x02, 0x01, 0x02}
-		teeContent = append([]byte{0xA1, byte(len(set))}, set...)
+		teeFields = append(teeFields, androidExplicitField(1, set))
 	}
+	if !opts.NoOrigin {
+		// [702] EXPLICIT INTEGER (origin); 0=GENERATED,
+		// 2=IMPORTED.
+		origin := 0
+		if opts.WrongOrigin {
+			origin = 2
+		}
+		teeFields = append(teeFields, androidExplicitField(702, []byte{0x02, 0x01, byte(origin)}))
+	}
+	if opts.AllApplications {
+		// [600] EXPLICIT NULL — must be absent per WebAuthn
+		// §8.4; present here only for the negative test.
+		teeFields = append(teeFields, androidExplicitField(600, []byte{0x05, 0x00}))
+	}
+	var swFields [][]byte
+	if opts.PurposeSWOnly {
+		set := []byte{0x31, 0x03, 0x02, 0x01, 0x02}
+		swFields = append(swFields, androidExplicitField(1, set))
+	}
+	teeEnforced := asn1.RawValue{Class: 0, Tag: 16, IsCompound: true, Bytes: androidAuthListContent(teeFields...)}
+	softwareEnforced := asn1.RawValue{Class: 0, Tag: 16, IsCompound: true, Bytes: androidAuthListContent(swFields...)}
 	kd := struct {
 		AttestationVersion       int
 		AttestationSecurityLevel asn1.Enumerated
@@ -447,8 +498,8 @@ func androidKeyDescriptionDER(t *testing.T, challenge []byte, securityLevel int,
 		KeymasterSecurityLevel:   asn1.Enumerated(securityLevel),
 		AttestationChallenge:     challenge,
 		UniqueID:                 []byte{},
-		SoftwareEnforced:         asn1.RawValue{Class: 0, Tag: 16, IsCompound: true, Bytes: []byte{}},
-		TEEEnforced:              asn1.RawValue{Class: 0, Tag: 16, IsCompound: true, Bytes: teeContent},
+		SoftwareEnforced:         softwareEnforced,
+		TEEEnforced:              teeEnforced,
 	}
 	der, err := asn1.Marshal(kd)
 	if err != nil {
@@ -479,10 +530,9 @@ func (p *PKI) EnrollAndroidKey(t *testing.T, rpID, origin string, challenge []by
 	clientData := `{"type":"webauthn.create","challenge":"` + b64.EncodeToString(challenge) + `","origin":"` + origin + `"}`
 	cdHash := sha256.Sum256([]byte(clientData))
 
-	// The KeyDescription challenge binds
-	// SHA-256(authenticatorData || clientDataHash).
-	bound := sha256.Sum256(append(append([]byte{}, authData...), cdHash[:]...))
-	kdChallenge := bound[:]
+	// The KeyDescription challenge is identical to clientDataHash
+	// (WebAuthn §8.4).
+	kdChallenge := cdHash[:]
 	if opts.WrongChallenge {
 		w := sha256.Sum256([]byte("wrong challenge"))
 		kdChallenge = w[:]
@@ -491,7 +541,7 @@ func (p *PKI) EnrollAndroidKey(t *testing.T, rpID, origin string, challenge []by
 	if opts.SecurityLevelSet {
 		level = opts.SecurityLevel
 	}
-	kdDER := androidKeyDescriptionDER(t, kdChallenge, level, !opts.NoPurpose)
+	kdDER := androidKeyDescriptionDER(t, kdChallenge, level, opts)
 	if opts.TrailingJunk {
 		kdDER = append(kdDER, 0xDE, 0xAD, 0xBE, 0xEF)
 	}
@@ -536,12 +586,14 @@ func (p *PKI) EnrollAndroidKey(t *testing.T, rpID, origin string, challenge []by
 		SerialNumber: big.NewInt(3),
 		// Real Android leaves use CN "Android Keystore Key" and
 		// no OU — the FIDO "Authenticator Attestation" OU
-		// requirement must not apply here.
-		Subject:               pkix.Name{CommonName: "Android Keystore Key"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		BasicConstraintsValid: true,
+		// requirement must not apply here. They also carry no
+		// Basic Constraints extension, so it is deliberately
+		// not set (matching real devices keeps the happy path
+		// representative).
+		Subject:   pkix.Name{CommonName: "Android Keystore Key"},
+		NotBefore: time.Now().Add(-time.Hour),
+		NotAfter:  time.Now().Add(time.Hour),
+		KeyUsage:  x509.KeyUsageDigitalSignature,
 		ExtraExtensions: []pkix.Extension{
 			{Id: androidKeyDescriptionOID, Value: kdDER},
 		},

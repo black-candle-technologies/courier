@@ -646,10 +646,15 @@ func verifyFidoU2FAttestation(attObj *attestationObject, authData, clientDataHas
 //  4. the leaf matches the Android attestation certificate
 //     profile and carries the KeyDescription extension,
 //  5. the KeyDescription parses with no trailing DER bytes, its
-//     attestationChallenge equals
-//     SHA-256(authenticatorData || clientDataHash), and its
+//     attestationChallenge is identical to clientDataHash
+//     (WebAuthn §8.4 — not the SafetyNet-style
+//     SHA-256(authData || clientDataHash) nonce), and its
 //     attestationSecurityLevel is hardware (never Software),
-//  6. the AuthorizationList grants purpose SIGN,
+//  6. the AuthorizationLists satisfy the WebAuthn §8.4 checks:
+//     allApplications absent from both lists, and —
+//     Courier's policy is hardware-only, so per the spec the
+//     teeEnforced list alone governs — origin is
+//     KM_ORIGIN_GENERATED and purpose grants KM_PURPOSE_SIGN,
 //  7. the leaf public key equals the enrolled credential key
 //     (P-256 coordinate comparison),
 //  8. sig verifies over authenticatorData || clientDataHash with
@@ -678,13 +683,219 @@ const (
 // create signatures. A WebAuthn credential key must grant it.
 const androidKeyPurposeSign = 2
 
-// androidAuthorizationList is the subset of Android's
-// AuthorizationList this verifier needs. The full list carries
-// dozens of optional context-tagged fields; only purpose ([1]
-// EXPLICIT SET OF INTEGER) is extracted, the rest are ignored.
-// (encoding/asn1 tolerates the trailing fields.)
-type androidAuthorizationList struct {
-	Purpose asn1.RawValue `asn1:"explicit,optional,tag:1"`
+// androidKeyOriginGenerated is KeyProperties.ORIGIN_GENERATED: the
+// key was generated inside the Android KeyStore, not imported. A
+// WebAuthn credential key must be device-generated.
+const androidKeyOriginGenerated = 0
+
+// androidAuthList is the parsed subset of Android's
+// AuthorizationList this verifier enforces. The full list carries
+// dozens of optional context-tagged fields; only purpose ([1]),
+// allApplications ([600]) and origin ([702]) are extracted, the
+// rest are skipped with strict bounds checks.
+type androidAuthList struct {
+	purposes        []int
+	purposePresent  bool
+	allApplications bool
+	origin          int
+	originPresent   bool
+}
+
+// parseAndroidAuthList parses one AuthorizationList SEQUENCE,
+// enforcing the WebAuthn §8.4 checks: allApplications must be
+// absent, and (for the hardware-only policy, from the teeEnforced
+// list) origin must be KM_ORIGIN_GENERATED and purpose must grant
+// KM_PURPOSE_SIGN. Unknown fields are skipped with strict bounds
+// checks; duplicate fields fail closed.
+func parseAndroidAuthList(der []byte) (*androidAuthList, error) {
+	if len(der) < 2 || der[0] != 0x30 {
+		return nil, fmt.Errorf("enrollment: android-key authorization list is not a SEQUENCE")
+	}
+	_, _, _, content, total, err := derParseTLV(der)
+	if err != nil {
+		return nil, fmt.Errorf("enrollment: android-key authorization list: %w", err)
+	}
+	if total != len(der) {
+		return nil, fmt.Errorf("enrollment: android-key authorization list has trailing bytes")
+	}
+	out := &androidAuthList{}
+	seen := map[int]bool{}
+	for len(content) > 0 {
+		class, constructed, tagNo, value, vtotal, err := derParseTLV(content)
+		if err != nil {
+			return nil, fmt.Errorf("enrollment: android-key authorization list field: %w", err)
+		}
+		if class != 2 || !constructed {
+			return nil, fmt.Errorf("enrollment: android-key authorization list field is not context-specific constructed")
+		}
+		if seen[tagNo] {
+			return nil, fmt.Errorf("enrollment: android-key authorization list has duplicate field %d", tagNo)
+		}
+		seen[tagNo] = true
+		// Each field is [n] EXPLICIT <value>: the element
+		// content is the wrapped value's TLV.
+		switch tagNo {
+		case 1: // purpose: SET OF INTEGER
+			ints, err := derStrictIntegerSet(value)
+			if err != nil {
+				return nil, fmt.Errorf("enrollment: android-key purpose: %w", err)
+			}
+			out.purposes = ints
+			out.purposePresent = true
+		case 600: // allApplications: must be absent
+			out.allApplications = true
+		case 702: // origin: single INTEGER
+			v, err := derStrictInteger(value)
+			if err != nil {
+				return nil, fmt.Errorf("enrollment: android-key origin: %w", err)
+			}
+			out.origin = v
+			out.originPresent = true
+		default:
+			// Ignored: the verifier only enforces the
+			// WebAuthn §8.4 authorization-list checks.
+		}
+		content = content[vtotal:]
+	}
+	return out, nil
+}
+
+// derParseTLV parses one DER tag-length-value at the start of b,
+// returning the tag class (0=universal, 2=context-specific), the
+// constructed bit, the tag number (high-tag-number form decoded),
+// the content bytes, and the total TLV length. Lengths must be
+// definite and minimal; indefinite or overlong forms fail closed.
+// Bounds are checked by subtraction so a forged length cannot
+// overflow on any target.
+func derParseTLV(b []byte) (class int, constructed bool, tagNo int, value []byte, total int, err error) {
+	if len(b) < 2 {
+		err = fmt.Errorf("truncated tag")
+		return
+	}
+	class = int(b[0] >> 6)
+	constructed = b[0]&0x20 != 0
+	tagNo = int(b[0] & 0x1f)
+	pos := 1
+	if tagNo == 31 {
+		// High-tag-number form: base-128, big-endian.
+		tagNo = 0
+		for {
+			if pos >= len(b) {
+				err = fmt.Errorf("truncated tag number")
+				return
+			}
+			c := b[pos]
+			pos++
+			if tagNo > (1<<20)>>7 {
+				err = fmt.Errorf("tag number too large")
+				return
+			}
+			tagNo = tagNo<<7 | int(c&0x7f)
+			if c&0x80 == 0 {
+				break
+			}
+		}
+	}
+	if pos >= len(b) {
+		err = fmt.Errorf("truncated length")
+		return
+	}
+	lb := b[pos]
+	pos++
+	var contentLen int
+	if lb&0x80 == 0 {
+		contentLen = int(lb)
+	} else {
+		n := int(lb & 0x7f)
+		if n == 0 || n > 4 || len(b)-pos < n {
+			err = fmt.Errorf("bad length encoding")
+			return
+		}
+		if b[pos] == 0x00 {
+			err = fmt.Errorf("non-minimal length encoding")
+			return
+		}
+		for _, c := range b[pos : pos+n] {
+			contentLen = contentLen<<8 | int(c)
+		}
+		pos += n
+		// Minimal form: the length must not have fit in
+		// fewer bytes.
+		if contentLen < 128 || (n > 1 && contentLen < 1<<(8*(n-1))) {
+			err = fmt.Errorf("non-minimal length encoding")
+			return
+		}
+	}
+	if contentLen > len(b)-pos {
+		err = fmt.Errorf("length exceeds input")
+		return
+	}
+	value = b[pos : pos+contentLen]
+	total = pos + contentLen
+	return
+}
+
+// derStrictIntegerSet parses exactly one DER SET OF INTEGER,
+// requiring the SET tag, minimal length encoding, minimal
+// non-negative INTEGER encodings, and no trailing bytes.
+func derStrictIntegerSet(der []byte) ([]int, error) {
+	class, constructed, tagNo, content, total, err := derParseTLV(der)
+	if err != nil {
+		return nil, err
+	}
+	if class != 0 || !constructed || tagNo != 17 {
+		return nil, fmt.Errorf("want SET, got class %d tag %d", class, tagNo)
+	}
+	if total != len(der) {
+		return nil, fmt.Errorf("trailing bytes after SET")
+	}
+	var out []int
+	for len(content) > 0 {
+		v, vtotal, err := derStrictIntegerTLV(content)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+		content = content[vtotal:]
+	}
+	return out, nil
+}
+
+// derStrictInteger parses exactly one DER INTEGER TLV: minimal
+// non-negative encoding, values capped well above the small
+// constants this verifier compares.
+func derStrictInteger(der []byte) (int, error) {
+	v, total, err := derStrictIntegerTLV(der)
+	if err != nil {
+		return 0, err
+	}
+	if total != len(der) {
+		return 0, fmt.Errorf("trailing bytes after INTEGER")
+	}
+	return v, nil
+}
+
+func derStrictIntegerTLV(b []byte) (v, total int, err error) {
+	class, constructed, tagNo, value, total, err := derParseTLV(b)
+	if err != nil {
+		return 0, 0, err
+	}
+	if class != 0 || constructed || tagNo != 2 {
+		return 0, 0, fmt.Errorf("want INTEGER, got class %d tag %d", class, tagNo)
+	}
+	if len(value) == 0 || len(value) > 4 {
+		return 0, 0, fmt.Errorf("bad INTEGER length %d", len(value))
+	}
+	if value[0]&0x80 != 0 {
+		return 0, 0, fmt.Errorf("negative INTEGER")
+	}
+	if len(value) > 1 && value[0] == 0x00 && value[1]&0x80 == 0 {
+		return 0, 0, fmt.Errorf("non-minimal INTEGER encoding")
+	}
+	for _, c := range value {
+		v = v<<8 | int(c)
+	}
+	return v, total, nil
 }
 
 // androidKeyDescription is the ASN.1 KeyDescription in the
@@ -700,6 +911,11 @@ type androidAuthorizationList struct {
 //	    softwareEnforced           AuthorizationList,
 //	    teeEnforced                AuthorizationList,
 //	}
+//
+// The authorization lists are captured raw: their context-tagged
+// fields need a stricter parser than encoding/asn1's (notably
+// [1] EXPLICIT SET OF INTEGER for purpose), so they are decoded
+// by parseAndroidAuthList.
 type androidKeyDescription struct {
 	AttestationVersion       int
 	AttestationSecurityLevel asn1.Enumerated
@@ -707,8 +923,8 @@ type androidKeyDescription struct {
 	KeymasterSecurityLevel   asn1.Enumerated
 	AttestationChallenge     []byte
 	UniqueID                 []byte
-	SoftwareEnforced         androidAuthorizationList
-	TEEEnforced              androidAuthorizationList
+	SoftwareEnforced         asn1.RawValue
+	TEEEnforced              asn1.RawValue
 }
 
 // parseAndroidKeyDescription parses the KeyDescription extension
@@ -724,106 +940,20 @@ func parseAndroidKeyDescription(ext []byte) (*androidKeyDescription, error) {
 	if len(rest) != 0 {
 		return nil, fmt.Errorf("enrollment: android-key KeyDescription has %d trailing bytes", len(rest))
 	}
+	if kd.SoftwareEnforced.Class != 0 || kd.SoftwareEnforced.Tag != 16 || !kd.SoftwareEnforced.IsCompound ||
+		kd.TEEEnforced.Class != 0 || kd.TEEEnforced.Tag != 16 || !kd.TEEEnforced.IsCompound {
+		return nil, fmt.Errorf("enrollment: android-key authorization lists are not SEQUENCEs")
+	}
 	return &kd, nil
-}
-
-// androidKeyPurposes returns the union of purpose values granted in
-// the software-enforced and TEE-enforced authorization lists.
-// Purpose is checked in both lists rather than only teeEnforced:
-// the property that matters for enrollment is that the key is
-// authorized to sign, and real devices vary in which list carries
-// it (the live-device retest will confirm placement).
-func androidKeyPurposes(lists ...androidAuthorizationList) ([]int, error) {
-	var out []int
-	for _, l := range lists {
-		p := l.Purpose
-		if p.Class == 0 && p.Tag == 0 && !p.IsCompound {
-			continue // purpose absent from this list
-		}
-		if p.Class != 2 || p.Tag != 1 || !p.IsCompound {
-			return nil, fmt.Errorf("enrollment: android-key purpose field has unexpected tag (class %d tag %d)", p.Class, p.Tag)
-		}
-		ints, err := parseDERIntegerSet(p.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("enrollment: android-key purpose set: %w", err)
-		}
-		out = append(out, ints...)
-	}
-	return out, nil
-}
-
-// parseDERIntegerSet parses a DER SET OF INTEGER (or, leniently, a
-// SEQUENCE OF INTEGER — some encoders use it) into its values.
-// Values are bounded: purpose tags are small constants, and an
-// unbounded bignum here would only ever feed a membership test.
-func parseDERIntegerSet(der []byte) ([]int, error) {
-	if len(der) < 2 || (der[0] != 0x31 && der[0] != 0x30) {
-		return nil, fmt.Errorf("expected SET or SEQUENCE, got tag 0x%02x", der[0]&0xff)
-	}
-	inner, err := derContent(der)
-	if err != nil {
-		return nil, err
-	}
-	var out []int
-	for len(inner) > 0 {
-		if inner[0] != 0x02 {
-			return nil, fmt.Errorf("expected INTEGER, got tag 0x%02x", inner[0])
-		}
-		vb, err := derContent(inner)
-		if err != nil {
-			return nil, err
-		}
-		if len(vb) == 0 || len(vb) > 4 || vb[0]&0x80 != 0 || (len(vb) > 1 && vb[0] == 0x00 && vb[1]&0x80 == 0) {
-			return nil, fmt.Errorf("bad INTEGER encoding")
-		}
-		v := 0
-		for _, b := range vb {
-			v = v<<8 | int(b)
-		}
-		// Advance past this INTEGER element: its tag+length
-		// header plus the value bytes just consumed.
-		hl, _ := derTagLen(inner)
-		inner = inner[hl+len(vb):]
-		out = append(out, v)
-	}
-	return out, nil
-}
-
-// derTagLen parses a DER tag+length header, returning the total
-// header length and the content length.
-func derTagLen(b []byte) (headerLen int, contentLen int) {
-	if len(b) < 2 {
-		return 0, -1
-	}
-	lb := b[1]
-	if lb&0x80 == 0 {
-		return 2, int(lb)
-	}
-	n := int(lb & 0x7f)
-	if n == 0 || n > 4 || len(b) < 2+n {
-		return 0, -1
-	}
-	contentLen = 0
-	for _, c := range b[2 : 2+n] {
-		contentLen = contentLen<<8 | int(c)
-	}
-	return 2 + n, contentLen
-}
-
-// derContent returns the content bytes of one DER TLV at the start
-// of b, erroring on truncation or absurd lengths.
-func derContent(b []byte) ([]byte, error) {
-	hl, cl := derTagLen(b)
-	if cl < 0 || hl+cl > len(b) {
-		return nil, fmt.Errorf("truncated or overlong DER value")
-	}
-	return b[hl : hl+cl], nil
 }
 
 // checkAndroidAttestationCertProfile enforces the Android
 // attestation certificate profile. Unlike the FIDO packed profile,
 // Android leaves carry no "Authenticator Attestation" OU (real
-// leaves use CN "Android Keystore Key"), so the profile requires:
+// leaves use CN "Android Keystore Key") and no Basic Constraints
+// extension (Go reports BasicConstraintsValid=false when it is
+// absent, so requiring it would reject compliant leaves) — the
+// profile requires:
 //   - X.509 v3,
 //   - a non-CA end entity,
 //   - digitalSignature key usage,
@@ -834,7 +964,7 @@ func checkAndroidAttestationCertProfile(leaf *x509.Certificate, alg int64) error
 	if leaf.Version != 3 {
 		return fmt.Errorf("enrollment: android-key leaf is not X.509 v3 (got v%d)", leaf.Version)
 	}
-	if !leaf.BasicConstraintsValid || leaf.IsCA {
+	if leaf.IsCA {
 		return fmt.Errorf("enrollment: android-key leaf must be a non-CA end-entity certificate")
 	}
 	if leaf.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
@@ -910,10 +1040,13 @@ func verifyAndroidKeyAttestation(attObj *attestationObject, authData, clientData
 	}
 
 	// The KeyDescription binds this attestation to the ceremony:
-	// its attestationChallenge must equal
-	// SHA-256(authenticatorData || clientDataHash), so a
-	// challenge holder cannot transplant a genuine device's
-	// attestation onto their own ceremony.
+	// per WebAuthn §8.4 its attestationChallenge is identical to
+	// clientDataHash. (The SHA-256(authData || clientDataHash)
+	// nonce pattern belongs to SafetyNet, not android-key; the
+	// signature below already covers authData || clientDataHash.)
+	// Comparing against clientDataHash stops a challenge holder
+	// from transplanting a genuine device's attestation onto
+	// their own ceremony.
 	var kdDER []byte
 	for _, ext := range leaf.Extensions {
 		if ext.Id.Equal(androidKeyDescriptionOID) {
@@ -936,22 +1069,37 @@ func verifyAndroidKeyAttestation(attObj *attestationObject, authData, clientData
 	default:
 		return fmt.Errorf("enrollment: android-key attestation security level %d is not hardware-backed (need TrustedEnvironment or StrongBox)", kd.AttestationSecurityLevel)
 	}
-	bound := sha256.Sum256(append(append([]byte{}, authData...), clientDataHash...))
-	if subtle.ConstantTimeCompare(kd.AttestationChallenge, bound[:]) != 1 {
+	if subtle.ConstantTimeCompare(kd.AttestationChallenge, clientDataHash) != 1 {
 		return fmt.Errorf("enrollment: android-key attestation challenge does not match this ceremony")
 	}
-	purposes, err := androidKeyPurposes(kd.SoftwareEnforced, kd.TEEEnforced)
+	// WebAuthn §8.4 authorization-list checks. allApplications
+	// must be absent from both lists (the credential is scoped
+	// to the RP ID, never usable by any app). Courier's policy
+	// is hardware-only, so per the spec the teeEnforced list
+	// alone governs the remaining checks: the key must have
+	// been generated on-device and must be authorized to sign.
+	swEnforced, err := parseAndroidAuthList(kd.SoftwareEnforced.FullBytes)
 	if err != nil {
 		return err
 	}
+	teeEnforced, err := parseAndroidAuthList(kd.TEEEnforced.FullBytes)
+	if err != nil {
+		return err
+	}
+	if swEnforced.allApplications || teeEnforced.allApplications {
+		return fmt.Errorf("enrollment: android-key attested key is not scoped to this RP (allApplications present)")
+	}
+	if !teeEnforced.originPresent || teeEnforced.origin != androidKeyOriginGenerated {
+		return fmt.Errorf("enrollment: android-key attested key was not generated on-device")
+	}
 	signOK := false
-	for _, p := range purposes {
+	for _, p := range teeEnforced.purposes {
 		if p == androidKeyPurposeSign {
 			signOK = true
 			break
 		}
 	}
-	if !signOK {
+	if !teeEnforced.purposePresent || !signOK {
 		return fmt.Errorf("enrollment: android-key attested key does not grant purpose SIGN")
 	}
 
