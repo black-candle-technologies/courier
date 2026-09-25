@@ -38,6 +38,11 @@ type PKI struct {
 	AttestDER []byte
 	// RootDER is the DER-encoded self-signed CA certificate.
 	RootDER []byte
+	// RootKey and RootCert sign Android attestation leaves in
+	// tests (the android-key leaf carries the credential key, so
+	// each enrollment mints its own leaf).
+	RootKey  *ecdsa.PrivateKey
+	RootCert *x509.Certificate
 }
 
 // NewPKI generates a fresh attestation CA and leaf.
@@ -93,7 +98,7 @@ func NewPKI(t *testing.T) *PKI {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &PKI{AttestKey: attestKey, AttestDER: attestDER, RootDER: rootDER}
+	return &PKI{AttestKey: attestKey, AttestDER: attestDER, RootDER: rootDER, RootKey: rootKey, RootCert: rootCert}
 }
 
 // WriteRootFile writes the CA certificate to a temp file and returns
@@ -375,4 +380,219 @@ func cborArray(items ...[]byte) []byte {
 		out = append(out, it...)
 	}
 	return out
+}
+
+// --- Android Key (android-key) attestation fixtures ---
+
+// androidKeyDescriptionOID mirrors the vhl package's OID: the
+// Android KeyStore KeyDescription extension.
+var androidKeyDescriptionOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 1, 17}
+
+// Android security levels, mirroring the KeyDescription
+// attestationSecurityLevel values.
+const (
+	androidSecuritySoftware           = 0
+	androidSecurityTrustedEnvironment = 1
+	androidSecurityStrongBox          = 2
+)
+
+// AndroidEnrollOpts tunes the synthetic android-key enrollment for
+// negative tests. The zero value is the happy path: StrongBox
+// security level, correct challenge, matching key, trusted root,
+// valid signature.
+type AndroidEnrollOpts struct {
+	// SecurityLevel overrides the KeyDescription
+	// attestationSecurityLevel. It applies only when
+	// SecurityLevelSet is true (so the zero value keeps the
+	// StrongBox happy path while tests can still select
+	// Software(0)).
+	SecurityLevel    int
+	SecurityLevelSet bool
+	WrongChallenge   bool // KeyDescription carries the wrong challenge
+	KeyMismatch      bool // leaf cert holds a different key than the credential
+	NoPurpose        bool // omit purpose SIGN from the authorization lists
+	WrongRoot        bool // leaf signed by a throwaway CA, not the test root
+	BadSig           bool // corrupt the attestation signature
+	WrongAlg         bool // attStmt alg -257 instead of -7
+	DupX5C           bool // attStmt carries "x5c" twice (must fail closed)
+	ExtraStmtField   bool // attStmt carries an unknown extra field
+	TrailingJunk     bool // junk bytes appended after the KeyDescription DER
+}
+
+// androidKeyDescriptionDER builds a minimal but structurally valid
+// KeyDescription ASN.1 record. The purpose field is encoded as
+// [1] EXPLICIT SET OF INTEGER, matching real Android devices
+// (Go's asn1 would emit a SEQUENCE instead).
+func androidKeyDescriptionDER(t *testing.T, challenge []byte, securityLevel int, withPurpose bool) []byte {
+	t.Helper()
+	var teeContent []byte
+	if withPurpose {
+		// [1] EXPLICIT SET { INTEGER 2 }  (purpose SIGN)
+		set := []byte{0x31, 0x03, 0x02, 0x01, 0x02}
+		teeContent = append([]byte{0xA1, byte(len(set))}, set...)
+	}
+	kd := struct {
+		AttestationVersion       int
+		AttestationSecurityLevel asn1.Enumerated
+		KeymasterVersion         int
+		KeymasterSecurityLevel   asn1.Enumerated
+		AttestationChallenge     []byte
+		UniqueID                 []byte
+		SoftwareEnforced         asn1.RawValue
+		TEEEnforced              asn1.RawValue
+	}{
+		AttestationVersion:       4,
+		AttestationSecurityLevel: asn1.Enumerated(securityLevel),
+		KeymasterVersion:         41,
+		KeymasterSecurityLevel:   asn1.Enumerated(securityLevel),
+		AttestationChallenge:     challenge,
+		UniqueID:                 []byte{},
+		SoftwareEnforced:         asn1.RawValue{Class: 0, Tag: 16, IsCompound: true, Bytes: []byte{}},
+		TEEEnforced:              asn1.RawValue{Class: 0, Tag: 16, IsCompound: true, Bytes: teeContent},
+	}
+	der, err := asn1.Marshal(kd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return der
+}
+
+// EnrollAndroidKey builds an android-key enrollment ceremony: a
+// fresh credential key, UP|UV authData, and an attestation
+// statement in the Android Key Attestation format. The leaf
+// certificate's public key is the credential key, its
+// KeyDescription extension binds the ceremony challenge, and the
+// statement is signed by the credential key — in the Android
+// model the hardware proof is the certificate chain to the trust
+// anchor, and the signature proves possession at registration.
+func (p *PKI) EnrollAndroidKey(t *testing.T, rpID, origin string, challenge []byte, opts AndroidEnrollOpts) *Enrollment {
+	t.Helper()
+	credKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credID := make([]byte, 32)
+	if _, err := rand.Read(credID); err != nil {
+		t.Fatal(err)
+	}
+	authData := p.authData(t, rpID, credID, &credKey.PublicKey)
+	clientData := `{"type":"webauthn.create","challenge":"` + b64.EncodeToString(challenge) + `","origin":"` + origin + `"}`
+	cdHash := sha256.Sum256([]byte(clientData))
+
+	// The KeyDescription challenge binds
+	// SHA-256(authenticatorData || clientDataHash).
+	bound := sha256.Sum256(append(append([]byte{}, authData...), cdHash[:]...))
+	kdChallenge := bound[:]
+	if opts.WrongChallenge {
+		w := sha256.Sum256([]byte("wrong challenge"))
+		kdChallenge = w[:]
+	}
+	level := androidSecurityStrongBox
+	if opts.SecurityLevelSet {
+		level = opts.SecurityLevel
+	}
+	kdDER := androidKeyDescriptionDER(t, kdChallenge, level, !opts.NoPurpose)
+	if opts.TrailingJunk {
+		kdDER = append(kdDER, 0xDE, 0xAD, 0xBE, 0xEF)
+	}
+
+	// The attested key: the credential key, or a different key to
+	// exercise the key-binding check.
+	leafPub := &credKey.PublicKey
+	if opts.KeyMismatch {
+		other, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leafPub = &other.PublicKey
+	}
+	caCert := p.RootCert
+	caKey := p.RootKey
+	if opts.WrongRoot {
+		wrongKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wrongTmpl := &x509.Certificate{
+			SerialNumber:          big.NewInt(999),
+			Subject:               pkix.Name{CommonName: "wrong root"},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(time.Hour),
+			IsCA:                  true,
+			KeyUsage:              x509.KeyUsageCertSign,
+			BasicConstraintsValid: true,
+		}
+		wrongDER, err := x509.CreateCertificate(rand.Reader, wrongTmpl, wrongTmpl, &wrongKey.PublicKey, wrongKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		caCert, err = x509.ParseCertificate(wrongDER)
+		if err != nil {
+			t.Fatal(err)
+		}
+		caKey = wrongKey
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		// Real Android leaves use CN "Android Keystore Key" and
+		// no OU — the FIDO "Authenticator Attestation" OU
+		// requirement must not apply here.
+		Subject:               pkix.Name{CommonName: "Android Keystore Key"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		ExtraExtensions: []pkix.Extension{
+			{Id: androidKeyDescriptionOID, Value: kdDER},
+		},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, leafPub, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sig := ecdsaSign(t, credKey, authData, cdHash[:])
+	if opts.BadSig {
+		sig = append([]byte{}, sig...)
+		sig[len(sig)/2] ^= 0xFF
+	}
+	alg := int64(-7)
+	if opts.WrongAlg {
+		alg = -257
+	}
+	x5c := cborArray(cborBstr(leafDER))
+	var attStmt []byte
+	switch {
+	case opts.DupX5C:
+		attStmt = cborMap(
+			cborTstr("alg"), cborNeg(alg),
+			cborTstr("sig"), cborBstr(sig),
+			cborTstr("x5c"), x5c,
+			cborTstr("x5c"), x5c,
+		)
+	case opts.ExtraStmtField:
+		attStmt = cborMap(
+			cborTstr("alg"), cborNeg(alg),
+			cborTstr("sig"), cborBstr(sig),
+			cborTstr("x5c"), x5c,
+			cborTstr("ver"), cborTstr("1.0"),
+		)
+	default:
+		attStmt = cborMap(
+			cborTstr("alg"), cborNeg(alg),
+			cborTstr("sig"), cborBstr(sig),
+			cborTstr("x5c"), x5c,
+		)
+	}
+	attObj := cborMap(
+		cborTstr("fmt"), cborTstr("android-key"),
+		cborTstr("attStmt"), attStmt,
+		cborTstr("authData"), cborBstr(authData),
+	)
+	return &Enrollment{
+		OuterB64: p.outer(t, credID, clientData, attObj),
+		AuthData: authData,
+		CredKey:  credKey,
+		CredID:   credID,
+	}
 }

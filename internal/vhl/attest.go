@@ -29,9 +29,10 @@ package vhl
 // Enrollment therefore fails closed with no trust anchors
 // configured, and rejects "none" and self attestations outright.
 //
-// Supported formats: "packed" (x5c only) and "fido-u2f". Anything
-// else — "tpm", "android-key", "apple", "none" — is rejected with a
-// clear error, never silently accepted.
+// Supported formats: "packed" (x5c only), "fido-u2f", and
+// "android-key" (Android Key Attestation, WebAuthn §8.4). Anything
+// else — "tpm", "apple", "none" — is rejected with a clear error,
+// never silently accepted.
 
 import (
 	"bytes"
@@ -106,6 +107,10 @@ type attestationObject struct {
 	Format   string
 	AuthData []byte
 	Stmt     map[string]any // "alg" int64, "sig" []byte, "x5c" [][]byte
+	// StmtKeys records the attStmt map's keys in wire order,
+	// including unknown keys that were skipped during decode, so
+	// format verifiers can enforce a closed statement map.
+	StmtKeys []string
 }
 
 // parseAttestationObject decodes the CBOR attestation object:
@@ -140,11 +145,20 @@ func parseAttestationObject(raw []byte) (*attestationObject, error) {
 			if err != nil {
 				return nil, fmt.Errorf("attestation attStmt: %w", err)
 			}
+			seen := map[string]bool{}
 			for j := 0; j < m; j++ {
 				sk, err := d.readTstr()
 				if err != nil {
 					return nil, fmt.Errorf("attStmt key: %w", err)
 				}
+				// Duplicate statement keys fail closed: with
+				// last-wins map semantics a second "x5c" could
+				// silently replace the attested chain.
+				if seen[sk] {
+					return nil, fmt.Errorf("attestation attStmt: duplicate key %q", sk)
+				}
+				seen[sk] = true
+				out.StmtKeys = append(out.StmtKeys, sk)
 				switch sk {
 				case "alg":
 					v, err := d.readInt()
@@ -364,16 +378,19 @@ func isZeroAAGUID(aaguid []byte) bool {
 
 // verifyAttestationStatement verifies the attestation statement for
 // a registration ceremony. Only formats with a certificate chain to
-// a configured trust anchor are accepted: "packed" with x5c, and
-// "fido-u2f". "none" carries no proof and self attestations are
-// signed by the enrolled key itself — both are forgeable by anyone
-// holding the ceremony challenge, so both fail closed.
+// a configured trust anchor are accepted: "packed" with x5c,
+// "fido-u2f", and "android-key". "none" carries no proof and self
+// attestations are signed by the enrolled key itself — both are
+// forgeable by anyone holding the ceremony challenge, so both fail
+// closed.
 func verifyAttestationStatement(attObj *attestationObject, authData, clientDataHash, coseKey []byte, rp WebAuthnRP, now time.Time) error {
 	switch attObj.Format {
 	case "packed":
 		return verifyPackedAttestation(attObj, authData, clientDataHash, rp, now)
 	case "fido-u2f":
 		return verifyFidoU2FAttestation(attObj, authData, clientDataHash, rp, now)
+	case "android-key":
+		return verifyAndroidKeyAttestation(attObj, authData, clientDataHash, coseKey, rp, now)
 	case "none":
 		return fmt.Errorf("enrollment: attestation format %q carries no authenticator proof — refusing (request attestation \"direct\" in the ceremony)", attObj.Format)
 	default:
@@ -602,6 +619,369 @@ func verifyFidoU2FAttestation(attObj *attestationObject, authData, clientDataHas
 	digest := sha256.Sum256(signed)
 	if !ecdsa.VerifyASN1(pub, digest[:], sig) {
 		return fmt.Errorf("enrollment: fido-u2f attestation signature invalid")
+	}
+	return nil
+}
+
+// Android Key Attestation (WebAuthn §8.4, "android-key").
+//
+// Android platform authenticators — e.g. a phone used as the
+// authenticator over the WebAuthn hybrid (QR-code) transport — can
+// return hardware-backed attestations where Apple's can only
+// return "none" for synced passkeys: the leaf certificate's public
+// key IS the enrolled credential key, and the leaf carries the
+// Android KeyDescription extension (OID 1.3.6.1.4.1.11129.2.1.17)
+// binding the ceremony challenge. The chain terminates at Google's
+// Hardware Attestation Root CA, which the operator pins in
+// rp.AttestationRoots alongside the other vendor roots — trust
+// anchors are always operator-configured, never the system pool
+// and never anything the statement itself asserts.
+//
+// Verification, in order:
+//  1. the attStmt map is exactly {alg, sig, x5c} (the WebAuthn CDDL
+//     defines no other members; unknown fields fail closed),
+//  2. alg is ES256 (-7), the only algorithm Android WebAuthn
+//     credentials use,
+//  3. the x5c chain anchors to a configured trust anchor,
+//  4. the leaf matches the Android attestation certificate
+//     profile and carries the KeyDescription extension,
+//  5. the KeyDescription parses with no trailing DER bytes, its
+//     attestationChallenge equals
+//     SHA-256(authenticatorData || clientDataHash), and its
+//     attestationSecurityLevel is hardware (never Software),
+//  6. the AuthorizationList grants purpose SIGN,
+//  7. the leaf public key equals the enrolled credential key
+//     (P-256 coordinate comparison),
+//  8. sig verifies over authenticatorData || clientDataHash with
+//     the leaf key.
+//
+// A note on what the signature proves: in the Android attestation
+// model sig is made by the attested key itself, so the signature
+// alone proves only possession. The hardware proof is the
+// certificate chain to Google's root plus the challenge-bound
+// KeyDescription — that is what stops a challenge holder from
+// fabricating an enrollment.
+
+// androidKeyDescriptionOID is the Android KeyStore attestation
+// extension: the KeyDescription record describing the attested key.
+var androidKeyDescriptionOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 1, 17}
+
+// Android KeyStore security levels (KeyDescription
+// attestationSecurityLevel / keymasterSecurityLevel).
+const (
+	androidSecuritySoftware           = 0
+	androidSecurityTrustedEnvironment = 1
+	androidSecurityStrongBox          = 2
+)
+
+// androidKeyPurposeSign is KeyProperties.PURPOSE_SIGN: the key may
+// create signatures. A WebAuthn credential key must grant it.
+const androidKeyPurposeSign = 2
+
+// androidAuthorizationList is the subset of Android's
+// AuthorizationList this verifier needs. The full list carries
+// dozens of optional context-tagged fields; only purpose ([1]
+// EXPLICIT SET OF INTEGER) is extracted, the rest are ignored.
+// (encoding/asn1 tolerates the trailing fields.)
+type androidAuthorizationList struct {
+	Purpose asn1.RawValue `asn1:"explicit,optional,tag:1"`
+}
+
+// androidKeyDescription is the ASN.1 KeyDescription in the
+// attestation extension:
+//
+//	KeyDescription ::= SEQUENCE {
+//	    attestationVersion         INTEGER,
+//	    attestationSecurityLevel   SecurityLevel,
+//	    keymasterVersion           INTEGER,
+//	    keymasterSecurityLevel     SecurityLevel,
+//	    attestationChallenge       OCTET_STRING,
+//	    uniqueId                   OCTET_STRING,
+//	    softwareEnforced           AuthorizationList,
+//	    teeEnforced                AuthorizationList,
+//	}
+type androidKeyDescription struct {
+	AttestationVersion       int
+	AttestationSecurityLevel asn1.Enumerated
+	KeymasterVersion         int
+	KeymasterSecurityLevel   asn1.Enumerated
+	AttestationChallenge     []byte
+	UniqueID                 []byte
+	SoftwareEnforced         androidAuthorizationList
+	TEEEnforced              androidAuthorizationList
+}
+
+// parseAndroidKeyDescription parses the KeyDescription extension
+// value, failing closed on any trailing bytes after the DER —
+// trailing junk after a valid record must not be silently
+// ignored.
+func parseAndroidKeyDescription(ext []byte) (*androidKeyDescription, error) {
+	var kd androidKeyDescription
+	rest, err := asn1.Unmarshal(ext, &kd)
+	if err != nil {
+		return nil, fmt.Errorf("enrollment: android-key KeyDescription: %w", err)
+	}
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("enrollment: android-key KeyDescription has %d trailing bytes", len(rest))
+	}
+	return &kd, nil
+}
+
+// androidKeyPurposes returns the union of purpose values granted in
+// the software-enforced and TEE-enforced authorization lists.
+// Purpose is checked in both lists rather than only teeEnforced:
+// the property that matters for enrollment is that the key is
+// authorized to sign, and real devices vary in which list carries
+// it (the live-device retest will confirm placement).
+func androidKeyPurposes(lists ...androidAuthorizationList) ([]int, error) {
+	var out []int
+	for _, l := range lists {
+		p := l.Purpose
+		if p.Class == 0 && p.Tag == 0 && !p.IsCompound {
+			continue // purpose absent from this list
+		}
+		if p.Class != 2 || p.Tag != 1 || !p.IsCompound {
+			return nil, fmt.Errorf("enrollment: android-key purpose field has unexpected tag (class %d tag %d)", p.Class, p.Tag)
+		}
+		ints, err := parseDERIntegerSet(p.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("enrollment: android-key purpose set: %w", err)
+		}
+		out = append(out, ints...)
+	}
+	return out, nil
+}
+
+// parseDERIntegerSet parses a DER SET OF INTEGER (or, leniently, a
+// SEQUENCE OF INTEGER — some encoders use it) into its values.
+// Values are bounded: purpose tags are small constants, and an
+// unbounded bignum here would only ever feed a membership test.
+func parseDERIntegerSet(der []byte) ([]int, error) {
+	if len(der) < 2 || (der[0] != 0x31 && der[0] != 0x30) {
+		return nil, fmt.Errorf("expected SET or SEQUENCE, got tag 0x%02x", der[0]&0xff)
+	}
+	inner, err := derContent(der)
+	if err != nil {
+		return nil, err
+	}
+	var out []int
+	for len(inner) > 0 {
+		if inner[0] != 0x02 {
+			return nil, fmt.Errorf("expected INTEGER, got tag 0x%02x", inner[0])
+		}
+		vb, err := derContent(inner)
+		if err != nil {
+			return nil, err
+		}
+		if len(vb) == 0 || len(vb) > 4 || vb[0]&0x80 != 0 || (len(vb) > 1 && vb[0] == 0x00 && vb[1]&0x80 == 0) {
+			return nil, fmt.Errorf("bad INTEGER encoding")
+		}
+		v := 0
+		for _, b := range vb {
+			v = v<<8 | int(b)
+		}
+		// Advance past this INTEGER element: its tag+length
+		// header plus the value bytes just consumed.
+		hl, _ := derTagLen(inner)
+		inner = inner[hl+len(vb):]
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+// derTagLen parses a DER tag+length header, returning the total
+// header length and the content length.
+func derTagLen(b []byte) (headerLen int, contentLen int) {
+	if len(b) < 2 {
+		return 0, -1
+	}
+	lb := b[1]
+	if lb&0x80 == 0 {
+		return 2, int(lb)
+	}
+	n := int(lb & 0x7f)
+	if n == 0 || n > 4 || len(b) < 2+n {
+		return 0, -1
+	}
+	contentLen = 0
+	for _, c := range b[2 : 2+n] {
+		contentLen = contentLen<<8 | int(c)
+	}
+	return 2 + n, contentLen
+}
+
+// derContent returns the content bytes of one DER TLV at the start
+// of b, erroring on truncation or absurd lengths.
+func derContent(b []byte) ([]byte, error) {
+	hl, cl := derTagLen(b)
+	if cl < 0 || hl+cl > len(b) {
+		return nil, fmt.Errorf("truncated or overlong DER value")
+	}
+	return b[hl : hl+cl], nil
+}
+
+// checkAndroidAttestationCertProfile enforces the Android
+// attestation certificate profile. Unlike the FIDO packed profile,
+// Android leaves carry no "Authenticator Attestation" OU (real
+// leaves use CN "Android Keystore Key"), so the profile requires:
+//   - X.509 v3,
+//   - a non-CA end entity,
+//   - digitalSignature key usage,
+//   - the KeyDescription extension (its contents are verified
+//     separately),
+//   - for ES256 (alg -7): a P-256 public key.
+func checkAndroidAttestationCertProfile(leaf *x509.Certificate, alg int64) error {
+	if leaf.Version != 3 {
+		return fmt.Errorf("enrollment: android-key leaf is not X.509 v3 (got v%d)", leaf.Version)
+	}
+	if !leaf.BasicConstraintsValid || leaf.IsCA {
+		return fmt.Errorf("enrollment: android-key leaf must be a non-CA end-entity certificate")
+	}
+	if leaf.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		return fmt.Errorf("enrollment: android-key leaf lacks digitalSignature key usage")
+	}
+	if !hasExtensionOID(leaf, androidKeyDescriptionOID) {
+		return fmt.Errorf("enrollment: android-key leaf lacks the KeyDescription extension (OID 1.3.6.1.4.1.11129.2.1.17)")
+	}
+	if alg == -7 { // ES256
+		pub, ok := leaf.PublicKey.(*ecdsa.PublicKey)
+		if !ok || pub.Curve != elliptic.P256() {
+			return fmt.Errorf("enrollment: android-key leaf key is not P-256 for ES256")
+		}
+	}
+	return nil
+}
+
+func hasExtensionOID(cert *x509.Certificate, oid asn1.ObjectIdentifier) bool {
+	for _, ext := range cert.Extensions {
+		if ext.Id.Equal(oid) {
+			return true
+		}
+	}
+	return false
+}
+
+// androidStmtKeysEqual reports whether the attStmt key set is
+// exactly want. Duplicates are already rejected by the decoder, so
+// set equality on the wire-order key list is exact.
+func androidStmtKeysEqual(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for _, w := range want {
+		found := false
+		for _, g := range got {
+			if g == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// verifyAndroidKeyAttestation verifies an "android-key" attestation
+// statement (WebAuthn §8.4). See the format overview above for the
+// check order and the threat model.
+func verifyAndroidKeyAttestation(attObj *attestationObject, authData, clientDataHash, coseKey []byte, rp WebAuthnRP, now time.Time) error {
+	// The statement map is closed: exactly {alg, sig, x5c}.
+	if !androidStmtKeysEqual(attObj.StmtKeys, []string{"alg", "sig", "x5c"}) {
+		return fmt.Errorf("enrollment: android-key attestation statement must be exactly {alg, sig, x5c} (got %q)", attObj.StmtKeys)
+	}
+	alg, _ := attObj.Stmt["alg"].(int64)
+	if alg != -7 {
+		return fmt.Errorf("enrollment: android-key attestation with unsupported alg %d (want ES256/-7)", alg)
+	}
+	sig, _ := attObj.Stmt["sig"].([]byte)
+	if len(sig) == 0 {
+		return fmt.Errorf("enrollment: android-key attestation without signature")
+	}
+	x5c, _ := attObj.Stmt["x5c"].([][]byte)
+
+	leaf, err := verifyAttestationChain(x5c, rp, now)
+	if err != nil {
+		return err
+	}
+	if err := checkAndroidAttestationCertProfile(leaf, alg); err != nil {
+		return err
+	}
+
+	// The KeyDescription binds this attestation to the ceremony:
+	// its attestationChallenge must equal
+	// SHA-256(authenticatorData || clientDataHash), so a
+	// challenge holder cannot transplant a genuine device's
+	// attestation onto their own ceremony.
+	var kdDER []byte
+	for _, ext := range leaf.Extensions {
+		if ext.Id.Equal(androidKeyDescriptionOID) {
+			kdDER = ext.Value
+			break
+		}
+	}
+	kd, err := parseAndroidKeyDescription(kdDER)
+	if err != nil {
+		return err
+	}
+	// The security level gates what the attestation is WORTH. A
+	// Software level means the Android OS asserted its own
+	// key's provenance — a compromised OS can forge exactly
+	// that, so it proves nothing to a verifier. VHL enrolls
+	// credentials that mint session tokens; only hardware-rooted
+	// proof (TrustedEnvironment or StrongBox) clears the bar.
+	switch kd.AttestationSecurityLevel {
+	case androidSecurityTrustedEnvironment, androidSecurityStrongBox:
+	default:
+		return fmt.Errorf("enrollment: android-key attestation security level %d is not hardware-backed (need TrustedEnvironment or StrongBox)", kd.AttestationSecurityLevel)
+	}
+	bound := sha256.Sum256(append(append([]byte{}, authData...), clientDataHash...))
+	if subtle.ConstantTimeCompare(kd.AttestationChallenge, bound[:]) != 1 {
+		return fmt.Errorf("enrollment: android-key attestation challenge does not match this ceremony")
+	}
+	purposes, err := androidKeyPurposes(kd.SoftwareEnforced, kd.TEEEnforced)
+	if err != nil {
+		return err
+	}
+	signOK := false
+	for _, p := range purposes {
+		if p == androidKeyPurposeSign {
+			signOK = true
+			break
+		}
+	}
+	if !signOK {
+		return fmt.Errorf("enrollment: android-key attested key does not grant purpose SIGN")
+	}
+
+	// The attested key must BE the enrolled credential key: the
+	// leaf certificate's subject public key and the COSE key in
+	// the authenticator data are compared coordinate-wise. Without
+	// this, a genuine device's attestation could be replayed to
+	// enroll an attacker-chosen key.
+	leafPub, ok := leaf.PublicKey.(*ecdsa.PublicKey)
+	if !ok || leafPub.Curve != elliptic.P256() {
+		return fmt.Errorf("enrollment: android-key leaf key is not P-256")
+	}
+	credPubIface, err := credentialKey(coseKey)
+	if err != nil {
+		return fmt.Errorf("enrollment: android-key credential public key: %w", err)
+	}
+	credPub, ok := credPubIface.(*ecdsa.PublicKey)
+	if !ok {
+		return fmt.Errorf("enrollment: android-key credential key is not ECDSA")
+	}
+	if leafPub.X.Cmp(credPub.X) != 0 || leafPub.Y.Cmp(credPub.Y) != 0 {
+		return fmt.Errorf("enrollment: android-key leaf key does not match the enrolled credential key")
+	}
+
+	signed := make([]byte, 0, len(authData)+len(clientDataHash))
+	signed = append(signed, authData...)
+	signed = append(signed, clientDataHash...)
+	digest := sha256.Sum256(signed)
+	if !ecdsa.VerifyASN1(leafPub, digest[:], sig) {
+		return fmt.Errorf("enrollment: android-key attestation signature invalid")
 	}
 	return nil
 }

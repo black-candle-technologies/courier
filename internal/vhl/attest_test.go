@@ -440,3 +440,65 @@ func TestAttestationCertProfileNegative(t *testing.T) {
 		})
 	}
 }
+
+func TestVerifyRegistrationAndroidKeyHappyPath(t *testing.T) {
+	pki := vhltest.NewPKI(t)
+	chal := freshChallenge(t)
+	cer := pki.EnrollAndroidKey(t, "example.com", "https://example.com", chal, vhltest.AndroidEnrollOpts{})
+	res, err := VerifyRegistrationAttestation(cer.OuterB64, chal, testRP(pki, "example.com"))
+	if err != nil {
+		t.Fatalf("android-key happy path failed: %v", err)
+	}
+	if res.CredentialID != attestB64.EncodeToString(cer.CredID) {
+		t.Fatalf("credential id mismatch: %q", res.CredentialID)
+	}
+	// The enrolled key must be exactly the attested credential key.
+	if want := vhltest.COSEKeyP256(&cer.CredKey.PublicKey); !bytes.Equal(res.PublicKey, want) {
+		t.Fatalf("enrolled public key does not match the attested credential key")
+	}
+	if res.SignCount != 1 {
+		t.Fatalf("sign count = %d, want 1", res.SignCount)
+	}
+}
+
+func TestVerifyRegistrationAndroidKeyTrustedEnvironment(t *testing.T) {
+	pki := vhltest.NewPKI(t)
+	chal := freshChallenge(t)
+	cer := pki.EnrollAndroidKey(t, "example.com", "https://example.com", chal,
+		vhltest.AndroidEnrollOpts{SecurityLevelSet: true, SecurityLevel: 1})
+	if _, err := VerifyRegistrationAttestation(cer.OuterB64, chal, testRP(pki, "example.com")); err != nil {
+		t.Fatalf("TrustedEnvironment must be accepted: %v", err)
+	}
+}
+
+func TestVerifyRegistrationAndroidKeyRejectsNonconforming(t *testing.T) {
+	cases := []struct {
+		name    string
+		opts    vhltest.AndroidEnrollOpts
+		wantErr string
+	}{
+		{"wrong attestationChallenge", vhltest.AndroidEnrollOpts{WrongChallenge: true}, "attestation challenge does not match"},
+		{"key mismatch", vhltest.AndroidEnrollOpts{KeyMismatch: true}, "does not match the enrolled credential key"},
+		{"software security level", vhltest.AndroidEnrollOpts{SecurityLevelSet: true, SecurityLevel: 0}, "not hardware-backed"},
+		{"duplicate x5c key", vhltest.AndroidEnrollOpts{DupX5C: true}, "duplicate key"},
+		{"extra statement field", vhltest.AndroidEnrollOpts{ExtraStmtField: true}, "must be exactly {alg, sig, x5c}"},
+		{"trailing DER junk", vhltest.AndroidEnrollOpts{TrailingJunk: true}, "trailing bytes"},
+		{"untrusted root", vhltest.AndroidEnrollOpts{WrongRoot: true}, "does not chain to a configured trust anchor"},
+		{"bad signature", vhltest.AndroidEnrollOpts{BadSig: true}, "signature invalid"},
+		{"wrong alg", vhltest.AndroidEnrollOpts{WrongAlg: true}, "unsupported alg"},
+		{"no purpose SIGN", vhltest.AndroidEnrollOpts{NoPurpose: true}, "does not grant purpose SIGN"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pki := vhltest.NewPKI(t)
+			chal := freshChallenge(t)
+			cer := pki.EnrollAndroidKey(t, "example.com", "https://example.com", chal, tc.opts)
+			_, err := VerifyRegistrationAttestation(cer.OuterB64, chal, testRP(pki, "example.com"))
+			if err == nil {
+				t.Fatalf("%s: want rejection, got nil", tc.name)
+			} else if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("%s: want error containing %q, got %q", tc.name, tc.wantErr, err)
+			}
+		})
+	}
+}
