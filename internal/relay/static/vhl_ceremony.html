@@ -194,7 +194,7 @@ function tamperError() {
   confirmedEnrollApprover = false;
   setStatus("Security error: the ceremony context does not match the " +
     "challenge your agent signed. The relay may be showing you different " +
-    "values than your agent approved. Do NOT touch your security key — " +
+    "values than your agent approved. Do NOT complete the authentication prompt — " +
     "close this tab and ask your agent for a new ceremony.", "err");
   goBtn.disabled = true;
 }
@@ -263,7 +263,7 @@ async function renderContext() {
       confirmedEnrollApprover = e.target.checked;
       goBtn.disabled = !confirmedEnrollApprover;
       if (confirmedEnrollApprover)
-        setStatus("Confirmed. Your security key will be asked for.");
+        setStatus("Confirmed. Your authenticator will be asked for approval.");
     });
     if (!(await verifyEnrollApproverContext(ctx))) { tamperError(); return false; }
     return true;
@@ -289,7 +289,7 @@ async function loadCeremony(code) {
   activeCode = code;
   codeCard.hidden = true;
   const kind = {
-    enroll: "Register a security key",
+    enroll: "Register an authenticator",
     mint: "Approve a session-token mint",
     approve: "Approve an action",
     "enroll-approver": "Enroll an approver",
@@ -301,9 +301,9 @@ async function loadCeremony(code) {
     '<span class="hint">Relying party</span> <span class="mono">' +
     escapeHtml(details.rp_id) + "</span>";
   goBtn.textContent = {
-    enroll: "Register my security key",
-    mint: "Approve with my security key",
-    approve: "Approve with my security key",
+    enroll: "Register my authenticator",
+    mint: "Approve with my authenticator",
+    approve: "Approve with my authenticator",
     "enroll-approver": "Enroll this approver",
   }[details.type] || "Begin";
   if (details.completed) {
