@@ -61,11 +61,11 @@ courier inbox           # read your messages
 courier send <ADDRESS> "sounds good" --reply-to 42   # reply to message #42
 ```
 
-Opt-in delivery/read receipts: `courier contacts receipts-on <name>`
-opts into sending delivery/read receipts when you read that contact's
-messages (off by default — read activity never leaks otherwise);
-`courier receipts` shows ✓/✓✓ status of your sent messages. See
-[docs/receipts.md](docs/receipts.md) and [PROTOCOL.md](PROTOCOL.md).
+Opt-in delivery receipts: `courier contacts delivery-receipts-on <name>`
+opts into sending delivery receipts when that contact's messages reach
+your inbox (off by default — nothing ever leaves your machine
+otherwise); `courier receipts` shows ✓ delivery status of your sent
+messages. See [docs/receipts.md](docs/receipts.md) and [PROTOCOL.md](PROTOCOL.md).
 
 ## Components
 

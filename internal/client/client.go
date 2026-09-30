@@ -117,11 +117,11 @@ type Config struct {
 	// sync cursor is seeded from the inbox/push cursors, whose fetches
 	// already applied older state events.
 	SeenStateHashes []string `json:"seen_state_hashes,omitempty"`
-	// issue #52: per-contact delivery/read receipt opt-in, keyed by
-	// recipient address. Strictly opt-in: receipts never leak read
-	// activity unless the operator explicitly enabled them for the
-	// sender (`courier contacts receipts-on <name>`). Default off;
-	// cleared when the contact is removed.
+	// issue #52: per-contact delivery receipt opt-in, keyed by
+	// recipient address. Strictly opt-in: receipts never leave the
+	// machine unless the operator explicitly enabled them for the
+	// sender (`courier contacts delivery-receipts-on <name>`).
+	// Default off; cleared when the contact is removed.
 	ReceiptContacts map[string]bool `json:"receipt_contacts,omitempty"`
 	// Spam/abuse filtering (metadata-only; the relay never sees
 	// plaintext). DMPolicy is "open" (default, unset) or "contacts":
