@@ -378,9 +378,6 @@ func (c *Client) FetchMessage(id int64) (Message, error) {
 	if _, ok := parseGroupDMPayload(plain); ok {
 		return Message{}, fmt.Errorf("message #%d is a group protocol message, not a chat message", id)
 	}
-	if _, ok := parseChannelDMPayload(plain); ok {
-		return Message{}, fmt.Errorf("message #%d is a channel protocol message, not a chat message", id)
-	}
 	if _, ok := parseReceiptDMPayload(plain); ok {
 		return Message{}, fmt.Errorf("message #%d is a receipt protocol message, not a chat message", id)
 	}

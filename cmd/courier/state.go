@@ -10,6 +10,15 @@ import (
 	"github.com/black-candle-technologies/courier/internal/client"
 )
 
+// shortAddr renders an address in compact display form.
+func shortAddr(a string) string {
+	a = strings.TrimPrefix(a, "ed25519:")
+	if len(a) > 12 {
+		return a[:12] + "…"
+	}
+	return a
+}
+
 func stateUsage() string {
 	return `usage:
   courier state note add <peer> --title <t> [--body <b>] [--ttl <duration>]

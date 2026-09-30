@@ -1960,15 +1960,6 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			newHashes = append(newHashes, h)
 			continue
 		}
-		// issue #48: channel protocol direct messages (join requests
-		// and accepts, channel messages, rekeys, leaves) are consumed
-		// by the channel layer and never surface as chat messages.
-		if cp, ok := parseChannelDMPayload(plain); ok {
-			c.handleChannelDM(m.From, cp)
-			seen[h] = true
-			newHashes = append(newHashes, h)
-			continue
-		}
 		// issue #52: receipt protocol direct messages are consumed by
 		// the receipt layer and never surface as chat messages.
 		if rp, ok := parseReceiptDMPayload(plain); ok {
