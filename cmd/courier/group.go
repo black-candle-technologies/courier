@@ -18,7 +18,7 @@ func groupUsage() string {
 multi-party primitive. The creator becomes the admin, and only the
 admin can add or remove members or transfer adminship. Membership
 changes are signed control messages; when a member is removed,
-sender keys rotate so the removed member cannot read later messages.
+remaining senders rotate keys after observing the removal in an inbox sync.
 
 usage:
   courier group create --name <name> [addr...]
@@ -30,8 +30,8 @@ usage:
       add a member (admin only).
 
   courier group remove <group-id> <addr>
-      remove a member (admin only). Sender keys rotate, so the removed
-      member cannot decrypt later messages. The admin cannot remove
+      remove a member (admin only). Each remaining sender must sync and rotate
+      before later messages exclude the removed member. The admin cannot remove
       themselves — transfer adminship first.
 
   courier group transfer <group-id> <addr>
@@ -94,7 +94,7 @@ func cmdGroup(args []string) error {
 		if err := cl.GroupRemove(args[1], args[2]); err != nil {
 			return err
 		}
-		fmt.Printf("removed %s from %s (sender keys rotated)\n", args[2], args[1])
+		fmt.Printf("removed %s from %s (remaining senders must sync to rotate keys)\n", args[2], args[1])
 	case "transfer":
 		if len(args) != 3 {
 			return fmt.Errorf("usage: courier group transfer <group-id> <addr>")
