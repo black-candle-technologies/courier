@@ -287,6 +287,9 @@ func migrateEncKeys(c *Config) error {
 
 // LoadConfig reads the local identity.
 func LoadConfig() (*Config, error) {
+	if err := warnLegacyChannels(); err != nil {
+		return nil, err
+	}
 	if err := maintainLegacyState(); err != nil {
 		return nil, err
 	}
@@ -2005,7 +2008,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// recipient's keys; a manifest whose key cannot be opened is
 		// kept with KeyError set, so the message is still delivered
 		// and the failure is visible, never silent.
-		if isLegacyStatePayload(plain) {
+		if isLegacyStatePayload(plain) || isLegacyChannelPayload(plain) {
 			seen[h] = true
 			newHashes = append(newHashes, h)
 			continue

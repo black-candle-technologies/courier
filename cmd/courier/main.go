@@ -521,7 +521,7 @@ func cmdSend(args []string) error {
 	// opt-in, which is their private state. Note mine, which controls
 	// the delivery receipts I send for their messages.
 	if resolved, rerr := cfg.ResolveRecipient(address); rerr == nil && cfg.ReceiptsEnabledFor(resolved) {
-		fmt.Fprintf(os.Stderr, "receipts on for this contact — delivery status in `courier receipts`\n")
+		fmt.Fprintf(os.Stderr, "delivery receipts enabled for incoming messages from this contact\n")
 	}
 	return nil
 }

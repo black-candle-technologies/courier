@@ -2422,3 +2422,10 @@ folded into this document when they merge:
 `github.com/black-candle-technologies/courier` at `origin/main`.
 Where this document and the code disagree, the code governs — and
 the discrepancy is a bug in this document.*
+
+### Retired channel discriminator
+
+`cc:2` remains reserved for legacy `join-request`, `join-accept`, `msg`,
+`rekey`, and `leave` payloads. Updated clients consume them without chat output,
+cache insertion, dashboard publication, or channel mutation. Explicit fetch
+refuses these protocol frames. See [legacy archive retirement](docs/legacy-channel-retirement.md).

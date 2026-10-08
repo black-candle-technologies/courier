@@ -3,6 +3,7 @@ package client
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -315,9 +316,26 @@ func TestReceiptReadFromOldClientDropped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.alice.handleReceiptDM(e.bCfg.Address, receiptDMPayload{
-		Magic: receiptDMMagic, Type: receiptRead, MsgID: id, At: time.Now().Unix(),
-	})
+	e.asBob()
+	raw, err := json.Marshal(receiptDMPayload{Magic: receiptDMMagic, Type: receiptRead, MsgID: id, At: time.Now().Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.bob.sendProtocolDM(e.aCfg.Address, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	e.asAlice()
+	var cursor int64
+	if msgs := e.syncPersonal(e.alice, e.aCfg, &cursor); len(msgs) != 0 {
+		t.Fatal("legacy receipt became chat", msgs)
+	}
+	p, err := receiptsFilePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatalf("retired receipt created store: %v", err)
+	}
 	rs, err := loadReceipts()
 	if err != nil {
 		t.Fatal(err)
