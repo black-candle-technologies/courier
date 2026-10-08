@@ -408,12 +408,33 @@ func TestForwardIntroductionRequest(t *testing.T) {
 func TestPeerHandleCache(t *testing.T) {
 	_, carolID, _ := introIdentities(t)
 	carol := introClient(t, carolID, map[string]string{})
-	// No relay: reverse fails, PeerHandle returns "" and caches it.
+	// No relay: a transport failure is not authoritative negative knowledge.
 	if h := carol.PeerHandle("ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); h != "" {
 		t.Fatalf("want empty handle, got %q", h)
 	}
-	if carol.cfg.HandleCache == nil {
-		t.Fatal("cache not populated")
+	if len(carol.cfg.HandleCache) != 0 {
+		t.Fatal("transport failure cached")
+	}
+}
+
+func TestPeerHandleCachesAuthoritativeMiss(t *testing.T) {
+	_, id, bob := introIdentities(t)
+	c := introClient(t, id, map[string]string{})
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"results":[]}`))
+	}))
+	defer srv.Close()
+	c.cfg.RelayURL = srv.URL
+	if err := c.cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	c.PeerHandle(addrOf(bob))
+	c.PeerHandle(addrOf(bob))
+	if calls != 1 {
+		t.Fatal("authoritative miss not cached", calls)
 	}
 }
 
