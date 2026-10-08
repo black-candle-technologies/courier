@@ -112,3 +112,46 @@ func TestLegacyStateMalformedArchivePreserved(t *testing.T) {
 		t.Fatal("malformed archive overwritten")
 	}
 }
+
+func TestLegacyStateArchivePreservesOriginalFold(t *testing.T) {
+	cfg := testConfig(t)
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := configPath()
+	p = filepath.Join(filepath.Dir(p), "state.json")
+	raw := `{"conversations":{"peer":{"events":[{"k":"note-add","note_id":"live","ts":1,"title":"first-live"},{"k":"note-add","note_id":"live","ts":2,"expires_at":1,"title":"duplicate"},{"k":"task-add","task_id":"dead","note_id":"live","expires_at":1},{"k":"note-add","note_id":"snap","expires_at":1}],"snapshot_notes":{"snap":{"title":"snapshot-live"}}}}}`
+	if err := os.WriteFile(p, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	for _, want := range []string{"first-live", "duplicate", "snapshot-live"} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("lost %s", want)
+		}
+	}
+	if strings.Contains(string(b), `"task-add"`) {
+		t.Fatal("expired task retained")
+	}
+}
+
+func TestLegacyStateMaintenanceDuringPolling(t *testing.T) {
+	env := newAttachTestEnv(t)
+	env.asRecipient()
+	p, _ := configPath()
+	p = filepath.Join(filepath.Dir(p), "state.json")
+	if err := os.WriteFile(p, []byte(`{"conversations":{"peer":{"events":[{"k":"note-add","note_id":"dead","title":"poll-expired","expires_at":1}]}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Existing client instance; no LoadConfig call between polls.
+	if _, _, _, _, err := env.recipient.Inbox(0, 50); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	if strings.Contains(string(b), "poll-expired") {
+		t.Fatal("polling stranded expiry")
+	}
+}

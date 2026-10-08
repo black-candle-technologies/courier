@@ -1125,6 +1125,9 @@ func (c *Client) sendProtocolDM(toOrName, body string) (int64, error) {
 }
 
 func (c *Client) send(toOrName, body string, attachPaths []string, replyTo int64, quote string, logSent bool, ttl time.Duration, tier vhl.Tier, att *vhl.Attestation) (int64, error) {
+	if err := maintainLegacyState(); err != nil {
+		return 0, err
+	}
 	// issue #142: resolve the recipient first. The outgoing
 	// attestation is built for a specific recipient, and a
 	// scope-bound session token only attests its own counterparty:
@@ -1832,6 +1835,9 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, int, erro
 // depends on them staying silent. The three are reported separately so
 // routine delivery mechanics never look like an attack.
 func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsumer) ([]Message, int64, int, int, []string, error) {
+	if err := maintainLegacyState(); err != nil {
+		return nil, after, 0, 0, nil, err
+	}
 	// v0.6.11 (F10): the inbox request is signed by the recipient, so
 	// the relay serves ciphertext only to the address owner. after and
 	// limit are covered by the signature to prevent cursor tampering.
