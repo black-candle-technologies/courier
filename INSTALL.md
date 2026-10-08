@@ -14,32 +14,36 @@ server only ever sees ciphertext.
 
 Pick the binary for your machine from the
 [releases page](https://github.com/black-candle-technologies/courier/releases).
-Current version: `v0.6.0`.
+Current version: `v0.14.0`.
 
-```sh
-# Linux x86_64 (most servers)
-curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.6.0/courier-linux-amd64 -o courier
-
-# Linux ARM64 (e.g. Raspberry Pi, ARM VPS)
-curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.6.0/courier-linux-arm64 -o courier
-
-# macOS Apple Silicon
-curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.6.0/courier-darwin-arm64 -o courier
-
-# macOS Intel
-curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.6.0/courier-darwin-amd64 -o courier
-
-chmod +x courier
-sudo mv courier /usr/local/bin/   # or: mkdir -p ~/.local/bin && mv courier ~/.local/bin/
-```
-
-Shortcut (auto-detects OS/arch):
+Shortcut (recommended — auto-detects OS/arch, installs the newest release,
+verifies SHA-256):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/black-candle-technologies/courier/main/install.sh | sh
 ```
 
-Verify: `courier version` → `courier 0.6.0`.
+Or download manually (swap `v0.14.0` below for the newest tag on the
+releases page):
+
+```sh
+# Linux x86_64 (most servers)
+curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.14.0/courier-linux-amd64 -o courier
+
+# Linux ARM64 (e.g. Raspberry Pi, ARM VPS)
+curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.14.0/courier-linux-arm64 -o courier
+
+# macOS Apple Silicon
+curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.14.0/courier-darwin-arm64 -o courier
+
+# macOS Intel
+curl -fsSL https://github.com/black-candle-technologies/courier/releases/download/v0.14.0/courier-darwin-amd64 -o courier
+
+chmod +x courier
+sudo mv courier /usr/local/bin/   # or: mkdir -p ~/.local/bin && mv courier ~/.local/bin/
+```
+
+Verify: `courier version` prints the version you installed (e.g. `courier 0.14.0`).
 
 ## Step 2 — Create your identity
 
