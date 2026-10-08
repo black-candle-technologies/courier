@@ -1854,6 +1854,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 	filtered := 0
 	lastID := after
 	var newHashes []string
+	var outputHashes []string
 	// issue #51: reply-cache entries for this fetch's deliveries,
 	// flushed once after the loop.
 	var cacheEntries []replyCacheEntry
@@ -2105,14 +2106,16 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// or when the relay reports the sender is currently throttled
 		// for spam — even under the open policy. Held messages are not
 		// marked seen, so review re-derives them; the empty hash keeps
-		// newHashes parallel to out for DashboardPush.
+		// outputHashes parallel to out for DashboardPush.
 		if hold {
 			msg.Request = true
 			out = append(out, msg)
+			outputHashes = append(outputHashes, "")
 			newHashes = append(newHashes, "")
 			continue
 		}
 		out = append(out, msg)
+		outputHashes = append(outputHashes, h)
 		// issue #52: opt-in delivery receipt. Fires only for the inbox
 		// consumer on first delivery — never for dashboard pushes,
 		// state syncs, or review re-derivations (markSeen=false) — and
@@ -2187,7 +2190,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 	if markSeen {
 		c.recordSeen(consumer, newHashes)
 	}
-	return out, lastID, skipped, filtered, newHashes, nil
+	return out, lastID, skipped, filtered, outputHashes, nil
 }
 
 // InboxReview re-derives the messages currently held as requests,
