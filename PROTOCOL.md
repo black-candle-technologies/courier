@@ -342,7 +342,7 @@ that verifies came from the holder of that address's private key.
 - `kind` is `""` (or `"dm"`) for direct messages and `"group"` for
   group messages (§16). The relay rejects unknown kinds with `400`.
   Clients MUST skip envelopes whose kind is neither `""` nor `"dm"`
-  in personal inboxes, advancing the cursor past them (§27.2).
+  in personal inboxes, advancing the cursor past them (§10.2).
 - `key_epoch` is used only for group messages.
 - The relay validates shapes and sizes (ciphertext 1..256 KiB,
   `MaxCiphertextBytes`), verifies the signature, and responds
@@ -1289,7 +1289,7 @@ that set** (fail closed; `DisallowUnknownFields`). There are no PII
 fields in the directory schema, ever. Reference:
 `internal/relay/directory.go`, `internal/client/directory.go`.
 
-### 18.1 Handles
+### 17.1 Handles
 
 - Syntax: 3–32 chars, `[a-z0-9][a-z0-9_-]{2,31}` (must start with
   `[a-z0-9]`). Normalized to lowercase; uppercase input is accepted
@@ -1315,7 +1315,7 @@ fields in the directory schema, ever. Reference:
 - The operator may reserve administrative handles (e.g. `courier`,
   `admin`, `support`) via relay config; they can never be registered.
 
-### 18.2 Signed writes
+### 17.2 Signed writes
 
 All directory writes are signed by the holder's Ed25519 identity key.
 Epochs are strictly increasing per handle; stale epochs are rejected
@@ -1333,7 +1333,7 @@ Epochs are strictly increasing per handle; stale epochs are rejected
 Deregistration deletes the row (the holder's own choice). Operator
 takedown is distinct: it leaves a transparent tombstone (§17.5).
 
-### 18.3 Verifying a served profile
+### 17.3 Verifying a served profile
 
 Lookup/search/reverse responses carry the stored `sig` so clients
 verify the binding themselves instead of trusting the relay:
@@ -1348,7 +1348,7 @@ verify the binding themselves instead of trusting the relay:
 - A later update by the new owner replaces the transfer signature
   with a fresh registration signature and clears `transfer_from`.
 
-### 18.4 Private handles and introductions
+### 17.4 Private handles and introductions
 
 A `private` handle returns `404` from lookup/reverse,
 **indistinguishable from "never registered"** — there is no oracle
@@ -1376,7 +1376,7 @@ payload is ignored. Introductions appear under
 `courier directory introductions` for accept/forward/dismiss;
 `courier inbox` prints a pointer when introductions are pending.
 
-### 18.5 Operator takedown (transparent tombstones)
+### 17.5 Operator takedown (transparent tombstones)
 
 Under the published takedown policy (see INSTALL.md), the operator
 may tombstone a handle for abuse/impersonation
@@ -1386,7 +1386,7 @@ reason — takedowns are visible, never silent. Tombstones are
 reversible (`UntombstoneHandle`). Tombstoned **private** handles stay
 `404` (§17.4).
 
-### 18.6 Client behavior
+### 17.6 Client behavior
 
 - `courier directory register <handle> [--public|--unlisted|--private]
   [--cap chat,...] [--contacts-only]` — register (default private).
@@ -1444,7 +1444,7 @@ sent envelopes I can find locally. **Absence of a receipt is not a
 signal** — the recipient may simply not have opted in, and the sender
 cannot tell. Reference: `internal/client/receipts.go`.
 
-### 21.1 Wire format
+### 20.1 Wire format
 
 Receipts are ordinary encrypted DM envelopes (kind `dm`) carrying a
 protocol payload, like group protocol DMs. The relay
@@ -1467,7 +1467,7 @@ chat, never silently swallowed. Pre-receipt clients display the
 payload JSON as chat text (same forward-compatibility trade-off as
 group DMs).
 
-### 21.2 Triggers
+### 20.2 Triggers
 
 - `delivery`: the recipient's inbox consumer first delivers the
   envelope. Automatic, once per envelope. Dashboard pushes never fire
@@ -1475,7 +1475,7 @@ group DMs).
   messages are out of scope; dashboard thread opens are future work
   (the dashboard server holds no keys to sign with).
 
-### 21.3 Authentication and replay safety
+### 20.3 Authentication and replay safety
 
 The envelope's Ed25519 signature authenticates `from`. Identical
 envelope bytes are suppressed by the per-consumer seen sets; a replay
@@ -1488,7 +1488,7 @@ with a sane timestamp, so fabricated receipts are dropped. Receipts
 bypass the sent log (`logSent=false`): they are machine traffic, not
 chat, and never reach the dashboard.
 
-### 21.4 Local storage
+### 20.4 Local storage
 
 - Opt-in: `config.json` → `receipt_contacts` (address → true).
   Cleared on contact removal.
@@ -1505,7 +1505,7 @@ relay-wide unique, so the reference is unambiguous in both DM
 directions without any coordination layer
 (`internal/client/threading.go`).
 
-### 22.1 Wire format
+### 21.1 Wire format
 
 The reference lives inside the **E2E-encrypted DM plaintext** — no
 relay changes, no new endpoints, no migration. Messages that are
@@ -1524,7 +1524,7 @@ before, so a third party cannot forge a reply reference onto someone
 else's message. The quote is truncated to 500 chars (rune-boundary,
 whitespace-collapsed) — quotes are display hints, not content.
 
-### 22.2 Client behavior
+### 21.2 Client behavior
 
 - `courier send <address> <message> --reply-to <id>` — sends a reply.
   The client embeds the parent snippet best-effort (sent log, then the
@@ -1576,7 +1576,7 @@ erasure — a message delivered before expiry is still deleted locally,
 but any copy the recipient made outside Courier (screenshots, logs,
 backups, forwarded plaintext) is out of scope. See §26.2.
 
-### 23.1 Backward compatibility
+### 22.1 Backward compatibility
 
 Pre-#53 clients ignore unknown JSON fields: state `note-add` /
 `task-add` payloads still parse (the note/task simply never expires
@@ -1596,7 +1596,7 @@ belong to the inbox consumer (§10.2).
 
 ## 23. Bridge: ChatGPT web → Courier (issue #61)
 
-### 25.1 The one paragraph that matters
+### 24.1 The one paragraph that matters
 
 This bridge is **explicitly NOT end-to-end encrypted**, by
 construction. ChatGPT web cannot hold Ed25519 keys, and everything
@@ -1624,7 +1624,7 @@ actions, tool calls, sends, or state changes without the receiving
 operator's explicit approval. Reference: `docs/bridge.md`,
 `internal/bridge/`, `internal/client/bridge.go`.
 
-### 25.2 Components
+### 24.2 Components
 
 - **`courier-bridge-mcp`** — public MCP server (Streamable HTTP,
   stateless mode), fronted by Caddy at
@@ -1654,7 +1654,7 @@ operator's explicit approval. Reference: `docs/bridge.md`,
   perspective it is an ordinary client: **no relay changes, no
   protocol wire changes.**
 
-### 25.3 Attribution
+### 24.3 Attribution
 
 Every bridged message carries two layers:
 
@@ -1687,7 +1687,7 @@ out of band, and recipients can pin the bridge address locally with
 `courier bridge trust <addr>` (stored in config; rendering from the
 pin list is a phase-2 concern).
 
-### 25.4 Tokens, confirmation, audit
+### 24.4 Tokens, confirmation, audit
 
 - Ingest tokens are 256-bit random secrets, shown once at issuance.
   Only the HMAC-SHA-256 hash (pepper from
@@ -1714,7 +1714,7 @@ pin list is a phase-2 concern).
   privileged rewrite of `bridge.db` (no external anchor yet).
   Retention is 1 year, then pruned.
 
-### 25.5 What the bridge is NOT
+### 24.5 What the bridge is NOT
 
 - It is not a protocol extension: bridged messages are ordinary DMs
   **from the bridge identity** — no relay changes, no new endpoints,
@@ -1742,7 +1742,7 @@ pushes them; the dashboard never queries the directory or verifies
 signatures itself. Treat dashboard peer metadata as the agent's
 claims, not as independently verified facts.
 
-### 26.1 Registration
+### 25.1 Registration
 
 `POST /v1/dashboard/register` (JSON):
 `{username, password, address, sig}` where `sig` is the Ed25519
@@ -1761,7 +1761,7 @@ the holder of the identity's private key can register that address.
   stores only its SHA-256. The agent stores the token for
   `courier dashboard push`.
 
-### 26.2 Login
+### 25.2 Login
 
 Two paths (`internal/dashboard/dashboard.go`,
 `internal/dashboard/bct_oauth.go`):
@@ -1776,7 +1776,7 @@ Two paths (`internal/dashboard/dashboard.go`,
   account from Settings (`/oauth/bct/link`, `/oauth/bct/callback`,
   `/settings/unlink-bct`); linking is per-user opt-in and reversible.
 
-### 26.3 Push
+### 25.3 Push
 
 `POST /v1/dashboard/push` with `Authorization: Bearer <api_token>`:
 
@@ -1797,7 +1797,7 @@ advances its local cursor past every attempted push. `handles` and
 `verified` are the agent-reported peer labels (§17.6, §18). Each
 push also sweeps already-expired `expires_at` rows (§21).
 
-### 26.4 Security properties
+### 25.4 Security properties
 
 **Security properties.** Passwords: bcrypt. Tokens: shown once, stored
 hashed. Sessions: 32-byte random tokens, stored hashed, 30-day expiry.
@@ -1846,7 +1846,7 @@ defense-in-depth, and SameSite=Lax is retained. Limits are tunable via
 
 ## 26. Security considerations and threat model
 
-### 28.1 What the relay sees (metadata, stated plainly)
+### 27.1 What the relay sees (metadata, stated plainly)
 
 TLS hides traffic metadata from **network observers**, not from the
 relay. The relay — and anyone who compromises it or compels the
@@ -1868,7 +1868,7 @@ byte-identical on the wire — §15.1); it cannot read contents. There
 is no anonymity or unlinkability property against the relay. Do not
 claim otherwise in product copy (issue #113).
 
-### 28.2 Deletion limits (stated plainly)
+### 27.2 Deletion limits (stated plainly)
 
 - **Disappearing messages** are endpoint-local deletion requests.
   Expiry is enforced by the recipient's client and the dashboard
@@ -1888,7 +1888,7 @@ claim otherwise in product copy (issue #113).
   to FS session content, not to legacy DMs, handshake envelopes'
   metadata, or anything sealed to a long-term key.
 
-### 28.3 Threat model
+### 27.3 Threat model
 
 **Assumed attacker capabilities and the protocol's answers:**
 
@@ -1907,7 +1907,7 @@ claim otherwise in product copy (issue #113).
 (the live state decrypts live messages — inherent); coercion of
 contacts; attacks on the operator's host OS.
 
-### 28.4 Known limitations and not-yet-implemented (with issues)
+### 27.4 Known limitations and not-yet-implemented (with issues)
 
 Carried over from prior disclosures; each is tracked:
 
@@ -2002,6 +2002,389 @@ separates variable-length fields; `be64` is big-endian uint64.
 Safety numbers (not a signature) use the hash domain
 `courier-safety-v1` over both parties' Ed25519 keys, X25519 keys,
 and key epochs (§18).
+
+## 30. Verified Human in the Loop (issue #142)
+
+VHL lets a **receiver** verify that a message an agent sent was
+actually reviewed and approved by a human — countering malicious or
+compromised agents sending instructions other agents would follow.
+Attestation is receiver-enforced, never a sender-side protocol
+guarantee: the sender claims a tier, the receiver verifies the claim
+against its own locally-enrolled trust root, and anything unverified
+is held for human review — never acted on, never silently discarded.
+
+### 30.1 Tiers
+
+- **Tier 0** — unattested chat and status. The legacy wire is
+  untouched: a message with no VHL fields is Tier 0.
+- **Tier 1** — routine instructions and file reads, attested via a
+  human-minted **session token** (default 8-hour lifetime).
+- **Tier 2** — spending, merges/releases, irreversible sends, and
+  other policy-sensitive actions. Requires a **per-message human
+  approval** bound to the exact action bytes; drawn signatures do not
+  count as presence.
+
+### 30.2 Wire format
+
+The tier tag and the inline attestation live **inside the
+E2E-encrypted DM plaintext** (v1/v2 payloads gain `vhl_tier` and
+`vhl` fields) — no relay changes, no new endpoints. Tier 0 without an
+attestation keeps the exact legacy wire. Because the fields ride
+inside the signed E2E plaintext, the relay can neither strip a tier
+claim nor upgrade one without invalidating the message signature.
+
+A Tier 0 message that improperly carries an attestation is
+**invalid**, not harmless Tier 0 — an unattested tier tag with a
+smuggled artifact is a downgrade/evasiveness signal.
+
+### 30.3 Attestations
+
+An attestation is a signed, versioned artifact binding the action
+hash, tier, approver identity, timestamp, presence proof, and the
+locally enrolled signer key:
+
+- Tier 1 attestations wrap a live session token (the token attests
+  the session; the attestation id keeps each message's artifact
+  unique for the replay set).
+- Tier 2 attestations bind `MsgHashOf(body)` — the exact bytes the
+  human reviewed — and expire 15 minutes after minting. A request id
+  binds the approval to the approval request that carried the draft;
+  it is part of the signed bytes. The WebAuthn challenge for a Tier 2
+  approval is `ApprovalChallenge(actionHash, nonce)`: a fresh
+  32-byte nonce generated per approval, embedded in the attestation
+  (`approval_nonce`) and covered by the attestation signature. The
+  receiver recomputes the challenge from the signed nonce and
+  consumes each nonce exactly once, so a captured assertion
+  re-wrapped in a fresh attestation is still a replay — even against
+  counterless authenticators and concurrent verifiers.
+- The presence ladder: hash-bound hold-and-release (challenge),
+  FIDO2/WebAuthn, out-of-band challenge-response, PIN fallback.
+  Proof kinds are `fido2`, `challenge`, `pin`, `session`; each maps
+  to a strength, and a ceremony must meet the requested strength —
+  the *performed* presence is checked against the request, never the
+  proof kind's ceiling, so there are no silent downgrades. Only
+  `fido2` proofs are cryptographically verifiable by the receiver;
+  Tier 2 attestations with `pin`/`challenge` proofs fail closed
+  (`unverifiable-proof`) — their Ed25519 attestation signature is
+  self-producible by the requesting agent, so the receiver never
+  reports them as attested.
+- The receiver enforces its own minimum tier
+  (`courier vhl policy --require-tier N`, default 0 = off): a tier
+  claim below the receiver's requirement is `invalid`
+  (`below-required-tier`), never actionable. The sender's Tier 0
+  self-label cannot dodge a Tier 2 requirement.
+
+Session tokens carry issuer/session/expiry/counterparty/boot id
+plus the WebAuthn assertion that proves the mint-time human
+ceremony, and mint through a two-phase ceremony: `BeginSessionMint`
+binds issuer, scope, lifetime, and random ids into a pending mint
+and produces the challenge; the human's authenticator signs that
+challenge; `Finish` verifies the assertion against the enrolled
+WebAuthn credential (UV required) and the configured relying party
+BEFORE the issuer key signs the token. There is no presence
+parameter anywhere in the mint path — the ceremony strength is
+established by the assertion, never by a caller-supplied claim —
+so a process holding the issuer's identity key cannot mint Tier 1
+tokens on its own: the receiver re-verifies the embedded assertion
+independently of the issuer signature, and a forged or
+transplanted assertion fails there even though the issuer
+signature is valid. The mint challenge is
+`SHA256("courier-vhl-mint-challenge-v1" || 0x00 || 0x00 || ctx)`,
+where `ctx` is the canonical MintContext JSON (issuer, scope,
+token_id, session_id, issued_at, expires_at, presence; see
+`internal/vhl/mint_context.go`). BootID and the token version are
+covered by the issuer signature, not the challenge — so an
+assertion cannot be transplanted onto a token with different
+scope, lifetime, or ids. Tokens verify against the receiver-local
+clock with ~5 minutes of skew tolerance, and are bound to the
+machine boot: each token embeds the kernel boot id
+(`/proc/sys/kernel/random/boot_id` on Linux). The boot binding is
+issuer-side only: the issuer's keystore loader drops tokens whose
+boot id differs from the current boot, so pre-reboot tokens are
+never re-served — but a remote receiver cannot check the issuer's
+boot id, and the Tier 1 verification path checks lifetime, scope,
+signatures, mint assertion, revocation, and replay only. It is not
+receiver-verifiable reboot revocation. Where the host exposes a
+stable boot id (Linux `/proc/sys/kernel/random/boot_id`), tokens
+therefore survive process restart but die on machine reboot for
+the issuer, mirroring forward-secrecy session hygiene. Where no
+stable boot id exists the id is process-local by construction: a
+token minted by one process is dropped by the next, so tokens are
+single-process on those hosts. Minting is ceremony-bound: the CLI's
+`session mint` creates a relay-hosted WebAuthn ceremony over the
+mint challenge and the mint completes only against the verified
+assertion the human's authenticator produced in the browser (see
+§30.8). There is no path that mints a token without a fresh
+WebAuthn ceremony. The same-or-stronger re-mint rule still
+applies: a live token is never renewable with a weaker ceremony.
+
+### 30.4 Receiver verification
+
+The receiver's verifier (`internal/vhl/policy.go`) checks, in order:
+tier tag validity → receiver minimum-tier requirement (a claim
+below the configured `RequiredTier` is `invalid`:
+`below-required-tier`) → attestation presence → structural
+validity → tier match → approver enrollment in the
+**receiver-local registry** (the trust root; no shared directory
+can override it) → signature under an enrolled key → revocation →
+replay (attestation id, then — for Tier 2 FIDO2 — the approval
+nonce) → expiry → (Tier 2) action-hash match → (Tier 2) proof-kind
+verifiability: only `fido2` proofs verify cryptographically;
+`pin`/`challenge` Tier 2 attestations are `invalid`
+(`unverifiable-proof`) → (Tier 1) token validity, token issuer
+signature, and the token's mint assertion: the embedded WebAuthn
+assertion must be a genuine UV assertion over the token's mint
+challenge from an enrolled WebAuthn credential for the issuer,
+verified against the configured relying party. The mint-assertion
+check is independent of the issuer signature — it is what stops a
+process holding the issuer's identity key from minting Tier 1
+tokens with no human involved. An unconfigured relying party fails
+closed. Every outcome carries an explicit evaluated flag so
+"evaluated as Tier 0" is distinguishable from "never evaluated".
+
+The replay set is keyed by attestation id and records the relay
+envelope id: re-evaluating the same envelope (e.g. a second inbox
+consumer) is allowed; reusing one attestation across two envelopes
+is a replay and the second is held.
+
+FIDO2 approval replay. The Tier 2 WebAuthn challenge is
+`ApprovalChallenge(actionHash, nonce)` — the action hash bound to
+a fresh per-approval nonce (there is no receiver-issued
+challenge round-trip in this asynchronous protocol, issue #142).
+The nonce is embedded in the attestation and covered by the
+attestation's Ed25519 signature; the receiver recomputes the
+challenge from the signed nonce and consumes each
+(approver, nonce) pair exactly once, so a captured assertion
+re-wrapped in a fresh attestation for the same body is still a
+replay. The authenticator's signature counter is kept as defense
+in depth: it must strictly increase per enrolled credential
+(persisted alongside enrollment). Authenticators without a
+counter report 0, which is accepted only while the stored value
+is also 0, per the WebAuthn spec.
+
+Verdicts: `attested` (flagged `vhl_attested`), `missing-attestation`
+and `invalid-attestation` (flagged `vhl_unverified`, held for
+review). `courier inbox` renders a typed badge — `✔ human-verified
+(tier N) by <address>` or `⚠ UNVERIFIED … HELD for human review` —
+never body text, so an unverified claim can never look reviewed.
+
+### 30.5 Native frames
+
+Three frame types travel as E2E-encrypted protocol DMs (consumed by
+the VHL layer, never surfaced as chat):
+
+- **approval-request** — an agent asks a human to review exact
+  bytes; the human's inbox files it in their review queue
+  (`courier vhl request list`).
+- **attestation** — the human's signed approval travels back; the
+  agent's inbox stores it for the send (`courier vhl attestations`).
+- **revocation** — session-token revocation, signed by the issuer
+  and verified against the enrolled key for the claimed issuer
+  (anyone cannot revoke anyone's tokens). Broadcast reaches the
+  sender's contacts.
+
+### 30.6 Client behavior
+
+- `courier vhl approver add <address> [--name N]` — enroll a human
+  approver through a relay-hosted WebAuthn assertion ceremony
+  (§30.8): the agent creates an `enroll-approver` ceremony binding
+  the approver and agent addresses, the human approves the pairing
+  with their enrolled security key in the browser, and the agent
+  validates the resulting artifact (challenge recomputation,
+  assertion verification against the enrolled credential, user
+  verification required) before the identity is trusted. Typed
+  confirmation alone is not sufficient to create a trust root —
+  a PTY-driving process could reproduce it. Enrollment is a Tier 2
+  human-approved event. `approver list` lists enrolled approvers;
+  `approver remove <address|name>` revokes an approver.
+- `courier vhl enroll-webauthn [--device LABEL]` — enroll a
+  WebAuthn credential via the relay-hosted ceremony (§30.8): the
+  agent creates the ceremony, the human completes it with their
+  security key in the browser, and the agent verifies the
+  attestation itself before enrolling locally and publishing the
+  signed enrollment. Requires a configured relying party
+  (`courier vhl rp set`); fails closed without one. Attestation
+  certificates are profile-checked (X.509 v3, non-CA,
+  digitalSignature key usage, `OU=Authenticator Attestation`
+  subject, AAGUID extension consistency when present, P-256 for
+  ES256) in addition to chain validation.
+- `courier vhl rp set --id DOMAIN --origin https://DOMAIN
+  [--origin ...] --attestation-root CERT_FILE [...]` — configure
+  the local WebAuthn relying party: the RP id, the allowed
+  origins, and the mandatory attestation trust roots (X.509 CA
+  certificates, PEM or DER — e.g. the authenticator vendor's
+  root). Attestation roots are mandatory: without them enrollment
+  cannot distinguish a real authenticator's attestation from one
+  forged by anyone holding the ceremony challenge, so enrollment
+  fails closed. `courier vhl rp show` prints the current config.
+- `courier vhl session mint [--scope ADDRESS] [--ttl DURATION]`
+  — mint a session token through the relay-hosted mint ceremony
+  (§30.8): the agent begins the mint locally, creates the
+  ceremony bound to the mint challenge, waits for the human to
+  approve it with their security key in the browser, and finishes
+  the mint against the verified assertion. The returned token is
+  ceremony-bound — minting is impossible without a fresh WebAuthn
+  ceremony. `session status` lists live tokens;
+  `session revoke <id> [--broadcast]` revokes.
+- `courier vhl request new --tier 2 --message TEXT [--to ADDR]` —
+  file an approval request for exact bytes; `courier vhl request
+  list` shows the pending queue; `courier vhl approve
+  <request-id> [--presence pin|challenge|fido2|fido2_uv]` shows the
+  human the exact bytes and the recomputed action hash before the
+  ceremony. `fido2`/`fido2_uv` run the relay-hosted `approve`
+  ceremony (§30.8): the human reviews the exact action context in
+  the browser and answers the nonce-bound approval challenge with
+  their security key. Approval is atomic: the displayed hash and
+  sender are bound to the minted attestation inside one locked
+  update — if the request changed since display, nothing is
+  minted — and the request is consumed as it is minted, so a
+  transport failure after minting requires a new request rather
+  than a retry.
+- `courier vhl policy [--require-tier 0|1|2]` — show or set the
+  receiver-side minimum tier (see §30.3).
+- `courier send --tier 1|2 [--attestation <id>]` — tiered send.
+  Tier 1 without a live session token fails closed; Tier 2 without
+  a human approval attestation for the exact bytes fails closed;
+  tiered sends refuse attachments (the approval hash binds the
+  body bytes only).
+- `courier vhl challenge --action TEXT` — mint a one-time
+  out-of-band challenge code bound to the exact action bytes
+  (single-use, constant-time compare, 8 unambiguous characters
+  from a 32-symbol alphabet; 256 mod 32 == 0 so the modulo
+  sampling is unbiased).
+
+### 30.7 Security properties stated honestly
+
+- The PIN ceremony is only as strong as the terminal it runs on:
+  typing `APPROVE <id>` proves a human is at *that* keyboard, not
+  which human. FIDO2/WebAuthn is the gold standard for approver
+  identity: the verifier checks real WebAuthn attestations and
+  assertions (exact challenge binding, origin allowlist, RP id
+  hash, UP/UV flags, attested credential data, and the
+  authenticator's attestation chain or assertion signature)
+  against the locally configured relying party. Enrollment
+  accepts only `packed` (x5c), `fido-u2f`, and `android-key`
+  (Android Key Attestation, WebAuthn §8.4 — the leaf's
+  KeyDescription must bind the ceremony challenge and the chain
+  must anchor to a pinned Google Hardware Attestation Root)
+  attestations chained
+  to operator-provisioned attestation roots; `none` and self
+  attestations are rejected outright, and enrollment fails closed
+  when no roots are configured — anyone holding the ceremony
+  challenge (including a compromised relay, which sees every
+  challenge) could forge those. The CLI currently performs PIN,
+  challenge, and WebAuthn ceremonies.
+- Session tokens are bearer-adjacent: whoever holds the sealed
+  token file and the process can mint Tier 1 attestations. The
+  8-hour default, boot-id binding, and per-token revocation
+  bound the exposure; Tier 2 never uses tokens. The mint itself,
+  however, cannot be forged by a process holding the issuer's
+  identity key: the embedded WebAuthn assertion is verified by
+  the receiver against the enrolled credential and the
+  configured relying party, independently of the issuer
+  signature, and the mint challenge binds the assertion to the
+  canonical mint context (counterparty scope, token/session ids,
+  issued/expiry, presence) — so neither a caller-supplied presence
+  claim nor a transplanted assertion produces a usable token. The
+  browser page displays that exact context and recomputes the
+  challenge from it before invoking WebAuthn, so the human sees
+  what they are granting and relay tampering with the display
+  fails closed.
+- The receiver-local enrollment registry is the whole trust root.
+  If an attacker enrolls themselves on the victim's machine, VHL
+  attests the attacker's "approvals" faithfully — VHL verifies
+  *human review happened*, not *which human* beyond enrollment.
+  Enrollment itself must be a human-controlled cryptographic
+  ceremony: `courier vhl approver add <address> [--name N]` requires a WebAuthn assertion
+  from the operator's enrolled security key over the
+  approver-binding challenge; typed confirmation is not accepted.
+  The relay's enrollment-publication directory is per-credential
+  (`(address, credential_id)` primary key, per-binding epoch and
+  revocation), and revocation of one credential never affects the
+  address's other credentials — but the directory is discovery
+  only and never overrides the local registry.
+
+### 30.8 Relay-hosted WebAuthn ceremony transport
+
+The agent cannot touch a YubiKey, so enrollment, session minting,
+Tier 2 approvals, and approver enrollment run as relay-hosted
+ceremonies. The relay is a courier, never a verifier: it stores
+the browser's response verbatim and the agent verifies it itself
+against its own challenge and RP config. Four ceremony types
+exist: `enroll` (WebAuthn registration), `mint` (WebAuthn
+assertion for a session mint), `approve` (WebAuthn assertion for a
+Tier 2 approval), and `enroll-approver` (WebAuthn assertion binding
+an approver enrollment).
+
+- `POST /v1/vhl/ceremonies` (identity-signed): the agent creates a
+  ceremony over a fresh 32-byte random challenge, the RP id, and
+  (for mint) the enrolled credential ids. The request carries a
+  timestamp (5-minute skew window), a canonical ceremony context,
+  and a signature over the domain-separated canonical form binding
+  the address, type, challenge, context, and timestamp. The context
+  is what the human reviews: for `mint`, the counterparty scope,
+  token/session ids, issued/expiry times, and presence; for
+  `approve`, the request id, approver, action hash, and the draft
+  summary; for `enroll-approver`, the approver and agent addresses.
+  The relay answers with a cryptographically random 8-character
+  single-use code (5-minute TTL) and the ceremony page path.
+- `GET /v1/vhl/ceremonies/{code}` and
+  `POST /v1/vhl/ceremonies/{code}/attestation` (dashboard login):
+  the human opens the ceremony page in their browser while logged
+  into the dashboard; the page displays the exact ceremony context
+  and recomputes the challenge from the displayed values before
+  invoking `navigator.credentials.create()` (enrollment) or
+  `.get()` (mint/approve/enroll-approver) — a relay that tampers
+  with the displayed context fails the page's challenge check and
+  the ceremony cannot proceed. Both endpoints require the
+  dashboard session cookie, the session's Courier identity must
+  match the ceremony creator's (a second human on a shared relay
+  cannot complete or snoop someone else's ceremony), and the
+  submission carries the session's CSRF synchronizer token.
+- `GET /v1/vhl/ceremonies/{code}/result` (identity-signed): the
+  agent polls for the completed attestation. Only the creating
+  identity may read it. The agent then verifies the attestation
+  itself — exact challenge, RP id hash, origin allowlist, UP/UV,
+  attested credential data, and the attestation chain against its
+  operator-provisioned roots — and proceeds only on success. A
+  compromised relay that swaps the attestation, the challenge, or
+  the RP id fails closed at this step: the agent never trusts the
+  relay's word for what the authenticator said.
+- Abuse controls: the in-memory ceremony registry is capped at
+  1024 live ceremonies and 8 MiB of stored attestation bytes
+  (purge-then-reject); ceremony creation is rate-limited globally
+  as well as per Courier address, so cheap identities cannot Sybil
+  past the per-address limiter.
+- Ceremonies are single-use and short-lived: the first attestation
+  submission wins, double submission is a conflict, and expired or
+  completed records are purged. Missing enrollment, missing RP
+  config, missing login, expiry, malformed or tampered
+  challenges, and invalid attestations all fail closed with
+  explicit errors.
+- Enrollment publication: after verifying the attestation, the
+  agent enrolls the credential locally and publishes the signed
+  identity→credential binding to `POST /v1/vhl/enrollments` for
+  discovery (`GET /v1/vhl/enrollments/{address}`). Only the
+  address owner can publish (identity signature over the
+  domain-separated canonical form), and only a strictly increasing
+  epoch is applied — stale re-publications are no-ops. The local
+  registry stays the trust root: a directory entry can never
+  override a local enrollment.
+- Attestation roots are provisioned by the operator via
+  `courier vhl rp set --attestation-root CERT_FILE` (the
+  authenticator vendor's root CA, e.g. Yubico's). They are
+  mandatory: enrollment fails closed without them.
+- Deployment: the ceremony page must share the dashboard's origin
+  (session cookie + TLS certificate). The production RP id and
+  ceremony origin is `courier.blackcandletech.com`: operators
+  configure it with
+  `courier vhl rp set --id courier.blackcandletech.com --origin
+  https://courier.blackcandletech.com --attestation-root <CA>`
+  and route `/vhl/*` and `/v1/vhl/*` at that domain to the relay;
+  the relay and dashboard share one SQLite database so the
+  dashboard session is visible to the relay's login gate. No proxy
+  or production routing changes are part of this change — that is
+  separate deploy work.
 
 ## Appendix B. In-flight work requiring spec updates after merge
 

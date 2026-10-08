@@ -32,6 +32,7 @@ import (
 type attachTestEnv struct {
 	t   *testing.T
 	srv *httptest.Server
+	st  *store.Store
 
 	senderHome, recipHome, snoopHome string
 	senderCfg, recipCfg, snoopCfg    *Config
@@ -48,7 +49,7 @@ func newAttachTestEnv(t *testing.T) *attachTestEnv {
 	srv := httptest.NewServer(relay.New(st).Routes())
 	t.Cleanup(srv.Close)
 
-	env := &attachTestEnv{t: t, srv: srv}
+	env := &attachTestEnv{t: t, srv: srv, st: st}
 	env.senderHome, env.recipHome, env.snoopHome = t.TempDir(), t.TempDir(), t.TempDir()
 	// Each identity is created and persisted under its own HOME, so the
 	// on-disk configs can never overwrite each other. Persisting also

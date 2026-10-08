@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/black-candle-technologies/courier/internal/client"
@@ -12,13 +13,16 @@ import (
 
 func TestSplitSendArgs(t *testing.T) {
 	cases := []struct {
-		name     string
-		args     []string
-		wantPos  []string
-		wantFile string
-		wantRply string
-		wantAtt  []string
-		wantTTL  string
+		name      string
+		args      []string
+		wantPos   []string
+		wantFile  string
+		wantRply  string
+		wantAtt   []string
+		wantTTL   string
+		wantTier  string
+		wantAttst string
+		wantErr   bool
 	}{
 		{
 			name:    "flags before positionals",
@@ -73,10 +77,48 @@ func TestSplitSendArgs(t *testing.T) {
 			wantPos: []string{"ed25519:abc", "hello"},
 			wantTTL: "2h",
 		},
+		{
+			name:      "tier and attestation flags",
+			args:      []string{"ed25519:abc", "hello", "--tier", "2", "--attestation=abc123"},
+			wantPos:   []string{"ed25519:abc", "hello"},
+			wantTier:  "2",
+			wantAttst: "abc123",
+		},
+		{
+			name:     "tier equals form before positionals",
+			args:     []string{"--tier=1", "ed25519:abc", "hello"},
+			wantPos:  []string{"ed25519:abc", "hello"},
+			wantTier: "1",
+		},
+		{
+			name:    "bare trailing --tier is an error, not a silent Tier 0",
+			args:    []string{"ed25519:abc", "hello", "--tier"},
+			wantErr: true,
+		},
+		{
+			name:    "empty --tier= is an error, not a silent Tier 0",
+			args:    []string{"ed25519:abc", "hello", "--tier="},
+			wantErr: true,
+		},
+		{
+			name:     "equals form allows dash-prefixed value",
+			args:     []string{"--file=--weird", "ed25519:abc"},
+			wantPos:  []string{"ed25519:abc"},
+			wantFile: "--weird",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pos, file, replyTo, att, ttl := splitSendArgs(tc.args)
+			pos, file, replyTo, att, ttl, tier, attest, err := splitSendArgs(tc.args)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("splitSendArgs(%v) = no error, want an argument error", tc.args)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("splitSendArgs(%v) = unexpected error: %v", tc.args, err)
+			}
 			if !reflect.DeepEqual(pos, tc.wantPos) {
 				t.Errorf("positional = %v, want %v", pos, tc.wantPos)
 			}
@@ -91,6 +133,195 @@ func TestSplitSendArgs(t *testing.T) {
 			}
 			if ttl != tc.wantTTL {
 				t.Errorf("ttl = %q, want %q", ttl, tc.wantTTL)
+			}
+			if tier != tc.wantTier {
+				t.Errorf("tier = %q, want %q", tier, tc.wantTier)
+			}
+			if attest != tc.wantAttst {
+				t.Errorf("attestation = %q, want %q", attest, tc.wantAttst)
+			}
+		})
+	}
+}
+
+func TestSplitSendArgsUnknownFlag(t *testing.T) {
+	// Regression test for issue #155: an unrecognized --flag must fail
+	// loudly instead of being silently sent as the message body.
+	cases := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "message-file after positionals",
+			args:    []string{"lane", "--message-file", "/dev/stdin"},
+			wantErr: `unknown flag "--message-file" (did you mean --file?)`,
+		},
+		{
+			name:    "message-file equals form",
+			args:    []string{"lane", "--message-file=/dev/stdin"},
+			wantErr: `unknown flag "--message-file=/dev/stdin" (did you mean --file?)`,
+		},
+		{
+			name:    "unknown flag before positionals",
+			args:    []string{"--bogus", "x", "lane", "hello"},
+			wantErr: `unknown flag "--bogus"`,
+		},
+		{
+			name:    "unknown equals-form flag",
+			args:    []string{"lane", "hello", "--wat=1"},
+			wantErr: `unknown flag "--wat=1"`,
+		},
+		{
+			name:    "known flag missing value",
+			args:    []string{"lane", "hello", "--file"},
+			wantErr: `flag "--file" requires a value`,
+		},
+		{
+			name:    "empty ttl equals form",
+			args:    []string{"lane", "hello", "--ttl="},
+			wantErr: `flag "--ttl" requires a value`,
+		},
+		{
+			name:    "empty reply-to equals form",
+			args:    []string{"lane", "hello", "--reply-to="},
+			wantErr: `flag "--reply-to" requires a value`,
+		},
+		{
+			name:    "empty file equals form",
+			args:    []string{"lane", "--file="},
+			wantErr: `flag "--file" requires a value`,
+		},
+		{
+			name:    "empty attach equals form",
+			args:    []string{"lane", "--attach="},
+			wantErr: `flag "--attach" requires a value`,
+		},
+		{
+			name:    "flag-like token is not a value",
+			args:    []string{"lane", "--attach", "--bogus"},
+			wantErr: `flag "--attach" requires a value`,
+		},
+		{
+			name:    "flag-like token is not a file value",
+			args:    []string{"lane", "--file", "--ttl"},
+			wantErr: `flag "--file" requires a value`,
+		},
+		{
+			name:    "flag-like token is not a reply-to value",
+			args:    []string{"lane", "--reply-to", "--bogus"},
+			wantErr: `flag "--reply-to" requires a value`,
+		},
+		{
+			name:    "flag-like token is not a ttl value",
+			args:    []string{"lane", "--ttl", "--bogus"},
+			wantErr: `flag "--ttl" requires a value`,
+		},
+		{
+			name:    "terminator is not a value",
+			args:    []string{"lane", "--file", "--"},
+			wantErr: `flag "--file" requires a value`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, _, _, _, _, _, err := splitSendArgs(tc.args)
+			if err == nil {
+				t.Fatalf("splitSendArgs(%v) = nil error, want %q", tc.args, tc.wantErr)
+			}
+			if err.Error() != tc.wantErr {
+				t.Errorf("splitSendArgs(%v) error = %q, want %q", tc.args, err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestSplitSendArgsDashForms(t *testing.T) {
+	// "-" alone still reads the body from stdin; "--" ends flag parsing.
+	pos, _, _, _, _, _, _, err := splitSendArgs([]string{"lane", "-"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(pos, []string{"lane", "-"}) {
+		t.Errorf("positional = %v, want [lane -]", pos)
+	}
+
+	pos, file, _, _, _, _, _, err := splitSendArgs([]string{"lane", "--", "--file"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(pos, []string{"lane", "--file"}) {
+		t.Errorf("positional = %v, want [lane --file]", pos)
+	}
+	if file != "" {
+		t.Errorf("file = %q, want empty (-- after -- is positional, not a flag)", file)
+	}
+}
+
+// TestSendForceTerminatorRepro is the exact scenario from the GitHub
+// Codex review: `courier send lane -- hello --force` must transmit the
+// literal body "hello --force" without enabling force mode (which would
+// bypass first-contact confirmation).
+func TestSendForceTerminatorRepro(t *testing.T) {
+	noForce, force := stripForce([]string{"lane", "--", "hello", "--force"})
+	if force {
+		t.Errorf("force = true, want false (--force after -- is message text)")
+	}
+	pos, _, _, _, _, _, _, err := splitSendArgs(noForce)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	body := strings.Join(pos[1:], " ")
+	if body != "hello --force" {
+		t.Errorf("body = %q, want %q", body, "hello --force")
+	}
+}
+func TestStripForce(t *testing.T) {
+	cases := []struct {
+		name      string
+		args      []string
+		wantArgs  []string
+		wantForce bool
+	}{
+		{
+			name:      "force anywhere",
+			args:      []string{"lane", "hello", "--force"},
+			wantArgs:  []string{"lane", "hello"},
+			wantForce: true,
+		},
+		{
+			name:      "force before positionals",
+			args:      []string{"--force", "lane", "hello"},
+			wantArgs:  []string{"lane", "hello"},
+			wantForce: true,
+		},
+		{
+			name:      "no force",
+			args:      []string{"lane", "hello"},
+			wantArgs:  []string{"lane", "hello"},
+			wantForce: false,
+		},
+		{
+			name:      "force after terminator stays positional",
+			args:      []string{"lane", "--", "--force"},
+			wantArgs:  []string{"lane", "--", "--force"},
+			wantForce: false,
+		},
+		{
+			name:      "force before terminator still strips",
+			args:      []string{"lane", "--force", "--", "hello"},
+			wantArgs:  []string{"lane", "--", "hello"},
+			wantForce: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotArgs, gotForce := stripForce(tc.args)
+			if !reflect.DeepEqual(gotArgs, tc.wantArgs) {
+				t.Errorf("args = %v, want %v", gotArgs, tc.wantArgs)
+			}
+			if gotForce != tc.wantForce {
+				t.Errorf("force = %v, want %v", gotForce, tc.wantForce)
 			}
 		})
 	}
