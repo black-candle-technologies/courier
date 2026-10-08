@@ -138,7 +138,7 @@ TLS with pinning protects **metadata from network observers** — who
 exchanges envelopes, when, and how much — from anyone on the path who
 is not the relay. Message contents are already protected by
 end-to-end encryption. **The relay itself still sees metadata**
-(§25.1).
+(§26.1).
 
 ## 5. Identities, addresses, and key management
 
@@ -846,7 +846,7 @@ The envelope ciphertext decrypts to one of (dispatch order in
    - **v2** (`{"v": 2, "body": ..., "reply_to"?, "quote"?,
      "attachments"?, "expires_at"?, "bridge"?}`) — reply threading
      (§20), plus attachments/expiry, plus bridge attribution (§23).
-4. Anything else renders as raw text (harmless degradation, §27.2).
+4. Anything else renders as raw text (harmless degradation, §27).
 
 `encodeMessageBody` (`internal/client/threading.go`) picks the
 minimal form: raw text for plain messages, v1 when attachments or a
@@ -890,7 +890,7 @@ Limits: 25 MiB plaintext per attachment (`MaxAttachmentBytes`),
 Upload/download authorization is in §9.7.
 The relay never sees plaintext, filenames, MIME types, plaintext
 hashes, or data keys — only opaque ciphertext blobs addressed to a
-recipient. Blob retention follows envelope retention (§25.3).
+recipient. Blob retention follows envelope retention (§25).
 
 CLI: `courier send <address> <message> --attach <file>`
 (repeatable); `courier inbox --attachments-dir <dir>` downloads and
