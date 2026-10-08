@@ -384,6 +384,9 @@ func (c *Client) FetchMessage(id int64) (Message, error) {
 	if _, ok := parseIntroductionPayload(plain); ok {
 		return Message{}, fmt.Errorf("message #%d is an introduction protocol message, not a chat message", id)
 	}
+	if isLegacyStatePayload(plain) {
+		return Message{}, fmt.Errorf("message #%d is a retired state protocol message, not a chat message", id)
+	}
 	body, manifests, rinfo, expiresAt, bmeta := parseMessagePayload(plain)
 	// issue #53: an expired message is gone. The inbox consumes it
 	// silently; the explicit fetch says so instead.

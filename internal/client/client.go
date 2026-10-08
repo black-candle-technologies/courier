@@ -287,6 +287,9 @@ func migrateEncKeys(c *Config) error {
 
 // LoadConfig reads the local identity.
 func LoadConfig() (*Config, error) {
+	if err := maintainLegacyState(); err != nil {
+		return nil, err
+	}
 	c, err := loadConfigRaw()
 	if err != nil {
 		return nil, err
@@ -1996,6 +1999,11 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// recipient's keys; a manifest whose key cannot be opened is
 		// kept with KeyError set, so the message is still delivered
 		// and the failure is visible, never silent.
+		if isLegacyStatePayload(plain) {
+			seen[h] = true
+			newHashes = append(newHashes, h)
+			continue
+		}
 		body, manifests, rinfo, expiresAt, bmeta := parseMessagePayload(plain)
 		// issue #53: a message already expired at fetch time is
 		// consumed silently — dropped, never delivered to the inbox,
