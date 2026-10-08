@@ -21,7 +21,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, "consolidation/**"]
   workflow_dispatch:
 
 # Least privilege by default; jobs request what they need.

@@ -5,7 +5,7 @@
 //
 //	courier init [--relay URL] [--force]   create your identity
 //	courier address                      print your address (public key)
-//	courier send <address> <message|-> [--attach file]... [--reply-to id] [--ttl 10m]
+//	courier send <address> <message|-> [--file path] [--attach file]... [--reply-to id] [--ttl 10m]
 //	courier inbox [--all] [--limit N] [--follow] [--attachments-dir dir]
 //	courier attachments fetch --message <id> --attachments-dir <dir>
 //	courier backup create|restore|export-sync|import-sync
@@ -33,6 +33,7 @@ import (
 	"github.com/black-candle-technologies/courier/internal/store"
 	"github.com/black-candle-technologies/courier/internal/update"
 	"github.com/black-candle-technologies/courier/internal/version"
+	"github.com/black-candle-technologies/courier/internal/vhl"
 	"github.com/mattn/go-isatty"
 )
 
@@ -87,6 +88,8 @@ func main() {
 		err = cmdGroup(os.Args[2:])
 	case "rotate":
 		err = cmdRotate(os.Args[2:])
+	case "vhl":
+		err = cmdVHL(os.Args[2:])
 	case "publish-key":
 		err = cmdPublishKey()
 	case "backup":
@@ -121,9 +124,12 @@ func usage() {
   courier send <address|contact|@handle> <msg>
                                          send a message ("-" reads stdin); --force confirms
                                          first-contact or contacts-policy handle sends
+      [--file <path>]                      read message body from file instead of an argument
       [--attach <file>]...               attach files (E2E encrypted, 25 MiB max each)
       [--reply-to <id>]                  reply to message #id (quotes it, threads the view)
       [--ttl <duration>]                 disappearing message: local delete after duration (e.g. 10m, 2h)
+      [--tier 1|2] [--attestation <id>]  VHL: tier-1 attests via your session token
+                                         (tier-2 needs an approval attestation id)
   courier inbox [--all] [--limit N] [--follow [--interval 5s]] [--requests]
       [--attachments-dir <dir>]          download verified attachments into dir
                                          --requests lists held message requests instead
@@ -154,12 +160,21 @@ func usage() {
   courier contacts unverify <name>       clear a contact's verification
   courier contacts delivery-receipts-on <name>    opt into delivery receipts for a contact
   courier contacts delivery-receipts-off <name>   opt out of delivery receipts (default)
+  courier contacts require-fs-on <name>      require forward secrecy: sends fail
+                                         rather than fall back to legacy (default off)
+  courier contacts require-fs-off <name>    clear the require-forward-secrecy policy
   courier contacts remove <name>         delete a contact
   courier receipts [contact] [--limit N] show delivery status of sent messages
   courier group create --name <name> [addr...]
                                          create an encrypted group (you are admin)
+  courier group add <group-id> <addr>    add a member (admin only)
+  courier group remove <group-id> <addr> remove a member (admin only; sender keys rotate)
+  courier group transfer <group-id> <addr>
+                                         transfer adminship to a member (admin only)
   courier group send <group-id> <msg>    send a message to the group
   courier group inbox <group-id>         read new group messages
+  courier group list                     list your groups
+  courier group show <group-id>          show group details and roster
   courier directory register <handle> [--visibility public|unlisted|private]
       [--caps a,b] [--policy open|contacts]
                                          claim a handle (first-come, signed)
@@ -179,6 +194,30 @@ func usage() {
   courier directory dismiss <id>         dismiss a pending introduction
   courier rotate                         rotate encryption key (durable crypto)
   courier publish-key                    re-announce your encryption key
+  courier vhl approver add <address> [--name N]
+                                         enroll a human approver (interactive confirm)
+  courier vhl enroll-webauthn [--device LABEL]
+                                         enroll a WebAuthn credential via the
+                                         relay-hosted browser ceremony
+  courier vhl rp set --id DOMAIN --origin https://DOMAIN --attestation-root CERT_FILE [...]
+                                         configure the WebAuthn relying party
+  courier vhl rp show                    show the relying-party config
+  courier vhl approver list              list enrolled approvers
+  courier vhl approver remove <address|name>
+                                         revoke an approver
+  courier vhl session mint [--scope ADDRESS] [--ttl DURATION]
+                                         mint a tier-1 session token via the
+                                         relay-hosted WebAuthn ceremony
+  courier vhl session status             show live session tokens
+  courier vhl session revoke <id> [--broadcast]
+                                         revoke a session token
+  courier vhl request new --tier 2 --message TEXT [--presence pin] [--to ADDR]
+                                         ask a human to approve exact bytes
+  courier vhl request list               list pending approval requests
+  courier vhl approve <request-id> [--presence pin|challenge]
+                                         review and approve exact bytes (interactive)
+  courier vhl attestations               list received attestations
+  courier vhl challenge --action TEXT    mint an out-of-band challenge code
   courier backup create [--output f]     write an encrypted identity backup
                                          (seed + live keys, passphrase-protected)
   courier backup restore [--force] <file>
@@ -340,19 +379,14 @@ func cmdSend(args []string) error {
 	fs.Var(&attach, "attach", "attach a file (repeatable, max 25 MiB each)")
 	// --force may appear anywhere; strip it before splitSendArgs so the
 	// v0.7.1 positional parsing (and its regression tests) is untouched.
-	var force bool
-	noForce := make([]string, 0, len(args))
-	for _, a := range args {
-		if a == "--force" {
-			force = true
-			continue
-		}
-		noForce = append(noForce, a)
-	}
+	noForce, force := stripForce(args)
 	// Accept flags before or after the positional address/message, as the
 	// usage string documents: Go's flag package stops parsing at the first
 	// positional argument, so extract them manually first.
-	positional, fileVal, replyToVal, attachVals, ttlVal := splitSendArgs(noForce)
+	positional, fileVal, replyToVal, attachVals, ttlVal, tierVal, attestVal, splitErr := splitSendArgs(noForce)
+	if splitErr != nil {
+		return splitErr
+	}
 	if fileVal != "" {
 		*file = fileVal
 	}
@@ -435,7 +469,42 @@ func cmdSend(args []string) error {
 			return fmt.Errorf("--ttl must be a positive duration (e.g. 30s, 10m, 2h)")
 		}
 	}
-	id, err := cl.SendFull(address, body, attach, replyTo, ttl)
+	// issue #142: VHL tiered send. --tier 1 attests via the live
+	// session token (minted through the WebAuthn mint ceremony once
+	// a ceremony transport exists); --tier 2
+	// needs a human approval attestation from `courier vhl approve`.
+	// Tiered sends refuse attachments: the approval hash binds the
+	// body bytes, and an unattested attachment would bypass review.
+	var tier vhl.Tier
+	switch tierVal {
+	case "":
+		tier = vhl.Tier0
+	case "1":
+		tier = vhl.Tier1
+	case "2":
+		tier = vhl.Tier2
+	default:
+		return fmt.Errorf("--tier must be 1 or 2")
+	}
+	var id int64
+	if tier == vhl.Tier0 {
+		if attestVal != "" {
+			return fmt.Errorf("--attestation needs --tier 1 or --tier 2")
+		}
+		id, err = cl.SendFull(address, body, attach, replyTo, ttl)
+	} else {
+		if len(attach) > 0 {
+			return fmt.Errorf("--tier %d does not support --attach: the approval hash binds the body bytes only", int(tier))
+		}
+		var att *vhl.Attestation
+		if attestVal != "" {
+			att, err = cl.VHLGetAttestation(attestVal)
+			if err != nil {
+				return err
+			}
+		}
+		id, err = cl.SendFullTiered(address, body, replyTo, ttl, tier, att)
+	}
 	if err != nil {
 		return err
 	}
@@ -465,40 +534,137 @@ func cmdSend(args []string) error {
 	return nil
 }
 
+// eqValue returns the value of a --name=value argument. An empty value
+// is rejected the same way a missing trailing value is: silently
+// dropping a requested --ttl or --reply-to would be worse than refusing.
+func eqValue(arg, name string) (string, error) {
+	v := strings.TrimPrefix(arg, name+"=")
+	if v == "" {
+		return "", fmt.Errorf("flag %q requires a value", name)
+	}
+	return v, nil
+}
+
+// stripForce removes --force from the argument list, reporting whether it
+// was present. A lone -- ends flag parsing: anything after it (including a
+// literal --force) is positional message text, not a flag.
+func stripForce(args []string) (noForce []string, force bool) {
+	noForce = make([]string, 0, len(args))
+	flagsDone := false
+	for _, a := range args {
+		if a == "--" {
+			flagsDone = true
+		}
+		if a == "--force" && !flagsDone {
+			force = true
+			continue
+		}
+		noForce = append(noForce, a)
+	}
+	return noForce, force
+}
+
 // splitSendArgs extracts --file/--attach/--reply-to/--ttl flags from any
 // position in the send command's arguments, returning the remaining
 // positional arguments. Go's flag package stops parsing at the first
 // positional, but the usage string documents flags after the message,
 // so this keeps both working.
-func splitSendArgs(args []string) (positional []string, file, replyTo string, attach []string, ttl string) {
+//
+// splitSendArgs extracts --file/--attach/--reply-to/--ttl flags from any
+// position in the send command's arguments, returning the remaining
+// positional arguments. Go's flag package stops parsing at the first
+// positional, but the usage string documents flags after the message,
+// so this keeps both working.
+//
+// An unrecognized --flag is an error, never message text: silently
+// sending the flag itself as the body (issue #155) is worse than
+// refusing. A lone "-" still means "read the body from stdin" and a
+// lone "--" still ends flag parsing the way users expect.
+//
+// A bare --tier with no value, or --tier= with an empty value, is an
+// argument error rather than a silent Tier 0: the human asked for a
+// verification tier and must not get an unattested message instead.
+func splitSendArgs(args []string) (positional []string, file, replyTo string, attach []string, ttl string, tier string, attestation string, err error) {
+	onlyPositional := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if onlyPositional {
+			positional = append(positional, a)
+			continue
+		}
 		switch {
-		case a == "--attach" && i+1 < len(args):
-			attach = append(attach, args[i+1])
+		case a == "--":
+			onlyPositional = true
+		case a == "--attach" || a == "--file" || a == "--reply-to" || a == "--ttl":
+			// A --prefixed token is never a value: it is either another
+			// flag or the -- terminator. The --name=value form remains
+			// available for values that genuinely start with --.
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+				return nil, "", "", nil, "", "", "", fmt.Errorf("flag %q requires a value", a)
+			}
+			switch a {
+			case "--attach":
+				attach = append(attach, args[i+1])
+			case "--file":
+				file = args[i+1]
+			case "--reply-to":
+				replyTo = args[i+1]
+			case "--ttl":
+				ttl = args[i+1]
+			}
 			i++
 		case strings.HasPrefix(a, "--attach="):
-			attach = append(attach, strings.TrimPrefix(a, "--attach="))
-		case a == "--file" && i+1 < len(args):
-			file = args[i+1]
-			i++
+			v, verr := eqValue(a, "--attach")
+			if verr != nil {
+				return nil, "", "", nil, "", "", "", verr
+			}
+			attach = append(attach, v)
 		case strings.HasPrefix(a, "--file="):
-			file = strings.TrimPrefix(a, "--file=")
-		case a == "--reply-to" && i+1 < len(args):
-			replyTo = args[i+1]
-			i++
+			v, verr := eqValue(a, "--file")
+			if verr != nil {
+				return nil, "", "", nil, "", "", "", verr
+			}
+			file = v
 		case strings.HasPrefix(a, "--reply-to="):
-			replyTo = strings.TrimPrefix(a, "--reply-to=")
-		case a == "--ttl" && i+1 < len(args):
-			ttl = args[i+1]
-			i++
+			v, verr := eqValue(a, "--reply-to")
+			if verr != nil {
+				return nil, "", "", nil, "", "", "", verr
+			}
+			replyTo = v
 		case strings.HasPrefix(a, "--ttl="):
-			ttl = strings.TrimPrefix(a, "--ttl=")
+			v, verr := eqValue(a, "--ttl")
+			if verr != nil {
+				return nil, "", "", nil, "", "", "", verr
+			}
+			ttl = v
+		case a == "--tier" && i+1 < len(args):
+			tier = args[i+1]
+			if tier == "" {
+				return nil, "", "", nil, "", "", "", fmt.Errorf("--tier needs a value (1 or 2); refusing to send an unattested message")
+			}
+			i++
+		case a == "--tier":
+			return nil, "", "", nil, "", "", "", fmt.Errorf("--tier needs a value (1 or 2); refusing to send an unattested message")
+		case strings.HasPrefix(a, "--tier="):
+			tier = strings.TrimPrefix(a, "--tier=")
+			if tier == "" {
+				return nil, "", "", nil, "", "", "", fmt.Errorf("--tier needs a value (1 or 2); refusing to send an unattested message")
+			}
+		case a == "--attestation" && i+1 < len(args):
+			attestation = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--attestation="):
+			attestation = strings.TrimPrefix(a, "--attestation=")
+		case len(a) > 2 && strings.HasPrefix(a, "--"):
+			if a == "--message-file" || strings.HasPrefix(a, "--message-file=") {
+				return nil, "", "", nil, "", "", "", fmt.Errorf("unknown flag %q (did you mean --file?)", a)
+			}
+			return nil, "", "", nil, "", "", "", fmt.Errorf("unknown flag %q", a)
 		default:
 			positional = append(positional, a)
 		}
 	}
-	return positional, file, replyTo, attach, ttl
+	return positional, file, replyTo, attach, ttl, tier, attestation, nil
 }
 
 // stringSliceFlag is a repeatable string flag (e.g. --attach a --attach b).
@@ -526,6 +692,12 @@ func printMessages(cl *client.Client, msgs []client.Message) {
 			flagStr += fmt.Sprintf(" [expires %s]", time.Unix(m.ExpiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"))
 		}
 		fmt.Printf("[#%d] from %s at %s%s\n", m.ID, cl.ContactDisplayName(m.From), ts, flagStr)
+		// issue #142: VHL attestation status renders as a typed badge,
+		// not body text — an unverified claim must look unverified,
+		// never like a reviewed message.
+		if m.VHL != nil {
+			fmt.Printf("%s\n", m.VHL.Badge())
+		}
 		// issues #96/#97: bridged messages are untrusted input. The
 		// marker renders from the typed flag — not the body banner —
 		// so attribution shows even when it comes from the pinned
@@ -928,7 +1100,7 @@ func writeSvcJSON(w http.ResponseWriter, code int, v any) {
 
 func cmdContacts(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|remove>")
+		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|require-fs-on|require-fs-off|remove>")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
@@ -1042,14 +1214,29 @@ func cmdContacts(args []string) error {
 		}
 		fmt.Printf("receipts: %s\n", onOff)
 		// #146: forward secrecy is fully automatic — no `courier fs`
-		// commands. Show whether an FS session is established.
+		// commands. Show whether an FS session is established, and
+		// whether the per-contact fail-closed policy is set (#327).
 		fsActive, err := cl.FSActive(args[1])
+		if err != nil {
+			return err
+		}
+		fsRequired, err := cl.FSRequired(args[1])
 		if err != nil {
 			return err
 		}
 		fsState := "inactive"
 		if fsActive {
 			fsState = "active"
+		}
+		suspected, err := cl.FSDowngradeSuspected(args[1])
+		if err != nil {
+			return err
+		}
+		if suspected {
+			fsState += " (DOWNGRADE SUSPECTED)"
+		}
+		if fsRequired {
+			fsState += " (required: sends fail closed without a session)"
 		}
 		fmt.Printf("forward secrecy: %s\n", fsState)
 		if rec, ok := cfg.StoredVerification(args[1]); ok {
@@ -1112,21 +1299,51 @@ func cmdContacts(args []string) error {
 		} else {
 			fmt.Printf("delivery receipts off for %q.\n", args[1])
 		}
+	case "require-fs-on", "require-fs-off":
+		// #146 (per #327): the per-contact fail-closed policy.
+		// Opting a contact in means sends to them refuse legacy
+		// encryption — without an established FS session the send
+		// fails instead of falling back. The handshake is still
+		// retried automatically on the next send. Default is off
+		// (fail-open).
+		if len(args) != 2 {
+			return fmt.Errorf("usage: courier contacts %s <name>", args[0])
+		}
+		on := args[0] == "require-fs-on"
+		if err := cl.FSRequire(args[1], on); err != nil {
+			return err
+		}
+		if on {
+			fmt.Printf("forward secrecy required for %q: sends will fail rather than fall back to legacy encryption until an FS session is established.\n", args[1])
+		} else {
+			fmt.Printf("forward secrecy no longer required for %q (fail-open default).\n", args[1])
+		}
 	case "remove", "rm", "delete":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: courier contacts remove <name>")
 		}
-		// #146: secure-erase the forward-secrecy session automatically
-		// on contact removal (best-effort; removal proceeds regardless).
-		if ferr := cl.FSForget(args[1]); ferr != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not erase FS session: %v\n", ferr)
+		address, err := cfg.ResolveRecipient(args[1])
+		if err != nil {
+			return err
 		}
 		if err := cfg.RemoveContact(args[1]); err != nil {
 			return err
 		}
+		stillReferenced := false
+		for _, addr := range cfg.Contacts {
+			if addr == address {
+				stillReferenced = true
+				break
+			}
+		}
+		if !stillReferenced {
+			if ferr := cl.FSForget(address); ferr != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not erase FS session: %v\n", ferr)
+			}
+		}
 		fmt.Printf("contact %q removed.\n", args[1])
 	default:
-		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|remove)", args[0])
+		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|require-fs-on|require-fs-off|remove)", args[0])
 	}
 	return nil
 }

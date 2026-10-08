@@ -13,7 +13,7 @@ func TestFSFramesFallThroughAsChatForOldClient(t *testing.T) {
 		`{"cf":3,"t":"fs-msg","v":1,"sid":"AAAAAAAAAAAAAAAAAAAAAA","n":0}`,
 	}
 	for _, f := range frames {
-		body, _, _, _, _ := parseMessagePayload([]byte(f))
+		body, _ := legacyParseMessagePayload([]byte(f))
 		if body != f {
 			t.Fatalf("fs frame did not fall through as chat text: %q", body)
 		}

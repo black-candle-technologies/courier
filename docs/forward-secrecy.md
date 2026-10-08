@@ -2,10 +2,11 @@
 
 **Status:** design for v0.11.0. Implementation follows this document.
 **Update (#146, pre-launch consolidation):** forward secrecy is now fully
-automatic — the manual `courier fs` command tree, per-peer modes, and the
-`require` fail-closed policy were removed. Initiation is opportunistic,
-rekey is automatic (100 messages or 7 days), and session erasure happens
-on `courier contacts remove`.
+automatic — the manual `courier fs` command tree and per-peer modes were
+removed. Initiation is opportunistic, rekey is automatic (100 messages or
+7 days), and session erasure happens on `courier contacts remove`. The
+fail-closed policy survives as a per-contact flag (`courier contacts
+require-fs-on|require-fs-off <name>`, #327); the default is fail-open.
 **Scope:** per-conversation (1:1 DM) forward secrecy for the wire protocol,
 plus stored-state erasure of old keys in client state, client backups, and
 relay-retained envelopes.
@@ -46,9 +47,9 @@ per-conversation session, and erases old keys everywhere they are stored.
 
 **Non-goals (v1)**
 
-- Group messages, channels, and shared-state events keep their existing
+- Group messages keep their existing
   crypto. FS sessions cover 1:1 DMs only (chat text + attachments).
-  Protocol DMs (group/channel/state/handshake traffic) stay legacy-sealed:
+  Protocol DMs (group/handshake traffic) stay legacy-sealed:
   they are machine state where delivery reliability matters more, and the
   inbox pipeline decrypts FS before dispatching, so this is a one-line
   change per call site later if wanted.
@@ -83,18 +84,20 @@ them — no new relay endpoint, no new signed object.
      FS; the client records it and answers — automatically, with no
      prompt.
 - **Fallback:** no positive knowledge → today's legacy seal, byte for byte.
-  The client **never sends handshake probes to unknown peers**: an `fs-init`
+  Without an explicit require-FS policy, the client **never sends handshake probes to unknown peers**: an `fs-init`
   is a protocol DM, and a legacy client would display its JSON as a chat
   message. Probing strangers would spam them with garbage — the exact
   failure mode the v0.6.11 policy exists to prevent.
-- **No manual controls (#146):** there is no opt-out, no per-peer mode,
-  and no fail-closed policy. Sends are always fail-open to legacy when no
-  session exists; `courier contacts remove` erases the peer's FS session.
+- **Required FS:** `courier contacts require-fs-on <name>` explicitly
+  authorizes automatic handshake probes, including private/no-handle peers.
+  Sends fail closed until a session is established. `require-fs-off` restores
+  the default opportunistic fallback. There is no manual session CLI.
+- Removing a contact erases its FS session/policy only after removal is saved
+  and only when no remaining alias references that address. Persistent downgrade
+  suspicion is visible in `contacts show` and fail-closed send errors.
 
-**Limitation, stated plainly:** peers with private handles (or no handle)
-cannot advertise `fs` through the directory. For those peers, FS starts
-when they initiate (inbound proof) or once a handshake has been observed;
-after that, handshake memory keeps it working.
+Private peers can bootstrap with an explicit require-FS policy on either side;
+without that authorization or prior capability knowledge, no probe is sent.
 
 ## 4. Session protocol
 
@@ -114,13 +117,13 @@ plaintext-layer protocol: the inner plaintext is either legacy (raw body or
  "nonce":"<base64url 24B>", "ct":"<base64url secretbox>"}
 ```
 
-`cf:1` is the FS magic (group=1/`cg`, channel=2/`cc`, state=1/`cs` already
+`cf:1` is the FS magic (group=1/`cg`, retired channel=2/`cc` and state=1/`cs` remain reserved and already
 taken). The inner `ct` is XSalsa20-Poly1305 (`secretbox`) under the
 per-message key; it seals the chat body or the `messagePayload` JSON
 (body + attachment manifests).
 
 Handshake frames ride as **protocol DMs** (logSent=false, consumed silently
-by the inbox layer like group/channel/state traffic, never in the sent log
+by the inbox layer like group traffic, never in the sent log
 or dashboard):
 
 ```json
@@ -247,7 +250,7 @@ message #1 to a newly discovered FS peer has legacy-grade protection.
 - **Outer envelope, relay, inbox fetch, dedup, spam filtering, dashboard
   push, sent log, attachments blob store**: all untouched. FS frames are
   decrypted to ordinary plaintext before the existing pipeline
-  (group/channel/state/chat dispatch) runs.
+  (group/chat dispatch) runs.
 - **Attachment data keys**: for FS sends, the per-file data key is wrapped
   under a wrap key derived from the FS message key
   (`wrapKey = HKDF(msgKey, "courier-fs-attach-v1")`, secretbox) instead of
@@ -257,7 +260,7 @@ message #1 to a newly discovered FS peer has legacy-grade protection.
   unwrap method by transport (FS vs legacy). Attachment *contents* are
   therefore FS too — a long-term-key compromise does not reveal files sent
   over FS, only their relay-side metadata (blob id, size, timing).
-- **Protocol DMs** (group/channel/state/fs-handshake) stay legacy-sealed.
+- **Protocol DMs** (group/fs-handshake) stay legacy-sealed.
 
 ## 6. Stored-state erasure
 
@@ -357,7 +360,7 @@ chat.
 - **Not provided:** metadata protection; protection of messages sent on a
   device compromised *before* the next DH step (inherent — the live state
   decrypts live messages); readability of messages delayed past two DH
-  steps (erasure wins); FS for group/channel/state protocol traffic (v1
+  steps (erasure wins); FS for group protocol traffic (v1
   scope); anything sealed to the seed-derived key by a holder of an old
   backup (§6b limitation).
 - **Downgrade resistance:** FS is opportunistic **by default**, not
@@ -379,11 +382,16 @@ chat.
   positive capability again or a session re-establishes. Pins are
   keyed by the peer's address (the cryptographic identity), never by
   contact name.
-- **No fail-closed mode (#146):** the `courier fs require <peer>`
-  per-contact policy was removed in the pre-launch consolidation.
-  Sends are always fail-open to legacy when no session exists —
-  mixed-version pairs keep working with no flag day, and no send ever
-  blocks on a handshake round-trip.
+- **Per-contact fail-closed policy (#146, #327):** the default is
+  fail-open — sends fall back to legacy when no session exists, so
+  mixed-version pairs keep working with no flag day. An operator may
+  opt a contact into fail-closed sends with `courier contacts
+  require-fs-on <name>` (cleared with `require-fs-off`): without an
+  established FS session the send fails (`fs: forward secrecy is
+  required…`) instead of going legacy. The handshake is still retried
+  automatically on the next send, so a later attempt can succeed.
+  The flag is keyed by address in `fs.json` (`require_fs`) and is
+  erased with the session on `courier contacts remove`.
 
 ## 10. Changes
 
@@ -403,11 +411,14 @@ chat.
   `internal/client/fs.go` — `FSPins`/`Downgrade`/`DowngradeWarnedAt` in
   `fs.json` (additive; old files load unchanged),
   `fsAssessDowngrade`, `fsPinCapabilityLocked`,
-  `Client.FSConsumeWarning`. **#146 update:** the `RequireFS` fail-closed
-  policy, `errFSRequired`, `Client.FSSetRequireFS`/`FSRequireForPeer`,
-  and the `cmd/courier/fs.go` CLI (including `courier fs require`)
-  were removed — sends are always fail-open to legacy. Downgrade
-  detection (pins + send-time warnings) stays, fully automatic.
+  `Client.FSConsumeWarning`. **#146 update:** per-peer modes and the
+  `cmd/courier/fs.go` CLI (including `courier fs require`) were
+  removed. **#327 update:** the fail-closed policy is back as a
+  per-contact flag — `RequireFS` in `fs.json`, `errFSRequired`,
+  `Client.FSRequire`/`FSRequired`, `courier contacts
+  require-fs-on|require-fs-off <name>`; the default stays fail-open.
+  Downgrade detection (pins + send-time warnings) stays, fully
+  automatic.
 - **Relay / dashboard: no changes.** No new endpoints, no migration, no
   redeploy. The wire is unchanged; negotiation reuses the directory's
   existing capability tokens.
