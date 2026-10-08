@@ -25,6 +25,7 @@ import (
 
 	"github.com/black-candle-technologies/courier/internal/bridge"
 	"github.com/black-candle-technologies/courier/internal/envelope"
+	"github.com/black-candle-technologies/courier/internal/vhl"
 )
 
 // replyPayloadVersion is the DM plaintext payload version carrying
@@ -45,6 +46,10 @@ type replyPayload struct {
 	Attachments []envelope.AttachmentManifest `json:"attachments,omitempty"`
 	ExpiresAt   int64                         `json:"expires_at,omitempty"`
 	Bridge      *bridge.BridgeMeta            `json:"bridge,omitempty"`
+	// issue #142: VHL tier tag + inline attestation, inside the E2E
+	// ciphertext so the tag is sender-authenticated.
+	VHLTier int              `json:"vhl_tier,omitempty"`
+	VHL     *vhl.Attestation `json:"vhl,omitempty"`
 }
 
 // replyInfo is the threading metadata parsed out of a received message:
