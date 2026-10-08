@@ -49,3 +49,29 @@ func TestContactRemovalPreservesSharedFSPolicy(t *testing.T) {
 		t.Fatal("final removal retained policy", required, err)
 	}
 }
+
+func TestContactRemoveRejectsRawNonContactAddress(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cfg, err := client.NewIdentity("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := client.NewIdentity("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	c := client.New(cfg)
+	if err := c.FSRequire(peer.Address, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdContacts([]string{"remove", peer.Address}); err == nil {
+		t.Fatal("raw non-contact address accepted for removal")
+	}
+	required, err := c.FSRequired(peer.Address)
+	if err != nil || !required {
+		t.Fatal("non-contact removal erased policy", required, err)
+	}
+}
