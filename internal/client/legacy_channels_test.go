@@ -82,3 +82,28 @@ func TestLegacyChannelArchiveWarnsWithoutMutation(t *testing.T) {
 		t.Fatal("archive modified")
 	}
 }
+
+func TestRetiredProtocolKeepsPushHashesAligned(t *testing.T) {
+	env := newAttachTestEnv(t)
+	env.asRecipient()
+	if err := env.recipient.PublishKey(); err != nil {
+		t.Fatal(err)
+	}
+	env.asSender()
+	if _, err := env.sender.sendProtocolDM(env.recipCfg.Address, `{"cc":2,"t":"rekey","s":"secret"}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.sender.Send(env.recipCfg.Address, "chat after protocol"); err != nil {
+		t.Fatal(err)
+	}
+	env.asRecipient()
+	msgs, _, _, _, hashes, err := env.recipient.inbox(0, 50, false, seenConsumerPush)
+	if err != nil || len(msgs) != 1 || len(hashes) != 1 || hashes[0] == "" {
+		t.Fatalf("unaligned push: %v %v %v", msgs, hashes, err)
+	}
+	env.recipient.recordSeen(seenConsumerPush, hashes)
+	msgs, _, _, _, _, err = env.recipient.inbox(0, 50, false, seenConsumerPush)
+	if err != nil || len(msgs) != 0 {
+		t.Fatalf("acknowledged chat replayed: %v %v", msgs, err)
+	}
+}
