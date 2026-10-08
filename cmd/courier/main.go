@@ -152,7 +152,7 @@ func usage() {
   courier block list                     list blocked senders
   courier unblock <address|contact>      unblock a sender
   courier report-spam <message-id>       report a message as spam (throttles repeat offenders)
-  courier contacts add <address|@handle>   save a contact (uses their directory handle as the name)
+  courier contacts add <address|@handle> [--force]   save a contact (uses their directory handle as the name)
   courier contacts add <name> <address>  save a contact with a local private alias (overrides the handle)
   courier contacts list                  list contacts (with trust state)
   courier contacts show <name>           show a contact's address and trust state
@@ -1109,6 +1109,7 @@ func cmdContacts(args []string) error {
 	cl := client.New(cfg)
 	switch args[0] {
 	case "add":
+		args, force := stripForce(args)
 		// #146: the display name defaults to the known directory
 		// handle; a local alias is the optional private override.
 		// `contacts add <address>` names the contact after the
@@ -1124,16 +1125,35 @@ func cmdContacts(args []string) error {
 				return fmt.Errorf("handle resolution failed: %w", herr)
 			} else if isHandle {
 				address, name = addr, profile.Handle
+				fmt.Fprintf(os.Stderr, "resolved @%s -> %s\n", profile.Handle, addr)
+				known := false
+				for _, saved := range cfg.Contacts {
+					if saved == addr {
+						known = true
+						break
+					}
+				}
+				if !known && !force {
+					return fmt.Errorf("re-run with --force to confirm the contact identity")
+				}
 			} else {
 				address = args[1]
 				if _, err := crypto.ParseAddress(address); err != nil {
-					return fmt.Errorf("bad address %q: usage: courier contacts add <address|@handle> | courier contacts add <name> <address>", address)
+					return fmt.Errorf("bad address %q: usage: courier contacts add <address|@handle> [--force] | courier contacts add <name> <address>", address)
+				}
+				if existing := existingContactAlias(cfg, address); existing != "" {
+					fmt.Printf("contact already saved as %q.\n", existing)
+					return nil
 				}
 				handle := cl.PeerHandle(address)
 				if handle == "" {
 					return fmt.Errorf("no directory handle known for that address — add it with an explicit name: courier contacts add <name> <address>")
 				}
 				name = handle
+			}
+			if existing := existingContactAlias(cfg, address); existing != "" {
+				fmt.Printf("contact already saved as %q.\n", existing)
+				return nil
 			}
 			// Never repoint an existing name at a different
 			// address silently (e.g. a transferred handle).
@@ -1143,7 +1163,7 @@ func cmdContacts(args []string) error {
 		case 3:
 			name, address = args[1], args[2]
 		default:
-			return fmt.Errorf("usage: courier contacts add <address|@handle> | courier contacts add <name> <address>")
+			return fmt.Errorf("usage: courier contacts add <address|@handle> [--force] | courier contacts add <name> <address>")
 		}
 		if err := cfg.AddContact(name, address); err != nil {
 			return err
@@ -1182,7 +1202,7 @@ func cmdContacts(args []string) error {
 			// explicit private alias. Show the directory handle
 			// alongside when an alias shadows it.
 			display := n
-			if h := cl.PeerHandle(cfg.Contacts[n]); h != "" && h != n {
+			if h := cl.CachedPeerHandle(cfg.Contacts[n]); h != "" && h != n {
 				display = fmt.Sprintf("%s (@%s)", n, h)
 			}
 			fmt.Printf("%-32s %-12s%s %s\n", display, badge, receipts, cfg.Contacts[n])
@@ -1199,7 +1219,7 @@ func cmdContacts(args []string) error {
 		// #146: display defaults to the directory handle; the stored
 		// name is either that handle or an explicit private alias.
 		// Surface the handle when an alias shadows it.
-		if h := cl.PeerHandle(addr); h != "" && h != args[1] {
+		if h := cl.CachedPeerHandle(addr); h != "" && h != args[1] {
 			fmt.Printf("handle: @%s\n", h)
 		}
 		st, detail := cl.ContactTrust(args[1])
@@ -1903,4 +1923,14 @@ func cmdDashboardSetAdmin(args []string) error {
 		fmt.Printf("granted dashboard admin rights to %q\n", rest[0])
 	}
 	return nil
+}
+
+func existingContactAlias(cfg *client.Config, address string) string {
+	result := ""
+	for name, addr := range cfg.Contacts {
+		if addr == address && (result == "" || name < result) {
+			result = name
+		}
+	}
+	return result
 }

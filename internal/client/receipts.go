@@ -112,12 +112,13 @@ func (c *Config) SetReceiptsOptIn(address string, on bool) error {
 // contactNameForAddress returns the contact name for an address, or ""
 // when the address is not a named contact.
 func (c *Config) contactNameForAddress(address string) string {
+	result := ""
 	for name, addr := range c.Contacts {
-		if addr == address {
-			return name
+		if addr == address && (result == "" || name < result) {
+			result = name
 		}
 	}
-	return ""
+	return result
 }
 
 // ---- receipt traffic state (~/.courier/receipts.json) ----

@@ -456,6 +456,9 @@ func (c *Client) PeerHandle(address string) string {
 		}
 	}
 	profiles, err := c.DirectoryReverse(address)
+	if err != nil {
+		return ""
+	} // Transient/network/verification failures are not negative knowledge.
 	handle := ""
 	if err == nil && len(profiles) > 0 {
 		handle = profiles[0].Handle
@@ -727,19 +730,19 @@ func (c *Client) contactNameFor(address string) string {
 //  1. the local address-book name when the address is a contact —
 //     either a handle taken as the name at add time or an explicit
 //     private alias;
-//  2. the peer's known directory handle (24h-cached reverse lookup)
+//  2. the peer's known directory handle (cache only)
 //     when the address is not a contact;
-//  3. a truncated address as the last resort.
+//  3. the full actionable address as the last resort.
 //
 // Exported for CLI display.
 func (c *Client) ContactDisplayName(address string) string {
 	if name := c.cfg.contactNameForAddress(address); name != "" {
 		return name
 	}
-	if h := c.PeerHandle(address); h != "" {
-		return h
+	if h := c.CachedPeerHandle(address); h != "" {
+		return fmt.Sprintf("@%s (%s)", h, address)
 	}
-	return shortAddr(address)
+	return address
 }
 
 func shortAddr(address string) string {
@@ -919,4 +922,14 @@ func (c *Client) AcceptIntroduction(id, greet string) error {
 		return fmt.Errorf("contact added as %q, but the greeting failed to send: %w", name, err)
 	}
 	return c.DismissIntroduction(pi.ID)
+}
+
+// CachedPeerHandle never performs network I/O; rendering local views must not
+// generate serial directory requests or turn transient failures into cache misses.
+func (c *Client) CachedPeerHandle(address string) string {
+	e, ok := c.cfg.HandleCache[address]
+	if ok && time.Now().Unix()-e.At < 24*3600 {
+		return e.Handle
+	}
+	return ""
 }

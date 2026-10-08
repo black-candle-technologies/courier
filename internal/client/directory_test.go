@@ -538,7 +538,7 @@ func TestContactDisplayName(t *testing.T) {
 	// No contact: the cached directory handle.
 	plain := introClient(t, carolID, map[string]string{})
 	seedHandleCache(t, plain.cfg, bobAddr, "bob")
-	if got := plain.ContactDisplayName(bobAddr); got != "bob" {
+	if got := plain.ContactDisplayName(bobAddr); got != "@bob ("+bobAddr+")" {
 		t.Fatalf("want cached handle, got %q", got)
 	}
 
@@ -548,9 +548,44 @@ func TestContactDisplayName(t *testing.T) {
 		t.Fatalf("handle-as-name: got %q", got)
 	}
 
-	// Nothing known: truncated address (no relay — reverse fails fast).
+	// Nothing known: full actionable address, with no network lookup.
 	unknown := "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-	if got := plain.ContactDisplayName(unknown); got != shortAddr(unknown) {
-		t.Fatalf("want truncated address, got %q", got)
+	if got := plain.ContactDisplayName(unknown); got != unknown {
+		t.Fatalf("want full address, got %q", got)
+	}
+}
+
+func TestContactDisplayIsLocalAndUnambiguous(t *testing.T) {
+	_, id, bob := introIdentities(t)
+	addr := addrOf(bob)
+	c := introClient(t, id, map[string]string{"alice": "ed25519:local", "zulu": addr, "beta": addr})
+	for i := 0; i < 100; i++ {
+		if got := c.ContactDisplayName(addr); got != "beta" {
+			t.Fatalf("nondeterministic alias %q", got)
+		}
+	}
+	stranger := "ed25519:stranger"
+	seedHandleCache(t, c.cfg, stranger, "alice")
+	if got := c.ContactDisplayName(stranger); got != "@alice ("+stranger+")" {
+		t.Fatal("remote handle impersonates alias", got)
+	}
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(429) }))
+	defer srv.Close()
+	c.cfg.RelayURL = srv.URL
+	for i := 0; i < 100; i++ {
+		c.ContactDisplayName("unknown")
+		c.CachedPeerHandle(addr)
+	}
+	if calls != 0 {
+		t.Fatal("display accessed network", calls)
+	}
+	c.PeerHandle(addr)
+	c.PeerHandle(addr)
+	if calls != 2 {
+		t.Fatal("transient failure was cached", calls)
+	}
+	if _, ok := c.cfg.HandleCache[addr]; ok {
+		t.Fatal("negative cache contains transient error")
 	}
 }
