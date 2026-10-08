@@ -342,9 +342,12 @@ There are no `courier fs` commands (#146) — forward secrecy is fully
 automatic:
 
 - `courier contacts show <name>` reports `forward secrecy:
-  active/inactive` for the peer (replaces `fs status`).
-- `courier contacts remove <name>` erases the peer's FS session as part
-  of contact removal (replaces `fs forget`; no separate surface).
+  active/inactive`, the required policy, and persistent downgrade suspicion
+  for the peer (replaces `fs status`).
+- `courier contacts require-fs-on|require-fs-off <name>` enables or clears
+  fail-closed sending; enabling authorizes private-peer handshake probes.
+- `courier contacts remove <name>` erases the peer's FS session only after
+  the last alias is successfully removed (replaces `fs forget`).
 
 Handshake traffic never touches `~/.courier/sent.jsonl` (logSent=false,
 the existing `sendProtocolDM` pattern) — the dashboard shows only human
