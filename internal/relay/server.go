@@ -154,6 +154,10 @@ type Server struct {
 	// (issue #42), keyed by recipient address. Guarded by subMu.
 	subMu sync.Mutex
 	subs  map[string]map[*subscriber]struct{}
+	// ceremonies is the transient WebAuthn ceremony registry (issue
+	// #142): short-lived browser-ceremony records for VHL enrollment
+	// and session minting. In-memory only, never persisted.
+	ceremonies *vhlCeremonies
 }
 
 // New returns a Server backed by st with default abuse-control tuning.
@@ -228,6 +232,7 @@ func NewWithConfig(st *store.Store, cfg Config) *Server {
 		reserved:          reserved,
 		bridgeOrigins:     bridgeOrigins,
 		subs:              make(map[string]map[*subscriber]struct{}),
+		ceremonies:        newVHLCeremonies(),
 	}
 }
 
@@ -264,6 +269,16 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/directory/lookup", s.handleDirectoryLookup)
 	mux.HandleFunc("GET /v1/directory/search", s.handleDirectorySearch)
 	mux.HandleFunc("GET /v1/directory/reverse", s.handleDirectoryReverse)
+	// issue #142: VHL WebAuthn ceremony transport. Agent endpoints
+	// are identity-signature authenticated; browser endpoints are
+	// gated on the shared dashboard session.
+	mux.HandleFunc("POST /v1/vhl/ceremonies", s.handleVHLCeremonyCreate)
+	mux.HandleFunc("GET /v1/vhl/ceremonies/{code}", s.handleVHLCeremonyDetails)
+	mux.HandleFunc("POST /v1/vhl/ceremonies/{code}/attestation", s.handleVHLCeremonyAttest)
+	mux.HandleFunc("GET /v1/vhl/ceremonies/{code}/result", s.handleVHLCeremonyResult)
+	mux.HandleFunc("GET /vhl/ceremony", s.handleVHLCeremonyPage)
+	mux.HandleFunc("POST /v1/vhl/enrollments", s.handleVHLEnrollmentPublish)
+	mux.HandleFunc("GET /v1/vhl/enrollments/{address}", s.handleVHLEnrollmentLookup)
 	return mux
 }
 

@@ -47,9 +47,9 @@ per-conversation session, and erases old keys everywhere they are stored.
 
 **Non-goals (v1)**
 
-- Group messages, channels, and shared-state events keep their existing
+- Group messages keep their existing
   crypto. FS sessions cover 1:1 DMs only (chat text + attachments).
-  Protocol DMs (group/channel/state/handshake traffic) stay legacy-sealed:
+  Protocol DMs (group/handshake traffic) stay legacy-sealed:
   they are machine state where delivery reliability matters more, and the
   inbox pipeline decrypts FS before dispatching, so this is a one-line
   change per call site later if wanted.
@@ -115,13 +115,13 @@ plaintext-layer protocol: the inner plaintext is either legacy (raw body or
  "nonce":"<base64url 24B>", "ct":"<base64url secretbox>"}
 ```
 
-`cf:1` is the FS magic (group=1/`cg`, channel=2/`cc`, state=1/`cs` already
+`cf:1` is the FS magic (group=1/`cg`, retired channel=2/`cc` and state=1/`cs` remain reserved and already
 taken). The inner `ct` is XSalsa20-Poly1305 (`secretbox`) under the
 per-message key; it seals the chat body or the `messagePayload` JSON
 (body + attachment manifests).
 
 Handshake frames ride as **protocol DMs** (logSent=false, consumed silently
-by the inbox layer like group/channel/state traffic, never in the sent log
+by the inbox layer like group traffic, never in the sent log
 or dashboard):
 
 ```json
@@ -248,7 +248,7 @@ message #1 to a newly discovered FS peer has legacy-grade protection.
 - **Outer envelope, relay, inbox fetch, dedup, spam filtering, dashboard
   push, sent log, attachments blob store**: all untouched. FS frames are
   decrypted to ordinary plaintext before the existing pipeline
-  (group/channel/state/chat dispatch) runs.
+  (group/chat dispatch) runs.
 - **Attachment data keys**: for FS sends, the per-file data key is wrapped
   under a wrap key derived from the FS message key
   (`wrapKey = HKDF(msgKey, "courier-fs-attach-v1")`, secretbox) instead of
@@ -258,7 +258,7 @@ message #1 to a newly discovered FS peer has legacy-grade protection.
   unwrap method by transport (FS vs legacy). Attachment *contents* are
   therefore FS too — a long-term-key compromise does not reveal files sent
   over FS, only their relay-side metadata (blob id, size, timing).
-- **Protocol DMs** (group/channel/state/fs-handshake) stay legacy-sealed.
+- **Protocol DMs** (group/fs-handshake) stay legacy-sealed.
 
 ## 6. Stored-state erasure
 
@@ -358,7 +358,7 @@ chat.
 - **Not provided:** metadata protection; protection of messages sent on a
   device compromised *before* the next DH step (inherent — the live state
   decrypts live messages); readability of messages delayed past two DH
-  steps (erasure wins); FS for group/channel/state protocol traffic (v1
+  steps (erasure wins); FS for group protocol traffic (v1
   scope); anything sealed to the seed-derived key by a holder of an old
   backup (§6b limitation).
 - **Downgrade resistance:** FS is opportunistic **by default**, not
