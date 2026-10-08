@@ -743,6 +743,9 @@ func (c *Client) fsPrepareSend(address string) (*fsSendOutput, error) {
 		}
 	}
 	if required {
+		if warning := c.FSConsumeWarning(address); warning != "" {
+			return nil, fmt.Errorf("%w: %s", errFSRequired, warning)
+		}
 		return nil, errFSRequired
 	}
 	return nil, nil
@@ -849,6 +852,10 @@ func (c *Client) fsShouldInit(address string) bool {
 		if time.Now().Unix()-sess.CreatedAt <= fsInitRefreshSeconds {
 			return false
 		}
+	}
+	// Requiring FS explicitly authorizes a probe, even for private peers.
+	if ff.RequireFS[address] {
+		return true
 	}
 	// Issue #110: a pinned peer has proven FS support before. The pin
 	// is permanent capability knowledge, so handshake pressure
@@ -1663,4 +1670,18 @@ func (c *Client) FSForget(peer string) error {
 		delete(ff.RequireFS, address)
 		return nil
 	})
+}
+
+// FSDowngradeSuspected exposes persistent downgrade memory to local inspection.
+func (c *Client) FSDowngradeSuspected(peer string) (bool, error) {
+	address, err := c.cfg.ResolveRecipient(peer)
+	if err != nil {
+		return false, err
+	}
+	ff, err := loadFS()
+	if err != nil {
+		return false, err
+	}
+	_, ok := ff.Downgrade[address]
+	return ok, nil
 }

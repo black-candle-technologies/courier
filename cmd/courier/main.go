@@ -1170,6 +1170,13 @@ func cmdContacts(args []string) error {
 		if fsActive {
 			fsState = "active"
 		}
+		suspected, err := cl.FSDowngradeSuspected(args[1])
+		if err != nil {
+			return err
+		}
+		if suspected {
+			fsState += " (DOWNGRADE SUSPECTED)"
+		}
 		if fsRequired {
 			fsState += " (required: sends fail closed without a session)"
 		}
@@ -1257,13 +1264,24 @@ func cmdContacts(args []string) error {
 		if len(args) != 2 {
 			return fmt.Errorf("usage: courier contacts remove <name>")
 		}
-		// #146: secure-erase the forward-secrecy session automatically
-		// on contact removal (best-effort; removal proceeds regardless).
-		if ferr := cl.FSForget(args[1]); ferr != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not erase FS session: %v\n", ferr)
+		address, err := cfg.ResolveRecipient(args[1])
+		if err != nil {
+			return err
 		}
 		if err := cfg.RemoveContact(args[1]); err != nil {
 			return err
+		}
+		stillReferenced := false
+		for _, addr := range cfg.Contacts {
+			if addr == address {
+				stillReferenced = true
+				break
+			}
+		}
+		if !stillReferenced {
+			if ferr := cl.FSForget(address); ferr != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not erase FS session: %v\n", ferr)
+			}
 		}
 		fmt.Printf("contact %q removed.\n", args[1])
 	default:

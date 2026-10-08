@@ -84,18 +84,20 @@ them — no new relay endpoint, no new signed object.
      FS; the client records it and answers — automatically, with no
      prompt.
 - **Fallback:** no positive knowledge → today's legacy seal, byte for byte.
-  The client **never sends handshake probes to unknown peers**: an `fs-init`
+  Without an explicit require-FS policy, the client **never sends handshake probes to unknown peers**: an `fs-init`
   is a protocol DM, and a legacy client would display its JSON as a chat
   message. Probing strangers would spam them with garbage — the exact
   failure mode the v0.6.11 policy exists to prevent.
-- **No manual controls (#146):** there is no opt-out, no per-peer mode,
-  and no fail-closed policy. Sends are always fail-open to legacy when no
-  session exists; `courier contacts remove` erases the peer's FS session.
+- **Required FS:** `courier contacts require-fs-on <name>` explicitly
+  authorizes automatic handshake probes, including private/no-handle peers.
+  Sends fail closed until a session is established. `require-fs-off` restores
+  the default opportunistic fallback. There is no manual session CLI.
+- Removing a contact erases its FS session/policy only after removal is saved
+  and only when no remaining alias references that address. Persistent downgrade
+  suspicion is visible in `contacts show` and fail-closed send errors.
 
-**Limitation, stated plainly:** peers with private handles (or no handle)
-cannot advertise `fs` through the directory. For those peers, FS starts
-when they initiate (inbound proof) or once a handshake has been observed;
-after that, handshake memory keeps it working.
+Private peers can bootstrap with an explicit require-FS policy on either side;
+without that authorization or prior capability knowledge, no probe is sent.
 
 ## 4. Session protocol
 
