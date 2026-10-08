@@ -1444,7 +1444,7 @@ sent envelopes I can find locally. **Absence of a receipt is not a
 signal** — the recipient may simply not have opted in, and the sender
 cannot tell. Reference: `internal/client/receipts.go`.
 
-### 20.1 Wire format
+### 19.1 Wire format
 
 Receipts are ordinary encrypted DM envelopes (kind `dm`) carrying a
 protocol payload, like group protocol DMs. The relay
@@ -1467,7 +1467,7 @@ chat, never silently swallowed. Pre-receipt clients display the
 payload JSON as chat text (same forward-compatibility trade-off as
 group DMs).
 
-### 20.2 Triggers
+### 19.2 Triggers
 
 - `delivery`: the recipient's inbox consumer first delivers the
   envelope. Automatic, once per envelope. Dashboard pushes never fire
@@ -1475,7 +1475,7 @@ group DMs).
   messages are out of scope; dashboard thread opens are future work
   (the dashboard server holds no keys to sign with).
 
-### 20.3 Authentication and replay safety
+### 19.3 Authentication and replay safety
 
 The envelope's Ed25519 signature authenticates `from`. Identical
 envelope bytes are suppressed by the per-consumer seen sets; a replay
@@ -1488,7 +1488,7 @@ with a sane timestamp, so fabricated receipts are dropped. Receipts
 bypass the sent log (`logSent=false`): they are machine traffic, not
 chat, and never reach the dashboard.
 
-### 20.4 Local storage
+### 19.4 Local storage
 
 - Opt-in: `config.json` → `receipt_contacts` (address → true).
   Cleared on contact removal.
@@ -1505,7 +1505,7 @@ relay-wide unique, so the reference is unambiguous in both DM
 directions without any coordination layer
 (`internal/client/threading.go`).
 
-### 21.1 Wire format
+### 20.1 Wire format
 
 The reference lives inside the **E2E-encrypted DM plaintext** — no
 relay changes, no new endpoints, no migration. Messages that are
@@ -1524,7 +1524,7 @@ before, so a third party cannot forge a reply reference onto someone
 else's message. The quote is truncated to 500 chars (rune-boundary,
 whitespace-collapsed) — quotes are display hints, not content.
 
-### 21.2 Client behavior
+### 20.2 Client behavior
 
 - `courier send <address> <message> --reply-to <id>` — sends a reply.
   The client embeds the parent snippet best-effort (sent log, then the
@@ -1576,7 +1576,7 @@ erasure — a message delivered before expiry is still deleted locally,
 but any copy the recipient made outside Courier (screenshots, logs,
 backups, forwarded plaintext) is out of scope. See §26.2.
 
-### 22.1 Backward compatibility
+### 21.1 Backward compatibility
 
 Pre-#53 clients ignore unknown JSON fields: state `note-add` /
 `task-add` payloads still parse (the note/task simply never expires
@@ -1596,7 +1596,7 @@ belong to the inbox consumer (§10.2).
 
 ## 23. Bridge: ChatGPT web → Courier (issue #61)
 
-### 24.1 The one paragraph that matters
+### 23.1 The one paragraph that matters
 
 This bridge is **explicitly NOT end-to-end encrypted**, by
 construction. ChatGPT web cannot hold Ed25519 keys, and everything
@@ -1624,7 +1624,7 @@ actions, tool calls, sends, or state changes without the receiving
 operator's explicit approval. Reference: `docs/bridge.md`,
 `internal/bridge/`, `internal/client/bridge.go`.
 
-### 24.2 Components
+### 23.2 Components
 
 - **`courier-bridge-mcp`** — public MCP server (Streamable HTTP,
   stateless mode), fronted by Caddy at
@@ -1654,7 +1654,7 @@ operator's explicit approval. Reference: `docs/bridge.md`,
   perspective it is an ordinary client: **no relay changes, no
   protocol wire changes.**
 
-### 24.3 Attribution
+### 23.3 Attribution
 
 Every bridged message carries two layers:
 
@@ -1687,7 +1687,7 @@ out of band, and recipients can pin the bridge address locally with
 `courier bridge trust <addr>` (stored in config; rendering from the
 pin list is a phase-2 concern).
 
-### 24.4 Tokens, confirmation, audit
+### 23.4 Tokens, confirmation, audit
 
 - Ingest tokens are 256-bit random secrets, shown once at issuance.
   Only the HMAC-SHA-256 hash (pepper from
@@ -1714,7 +1714,7 @@ pin list is a phase-2 concern).
   privileged rewrite of `bridge.db` (no external anchor yet).
   Retention is 1 year, then pruned.
 
-### 24.5 What the bridge is NOT
+### 23.5 What the bridge is NOT
 
 - It is not a protocol extension: bridged messages are ordinary DMs
   **from the bridge identity** — no relay changes, no new endpoints,
@@ -1742,7 +1742,7 @@ pushes them; the dashboard never queries the directory or verifies
 signatures itself. Treat dashboard peer metadata as the agent's
 claims, not as independently verified facts.
 
-### 25.1 Registration
+### 24.1 Registration
 
 `POST /v1/dashboard/register` (JSON):
 `{username, password, address, sig}` where `sig` is the Ed25519
@@ -1761,7 +1761,7 @@ the holder of the identity's private key can register that address.
   stores only its SHA-256. The agent stores the token for
   `courier dashboard push`.
 
-### 25.2 Login
+### 24.2 Login
 
 Two paths (`internal/dashboard/dashboard.go`,
 `internal/dashboard/bct_oauth.go`):
@@ -1776,7 +1776,7 @@ Two paths (`internal/dashboard/dashboard.go`,
   account from Settings (`/oauth/bct/link`, `/oauth/bct/callback`,
   `/settings/unlink-bct`); linking is per-user opt-in and reversible.
 
-### 25.3 Push
+### 24.3 Push
 
 `POST /v1/dashboard/push` with `Authorization: Bearer <api_token>`:
 
@@ -1797,7 +1797,7 @@ advances its local cursor past every attempted push. `handles` and
 `verified` are the agent-reported peer labels (§17.6, §18). Each
 push also sweeps already-expired `expires_at` rows (§21).
 
-### 25.4 Security properties
+### 24.4 Security properties
 
 **Security properties.** Passwords: bcrypt. Tokens: shown once, stored
 hashed. Sessions: 32-byte random tokens, stored hashed, 30-day expiry.
@@ -1846,7 +1846,7 @@ defense-in-depth, and SameSite=Lax is retained. Limits are tunable via
 
 ## 26. Security considerations and threat model
 
-### 27.1 What the relay sees (metadata, stated plainly)
+### 26.1 What the relay sees (metadata, stated plainly)
 
 TLS hides traffic metadata from **network observers**, not from the
 relay. The relay — and anyone who compromises it or compels the
@@ -1868,7 +1868,7 @@ byte-identical on the wire — §15.1); it cannot read contents. There
 is no anonymity or unlinkability property against the relay. Do not
 claim otherwise in product copy (issue #113).
 
-### 27.2 Deletion limits (stated plainly)
+### 26.2 Deletion limits (stated plainly)
 
 - **Disappearing messages** are endpoint-local deletion requests.
   Expiry is enforced by the recipient's client and the dashboard
@@ -1888,7 +1888,7 @@ claim otherwise in product copy (issue #113).
   to FS session content, not to legacy DMs, handshake envelopes'
   metadata, or anything sealed to a long-term key.
 
-### 27.3 Threat model
+### 26.3 Threat model
 
 **Assumed attacker capabilities and the protocol's answers:**
 
@@ -1907,7 +1907,7 @@ claim otherwise in product copy (issue #113).
 (the live state decrypts live messages — inherent); coercion of
 contacts; attacks on the operator's host OS.
 
-### 27.4 Known limitations and not-yet-implemented (with issues)
+### 26.4 Known limitations and not-yet-implemented (with issues)
 
 Carried over from prior disclosures; each is tracked:
 
@@ -2003,7 +2003,7 @@ Safety numbers (not a signature) use the hash domain
 `courier-safety-v1` over both parties' Ed25519 keys, X25519 keys,
 and key epochs (§18).
 
-## 30. Verified Human in the Loop (issue #142)
+## 28. Verified Human in the Loop (issue #142)
 
 VHL lets a **receiver** verify that a message an agent sent was
 actually reviewed and approved by a human — countering malicious or
@@ -2013,7 +2013,7 @@ guarantee: the sender claims a tier, the receiver verifies the claim
 against its own locally-enrolled trust root, and anything unverified
 is held for human review — never acted on, never silently discarded.
 
-### 30.1 Tiers
+### 28.1 Tiers
 
 - **Tier 0** — unattested chat and status. The legacy wire is
   untouched: a message with no VHL fields is Tier 0.
@@ -2024,7 +2024,7 @@ is held for human review — never acted on, never silently discarded.
   approval** bound to the exact action bytes; drawn signatures do not
   count as presence.
 
-### 30.2 Wire format
+### 28.2 Wire format
 
 The tier tag and the inline attestation live **inside the
 E2E-encrypted DM plaintext** (v1/v2 payloads gain `vhl_tier` and
@@ -2037,7 +2037,7 @@ A Tier 0 message that improperly carries an attestation is
 **invalid**, not harmless Tier 0 — an unattested tier tag with a
 smuggled artifact is a downgrade/evasiveness signal.
 
-### 30.3 Attestations
+### 28.3 Attestations
 
 An attestation is a signed, versioned artifact binding the action
 hash, tier, approver identity, timestamp, presence proof, and the
@@ -2114,11 +2114,11 @@ single-process on those hosts. Minting is ceremony-bound: the CLI's
 `session mint` creates a relay-hosted WebAuthn ceremony over the
 mint challenge and the mint completes only against the verified
 assertion the human's authenticator produced in the browser (see
-§30.8). There is no path that mints a token without a fresh
+§28.8). There is no path that mints a token without a fresh
 WebAuthn ceremony. The same-or-stronger re-mint rule still
 applies: a live token is never renewable with a weaker ceremony.
 
-### 30.4 Receiver verification
+### 28.4 Receiver verification
 
 The receiver's verifier (`internal/vhl/policy.go`) checks, in order:
 tier tag validity → receiver minimum-tier requirement (a claim
@@ -2168,7 +2168,7 @@ review). `courier inbox` renders a typed badge — `✔ human-verified
 (tier N) by <address>` or `⚠ UNVERIFIED … HELD for human review` —
 never body text, so an unverified claim can never look reviewed.
 
-### 30.5 Native frames
+### 28.5 Native frames
 
 Three frame types travel as E2E-encrypted protocol DMs (consumed by
 the VHL layer, never surfaced as chat):
@@ -2183,11 +2183,11 @@ the VHL layer, never surfaced as chat):
   (anyone cannot revoke anyone's tokens). Broadcast reaches the
   sender's contacts.
 
-### 30.6 Client behavior
+### 28.6 Client behavior
 
 - `courier vhl approver add <address> [--name N]` — enroll a human
   approver through a relay-hosted WebAuthn assertion ceremony
-  (§30.8): the agent creates an `enroll-approver` ceremony binding
+  (§28.8): the agent creates an `enroll-approver` ceremony binding
   the approver and agent addresses, the human approves the pairing
   with their enrolled security key in the browser, and the agent
   validates the resulting artifact (challenge recomputation,
@@ -2198,7 +2198,7 @@ the VHL layer, never surfaced as chat):
   human-approved event. `approver list` lists enrolled approvers;
   `approver remove <address|name>` revokes an approver.
 - `courier vhl enroll-webauthn [--device LABEL]` — enroll a
-  WebAuthn credential via the relay-hosted ceremony (§30.8): the
+  WebAuthn credential via the relay-hosted ceremony (§28.8): the
   agent creates the ceremony, the human completes it with their
   security key in the browser, and the agent verifies the
   attestation itself before enrolling locally and publishing the
@@ -2219,7 +2219,7 @@ the VHL layer, never surfaced as chat):
   fails closed. `courier vhl rp show` prints the current config.
 - `courier vhl session mint [--scope ADDRESS] [--ttl DURATION]`
   — mint a session token through the relay-hosted mint ceremony
-  (§30.8): the agent begins the mint locally, creates the
+  (§28.8): the agent begins the mint locally, creates the
   ceremony bound to the mint challenge, waits for the human to
   approve it with their security key in the browser, and finishes
   the mint against the verified assertion. The returned token is
@@ -2232,7 +2232,7 @@ the VHL layer, never surfaced as chat):
   <request-id> [--presence pin|challenge|fido2|fido2_uv]` shows the
   human the exact bytes and the recomputed action hash before the
   ceremony. `fido2`/`fido2_uv` run the relay-hosted `approve`
-  ceremony (§30.8): the human reviews the exact action context in
+  ceremony (§28.8): the human reviews the exact action context in
   the browser and answers the nonce-bound approval challenge with
   their security key. Approval is atomic: the displayed hash and
   sender are bound to the minted attestation inside one locked
@@ -2241,7 +2241,7 @@ the VHL layer, never surfaced as chat):
   transport failure after minting requires a new request rather
   than a retry.
 - `courier vhl policy [--require-tier 0|1|2]` — show or set the
-  receiver-side minimum tier (see §30.3).
+  receiver-side minimum tier (see §28.3).
 - `courier send --tier 1|2 [--attestation <id>]` — tiered send.
   Tier 1 without a live session token fails closed; Tier 2 without
   a human approval attestation for the exact bytes fails closed;
@@ -2253,7 +2253,7 @@ the VHL layer, never surfaced as chat):
   from a 32-symbol alphabet; 256 mod 32 == 0 so the modulo
   sampling is unbiased).
 
-### 30.7 Security properties stated honestly
+### 28.7 Security properties stated honestly
 
 - The PIN ceremony is only as strong as the terminal it runs on:
   typing `APPROVE <id>` proves a human is at *that* keyboard, not
@@ -2304,7 +2304,7 @@ the VHL layer, never surfaced as chat):
   address's other credentials — but the directory is discovery
   only and never overrides the local registry.
 
-### 30.8 Relay-hosted WebAuthn ceremony transport
+### 28.8 Relay-hosted WebAuthn ceremony transport
 
 The agent cannot touch a YubiKey, so enrollment, session minting,
 Tier 2 approvals, and approver enrollment run as relay-hosted

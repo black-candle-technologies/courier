@@ -2,29 +2,13 @@
 
 ## Decision
 
-Expiry is implemented **once, client-side, in the ciphertext** — on two
-surfaces:
-
-1. **Shared-state substrate (the primary primitive, issue #49):** an
-   `expires_at` timestamp on `note-add` / `task-add` state events. A note
-   with an expiry is the natural agent primitive (scratch context,
-   one-time secrets, "remember this for 10 minutes").
-2. **Plain chat DMs:** an `expires_at` timestamp on the versioned message
-   payload (`courier send --ttl`). "Disappearing messages" without chat
-   coverage would be a surprising gap, and the dashboard is the human
-   reading surface where disappearance must be visible.
-
-There is deliberately **no new envelope kind, no new relay endpoint, and
-no relay change**. Both forms ride inside ordinary encrypted DMs, so the
-relay never learns which messages expire (metadata protection is
-preserved) and old clients degrade gracefully instead of choking.
+Expiry lives inside encrypted chat payloads (`courier send --ttl`). There is
+no new envelope kind or relay endpoint; the relay cannot inspect the deadline.
+Shared notes/tasks are retired. Their reserved `cs:1,t:state` payloads are
+consumed without rendering or caching, and explicit fetch refuses them.
 
 ## Where expiry lives
 
-- **State events:** `StateEvent.expires_at` (unix seconds, `omitempty`).
-  Valid only on `note-add` and `task-add`; rejected on other event kinds.
-  Folded into `StateNote.expires_at` / `StateTask.expires_at` so snapshots
-  and derived views carry it.
 - **Chat DMs:** `messagePayload.expires_at` (unix seconds, `omitempty`).
   `--ttl` wraps the body as `{"v":1,"body":...,"expires_at":...}`.
   Messages without TTL keep the legacy raw-text plaintext byte-for-byte.
@@ -64,7 +48,7 @@ own copies on its own schedule. A peer that never fetches keeps its
 This is the honest limit of the feature, and it matches the product's
 threat model: the relay is a dumb mailbox that already retains
 ciphertext for a bounded window. Endpoint deletion covers the realistic
-"disappearing" use cases (shared scratch state, secrets that should not
+"disappearing" use cases (temporary context, secrets that should not
 linger in logs or the dashboard UI).
 
 ## Clock skew
@@ -78,14 +62,10 @@ means expired. Senders that need tighter semantics should pad the TTL.
 
 ## Backward compatibility
 
-- **State events:** `expires_at` is `omitempty`. Pre-#53 clients unmarshal
-  the event fine (unknown JSON fields are ignored) and simply never
-  expire the note — graceful degradation, no choke.
 - **Chat DMs:** pre-#53 `parseMessagePayload` returns the JSON wrapper as
   raw body text when there are no attachments, so the message is
   **preserved and readable** (rendered as JSON) but the TTL is not
-  enforced. This mirrors the documented pre-v0.10.0 behavior for state
-  payloads ("display the payload JSON as chat text (harmless)"). Any
+  enforced. Any
   in-ciphertext scheme has this property; a relay envelope field would
   have been cleaner for old clients but requires a relay deploy, and a
   new envelope `kind` would make old clients *silently drop* the message,
@@ -111,6 +91,18 @@ messages only.)
 - Read-receipt-triggered expiry ("disappear after read") was a
   considered non-goal and is now moot: read receipts were cut
   pre-launch (#146); only delivery receipts remain.
-- Expiry on group/channel control traffic (out of scope; group messages
+- Expiry on group control traffic (out of scope; group messages
   could adopt `messagePayload.expires_at` later since they share the
   plaintext format path).
+
+## Retired shared-state archive
+
+Existing `~/.courier/state.json` remains a private, read-only legacy archive for
+manual inspection/export; no shared-state CLI or new state mutations remain.
+Every config load prunes expired notes/tasks and their related mutations and
+snapshot copies under the cross-process config lock. Later-expiring entries
+are pruned on later loads; no background deletion runs while Courier is idle.
+Nonexpired data and unknown metadata are preserved in place with atomic 0600
+replacement. A malformed archive stops loading with an error and is left intact
+for explicit recovery. Do not run old state-writing binaries concurrently.
+Backups and independently exported copies retain their own retention obligations.
