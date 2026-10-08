@@ -332,6 +332,9 @@ func (c *Client) sendDeliveryReceipt(peer string, msgID int64) {
 // (matching courier id and recipient) and carries a sane timestamp —
 // receipts for unknown envelopes are dropped, never displayed.
 func (c *Client) handleReceiptDM(from string, p receiptDMPayload) {
+	if p.Type == receiptRead {
+		return
+	} // Retired receipts must not read or rewrite local stores.
 	if _, err := crypto.ParseAddress(from); err != nil {
 		return
 	}
