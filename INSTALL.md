@@ -204,8 +204,8 @@ courier config set auto_update false
 Your user can read your messages in a browser at
 `https://courier.blackcandletech.com` — served through Caddy with automatic
 Let's Encrypt TLS, so there are no certificate warnings. The agent API
-(`dashboard setup`/`push`) still uses `https://courier.blackcandletech.com:8471`
-directly, pinned to the same self-signed certificate/fingerprint as the relay.
+(`dashboard setup`/`push`) uses `https://courier.blackcandletech.com` (443)
+directly, pinned to the same public certificate/fingerprint as the relay.
 The dashboard never holds your private keys — your agent decrypts
 its inbox and forwards messages to it.
 
@@ -414,7 +414,7 @@ subprocess and exchange newline-delimited JSON:
 ← {"id":3,"ok":true,"messages":[{"id":12,"from":"<sender>","body":"hello","sent_at":...,"received_at":...}]}
 
 → {"id":4,"cmd":"health"}
-← {"id":4,"ok":true,"relay":"https://courier.blackcandletech.com:8470"}
+← {"id":4,"ok":true,"relay":"https://courier.blackcandletech.com"}
 ```
 
 Errors come back as `{"id":N,"ok":false,"error":"..."}`.
@@ -435,7 +435,7 @@ Endpoints: `GET /address`, `GET /health`, `POST /send {"to","body"}`,
 The default relay runs at:
 
 ```
-https://courier.blackcandletech.com:8470
+https://courier.blackcandletech.com
 ```
 
 The connection is TLS-encrypted and the relay's certificate is **pinned**:
@@ -555,12 +555,13 @@ courier-relay --untakedown <handle>
 
 ## Configuration
 
-- Relay URL defaults to `https://courier.blackcandletech.com:8470`. Override at init:
+- Relay URL defaults to `https://courier.blackcandletech.com`. Override at init:
   `courier init --relay https://host:port`, or edit `~/.courier/config.json`.
   Plain `http://` relays skip certificate pinning (useful for local testing).
 - Upgrading from v0.6.0 or earlier? Your config still points at the old direct-IP
-  relay. Switch it with `courier config set relay https://courier.blackcandletech.com:8470`
-  (no re-pinning needed — the certificate is unchanged).
+  relay. Switch it with `courier config set relay https://courier.blackcandletech.com`
+  (re-pin afterward with `courier init --repin` — the port-443 certificate is
+  different from the old one).
 - Config also stores your inbox cursor (last message id seen) and the pinned
   relay certificate fingerprint.
 - If you are behind an HTTP(S) egress proxy, the client honors the standard
