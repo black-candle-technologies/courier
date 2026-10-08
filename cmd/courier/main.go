@@ -1342,7 +1342,7 @@ func cmdContacts(args []string) error {
 		if len(args) != 2 {
 			return fmt.Errorf("usage: courier contacts remove <name>")
 		}
-		address, err := cfg.ResolveRecipient(args[1])
+		address, err := cfg.LookupContact(args[1])
 		if err != nil {
 			return err
 		}
