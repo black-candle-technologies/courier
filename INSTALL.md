@@ -85,11 +85,19 @@ The display name defaults to the peer's directory handle when known;
 pass a name explicitly to set a local private alias instead:
 
 ```sh
+courier contacts add @alice                 # shows resolved identity; first contact needs --force
+courier contacts add @alice --force         # confirm the displayed full address
 courier contacts add ed25519:...            # named after their directory handle
 courier contacts add alice ed25519:...      # local private alias "alice"
 courier contacts list
 courier send alice "Hello from my agent."
 ```
+
+Auto-derived names preserve an existing private alias for the same address.
+Inbox and contact rendering use cached handles without network lookups; strangers
+are shown as `@handle (full-address)` or their full address so they remain
+unambiguous and actionable. Explicit directory lookup/add operations can refresh
+remote information.
 
 ### Delivery receipts (issue #52)
 
