@@ -155,3 +155,24 @@ func TestLegacyStateMaintenanceDuringPolling(t *testing.T) {
 		t.Fatal("polling stranded expiry")
 	}
 }
+
+func TestLegacyStateEmptyArchiveCompatibility(t *testing.T) {
+	cfg := testConfig(t)
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := configPath()
+	p = filepath.Join(filepath.Dir(p), "state.json")
+	for _, raw := range []string{`{}`, `null`, `{"conversations":null}`, `{"extra":"preserve"}`} {
+		if err := os.WriteFile(p, []byte(raw), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadConfig(); err != nil {
+			t.Fatalf("legacy empty archive rejected: %s: %v", raw, err)
+		}
+		b, _ := os.ReadFile(p)
+		if string(b) != raw {
+			t.Fatal("empty archive changed")
+		}
+	}
+}

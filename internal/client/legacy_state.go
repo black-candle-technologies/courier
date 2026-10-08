@@ -41,6 +41,9 @@ func maintainLegacyState() error {
 		if err = json.Unmarshal(data, &root); err != nil {
 			return fmt.Errorf("legacy state archive: %w", err)
 		}
+		if root["conversations"] == nil {
+			return nil
+		} // Legacy empty archives are valid.
 		var conversations map[string]map[string]json.RawMessage
 		if err = json.Unmarshal(root["conversations"], &conversations); err != nil {
 			return fmt.Errorf("legacy state conversations: %w", err)
