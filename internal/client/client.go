@@ -1858,6 +1858,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 	filtered := 0
 	lastID := after
 	var newHashes []string
+	var outputHashes []string
 	// issue #49: shared-state events newly applied during this fetch,
 	// with envelope metadata for the dashboard push announcements.
 	var stateApplied []appliedStateEvent
@@ -2140,14 +2141,16 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// or when the relay reports the sender is currently throttled
 		// for spam — even under the open policy. Held messages are not
 		// marked seen, so review re-derives them; the empty hash keeps
-		// newHashes parallel to out for DashboardPush.
+		// outputHashes parallel to out for DashboardPush.
 		if hold {
 			msg.Request = true
 			out = append(out, msg)
+			outputHashes = append(outputHashes, "")
 			newHashes = append(newHashes, "")
 			continue
 		}
 		out = append(out, msg)
+		outputHashes = append(outputHashes, h)
 		// issue #52: opt-in delivery receipt. Fires only for the inbox
 		// consumer on first delivery — never for dashboard pushes,
 		// state syncs, or review re-derivations (markSeen=false) — and
@@ -2222,7 +2225,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 	if markSeen {
 		c.recordSeen(consumer, newHashes)
 	}
-	return out, lastID, skipped, filtered, newHashes, stateApplied, nil
+	return out, lastID, skipped, filtered, outputHashes, stateApplied, nil
 }
 
 // InboxReview re-derives the messages currently held as requests,
