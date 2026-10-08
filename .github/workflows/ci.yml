@@ -33,10 +33,10 @@ concurrency:
 
 env:
   # Pinned deliberately. The govulncheck gate requires a toolchain with all
-  # known stdlib fixes (currently >= go1.26.6); bump this on purpose and
+  # known stdlib fixes (currently >= go1.26.9); bump this on purpose and
   # re-run the suite. The go.mod `go 1.25.0` line is the minimum *language*
   # version, not the toolchain.
-  GO_VERSION: "1.26.8"
+  GO_VERSION: "1.26.9"
 
 jobs:
   gofmt:
