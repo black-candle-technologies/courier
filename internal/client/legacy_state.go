@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -65,28 +66,56 @@ func maintainLegacyState() error {
 				Note    string `json:"note_id"`
 				Task    string `json:"task_id"`
 				Expires int64  `json:"expires_at"`
+				SentAt  int64  `json:"ts"`
+				Author  string `json:"author"`
+				Seq     int64  `json:"seq"`
 			}
+			noteExpiry, taskExpiry := map[string]int64{}, map[string]int64{}
 			for id, raw := range notes {
 				var e expiry
 				if err = json.Unmarshal(raw, &e); err != nil {
 					return err
 				}
-				if stateExpired(now, e.Expires) {
+				noteExpiry[id] = e.Expires
+			}
+			ordered := make([]expiry, len(events))
+			for i, raw := range events {
+				if err = json.Unmarshal(raw, &ordered[i]); err != nil {
+					return err
+				}
+			}
+			sort.Slice(ordered, func(i, j int) bool {
+				a, b := ordered[i], ordered[j]
+				if a.SentAt != b.SentAt {
+					return a.SentAt < b.SentAt
+				}
+				if a.Author != b.Author {
+					return a.Author < b.Author
+				}
+				return a.Seq < b.Seq
+			})
+			// Match the retired fold: snapshots precede events and the first
+			// add in (timestamp, author, sequence) order owns an item's TTL.
+			for _, e := range ordered {
+				switch e.Kind {
+				case "note-add":
+					if _, ok := noteExpiry[e.Note]; !ok {
+						noteExpiry[e.Note] = e.Expires
+					}
+				case "task-add":
+					if _, ok := taskExpiry[e.Task]; !ok {
+						taskExpiry[e.Task] = e.Expires
+					}
+				}
+			}
+			for id, exp := range noteExpiry {
+				if stateExpired(now, exp) {
 					deadNotes[id] = true
 				}
 			}
-			for _, raw := range events {
-				var e expiry
-				if err = json.Unmarshal(raw, &e); err != nil {
-					return err
-				}
-				if stateExpired(now, e.Expires) {
-					if e.Note != "" {
-						deadNotes[e.Note] = true
-					}
-					if e.Task != "" {
-						deadTasks[e.Task] = true
-					}
+			for id, exp := range taskExpiry {
+				if stateExpired(now, exp) {
+					deadTasks[id] = true
 				}
 			}
 			if len(deadNotes)+len(deadTasks) == 0 {
@@ -102,7 +131,14 @@ func maintainLegacyState() error {
 				if err = json.Unmarshal(raw, &e); err != nil {
 					return err
 				}
-				if !deadNotes[e.Note] && !deadTasks[e.Task] {
+				expired := false
+				switch e.Kind {
+				case "note-add", "note-done":
+					expired = deadNotes[e.Note]
+				case "task-add", "task-assign", "task-done", "task-reopen":
+					expired = deadTasks[e.Task]
+				}
+				if !expired {
 					keep = append(keep, raw)
 				}
 			}

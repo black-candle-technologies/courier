@@ -99,9 +99,9 @@ messages only.)
 
 Existing `~/.courier/state.json` remains a private, read-only legacy archive for
 manual inspection/export; no shared-state CLI or new state mutations remain.
-Every config load prunes expired notes/tasks and their related mutations and
+Every config load and send/inbox polling operation prunes expired notes/tasks and their related mutations and
 snapshot copies under the cross-process config lock. Later-expiring entries
-are pruned on later loads; no background deletion runs while Courier is idle.
+are pruned on later operations; no background deletion runs while Courier is idle.
 Nonexpired data and unknown metadata are preserved in place with atomic 0600
 replacement. A malformed archive stops loading with an error and is left intact
 for explicit recovery. Do not run old state-writing binaries concurrently.
