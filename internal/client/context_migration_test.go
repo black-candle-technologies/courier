@@ -77,6 +77,11 @@ func TestMigrationCrashRecovery(t *testing.T) {
 			} else if active != source {
 				t.Fatal("partial context selected")
 			}
+			if point != "committed" {
+				if _, _, e := target.IdentityStore().Load(); !errors.Is(e, ErrMigrationIncomplete) {
+					t.Fatalf("partial named target accessible: %v", e)
+				}
+			}
 			if err = source.MigrateLegacy(target, MigrationOptions{ConfirmLegacyWritersStopped: true}); err != nil {
 				t.Fatal(err)
 			}

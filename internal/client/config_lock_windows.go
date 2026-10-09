@@ -99,6 +99,9 @@ func (s Context) withConfigLock(fn func() error) error {
 			return err
 		}
 		defer releaseRoot()
+		if err := s.checkMigrationCommitted(); err != nil {
+			return err
+		}
 		if err := s.checkBinding(false); err != nil {
 			return err
 		}

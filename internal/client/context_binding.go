@@ -50,3 +50,35 @@ func (s Context) checkBinding(record bool) error {
 	}
 	return durableReplace(path, raw)
 }
+
+// A staged target must not become independently writable through --host before
+// the active manifest commits. Otherwise a crash after directory rename would
+// leave two live ratchet stores even though default selection stayed legacy.
+func (s Context) checkMigrationCommitted() error {
+	if s.principal == "" {
+		return nil
+	}
+	root := s.installation()
+	raw, err := os.ReadFile(filepath.Join(root.root, "context-migration.json"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var journal migrationJournal
+	if err = json.Unmarshal(raw, &journal); err != nil {
+		return err
+	}
+	if journal.Manifest.Principal != s.principal {
+		return nil
+	}
+	active, err := root.ActiveContext()
+	if err != nil {
+		return err
+	}
+	if active != s {
+		return ErrMigrationIncomplete
+	}
+	return nil
+}

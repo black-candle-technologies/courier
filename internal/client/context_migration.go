@@ -11,6 +11,8 @@ import (
 	"runtime"
 )
 
+var ErrMigrationIncomplete = errors.New("context migration is incomplete; explicitly resume before opening the named store")
+
 var ErrLegacyMigrated = errors.New("legacy Courier store has migrated; resolve the active context before opening stores")
 
 // MigrationOptions requires the operator to stop all legacy writers, including
