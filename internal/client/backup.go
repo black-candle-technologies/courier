@@ -202,7 +202,7 @@ func (c *Config) MergeSyncKeys(p *crypto.BackupPayload) (added int, err error) {
 	}
 	if scope := c.local(); scope.principal != "" {
 		origin, e := NormalizeRelayOrigin(p.RelayURL)
-		if e != nil || origin != scope.binding.Endpoint || p.RelayFingerprint != scope.binding.Pin {
+		if e != nil || origin != scope.binding.Endpoint || !sameCertificatePin(p.RelayFingerprint, scope.binding.Pin) {
 			return 0, ErrContextMismatch
 		}
 	}
