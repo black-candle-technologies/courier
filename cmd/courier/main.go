@@ -1152,13 +1152,13 @@ func cmdContacts(args []string) error {
 				if _, err := crypto.ParseAddress(address); err != nil {
 					return fmt.Errorf("bad address %q: usage: courier contacts add <address|@handle> [--force] | courier contacts add <name> <address>", address)
 				}
-				if existing := existingContactAlias(cfg, address); existing != "" {
-					fmt.Printf("contact already saved as %q.\n", existing)
-					return nil
-				}
 				handle, err := cl.LookupPeerHandle(address)
 				if err != nil {
 					return fmt.Errorf("directory handle lookup failed; retry or supply an explicit name: %w", err)
+				}
+				if existing := existingContactAlias(cfg, address); existing != "" {
+					fmt.Printf("contact already saved as %q.\n", existing)
+					return nil
 				}
 				if handle == "" {
 					return fmt.Errorf("no directory handle known for that address — add it with an explicit name: courier contacts add <name> <address>")

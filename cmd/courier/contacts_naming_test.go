@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestContactHandleRequiresConfirmationAndPreservesAlias(t *testing.T) {
@@ -205,5 +206,59 @@ func TestContactAddressDistinguishesDirectoryFailure(t *testing.T) {
 				t.Fatal("lookup failure cached as authoritative absence, or verified absence not cached")
 			}
 		})
+	}
+}
+
+func TestContactRawAddressRefreshesSavedAliasHandle(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "relay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	srv := httptest.NewServer(relay.New(st).Routes())
+	defer srv.Close()
+	setTestHome(t, t.TempDir())
+	peer, err := client.NewIdentity(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.New(peer).PublishKey(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.New(peer).DirectoryRegister("public-bob", "public", nil, "open"); err != nil {
+		t.Fatal(err)
+	}
+	setTestHome(t, t.TempDir())
+	cfg, err := client.NewIdentity(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.AddContactAlias("private-bob", peer.Address); err != nil {
+		t.Fatal(err)
+	}
+	for _, expired := range []bool{false, true} {
+		cfg.HandleCache = map[string]client.HandleCacheEntry{}
+		if expired {
+			cfg.HandleCache[peer.Address] = client.HandleCacheEntry{Handle: "old-handle", At: time.Now().Unix() - 25*3600}
+		}
+		if err := cfg.Save(); err != nil {
+			t.Fatal(err)
+		}
+		if err := cmdContacts([]string{"add", peer.Address}); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err = client.LoadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := client.New(cfg).CachedPeerHandle(peer.Address); got != "public-bob" {
+			t.Fatalf("raw add did not refresh verified handle: %q", got)
+		}
+		if len(cfg.Contacts) != 1 || cfg.Contacts["private-bob"] != peer.Address || cfg.PreferredContactNames[peer.Address] != "private-bob" {
+			t.Fatal("lookup changed private alias", cfg.Contacts)
+		}
 	}
 }
