@@ -1120,6 +1120,11 @@ sent over FS, only their relay-side metadata (blob id, size, timing).
   long-term keys) reveal only `rk0` + ephemeral pubs — insufficient
   to recover the session without the erased ephemeral DH privates.
 
+Replacing a contact name with a different address also erases the old peer's
+FS state after saving, provided no other alias references that peer. A failed
+contact save preserves the old state; a subsequent cleanup failure reports
+that the contact was saved but erasure failed.
+
 ### 15.8 CLI
 
 There are no `courier fs` commands (#146). Contact controls are:

@@ -457,8 +457,29 @@ func (c *Config) AddContact(name, address string) error {
 	if c.Contacts == nil {
 		c.Contacts = map[string]string{}
 	}
+	oldAddress, replaced := c.Contacts[name]
 	c.Contacts[name] = address
-	return c.Save()
+	if err := c.Save(); err != nil {
+		if replaced {
+			c.Contacts[name] = oldAddress
+		} else {
+			delete(c.Contacts, name)
+		}
+		return err
+	}
+	// Persist the replacement before erasing the old identity's keys. Other
+	// aliases still referencing that identity keep its session and policy.
+	if replaced && oldAddress != address {
+		for _, other := range c.Contacts {
+			if other == oldAddress {
+				return nil
+			}
+		}
+		if err := New(c).FSForget(oldAddress); err != nil {
+			return fmt.Errorf("contact saved, but could not erase replaced contact's FS session: %w", err)
+		}
+	}
+	return nil
 }
 
 // RemoveContact deletes a contact and its verification record (issue
