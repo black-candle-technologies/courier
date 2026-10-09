@@ -1632,11 +1632,12 @@ backups, forwarded plaintext) is out of scope. See §26.2.
 
 ### 21.1 Backward compatibility
 
-Pre-#53 clients ignore unknown JSON fields: state `note-add` /
-`task-add` payloads still parse (the note/task simply never expires
-for them), and old chat clients display a TTL message's versioned
-JSON as raw text rather than losing the message. Old dashboard rows
-default to `expires_at = 0`.
+Chat clients predating the TTL payload can display its versioned JSON as
+raw text rather than losing the message; clients that ignore `expires_at`
+do not enforce expiry. Old dashboard rows default to `expires_at = 0`.
+These compatibility rules concern chat and dashboard storage. Historical
+shared-state TTL behavior is not an active contract: current clients silently
+consume the reserved state discriminator at any version, as specified in §27.
 
 ## 22. Instant wake (client side)
 
