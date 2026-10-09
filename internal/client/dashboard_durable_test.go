@@ -145,7 +145,7 @@ func TestDashboardDiscoveryBoundAndDurableRetry(t *testing.T) {
 		mu.Lock()
 		queried = append(queried, r.URL.String())
 		mu.Unlock()
-		http.Error(w, "offline", 503)
+		http.Error(w, "offline", http.StatusServiceUnavailable)
 	}))
 	defer srv.Close()
 	cfg.RelayURL = srv.URL
@@ -214,7 +214,7 @@ func TestDashboardTrustRevocationDurableAndConcurrent(t *testing.T) {
 			<-release
 		}
 		if fail.Load() {
-			http.Error(w, "offline", 503)
+			http.Error(w, "offline", http.StatusServiceUnavailable)
 			return
 		}
 		fmt.Fprint(w, `{"stored":0}`)
