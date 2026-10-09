@@ -1155,7 +1155,10 @@ func cmdContacts(args []string) error {
 					fmt.Printf("contact already saved as %q.\n", existing)
 					return nil
 				}
-				handle := cl.PeerHandle(address)
+				handle, err := cl.LookupPeerHandle(address)
+				if err != nil {
+					return fmt.Errorf("directory handle lookup failed; retry or supply an explicit name: %w", err)
+				}
 				if handle == "" {
 					return fmt.Errorf("no directory handle known for that address — add it with an explicit name: courier contacts add <name> <address>")
 				}

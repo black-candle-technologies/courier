@@ -464,11 +464,13 @@ func (c *Client) directoryReverseContext(ctx context.Context, address string) ([
 // PeerHandle explicitly resolves a peer address, using a 24h cache.
 // Rendering uses CachedPeerHandle instead so directory I/O cannot block it.
 func (c *Client) PeerHandle(address string) string {
-	handle, _ := c.lookupPeerHandle(address)
+	handle, _ := c.LookupPeerHandle(address)
 	return handle
 }
 
-func (c *Client) lookupPeerHandle(address string) (string, error) {
+// LookupPeerHandle resolves a cached or verified directory handle. An empty
+// result with no error means no public handle; lookup failures remain errors.
+func (c *Client) LookupPeerHandle(address string) (string, error) {
 	if c.cfg.HandleCache != nil {
 		if e, ok := c.cfg.HandleCache[address]; ok &&
 			time.Now().Unix()-e.At < 24*3600 {
