@@ -1,16 +1,16 @@
 # Team addressing and multi-host plan
 
-**Status:** Revised design proposal, 2026-10-08. Documentation only; runtime implementation has not started. Recommendations below remain subject to the named owner decisions. Riley retains the merge gate; neither this document nor an independent design review authorizes a merge.
+**Status:** Revised design and implementation reference, updated 2026-10-09. Packet A context isolation and Packet B team wire implementation are in separate review PRs; this PR contains planning documents and a CI Go 1.26.9 pin, with no team runtime implementation. Remaining recommendations are subject to the named owner decisions and downstream integration gates. Riley retains the merge gate; neither this document nor an independent design review authorizes a merge.
 
 **Context:** Courier needs to link agents belonging to different people, including Riley’s Muse and Picasso and Lane’s Muse. Rig’s `user@team` addressing and named-host configuration are inspiration only; Courier is decoupled from rig and uses its own protocols. A Courier host means a relay endpoint, not an SSH machine.
 
 **Non-negotiable:** Courier remains end-to-end encrypted. The directory may learn names, addresses and membership, but never message plaintext.
 
-This revision supersedes the incompatible addressing and incomplete trust assumptions in the [initial proposal](https://github.com/black-candle-technologies/courier/blob/ec99b39f80c2f288c9374d49af1e7aeb0b4c10b6/docs/team-addressing-plan.md). It preserves the multi-owner, multi-host goal. See [implementation work packets](team-addressing-implementation-plan.md) for dependencies, file ownership, acceptance gates and prepared agent handoffs. Those packets are prepared, not dispatched.
+This revision supersedes the incompatible addressing and incomplete trust assumptions in the [initial proposal](https://github.com/black-candle-technologies/courier/blob/ec99b39f80c2f288c9374d49af1e7aeb0b4c10b6/docs/team-addressing-plan.md). It preserves the multi-owner, multi-host goal. See [implementation work packets](team-addressing-implementation-plan.md) for dependencies, file ownership, acceptance gates and prepared agent handoffs. Packets A and B have been dispatched under separate authorization; their implementation and review status do not establish readiness of downstream packets.
 
 Keep teams as signed address books, preserve Courier’s existing sender-key groups, and add multi-host support only after isolating local state by relay and principal. Use explicit team fanout rather than changing the meaning of `@handle`. Retain SuiteV1 throughout this work.
 
-This resolves the compatibility and trust gaps in [PR 162](https://github.com/black-candle-technologies/courier/pull/162). The recommended design below is proposed behavior, not an implemented feature or permission to merge. PR 162 remains unmerged; its historical first revision is linked above.
+This resolves the compatibility and trust gaps in [PR 162](https://github.com/black-candle-technologies/courier/pull/162). The design below combines the implemented Packet B wire contract with proposed downstream behavior; it does not establish a complete implemented feature or permission to merge. PR 162 remains unmerged; its historical first revision is linked above.
 
 ## Independent design review
 
@@ -105,17 +105,28 @@ Each store receives a `Context` or a context-bound interface, never a process-gl
 
 ## Team identity and signed wire format
 
-Use a cryptographic ID independent of a friendly slug. At creation, generate a 256-bit nonce. Define `team_id` as SHA256 over a domain separator, canonical relay origin, genesis owner address and nonce. Preserve the genesis owner namespace after ownership transfer. A slug is a signed display label; uniqueness applies within `(relay origin, genesis owner, slug)` while active. A deleted team leaves a permanent tombstone for its ID. Reusing a slug yields a new ID and never inherits client pins.
+Use a cryptographic ID independent of a friendly slug. The caller supplies 32 bytes of creation entropy encoded as canonical unpadded base64url `genesis_nonce` (strict decoding and exact encode/decode round-trip). `genesis_owner` must be a SuiteV1 address that exactly round-trips through the SuiteV1 formatter. Let `C` be the UTF-8 bytes of RFC 8785 canonical JSON containing **precisely** the three string fields `genesis_nonce`, `genesis_owner` and `relay_origin`, in that canonical key order. Use Packet B's restricted grammar: printable ASCII strings, objects, arrays and null; no JSON numbers, booleans, controls or non-ASCII strings. For this commitment, the values are the three validated strings, without extra fields.
+
+```text
+team_id      = "sha256:" + lowercase_hex(SHA256(ASCII("courier.team.id.v1")      || 0x00 || C))
+genesis_root = "sha256:" + lowercase_hex(SHA256(ASCII("courier.team.genesis.v1") || 0x00 || C))
+```
+
+`relay_origin` must already satisfy Packet B's canonical HTTPS grammar: lowercase ASCII DNS labels (1–63 characters, letters/digits/hyphens, no leading/trailing hyphen or empty label), or accepted canonical IP spelling; bracketed IPv6 must equal Go's canonical IP spelling. The origin is at most 269 bytes and has no userinfo, path (including `/`), query or fragment. An optional port is a canonical decimal integer from 1–65535 excluding 443, without leading zeroes; empty/default ports are rejected. The entire input must exactly equal the reconstructed `https://host[:port]`. Reject noncanonical signed field values; never normalize them before validating a root or signature. Packet A's endpoint normalizer can accept origins that B rejects. Downstream C/D must enforce B's grammar and compare the signed origin to their captured binding, failing visibly for an incompatible binding; no silent migration or trust reset is permitted.
+
+This encoding is implemented in [Packet B NewTeamRoot and origin validation](https://github.com/black-candle-technologies/courier/blob/a9af611aa478eb103a66300b133e98c098665abe/internal/envelope/team.go#L169-L238). The pinned [wire contract](https://github.com/black-candle-technologies/courier/blob/a9af611aa478eb103a66300b133e98c098665abe/docs/packet-b-team-wire.md), [golden fixture](https://github.com/black-candle-technologies/courier/blob/a9af611aa478eb103a66300b133e98c098665abe/internal/envelope/testdata/team/golden.json), [Go vector tests](https://github.com/black-candle-technologies/courier/blob/a9af611aa478eb103a66300b133e98c098665abe/internal/envelope/team_vectors_test.go) and [independent Node oracle](https://github.com/black-candle-technologies/courier/blob/a9af611aa478eb103a66300b133e98c098665abe/internal/envelope/testdata/team/vectors.mjs) define reproducible cross-language evidence. The creation commitment is member-free, avoiding a circular dependency with membership consent. Preserve the genesis owner namespace after ownership transfer. A slug is a signed display label; uniqueness applies within `(relay origin, genesis owner, slug)` while active. A deleted team leaves a permanent tombstone for its ID. Reusing a slug yields a new ID and never inherits client pins.
 
 The following is a field-level schema, with placeholders rather than a valid signed fixture:
 
 ```json
 {
   "schema": "courier.team.roster.v1",
+  "suite": "ed25519-x25519-naclbox-v1",
   "relay_origin": "https://relay.example:8470",
   "team_id": "sha256:<digest>",
   "genesis_owner": "ed25519:<key>",
   "genesis_nonce": "<base64url-32-bytes>",
+  "genesis_root": "sha256:<creation-commitment-digest>",
   "slug": "crew",
   "version": "3",
   "previous_hash": "sha256:<version-2-payload>",
@@ -127,6 +138,7 @@ The following is a field-level schema, with placeholders rather than a valid sig
   "status": "active",
   "visibility": "private",
   "history_disclosure": "current_and_future_members",
+  "removal_policy": "owner_dependent_with_local_blocking",
   "members": [
     {
       "handle": "muse",
@@ -138,7 +150,7 @@ The following is a field-level schema, with placeholders rather than a valid sig
 }
 ```
 
-Sign the exact UTF-8 canonical payload excluding `signatures`, prefixed by `courier.team.roster.v1\0`. Use RFC 8785 JSON Canonicalization Scheme with cross-language golden vectors; the restricted field grammar avoids Unicode and number-normalization ambiguity. Reject duplicate keys, all unknown fields in v1 (future extensions require a new schema or an explicitly signed extension contract), invalid UTF-8, noncanonical integers, inconsistent suite/address labels and oversized arrays or strings before verification. Decimal-string versions avoid JSON number precision differences; validate unsigned 64-bit range and increment without wrap. Sort members by canonical handle and require unique handles and unique addresses. Use lower-case ASCII handles/slugs, length 1–32, with an explicit `[a-z0-9][a-z0-9_-]*` grammar; do not normalize lookalike Unicode into trusted names.
+Sign the exact UTF-8 canonical payload excluding `signatures`, prefixed by `courier.team.roster.v1\0`. Use RFC 8785 JSON Canonicalization Scheme with cross-language golden vectors; the restricted field grammar avoids Unicode and number-normalization ambiguity. Reject duplicate keys, all unknown fields in v1 (future extensions require a new schema or an explicitly signed extension contract), invalid UTF-8, noncanonical integers, inconsistent suite/address labels and oversized arrays or strings before verification. Decimal-string versions avoid JSON number precision differences; validate unsigned 64-bit range and increment without wrap. Producers sort members by canonical handle before signing. Verifiers reject unsorted members and duplicate handles or addresses; they never reorder a signed array to make it valid. Equivalent valid JSON whitespace and escaping converge to the same canonical bytes, but invalid field encodings (such as padded base64url, noncanonical addresses, counters or origins) are rejected rather than repaired. Use lower-case ASCII handles/slugs, length 1–32, with an explicit `[a-z0-9][a-z0-9_-]*` grammar; do not normalize lookalike Unicode into trusted names.
 
 Hash the canonical payload, excluding signatures, with SHA256. The signature covers all routing, identity, privacy, membership and freshness fields. Genesis has version `1`, null previous hash and owner equal to genesis owner. Every later snapshot advances exactly one version, chaining to the last payload hash. Transport certificates are separate from roster signer identity; a legitimate certificate rotation never resets roster trust.
 

@@ -1,14 +1,14 @@
 # Team addressing implementation work packets
 
-**Status:** Prepared dispatch plan, 2026-10-08. No implementation agents have been dispatched by this plan. Documentation publication does not authorize runtime implementation, rollout or merge. Riley retains the merge gate.
+**Status:** Implementation work-packet reference, updated 2026-10-09. Packets A and B have been dispatched under separate authorization and are implemented in separate review PRs. PR 162 contains planning documents and a CI Go 1.26.9 pin; it contains no team runtime implementation. Documentation publication does not itself authorize additional implementation, rollout or merge. Riley retains the merge gate.
 
 Implement the [revised team addressing design](team-addressing-plan.md) in small independently reviewable changes. The verified source baseline is main `454843d411f3c0db7f00f8dcbf0b6ad05d2f354d`; PR 162 originally contains only the proposal at `ec99b39f80c2f288c9374d49af1e7aeb0b4c10b6`. Recheck both before any future dispatch and pin every worker to its actual assigned base. Do not assume these SHAs remain current.
 
 ## Dispatch gate and decision record
 
-The next authorized action today is documentation only. A later explicit implementation authorization opens packet dispatch; it does not waive the following unresolved product/security decisions or Riley’s merge gate.
+The original documentation-only dispatch restriction has been superseded by separate authorization for A/B implementation. The pinned [Packet B decision and wire record](https://github.com/black-candle-technologies/courier/blob/a9af611aa478eb103a66300b133e98c098665abe/docs/packet-b-team-wire.md) records approved choices and remaining numeric-policy gates. The table below preserves the planning recommendations; it is not a claim that every decision remains unresolved. Further packet dispatch requires its applicable authorization and dependencies; Riley’s merge gate remains.
 
-Record each decision with the responsible owner, approval date, chosen value, rationale and affected packet IDs before releasing the dependent implementation. Recommended values are design proposals, not already accepted policy:
+Record each decision with the responsible owner, approval date, chosen value, rationale and affected packet IDs before releasing the dependent implementation. The table records the original recommendations; use the pinned decision record above to distinguish approved choices from remaining proposals:
 
 | Decision | Recommended first release | Gates |
 | --- | --- | --- |
