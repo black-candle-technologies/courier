@@ -1872,268 +1872,271 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		vfr = nil
 	}
 	for _, m := range inboxEnvs {
-		// Track the highest inspected envelope id regardless of
-		// outcome: the cursor must advance past undecryptable and
-		// replayed messages too (v0.6.11 F4).
-		if m.ID > lastID {
-			lastID = m.ID
-		}
-		// issue #32: skip envelope kinds this client does not
-		// understand (sent by newer clients) without stalling the
-		// cursor.
-		if m.Kind != "" && m.Kind != "dm" {
-			skipped++
-			continue
-		}
-		// v0.6.11 (F3): suppress replays independently of relay message
-		// ids — identical envelope bytes are never delivered twice to
-		// the same consumer. Replays are routine dedup, not failures
-		// (v0.9.1): they stay silent so the "no new messages." sentinel
-		// contract that poll-based wake scripts rely on holds.
-		// Suppression is per consumer (issue #45, v0.9.2): a message
-		// the dashboard pusher already pushed is still new to the
-		// inbox poller, and vice versa.
-		h := envelope.DedupHash(c.cfg.Address, m.From, m.Eph, m.Nonce, m.SentAt, m.Ct, m.Sig)
-		if seen[h] {
-			continue
-		}
-		// Issue #138: the envelope names its crypto suite. Absent means
-		// SuiteV1 (older relays). A suite this client does not understand
-		// is skipped loudly — never trial-decrypted as if it were v1.
-		suite := crypto.Suite(m.Suite)
-		if suite == "" {
-			suite = crypto.SuiteV1
-		}
-		if !crypto.ValidSuite(suite) {
-			skipped++
-			continue
-		}
-		// Blocklist and dismissed requests: messages from these senders
-		// are dropped at read time, before any decryption work. The
-		// cursor still advances past them (F4) and they are never marked
-		// seen, so unblocking/undismissing later plus `inbox --all`
-		// recovers them. Counted as filtered (the recipient's own
-		// choice), not as skipped (corrupt/forged).
-		if c.cfg.IsBlocked(m.From) || c.cfg.IsDismissed(m.From) {
-			filtered++
-			continue
-		}
-		plain, err := c.openEnvelope(m)
-		if err != nil {
-			skipped++ // forged, corrupted, or undecryptable: drop
-			continue
-		}
+		func() {
+			// Track the highest inspected envelope id regardless of
+			// outcome: the cursor must advance past undecryptable and
+			// replayed messages too (v0.6.11 F4).
+			if m.ID > lastID {
+				lastID = m.ID
+			}
+			// issue #32: skip envelope kinds this client does not
+			// understand (sent by newer clients) without stalling the
+			// cursor.
+			if m.Kind != "" && m.Kind != "dm" {
+				skipped++
+				return
+			}
+			// v0.6.11 (F3): suppress replays independently of relay message
+			// ids — identical envelope bytes are never delivered twice to
+			// the same consumer. Replays are routine dedup, not failures
+			// (v0.9.1): they stay silent so the "no new messages." sentinel
+			// contract that poll-based wake scripts rely on holds.
+			// Suppression is per consumer (issue #45, v0.9.2): a message
+			// the dashboard pusher already pushed is still new to the
+			// inbox poller, and vice versa.
+			h := envelope.DedupHash(c.cfg.Address, m.From, m.Eph, m.Nonce, m.SentAt, m.Ct, m.Sig)
+			if seen[h] {
+				return
+			}
+			// Issue #138: the envelope names its crypto suite. Absent means
+			// SuiteV1 (older relays). A suite this client does not understand
+			// is skipped loudly — never trial-decrypted as if it were v1.
+			suite := crypto.Suite(m.Suite)
+			if suite == "" {
+				suite = crypto.SuiteV1
+			}
+			if !crypto.ValidSuite(suite) {
+				skipped++
+				return
+			}
+			// Blocklist and dismissed requests: messages from these senders
+			// are dropped at read time, before any decryption work. The
+			// cursor still advances past them (F4) and they are never marked
+			// seen, so unblocking/undismissing later plus `inbox --all`
+			// recovers them. Counted as filtered (the recipient's own
+			// choice), not as skipped (corrupt/forged).
+			if c.cfg.IsBlocked(m.From) || c.cfg.IsDismissed(m.From) {
+				filtered++
+				return
+			}
+			plain, err := c.openEnvelope(m)
+			if err != nil {
+				skipped++ // forged, corrupted, or undecryptable: drop
+				return
+			}
 
-		// issue #50: forward-secrecy frames are consumed by the FS
-		// layer and never surface as chat messages. Handshake frames
-		// (init/accept) are answered silently; message frames are
-		// decrypted into the inner plaintext, which is then dispatched
-		// exactly like a legacy DM below. Frames that fail decryption
-		// count as skipped (genuine failures), matching the existing
-		// docstring.
-		var fsWrapKey *[32]byte
-		if fp, ok := parseFSPayload(plain); ok {
-			switch fp.Type {
-			case fsTypeInit, fsTypeAccept:
-				c.handleFSHandshake(m.From, fp)
-				seen[h] = true
-				newHashes = append(newHashes, h)
-				continue
-			case fsTypeMsg:
-				inner, wk, ferr := c.fsDecryptMessage(m.From, fp)
-				if ferr != nil {
-					skipped++
-					continue
-				}
-				plain = inner
-				fsWrapKey = wk // attachment data-key unwrap, below
-			}
-		}
-
-		// issue #32: group protocol direct messages (sender-key
-		// distributions and group invitations) are consumed by the
-		// group layer and never surface as chat messages.
-		if gp, ok := parseGroupDMPayload(plain); ok {
-			c.handleGroupDM(m.From, gp)
-			seen[h] = true
-			newHashes = append(newHashes, h)
-			continue
-		}
-		// issue #52: receipt protocol direct messages are consumed by
-		// the receipt layer and never surface as chat messages.
-		if rp, ok := parseReceiptDMPayload(plain); ok {
-			c.handleReceiptDM(m.From, rp)
-			seen[h] = true
-			newHashes = append(newHashes, h)
-			continue
-		}
-		// issue #142: VHL protocol frames (approval requests,
-		// attestations, revocations) are consumed by the VHL layer
-		// and never surface as chat messages. Payloads that fail
-		// frame parsing fall through as ordinary messages — never
-		// silently swallowed.
-		if vf, ok := vhl.ParseFrame(plain); ok {
-			// issue #142 review: VHL frames from a held or
-			// relay-reported sender are not applied to protocol
-			// state — a quarantined stranger must not stuff the
-			// bounded request/attestation queues and evict
-			// legitimate records (same gate as the shared-state
-			// path). Their frames fall through to normal
-			// delivery as held messages below. Revocation frames
-			// are the exception: they are self-verifying (the
-			// signature must come from an enrolled approver
-			// key), so they are always honored.
-			if vf.Type == vhl.FrameRevoke || (!c.cfg.HoldForReview(m.From) && !slices.Contains(m.SenderFlags, "reported")) {
-				c.handleVHLFrame(m.From, vf, m.ID, vfr)
-				seen[h] = true
-				newHashes = append(newHashes, h)
-				continue
-			}
-		}
-		// issue #39: introduction protocol DMs are consumed by the
-		// introduction layer and never surface as chat messages (same
-		// as group-control DMs, issue #32). Valid payloads are recorded
-		// as pending introductions, listed via
-		// `courier directory introductions`. Payloads that fail
-		// validation (bad signature, unknown parties) fall through as
-		// ordinary messages — never silently swallowed.
-		if ip, ok := parseIntroductionPayload(plain); ok {
-			if _, rec := c.recordIntroduction(m.From, m.ID, ip); rec {
-				seen[h] = true
-				newHashes = append(newHashes, h)
-				continue
-			}
-		}
-		// Split a decrypted payload into its body text, attachment
-		// manifests, reply threading metadata (issue #51), and
-		// disappearing-message expiry (issue #53). Manifests are
-		// validated and their data keys are unwrapped with this
-		// recipient's keys; a manifest whose key cannot be opened is
-		// kept with KeyError set, so the message is still delivered
-		// and the failure is visible, never silent.
-		if isLegacyStatePayload(plain) || isLegacyChannelPayload(plain) {
-			seen[h] = true
-			newHashes = append(newHashes, h)
-			continue
-		}
-		body, manifests, rinfo, expiresAt, bmeta := parseMessagePayload(plain)
-		// issue #53: a message already expired at fetch time is
-		// consumed silently — dropped, never delivered to the inbox,
-		// the dashboard, or the request queue. The cursor still
-		// advances past it and it is marked seen, so it is not
-		// re-derived on every fetch.
-		if stateExpired(time.Now().Unix(), expiresAt) {
-			seen[h] = true
-			newHashes = append(newHashes, h)
-			continue
-		}
-		atts := c.unwrapAttachmentKeys(manifests, fsWrapKey)
-		// The FS wrap key exists only for this message's manifests;
-		// erase it now that the data keys are extracted.
-		if fsWrapKey != nil {
-			crypto.Zero(fsWrapKey[:])
-			fsWrapKey = nil
-		}
-		msg := Message{
-			ID: m.ID, From: m.From, Body: body,
-			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
-			Attachments: atts, ExpiresAt: expiresAt,
-			ReplyTo: rinfo.To, ReplyQuote: rinfo.Quote,
-			Bridge: bmeta,
-		}
-		// Shared inbound classification (bridge attribution, flags,
-		// hold/request policy) — the same helper FetchMessage uses, so
-		// the delivery paths cannot drift.
-		bridged, flags, hold, _ := c.classifyInbound(m.From, m.SenderFlags, body, bmeta)
-		msg.Bridged, msg.Flags = bridged, flags
-		// issue #142: VHL verification. The tier tag and inline
-		// attestation ride inside the E2E plaintext, so they are
-		// sender-authenticated — a claimed tier can neither be
-		// stripped nor upgraded in transit. An attested message is
-		// flagged; a claimed tier without a valid attestation is
-		// held for review (never acted on, never silently dropped).
-		// The required-tier floor applies to every DM, including
-		// untagged Tier 0: without this a sender could omit the
-		// tier tag to dodge the floor (issue #142 review).
-		if tier, att := parseVHLPayload(plain); tier != vhl.Tier0 || att != nil || (vfr != nil && vfr.RequiredTier > vhl.Tier0) {
-			out := c.vhlEvaluateInbound(vfr, tier, []byte(body), att, m.ID)
-			// issue #142 review: make the Tier 2
-			// replay-check-and-consume atomic across processes.
-			// Evaluate marks only the fetch-local set; two
-			// concurrent fetches (inbox CLI vs. dashboard push)
-			// could otherwise evaluate the same attestation
-			// against empty snapshots and both verdict attested.
-			// A consume that finds the id or the approval nonce
-			// already taken in a different envelope downgrades the
-			// verdict to a replay hold.
-			if out.Verdict == vhl.VerdictAttested && tier == vhl.Tier2 && att != nil {
-				replayed, cerr := vhlConsumeAttestation(att.ID, att.Approver, att.ApprovalNonce, m.ID)
-				switch {
-				case cerr != nil:
-					// Fail closed: without a committed replay mark,
-					// another consumer could accept the same
-					// attestation. The message is held for review,
-					// never delivered as attested.
-					out.Verdict = vhl.VerdictInvalid
-					out.Reason = "vhl-unavailable"
-				case replayed:
-					out.Verdict = vhl.VerdictInvalid
-					out.Reason = "replay"
+			// issue #50: forward-secrecy frames are consumed by the FS
+			// layer and never surface as chat messages. Handshake frames
+			// (init/accept) are answered silently; message frames are
+			// decrypted into the inner plaintext, which is then dispatched
+			// exactly like a legacy DM below. Frames that fail decryption
+			// count as skipped (genuine failures), matching the existing
+			// docstring.
+			var fsWrapKey *[32]byte
+			if fp, ok := parseFSPayload(plain); ok {
+				switch fp.Type {
+				case fsTypeInit, fsTypeAccept:
+					c.handleFSHandshake(m.From, fp)
+					seen[h] = true
+					newHashes = append(newHashes, h)
+					return
+				case fsTypeMsg:
+					inner, wk, ferr := c.fsDecryptMessage(m.From, fp)
+					if ferr != nil {
+						skipped++
+						return
+					}
+					plain = inner
+					fsWrapKey = wk           // attachment data-key unwrap, below
+					defer crypto.Zero(wk[:]) // erase on every per-envelope exit
 				}
 			}
-			msg.VHL = &VHLStatus{
-				Tier: int(tier), Verdict: out.Verdict.String(),
-				Approver: out.Approver, Reason: out.Reason,
+
+			// issue #32: group protocol direct messages (sender-key
+			// distributions and group invitations) are consumed by the
+			// group layer and never surface as chat messages.
+			if gp, ok := parseGroupDMPayload(plain); ok {
+				c.handleGroupDM(m.From, gp)
+				seen[h] = true
+				newHashes = append(newHashes, h)
+				return
 			}
-			switch out.Verdict {
-			case vhl.VerdictAttested:
-				flags = append(flags, "vhl_attested")
-				msg.Flags = flags
-			case vhl.VerdictMissing, vhl.VerdictInvalid:
-				hold = true
-				flags = append(flags, "vhl_unverified")
-				msg.Flags = flags
+			// issue #52: receipt protocol direct messages are consumed by
+			// the receipt layer and never surface as chat messages.
+			if rp, ok := parseReceiptDMPayload(plain); ok {
+				c.handleReceiptDM(m.From, rp)
+				seen[h] = true
+				newHashes = append(newHashes, h)
+				return
 			}
-		}
-		// issue #51: remember this delivery in the reply cache so a
-		// later reply to it can quote the parent without a relay
-		// round-trip. Best effort; delivery never depends on it.
-		cacheEntries = append(cacheEntries, replyCacheEntry{
-			CourierID: m.ID, From: m.From,
-			Snippet: truncateQuote(body), SentAt: m.SentAt,
-		})
-		// Hold rule: a message becomes a request (held for review,
-		// never delivered to the inbox or dashboard) when the
-		// recipient's contacts-only policy quarantines a first contact,
-		// or when the relay reports the sender is currently throttled
-		// for spam — even under the open policy. Held messages are not
-		// marked seen, so review re-derives them; the empty hash keeps
-		// outputHashes parallel to out for DashboardPush.
-		if hold {
-			msg.Request = true
+			// issue #142: VHL protocol frames (approval requests,
+			// attestations, revocations) are consumed by the VHL layer
+			// and never surface as chat messages. Payloads that fail
+			// frame parsing fall through as ordinary messages — never
+			// silently swallowed.
+			if vf, ok := vhl.ParseFrame(plain); ok {
+				// issue #142 review: VHL frames from a held or
+				// relay-reported sender are not applied to protocol
+				// state — a quarantined stranger must not stuff the
+				// bounded request/attestation queues and evict
+				// legitimate records (same gate as the shared-state
+				// path). Their frames fall through to normal
+				// delivery as held messages below. Revocation frames
+				// are the exception: they are self-verifying (the
+				// signature must come from an enrolled approver
+				// key), so they are always honored.
+				if vf.Type == vhl.FrameRevoke || (!c.cfg.HoldForReview(m.From) && !slices.Contains(m.SenderFlags, "reported")) {
+					c.handleVHLFrame(m.From, vf, m.ID, vfr)
+					seen[h] = true
+					newHashes = append(newHashes, h)
+					return
+				}
+			}
+			// issue #39: introduction protocol DMs are consumed by the
+			// introduction layer and never surface as chat messages (same
+			// as group-control DMs, issue #32). Valid payloads are recorded
+			// as pending introductions, listed via
+			// `courier directory introductions`. Payloads that fail
+			// validation (bad signature, unknown parties) fall through as
+			// ordinary messages — never silently swallowed.
+			if ip, ok := parseIntroductionPayload(plain); ok {
+				if _, rec := c.recordIntroduction(m.From, m.ID, ip); rec {
+					seen[h] = true
+					newHashes = append(newHashes, h)
+					return
+				}
+			}
+			// Split a decrypted payload into its body text, attachment
+			// manifests, reply threading metadata (issue #51), and
+			// disappearing-message expiry (issue #53). Manifests are
+			// validated and their data keys are unwrapped with this
+			// recipient's keys; a manifest whose key cannot be opened is
+			// kept with KeyError set, so the message is still delivered
+			// and the failure is visible, never silent.
+			if isLegacyStatePayload(plain) || isLegacyChannelPayload(plain) {
+				seen[h] = true
+				newHashes = append(newHashes, h)
+				return
+			}
+			body, manifests, rinfo, expiresAt, bmeta := parseMessagePayload(plain)
+			// issue #53: a message already expired at fetch time is
+			// consumed silently — dropped, never delivered to the inbox,
+			// the dashboard, or the request queue. The cursor still
+			// advances past it and it is marked seen, so it is not
+			// re-derived on every fetch.
+			if stateExpired(time.Now().Unix(), expiresAt) {
+				seen[h] = true
+				newHashes = append(newHashes, h)
+				return
+			}
+			atts := c.unwrapAttachmentKeys(manifests, fsWrapKey)
+			// The FS wrap key exists only for this message's manifests;
+			// erase it now that the data keys are extracted.
+			if fsWrapKey != nil {
+				crypto.Zero(fsWrapKey[:])
+				fsWrapKey = nil
+			}
+			msg := Message{
+				ID: m.ID, From: m.From, Body: body,
+				SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
+				Attachments: atts, ExpiresAt: expiresAt,
+				ReplyTo: rinfo.To, ReplyQuote: rinfo.Quote,
+				Bridge: bmeta,
+			}
+			// Shared inbound classification (bridge attribution, flags,
+			// hold/request policy) — the same helper FetchMessage uses, so
+			// the delivery paths cannot drift.
+			bridged, flags, hold, _ := c.classifyInbound(m.From, m.SenderFlags, body, bmeta)
+			msg.Bridged, msg.Flags = bridged, flags
+			// issue #142: VHL verification. The tier tag and inline
+			// attestation ride inside the E2E plaintext, so they are
+			// sender-authenticated — a claimed tier can neither be
+			// stripped nor upgraded in transit. An attested message is
+			// flagged; a claimed tier without a valid attestation is
+			// held for review (never acted on, never silently dropped).
+			// The required-tier floor applies to every DM, including
+			// untagged Tier 0: without this a sender could omit the
+			// tier tag to dodge the floor (issue #142 review).
+			if tier, att := parseVHLPayload(plain); tier != vhl.Tier0 || att != nil || (vfr != nil && vfr.RequiredTier > vhl.Tier0) {
+				out := c.vhlEvaluateInbound(vfr, tier, []byte(body), att, m.ID)
+				// issue #142 review: make the Tier 2
+				// replay-check-and-consume atomic across processes.
+				// Evaluate marks only the fetch-local set; two
+				// concurrent fetches (inbox CLI vs. dashboard push)
+				// could otherwise evaluate the same attestation
+				// against empty snapshots and both verdict attested.
+				// A consume that finds the id or the approval nonce
+				// already taken in a different envelope downgrades the
+				// verdict to a replay hold.
+				if out.Verdict == vhl.VerdictAttested && tier == vhl.Tier2 && att != nil {
+					replayed, cerr := vhlConsumeAttestation(att.ID, att.Approver, att.ApprovalNonce, m.ID)
+					switch {
+					case cerr != nil:
+						// Fail closed: without a committed replay mark,
+						// another consumer could accept the same
+						// attestation. The message is held for review,
+						// never delivered as attested.
+						out.Verdict = vhl.VerdictInvalid
+						out.Reason = "vhl-unavailable"
+					case replayed:
+						out.Verdict = vhl.VerdictInvalid
+						out.Reason = "replay"
+					}
+				}
+				msg.VHL = &VHLStatus{
+					Tier: int(tier), Verdict: out.Verdict.String(),
+					Approver: out.Approver, Reason: out.Reason,
+				}
+				switch out.Verdict {
+				case vhl.VerdictAttested:
+					flags = append(flags, "vhl_attested")
+					msg.Flags = flags
+				case vhl.VerdictMissing, vhl.VerdictInvalid:
+					hold = true
+					flags = append(flags, "vhl_unverified")
+					msg.Flags = flags
+				}
+			}
+			// issue #51: remember this delivery in the reply cache so a
+			// later reply to it can quote the parent without a relay
+			// round-trip. Best effort; delivery never depends on it.
+			cacheEntries = append(cacheEntries, replyCacheEntry{
+				CourierID: m.ID, From: m.From,
+				Snippet: truncateQuote(body), SentAt: m.SentAt,
+			})
+			// Hold rule: a message becomes a request (held for review,
+			// never delivered to the inbox or dashboard) when the
+			// recipient's contacts-only policy quarantines a first contact,
+			// or when the relay reports the sender is currently throttled
+			// for spam — even under the open policy. Held messages are not
+			// marked seen, so review re-derives them; the empty hash keeps
+			// outputHashes parallel to out for DashboardPush.
+			if hold {
+				msg.Request = true
+				out = append(out, msg)
+				outputHashes = append(outputHashes, "")
+				newHashes = append(newHashes, "")
+				return
+			}
 			out = append(out, msg)
-			outputHashes = append(outputHashes, "")
-			newHashes = append(newHashes, "")
-			continue
-		}
-		out = append(out, msg)
-		outputHashes = append(outputHashes, h)
-		// issue #52: opt-in delivery receipt. Fires only for the inbox
-		// consumer on first delivery — never for dashboard pushes,
-		// state syncs, or review re-derivations (markSeen=false) — and
-		// only when this agent explicitly opted into receipts for the
-		// sender. Held requests continue above, so they never generate
-		// receipts. The receipt is a signed protocol DM excluded from
-		// the sent log; best effort, never fatal to delivery.
-		if consumer == seenConsumerInbox && markSeen && c.cfg.ReceiptsEnabledFor(m.From) {
-			c.sendDeliveryReceipt(m.From, m.ID)
-		}
-		// Only successfully delivered messages are marked seen: a
-		// message that fails verification or decryption now may become
-		// readable later (e.g. after the sender's key announcement
-		// arrives), and must not be suppressed.
-		seen[h] = true
-		newHashes = append(newHashes, h)
+			outputHashes = append(outputHashes, h)
+			// issue #52: opt-in delivery receipt. Fires only for the inbox
+			// consumer on first delivery — never for dashboard pushes,
+			// state syncs, or review re-derivations (markSeen=false) — and
+			// only when this agent explicitly opted into receipts for the
+			// sender. Held requests continue above, so they never generate
+			// receipts. The receipt is a signed protocol DM excluded from
+			// the sent log; best effort, never fatal to delivery.
+			if consumer == seenConsumerInbox && markSeen && c.cfg.ReceiptsEnabledFor(m.From) {
+				c.sendDeliveryReceipt(m.From, m.ID)
+			}
+			// Only successfully delivered messages are marked seen: a
+			// message that fails verification or decryption now may become
+			// readable later (e.g. after the sender's key announcement
+			// arrives), and must not be suppressed.
+			seen[h] = true
+			newHashes = append(newHashes, h)
+		}()
 	}
 	// issue #51: resolve reply quotes. A locally-known parent snippet
 	// (my sent log, or an earlier delivery on this machine) is this
