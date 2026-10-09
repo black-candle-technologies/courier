@@ -804,7 +804,7 @@ The inbox pipeline (`Client.inbox`, `internal/client/client.go`):
 7. Trial-decrypt across retained X25519 private keys (current + up to
    4 retired, §5.3); undecryptable messages are skipped without
    stalling.
-8. Dispatch the plaintext in the order in §13.1: FS frames to the FS
+8. Dispatch the plaintext in the order in §13: FS frames to the FS
    layer (§15), retired state/channel payloads to silent consumption
    (§27), active group / receipt / introduction protocol DMs to their
    consumers, and chat to the inbox. Retired payloads never enter the
