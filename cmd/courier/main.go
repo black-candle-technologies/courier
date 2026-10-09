@@ -283,8 +283,13 @@ func (scope command) cmdInit(args []string) error {
 		if err != nil {
 			return err
 		}
-		cfg.RelayFingerprint = fp
-		if err := cfg.Save(); err != nil {
+		if err := cfg.Update(func(fresh *client.Config) error {
+			if fresh.RelayURL != cfg.RelayURL {
+				return client.ErrContextMismatch
+			}
+			fresh.RelayFingerprint = fp
+			return nil
+		}); err != nil {
 			return err
 		}
 		fmt.Println("pinned relay certificate:")
@@ -1745,8 +1750,7 @@ func (scope command) cmdConfig(args []string) error {
 			if err != nil {
 				return fmt.Errorf("auto_update must be true or false")
 			}
-			cfg.AutoUpdate = &v
-			if err := cfg.Save(); err != nil {
+			if err := cfg.Update(func(fresh *client.Config) error { fresh.AutoUpdate = &v; return nil }); err != nil {
 				return err
 			}
 			fmt.Printf("auto_update=%v\n", v)
@@ -1760,8 +1764,7 @@ func (scope command) cmdConfig(args []string) error {
 			if !strings.HasPrefix(u, "https://") {
 				return fmt.Errorf("relay must be an https:// URL")
 			}
-			cfg.RelayURL = u
-			if err := cfg.Save(); err != nil {
+			if err := cfg.Update(func(fresh *client.Config) error { fresh.RelayURL = u; return nil }); err != nil {
 				return err
 			}
 			fmt.Printf("relay=%s\n", u)

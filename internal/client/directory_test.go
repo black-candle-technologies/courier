@@ -271,9 +271,10 @@ func TestAcceptIntroductionAddsContact(t *testing.T) {
 	if _, rec := bobClient.recordIntroduction(addrOf(carolID), 7, p); !rec {
 		t.Fatal("setup: introduction not recorded")
 	}
-	// Point at the fake relay after recordIntroduction: the config
-	// Update inside recordIntroduction reloads from disk (F5).
-	bobClient.cfg.RelayURL = ts.URL
+	// Persist the disposable relay so subsequent field updates reload it.
+	if err := bobClient.cfg.Update(func(fresh *Config) error { fresh.RelayURL = ts.URL; return nil }); err != nil {
+		t.Fatal(err)
+	}
 	pending := bobClient.PendingIntroductions()
 	if len(pending) != 1 {
 		t.Fatalf("setup: want 1 pending, got %d", len(pending))

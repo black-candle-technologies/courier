@@ -323,7 +323,7 @@ func (s Context) LoadConfig() (*Config, error) {
 	}
 	if migrated {
 		// Best effort: persist the migration so it only happens once.
-		_ = c.Save()
+		_ = c.Update(func(*Config) error { return nil })
 	}
 	return c, nil
 }
@@ -492,11 +492,13 @@ func (c *Config) AddContact(name, address string) error {
 	if _, err := crypto.ParseAddress(address); err != nil {
 		return fmt.Errorf("bad address: %w", err)
 	}
-	if c.Contacts == nil {
-		c.Contacts = map[string]string{}
-	}
-	c.Contacts[name] = address
-	return c.Save()
+	return c.Update(func(fresh *Config) error {
+		if fresh.Contacts == nil {
+			fresh.Contacts = map[string]string{}
+		}
+		fresh.Contacts[name] = address
+		return nil
+	})
 }
 
 // RemoveContact deletes a contact and its verification record (issue
@@ -504,12 +506,14 @@ func (c *Config) AddContact(name, address string) error {
 // its receipt opt-in (issue #52: no lingering activity-leak consent).
 // It is not an error if absent.
 func (c *Config) RemoveContact(name string) error {
-	if addr, ok := c.Contacts[name]; ok {
-		delete(c.ReceiptContacts, addr)
-	}
-	delete(c.Contacts, name)
-	delete(c.ContactVerifications, name)
-	return c.Save()
+	return c.Update(func(fresh *Config) error {
+		if addr, ok := fresh.Contacts[name]; ok {
+			delete(fresh.ReceiptContacts, addr)
+		}
+		delete(fresh.Contacts, name)
+		delete(fresh.ContactVerifications, name)
+		return nil
+	})
 }
 
 // LookupContact returns the address for a contact name.
@@ -924,17 +928,12 @@ type Client struct {
 	fsWarnPending map[string]string
 }
 
-// New returns a Client for cfg.
+// New returns a Client sharing cfg, for both legacy and named contexts.
+// Successful config updates remain visible to the caller. Neither Client nor
+// Config supports concurrent mutation; workers must load their own Config.
+// The captured Context is immutable and is never replaced during refresh.
 func New(cfg *Config) *Client {
 	cfg.bindLegacyContext()
-	if cfg.local().principal != "" {
-		raw, _ := json.Marshal(cfg)
-		var snapshot Config
-		_ = json.Unmarshal(raw, &snapshot)
-		ctx := cfg.local()
-		snapshot.localContext = &ctx
-		cfg = &snapshot
-	}
 	return &Client{cfg: cfg}
 }
 
@@ -2500,8 +2499,7 @@ func (c *Client) MaybeUpdateCheck(current string) {
 		return
 	}
 	rel, err := update.Latest()
-	c.cfg.UpdateCheckedAt = now
-	_ = c.cfg.Save()
+	_ = c.cfg.Update(func(fresh *Config) error { fresh.UpdateCheckedAt = now; return nil })
 	if err != nil {
 		return
 	}
@@ -2636,10 +2634,14 @@ func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassw
 	if err := json.Unmarshal(raw, &out); err != nil || out.APIToken == "" {
 		return "", fmt.Errorf("register: bad response")
 	}
-	c.cfg.DashboardUser = out.Username
-	c.cfg.DashboardToken = out.APIToken
-	c.cfg.DashboardFingerprint = fp
-	if err := c.cfg.Save(); err != nil {
+	dashboardURL := c.cfg.DashboardURL
+	if err := c.cfg.Update(func(fresh *Config) error {
+		fresh.DashboardURL = dashboardURL
+		fresh.DashboardUser = out.Username
+		fresh.DashboardToken = out.APIToken
+		fresh.DashboardFingerprint = fp
+		return nil
+	}); err != nil {
 		return "", fmt.Errorf("save config: %w", err)
 	}
 	return tempPassword, nil

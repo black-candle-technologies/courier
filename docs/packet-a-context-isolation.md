@@ -16,7 +16,7 @@ Base initially verified at `1e71d18f96e049b127ca48c55a012af7eeb06aa2`, tree `05c
 
 ## Store and migration contract
 
-All client path helpers now receive `Context`; legacy package functions are adapters. `Config` captures its context when loaded/saved or attached to a client. Named clients snapshot their config so later caller mutations cannot select another principal. `IdentityStore` is a context-bound view of identity keys, co-located in `config.json` during this compatibility phase. D3 makes its cross-process config lock identity-wide. Rotation reloads key history under that lock. This is logical separation without introducing a second key-file commit point.
+All client path helpers now receive `Context`; legacy package functions are adapters. `Config` captures its context when loaded/saved or attached to a client. Clients share the supplied config consistently across legacy and named contexts; successful updates refresh that same config. Client/config mutation is single-owner: background workers load their own config. The captured context remains immutable. `IdentityStore` is a context-bound view of identity keys, co-located in `config.json` during this compatibility phase. D3 makes its cross-process config lock identity-wide. Rotation reloads key history under that lock. This is logical separation without introducing a second key-file commit point.
 
 `Hosts.Resolve(root, host, identity)` is pure and disabled unless the registry explicitly sets `enabled: true`. It validates HTTPS origins and supplied SHA256 pins, checks D3 across all identity aliases, and derives a directory from binding ID plus principal, never from aliases. Config loading rejects mismatched principal/seed, endpoint, or pin. Unknown selectors never fall back.
 
