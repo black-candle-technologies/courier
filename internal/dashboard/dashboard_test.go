@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/black-candle-technologies/courier/internal/bridge"
 	"github.com/black-candle-technologies/courier/internal/crypto"
@@ -948,5 +949,30 @@ func TestBridgeBadgeFromPinList(t *testing.T) {
 	rec = get(t, srv, "/app", cookie.session)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `class="nbadge small"`) {
 		t.Fatalf("/app: got %d, missing bridged-thread marker from pin-list flag", rec.Code)
+	}
+}
+
+func TestPushCachedVerificationAndClear(t *testing.T) {
+	srv := testServer(t)
+	id := testIdentity(t)
+	peer := crypto.FormatAddress(id.EdPub[:])
+	token := register(t, srv, "cachedtrust", "temporary-password-123", id)
+	user, err := srv.store.DashboardUserByName("cachedtrust")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []string{"verified_cached", "stale", ""} {
+		body, _ := json.Marshal(map[string]any{"messages": []any{}, "verified": map[string]string{peer: status}})
+		req := httptest.NewRequest("POST", "/v1/dashboard/push", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("push status %q: %d", status, rec.Code)
+		}
+		got, err := srv.store.PeerVerified(user.ID, 24*time.Hour)
+		if err != nil || got[peer] != status {
+			t.Fatalf("cached/stale/clear badge %q: %v %v", status, got, err)
+		}
 	}
 }

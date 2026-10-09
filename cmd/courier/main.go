@@ -16,6 +16,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -1142,6 +1143,9 @@ func cmdContacts(args []string) error {
 				if !known && !force {
 					return fmt.Errorf("re-run with --force to confirm the contact identity")
 				}
+				if err := cl.CacheDirectoryProfile(profile); err != nil {
+					return err
+				}
 			} else {
 				address = args[1]
 				if _, err := crypto.ParseAddress(address); err != nil {
@@ -1855,6 +1859,11 @@ func cmdDashboardPush(args []string) error {
 	}
 	c := client.New(cfg)
 	pushOnce := func() error {
+		fresh, err := client.LoadConfig()
+		if err != nil {
+			return err
+		}
+		c = client.New(fresh)
 		n, err := c.DashboardPush()
 		if err != nil {
 			return err
@@ -1868,6 +1877,10 @@ func cmdDashboardPush(args []string) error {
 	if !*follow {
 		return nil
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); client.RunDashboardMetadataRefresh(ctx) }()
+	defer func() { cancel(); <-done }()
 	t := time.NewTicker(*interval)
 	defer t.Stop()
 	for range t.C {

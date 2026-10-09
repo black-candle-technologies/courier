@@ -183,6 +183,27 @@ func (c *Config) StoredVerification(name string) (ContactVerification, bool) {
 	return rec, ok
 }
 
+// CachedContactTrust reports stored out-of-band evidence and locally observed
+// key changes only. It never revalidates against the relay; a verified result
+// must be presented as cached, not as a freshly validated current identity.
+func (c *Client) CachedContactTrust(name string) (TrustState, string) {
+	address, err := c.cfg.LookupContact(name)
+	if err != nil {
+		return TrustUnverified, "unknown contact"
+	}
+	rec, ok := c.cfg.StoredVerification(name)
+	if !ok {
+		return TrustUnverified, "never verified out of band"
+	}
+	if rec.Address != address {
+		return TrustStale, "contact address changed since verification"
+	}
+	if epoch, ok := c.cfg.VerifiedKeyEpochs[address]; ok && epoch > rec.KeyEpoch {
+		return TrustStale, "locally observed key rotation since verification"
+	}
+	return TrustVerified, "stored out-of-band verification; current keys not revalidated"
+}
+
 // ContactTrust evaluates the live trust state of a contact: the stored
 // record is fresh only if the contact's address and current key epoch
 // still match what was verified. The key-directory fetch is best-effort:

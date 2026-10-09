@@ -8,6 +8,7 @@
 package client
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -324,6 +325,10 @@ func (c *Client) DirectoryTransfer(handle, toAddress string) error {
 // signedDirectoryGet performs an identity-signed directory query
 // (lookup/search/reverse), binding the query to the querier (T2).
 func (c *Client) signedDirectoryGet(op, query string, params url.Values) ([]byte, int, error) {
+	return c.signedDirectoryGetContext(context.Background(), op, query, params)
+}
+
+func (c *Client) signedDirectoryGetContext(ctx context.Context, op, query string, params url.Values) ([]byte, int, error) {
 	hc, err := c.httpClient()
 	if err != nil {
 		return nil, 0, err
@@ -341,7 +346,11 @@ func (c *Client) signedDirectoryGet(op, query string, params url.Values) ([]byte
 	params.Set("querier", c.cfg.Address)
 	params.Set("ts", fmt.Sprintf("%d", ts))
 	params.Set("sig", base64.RawURLEncoding.EncodeToString(sig))
-	resp, err := hc.Get(c.cfg.RelayURL + "/v1/directory/" + op + "?" + params.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.RelayURL+"/v1/directory/"+op+"?"+params.Encode(), nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("relay unreachable: %w", err)
 	}
@@ -419,12 +428,16 @@ func (c *Client) DirectorySearch(prefix string) ([]DirectoryProfile, error) {
 // DirectoryReverse returns the listed (non-private) handle(s) for an
 // address the querier already knows. Used for dashboard handle display.
 func (c *Client) DirectoryReverse(address string) ([]DirectoryProfile, error) {
+	return c.directoryReverseContext(context.Background(), address)
+}
+
+func (c *Client) directoryReverseContext(ctx context.Context, address string) ([]DirectoryProfile, error) {
 	if _, err := crypto.ParseAddress(address); err != nil {
 		return nil, err
 	}
 	params := url.Values{}
 	params.Set("address", address)
-	data, code, err := c.signedDirectoryGet("reverse", address, params)
+	data, code, err := c.signedDirectoryGetContext(ctx, "reverse", address, params)
 	if err != nil {
 		return nil, err
 	}
@@ -438,6 +451,9 @@ func (c *Client) DirectoryReverse(address string) ([]DirectoryProfile, error) {
 		return nil, fmt.Errorf("bad relay response: %w", err)
 	}
 	for i := range rout.Results {
+		if rout.Results[i].Address != address {
+			return nil, fmt.Errorf("directory reverse returned a different address")
+		}
 		if err := verifyDirectoryProfile(&rout.Results[i]); err != nil {
 			return nil, err
 		}
@@ -445,9 +461,8 @@ func (c *Client) DirectoryReverse(address string) ([]DirectoryProfile, error) {
 	return rout.Results, nil
 }
 
-// PeerHandle resolves a peer address to a display handle for the
-// dashboard, with a 24h local cache so the per-minute push does not
-// query the relay for every thread.
+// PeerHandle explicitly resolves a peer address, using a 24h cache.
+// Rendering uses CachedPeerHandle instead so directory I/O cannot block it.
 func (c *Client) PeerHandle(address string) string {
 	handle, _ := c.lookupPeerHandle(address)
 	return handle
@@ -468,16 +483,31 @@ func (c *Client) lookupPeerHandle(address string) (string, error) {
 	if err == nil && len(profiles) > 0 {
 		handle = profiles[0].Handle
 	}
-	_ = c.cfg.Update(func(fresh *Config) error {
+	_ = c.cachePeerHandle(address, handle)
+	return handle, nil
+}
+
+// CacheDirectoryProfile saves freshly signature-verified discovery evidence.
+// It does not create a trusted contact or override a private alias.
+func (c *Client) CacheDirectoryProfile(profile *DirectoryProfile) error {
+	if err := verifyDirectoryProfile(profile); err != nil {
+		return err
+	}
+	return c.cachePeerHandle(profile.Address, profile.Handle)
+}
+
+func (c *Client) cachePeerHandle(address, handle string) error {
+	return c.cfg.Update(func(fresh *Config) error {
 		if fresh.HandleCache == nil {
 			fresh.HandleCache = make(map[string]HandleCacheEntry)
 		}
+		fresh.HandleRefreshAt = 0
 		fresh.HandleCache[address] = HandleCacheEntry{Handle: handle, At: time.Now().Unix()}
 		// Bound the cache; drop oldest beyond 500 entries.
 		if len(fresh.HandleCache) > 500 {
 			oldest, oldestK := time.Now().Unix(), ""
 			for k, v := range fresh.HandleCache {
-				if v.At < oldest {
+				if oldestK == "" || v.At < oldest {
 					oldest, oldestK = v.At, k
 				}
 			}
@@ -487,7 +517,6 @@ func (c *Client) lookupPeerHandle(address string) (string, error) {
 		}
 		return nil
 	})
-	return handle, nil
 }
 
 // ResolveHandleTarget accepts "@handle" or "handle:<name>" and resolves

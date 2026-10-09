@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -855,6 +856,7 @@ func (c *Client) verifyKeyAnnouncement(addr crypto.ParsedAddress, address, x2551
 			}
 			if epoch > fresh.VerifiedKeyEpochs[address] {
 				fresh.VerifiedKeyEpochs[address] = epoch
+				fresh.HandleRefreshAt = 0
 			}
 			return nil
 		})
@@ -2800,8 +2802,8 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 // refreshPeerHandles pushes a handles-only update for every cached peer
 // using only locally cached evidence, at most once per 24h. Directory
 // outages must not block dashboard delivery. Expired labels are omitted;
-// the dashboard applies its own label TTL. Explicit discovery refreshes
-// the local cache independently of dashboard rendering.
+// the dashboard applies its own label TTL. Explicit discovery and the
+// bounded follow-mode worker refresh the cache independently.
 func (c *Client) refreshPeerHandles(hc *http.Client) {
 	if time.Now().Unix()-c.cfg.HandleRefreshAt < 24*3600 {
 		return
@@ -2822,8 +2824,8 @@ func (c *Client) refreshPeerHandles(hc *http.Client) {
 			continue
 		}
 		seen[peer] = true
-		if h := c.CachedPeerHandle(peer); h != "" {
-			handles[peer] = h
+		if entry, ok := c.cfg.HandleCache[peer]; ok && time.Now().Unix()-entry.At < 24*3600 {
+			handles[peer] = entry.Handle // authoritative empty clears an old label
 		}
 	}
 	// issue #48: push contact trust states alongside the handle labels.
@@ -2835,17 +2837,28 @@ func (c *Client) refreshPeerHandles(hc *http.Client) {
 		if err != nil {
 			continue
 		}
-		if st, _ := c.ContactTrust(name); st == TrustVerified || st == TrustStale {
-			verified[addr] = st.String()
+		st, _ := c.CachedContactTrust(name)
+		switch st {
+		case TrustVerified:
+			verified[addr] = "verified_cached"
+		case TrustStale:
+			verified[addr] = "stale"
+		default:
+			verified[addr] = ""
 		}
 	}
-	// Mark the refresh even when there is nothing to push, so a peer
-	// set with no listed handles does not retry every minute.
-	_ = c.cfg.Update(func(fresh *Config) error {
-		fresh.HandleRefreshAt = time.Now().Unix()
-		return nil
-	})
-	if len(handles) == 0 {
+	// Mark only successfully published evidence, and do not consume a
+	// concurrent worker's refresh request for a newer local snapshot.
+	markRefreshed := func() {
+		_ = c.cfg.Update(func(fresh *Config) error {
+			if maps.Equal(fresh.HandleCache, c.cfg.HandleCache) && maps.Equal(fresh.ContactVerifications, c.cfg.ContactVerifications) && maps.Equal(fresh.VerifiedKeyEpochs, c.cfg.VerifiedKeyEpochs) && maps.Equal(fresh.Contacts, c.cfg.Contacts) {
+				fresh.HandleRefreshAt = time.Now().Unix()
+			}
+			return nil
+		})
+	}
+	if len(handles) == 0 && len(verified) == 0 {
+		markRefreshed()
 		return
 	}
 	body, _ := json.Marshal(map[string]any{
@@ -2862,6 +2875,9 @@ func (c *Client) refreshPeerHandles(hc *http.Client) {
 	}
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
 	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		markRefreshed()
+	}
 }
 
 // pushBatch POSTs one bounded batch of messages to the dashboard and

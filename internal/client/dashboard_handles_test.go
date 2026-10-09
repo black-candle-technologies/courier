@@ -40,7 +40,9 @@ func TestDashboardHandleRenderingNeverQueriesDirectory(t *testing.T) {
 	defer srv.Close()
 	cfg.RelayURL, cfg.DashboardURL = srv.URL, srv.URL
 	cfg.HandleCache = map[string]HandleCacheEntry{cfg.Address: {Handle: "known", At: time.Now().Unix()}}
-	cfg.Contacts = map[string]string{"unknown": unknownAddress}
+	cfg.Contacts = map[string]string{"unknown": unknownAddress, "known": cfg.Address}
+	cfg.ContactVerifications = map[string]ContactVerification{"known": {Address: cfg.Address, KeyEpoch: 1}}
+	cfg.VerifiedKeyEpochs = map[string]int64{cfg.Address: 1}
 	if err := cfg.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -52,6 +54,17 @@ func TestDashboardHandleRenderingNeverQueriesDirectory(t *testing.T) {
 		}
 	}
 	cl.refreshPeerHandles(srv.Client())
+	if st, _ := cl.CachedContactTrust("unknown"); st != TrustUnverified {
+		t.Fatal("unknown became verified")
+	}
+	if err := cfg.Update(func(fresh *Config) error {
+		fresh.VerifiedKeyEpochs[cfg.Address] = 2
+		fresh.HandleRefreshAt = 0
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cl.refreshPeerHandles(srv.Client())
 	if directoryCalls.Load() != 0 {
 		t.Fatalf("dashboard made %d directory requests", directoryCalls.Load())
 	}
@@ -60,8 +73,17 @@ func TestDashboardHandleRenderingNeverQueriesDirectory(t *testing.T) {
 	}
 	pushedMu.Lock()
 	defer pushedMu.Unlock()
-	if len(pushed) != 3 {
-		t.Fatalf("want two batches and cached refresh, got %d", len(pushed))
+	if len(pushed) != 4 {
+		t.Fatalf("want two batches and two cached refreshes, got %d", len(pushed))
+	}
+	for i, want := range []string{"verified_cached", "stale"} {
+		var states map[string]string
+		if err := json.Unmarshal(pushed[i+2]["verified"], &states); err != nil {
+			t.Fatal(err)
+		}
+		if states[cfg.Address] != want || states[unknownAddress] != "" {
+			t.Fatalf("incorrect cached trust: %v", states)
+		}
 	}
 	for _, p := range pushed {
 		var handles map[string]string
