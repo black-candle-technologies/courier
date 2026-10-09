@@ -68,6 +68,8 @@ type EncKey struct {
 // Config is the local agent identity, stored at ~/.courier/config.json.
 // The seed and encryption private keys never leave this file (mode 0600).
 type Config struct {
+	unsavedIdentity bool // only NewIdentity may initialize through contact mutation
+
 	Version          int               `json:"version"`
 	RelayURL         string            `json:"relay"`
 	Seed             string            `json:"seed"`                        // base64url 32-byte identity seed
@@ -369,7 +371,11 @@ func (c *Config) saveAtomic() error {
 // otherwise fields another process changed meanwhile (e.g. rotated
 // encryption keys) are silently clobbered.
 func (c *Config) Save() error {
-	return withConfigLock(func() error { return c.saveAtomic() })
+	err := withConfigLock(func() error { return c.saveAtomic() })
+	if err == nil {
+		c.unsavedIdentity = false
+	}
+	return err
 }
 
 // Update performs an atomic read-modify-write: it takes the cross-process
@@ -379,8 +385,23 @@ func (c *Config) Save() error {
 // mutating a stale in-memory Config and calling Save would clobber fields
 // another process wrote meanwhile (v0.6.11 F5).
 func (c *Config) Update(fn func(*Config) error) error {
+	return c.updateWithSave(fn, false, (*Config).saveAtomic)
+}
+
+// updateWithSave shares the fresh-config transaction; only contact initialization
+// on an unsaved NewIdentity may create a missing file.
+func (c *Config) updateWithSave(fn func(*Config) error, initialize bool, save func(*Config) error) error {
 	return withConfigLock(func() error {
 		fresh, err := loadConfigRaw()
+		if errors.Is(err, os.ErrNotExist) && initialize && c.unsavedIdentity {
+			// Clone all maps/slices so a failed mutation cannot alter the receiver.
+			raw, cloneErr := json.Marshal(c)
+			if cloneErr != nil {
+				return cloneErr
+			}
+			fresh = new(Config)
+			err = json.Unmarshal(raw, fresh)
+		}
 		if err != nil {
 			return err
 		}
@@ -395,7 +416,7 @@ func (c *Config) Update(fn func(*Config) error) error {
 		if err := fn(fresh); err != nil {
 			return err
 		}
-		if err := fresh.saveAtomic(); err != nil {
+		if err := save(fresh); err != nil {
 			return err
 		}
 		*c = *fresh
@@ -426,10 +447,11 @@ func NewIdentity(relayURL string) (*Config, error) {
 		return nil, err
 	}
 	return &Config{
-		Version:  ConfigVersion,
-		RelayURL: relayURL,
-		Seed:     base64.RawURLEncoding.EncodeToString(id.Seed[:]),
-		Address:  crypto.FormatAddress(id.EdPub[:]),
+		unsavedIdentity: true,
+		Version:         ConfigVersion,
+		RelayURL:        relayURL,
+		Seed:            base64.RawURLEncoding.EncodeToString(id.Seed[:]),
+		Address:         crypto.FormatAddress(id.EdPub[:]),
 		EncKeys: []EncKey{{
 			Pub:       base64.RawURLEncoding.EncodeToString(xpub[:]),
 			Priv:      base64.RawURLEncoding.EncodeToString(xpriv[:]),
@@ -452,93 +474,87 @@ func (c *Config) Identity() (*crypto.Identity, error) {
 
 var contactNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
-// AddContact stores name -> address after validating both.
+// AddContact stores an explicitly requested name-to-address mapping.
 func (c *Config) AddContact(name, address string) error {
-	return c.addContact(name, address, false)
+	_, err := c.addContact(name, address, false, false)
+	return err
 }
 
-// AddContactAlias saves an explicitly chosen private display alias without
-// deleting other names or their verification metadata for the same address.
+// AddContactAlias also makes the private alias the preferred display name.
 func (c *Config) AddContactAlias(name, address string) error {
-	return c.addContact(name, address, true)
+	_, err := c.addContact(name, address, true, false)
+	return err
 }
 
-func (c *Config) addContact(name, address string, prefer bool) error {
+// AddDiscoveredContact never replaces a saved alias on directory evidence alone.
+// It returns the actual saved name, including one concurrently saved elsewhere.
+func (c *Config) AddDiscoveredContact(name, address string) (string, error) {
+	return c.addContact(name, address, false, true)
+}
+
+func (c *Config) addContact(name, address string, prefer, discovered bool) (string, error) {
 	if !contactNameRe.MatchString(name) {
-		return fmt.Errorf("bad contact name %q: use 1-32 chars, lowercase letters, digits, - and _, starting with a letter or digit", name)
+		return "", fmt.Errorf("bad contact name %q: use 1-32 chars, lowercase letters, digits, - and _, starting with a letter or digit", name)
 	}
 	if _, err := crypto.ParseAddress(address); err != nil {
-		return fmt.Errorf("bad address: %w", err)
+		return "", fmt.Errorf("bad address: %w", err)
 	}
-	if c.Contacts == nil {
-		c.Contacts = map[string]string{}
-	}
-	oldAddress, replaced := c.Contacts[name]
-	oldPreferences := maps.Clone(c.PreferredContactNames)
-	if c.PreferredContactNames[oldAddress] == name && oldAddress != address {
-		delete(c.PreferredContactNames, oldAddress)
-	}
-	if prefer {
-		if c.PreferredContactNames == nil {
-			c.PreferredContactNames = map[string]string{}
+	var oldAddress string
+	var replaced bool
+	savedName := name
+	if err := c.updateWithSave(func(fresh *Config) error {
+		if discovered {
+			if existing := fresh.ContactNameForAddress(address); existing != "" {
+				savedName = existing
+				return nil
+			}
+			if old, exists := fresh.Contacts[name]; exists && old != address {
+				return fmt.Errorf("contact %q already exists for a different address", name)
+			}
 		}
-		c.PreferredContactNames[address] = name
-	}
-	c.Contacts[name] = address
-	if err := c.Save(); err != nil {
-		c.PreferredContactNames = oldPreferences
-		if replaced {
-			c.Contacts[name] = oldAddress
-		} else {
-			delete(c.Contacts, name)
+		var err error
+		oldAddress, replaced, err = replaceContactLocked(fresh, name, address)
+		if err != nil {
+			return err
 		}
-		return err
+		if fresh.PreferredContactNames[oldAddress] == name && oldAddress != address {
+			delete(fresh.PreferredContactNames, oldAddress)
+		}
+		if prefer {
+			if fresh.PreferredContactNames == nil {
+				fresh.PreferredContactNames = map[string]string{}
+			}
+			fresh.PreferredContactNames[address] = name
+		}
+		return nil
+	}, true, (*Config).saveAtomic); err != nil {
+		return "", err
 	}
-	// Persist the replacement before erasure; retry checks the freshest aliases.
 	if replaced && oldAddress != address {
 		if _, err := New(c).FSCleanupOrphan(oldAddress); err != nil {
-			return fmt.Errorf("contact saved, but could not erase replaced contact's FS session; retry with courier contacts retry-fs-cleanup %s: %w", oldAddress, err)
+			return savedName, fmt.Errorf("contact saved, but could not erase replaced contact's FS session; retry with courier contacts retry-fs-cleanup %s: %w", oldAddress, err)
 		}
 	}
-	return nil
+	return savedName, nil
 }
 
-// RemoveContact deletes a contact and its verification record (issue
-// #48: a removed contact's trust must not resurrect if re-added), plus
-// its receipt opt-in when the last alias is removed (issue #52: no lingering
-// activity-leak consent after removing the identity).
-// It is not an error if absent.
+// RemoveContact changes fresh aliases and live trust in one config transaction.
 func (c *Config) RemoveContact(name string) error {
-	address, existed := c.Contacts[name]
-	verification, verified := c.ContactVerifications[name]
-	receipt, hadReceipt := c.ReceiptContacts[address]
-	oldPreferences := maps.Clone(c.PreferredContactNames)
-	if existed && c.PreferredContactNames[address] == name {
-		delete(c.PreferredContactNames, address)
-	}
-	delete(c.Contacts, name)
-	stillReferenced := false
-	for _, other := range c.Contacts {
-		if other == address {
-			stillReferenced = true
-			break
+	var address string
+	var existed bool
+	if err := c.Update(func(fresh *Config) error {
+		address, existed = fresh.Contacts[name]
+		if existed && fresh.PreferredContactNames[address] == name {
+			delete(fresh.PreferredContactNames, address)
 		}
-	}
-	if existed && !stillReferenced {
-		delete(c.ReceiptContacts, address)
-	}
-	delete(c.ContactVerifications, name)
-	if err := c.Save(); err != nil {
-		c.PreferredContactNames = oldPreferences
+		delete(fresh.Contacts, name)
+		delete(fresh.ContactVerifications, name)
 		if existed {
-			c.Contacts[name] = address
+			clearOrphanReceipt(fresh, address)
+			fresh.HandleRefreshAt = 0
 		}
-		if verified {
-			c.ContactVerifications[name] = verification
-		}
-		if hadReceipt {
-			c.ReceiptContacts[address] = receipt
-		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	if existed {
@@ -2172,13 +2188,6 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 					msg.Flags = flags
 				}
 			}
-			// issue #51: remember this delivery in the reply cache so a
-			// later reply to it can quote the parent without a relay
-			// round-trip. Best effort; delivery never depends on it.
-			cacheEntries = append(cacheEntries, replyCacheEntry{
-				CourierID: m.ID, From: m.From,
-				Snippet: truncateQuote(body), SentAt: m.SentAt,
-			})
 			// Hold rule: a message becomes a request (held for review,
 			// never delivered to the inbox or dashboard) when the
 			// recipient's contacts-only policy quarantines a first contact,
@@ -2194,6 +2203,14 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 				return
 			}
 			_ = c.queuePeerDiscovery(m.From)
+			// issue #51: remember this delivery in the reply cache so a
+			// later reply to it can quote the parent without a relay
+			// round-trip. Best effort; delivery never depends on it.
+			cacheEntries = append(cacheEntries, replyCacheEntry{
+				CourierID: m.ID, From: m.From,
+				Snippet: truncateQuote(body), SentAt: m.SentAt, ExpiresAt: expiresAt,
+			})
+
 			out = append(out, msg)
 			outputHashes = append(outputHashes, h)
 			// issue #52: opt-in delivery receipt. Fires only for the inbox
@@ -2232,7 +2249,9 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// comes first: a parent and its reply can arrive together.
 		local := make(map[int64]string)
 		for _, m := range out {
-			if m.Body != "" {
+			// A held or now-expired parent must not escape through an accepted
+			// reply, including a dashboard batch that omits the parent itself.
+			if !m.Request && !stateExpired(time.Now().Unix(), m.ExpiresAt) && m.Body != "" {
 				local[m.ID] = truncateQuote(m.Body)
 			}
 		}

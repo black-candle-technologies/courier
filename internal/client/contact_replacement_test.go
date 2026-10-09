@@ -118,7 +118,7 @@ func TestContactReplacementSaveFailurePreservesFS(t *testing.T) {
 	}
 }
 
-func TestContactReplacementReportsCleanupFailureAfterSave(t *testing.T) {
+func TestContactReplacementRejectsUnreadablePolicy(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
@@ -145,15 +145,15 @@ func TestContactReplacementReportsCleanupFailureAfterSave(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = cfg.AddContact("peer", next.Address)
-	if err == nil || !strings.Contains(err.Error(), "contact saved, but could not erase") {
-		t.Fatalf("missing partial-success diagnosis: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "cannot inspect replacement FS policy") {
+		t.Fatalf("missing policy diagnosis: %v", err)
 	}
 	saved, err := LoadConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved.Contacts["peer"] != next.Address {
-		t.Fatal("replacement was not saved before cleanup")
+	if saved.Contacts["peer"] != old.Address {
+		t.Fatal("unreadable policy allowed replacement")
 	}
 	b, err := os.ReadFile(p)
 	if err != nil || string(b) != "malformed private archive" {

@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/black-candle-technologies/courier/internal/bridge"
@@ -141,6 +142,7 @@ type replyCacheEntry struct {
 	From      string `json:"from"`
 	Snippet   string `json:"snippet"`
 	SentAt    int64  `json:"sent_at"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
 }
 
 // maxReplyCache is the cap on the local reply cache; older entries are
@@ -158,77 +160,113 @@ func replyCachePath() (string, error) {
 // readReplyCache returns cached entries, oldest first. A missing or
 // corrupt file yields no entries, never an error: the cache is a
 // best-effort accelerator.
-func readReplyCache() []replyCacheEntry {
+func readReplyCache() []replyCacheEntry { return readReplyCacheAt(time.Now().Unix()) }
+
+// Old records without expiry metadata cannot be retroactively classified.
+// Even when locking or physical pruning fails, expired plaintext is never returned.
+func readReplyCacheAt(now int64) []replyCacheEntry {
 	p, err := replyCachePath()
-	if err != nil {
-		return nil
-	}
-	raw, err := os.ReadFile(p)
 	if err != nil {
 		return nil
 	}
 	var out []replyCacheEntry
-	for _, line := range bytes.Split(raw, []byte("\n")) {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			continue
+	entered := false
+	_ = withConfigLock(func() error {
+		entered = true
+		var expired bool
+		out, expired = readReplyCacheLocked(p, now)
+		if expired {
+			return replaceReplyCacheLocked(p, out)
 		}
-		var e replyCacheEntry
-		if err := json.Unmarshal(line, &e); err != nil {
-			continue
-		}
-		if e.CourierID > 0 {
-			out = append(out, e)
-		}
+		return nil
+	})
+	if !entered {
+		out, _ = readReplyCacheLocked(p, now)
 	}
 	return out
 }
 
-// writeReplyCache merges new entries into the cache (deduplicated by
-// courier id, newest wins) and prunes to maxReplyCache. Best effort: a
-// cache failure must never fail message delivery.
-func writeReplyCache(entries []replyCacheEntry) {
-	if len(entries) == 0 {
-		return
+func readReplyCacheLocked(p string, now int64) ([]replyCacheEntry, bool) {
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return nil, false
 	}
-	merged := make(map[int64]replyCacheEntry, len(entries))
-	var order []int64
-	seen := func(id int64) bool {
-		_, ok := merged[id]
-		return ok
-	}
-	for _, e := range readReplyCache() {
-		if !seen(e.CourierID) {
-			order = append(order, e.CourierID)
+	var out []replyCacheEntry
+	expired := false
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		var e replyCacheEntry
+		if json.Unmarshal(line, &e) != nil || e.CourierID <= 0 {
+			continue
 		}
-		merged[e.CourierID] = e
+		if stateExpired(now, e.ExpiresAt) {
+			expired = true
+			continue
+		}
+		out = append(out, e)
 	}
+	return out, expired
+}
+
+// Caller holds the config lock. Same-directory replacement never exposes a
+// partially written cache and newly created files are private from creation.
+func replaceReplyCacheLocked(p string, entries []replyCacheEntry) error {
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(p), ".thread-cache-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	enc := json.NewEncoder(f)
 	for _, e := range entries {
-		if !seen(e.CourierID) {
-			order = append(order, e.CourierID)
+		if err := enc.Encode(e); err != nil {
+			f.Close()
+			return err
 		}
-		merged[e.CourierID] = e // newest record wins
 	}
-	if len(order) > maxReplyCache {
-		for _, id := range order[:len(order)-maxReplyCache] {
-			delete(merged, id)
-		}
-		order = order[len(order)-maxReplyCache:]
+	if err := f.Close(); err != nil {
+		return err
 	}
-	var buf bytes.Buffer
-	for _, id := range order {
-		line, _ := json.Marshal(merged[id])
-		buf.Write(line)
-		buf.WriteByte('\n')
-	}
+	return os.Rename(f.Name(), p)
+}
+
+// writeReplyCache merges under the same cross-process lock as pruning.
+// Empty input still performs expiry maintenance. Cache failures never fail delivery.
+func writeReplyCache(entries []replyCacheEntry) { writeReplyCacheAt(entries, time.Now().Unix()) }
+
+func writeReplyCacheAt(entries []replyCacheEntry, now int64) {
 	p, err := replyCachePath()
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return
-	}
-	_ = os.WriteFile(p, buf.Bytes(), 0o600)
+	_ = withConfigLock(func() error {
+		existing, expired := readReplyCacheLocked(p, now)
+		if len(entries) == 0 && !expired {
+			return nil
+		}
+		merged := make(map[int64]replyCacheEntry)
+		var order []int64
+		for _, batch := range [][]replyCacheEntry{existing, entries} {
+			for _, e := range batch {
+				if e.CourierID <= 0 || stateExpired(now, e.ExpiresAt) {
+					continue
+				}
+				if _, ok := merged[e.CourierID]; !ok {
+					order = append(order, e.CourierID)
+				}
+				merged[e.CourierID] = e
+			}
+		}
+		if len(order) > maxReplyCache {
+			order = order[len(order)-maxReplyCache:]
+		}
+		out := make([]replyCacheEntry, 0, len(order))
+		for _, id := range order {
+			out = append(out, merged[id])
+		}
+		return replaceReplyCacheLocked(p, out)
+	})
 }
 
 // LookupReplyParent resolves the best-effort parent snippet for a reply
@@ -237,6 +275,10 @@ func writeReplyCache(entries []replyCacheEntry) {
 // the parent is unknown locally — the reply is still sent, referencing
 // the id; the recipient may resolve it from their own state.
 func LookupReplyParent(replyTo int64) (quote string, ok bool) {
+	return lookupReplyParentAt(replyTo, time.Now().Unix())
+}
+
+func lookupReplyParentAt(replyTo, now int64) (quote string, ok bool) {
 	if replyTo <= 0 {
 		return "", false
 	}
@@ -247,7 +289,7 @@ func LookupReplyParent(replyTo int64) (quote string, ok bool) {
 			}
 		}
 	}
-	for _, e := range readReplyCache() {
+	for _, e := range readReplyCacheAt(now) {
 		if e.CourierID == replyTo && e.Snippet != "" {
 			return e.Snippet, true
 		}

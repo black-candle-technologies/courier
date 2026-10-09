@@ -739,7 +739,7 @@ func (c *Client) fsPrepareSend(address string) (*fsSendOutput, error) {
 		if due {
 			// Best-effort: a failed init just means this message (and
 			// later ones, until the next due init) go legacy.
-			_ = c.sendFSInit(address)
+			_ = c.sendFSInitGuarded(address, true)
 		}
 	}
 	if required {
@@ -913,9 +913,14 @@ func (c *Client) fsDirectoryCapable(address string) bool {
 
 // ---- handshake ----
 
-// sendFSInit starts (or refreshes) an FS handshake with address: a
-// protocol DM sealed with the legacy seal, never in the sent log.
+// sendFSInit initiates opportunistically without replacing an active session.
 func (c *Client) sendFSInit(address string) error {
+	return c.sendFSInitGuarded(address, true)
+}
+
+// sendFSRecoveryInit deliberately replaces a stale session after an unknown-SID
+// frame. Ordinary opportunistic initiation must never use this recovery path.
+func (c *Client) sendFSRecoveryInit(address string) error {
 	return c.sendFSInitGuarded(address, false)
 }
 
@@ -966,8 +971,9 @@ func (c *Client) sendFSInitGuarded(address string, preserveActive bool) error {
 			skipped = true
 			return nil
 		}
-		// Explicit start-fs bypasses fsPrepareSend's attempt clock. Persist its
-		// fresh probe with the pending session so immediate sends recognize it.
+		// Guarded initiation includes explicit start-fs, which bypasses
+		// fsPrepareSend's attempt clock. Persist the probe with its pending
+		// session so immediate sends recognize it.
 		if preserveActive {
 			ff.LastInitAt[address] = now
 		}
@@ -1595,7 +1601,7 @@ func (c *Client) fsDecryptMessage(from string, p fsPayload) (plain []byte, wrapK
 		return nil
 	})
 	if healInit {
-		_ = c.sendFSInit(from)
+		_ = c.sendFSRecoveryInit(from)
 	}
 	if err != nil {
 		crypto.Zero(wk[:])

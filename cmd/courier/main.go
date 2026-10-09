@@ -1189,7 +1189,7 @@ func cmdContacts(args []string) error {
 		if len(args) == 3 {
 			err = cfg.AddContactAlias(name, address)
 		} else {
-			err = cfg.AddContact(name, address)
+			name, err = cfg.AddDiscoveredContact(name, address)
 		}
 		if err != nil {
 			return err

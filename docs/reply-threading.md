@@ -89,8 +89,12 @@ yes, 3 works
 - Held message requests render the same way.
 
 **Reply cache** (`~/.courier/thread_cache.jsonl`, 0600, capped at
-1000 entries): every successfully decrypted+verified DM delivery
-records `{courier_id, from, snippet (≤500 bytes), sent_at}`. It is a
+1000 entries): accepted, successfully decrypted+verified DM deliveries
+record `{courier_id, from, snippet (≤500 bytes), sent_at, expires_at?}`.
+Held requests are not cached until accepted and re-derived. Reads and writes
+filter expired snippets and atomically prune them under the config lock;
+read results remain filtered even if disk maintenance fails. Legacy cache
+records without expiry metadata cannot be retroactively classified. It is a
 best-effort local accelerator, written on the inbox path (all
 consumers: inbox poller, dashboard pusher, review). It makes
 "see [#42], reply to it" work for inbound parents without a relay
