@@ -30,12 +30,22 @@ func TestContactRemovalPreservesSharedFSPolicy(t *testing.T) {
 	if err := c.FSRequire(peer.Address, true); err != nil {
 		t.Fatal(err)
 	}
+	if err := cfg.SetReceiptsOptIn(peer.Address, true); err != nil {
+		t.Fatal(err)
+	}
 	if err := cmdContacts([]string{"remove", "first"}); err != nil {
 		t.Fatal(err)
 	}
 	required, err := c.FSRequired(peer.Address)
 	if err != nil || !required {
 		t.Fatal("remaining alias lost policy", required, err)
+	}
+	saved, err := client.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !saved.ReceiptsEnabledFor(peer.Address) {
+		t.Fatal("remaining alias lost receipt opt-in")
 	}
 	if err := cmdContacts([]string{"remove", "missing"}); err == nil {
 		t.Fatal("missing removal accepted")
@@ -51,6 +61,14 @@ func TestContactRemovalPreservesSharedFSPolicy(t *testing.T) {
 	if err != nil || required {
 		t.Fatal("final removal retained policy", required, err)
 	}
+	saved, err = client.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.ReceiptsEnabledFor(peer.Address) {
+		t.Fatal("final alias removal retained receipt opt-in")
+	}
+
 }
 
 func TestContactRemoveRejectsRawNonContactAddress(t *testing.T) {

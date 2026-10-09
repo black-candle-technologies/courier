@@ -503,7 +503,8 @@ func (c *Config) addContact(name, address string, prefer bool) error {
 
 // RemoveContact deletes a contact and its verification record (issue
 // #48: a removed contact's trust must not resurrect if re-added), plus
-// its receipt opt-in (issue #52: no lingering activity-leak consent).
+// its receipt opt-in when the last alias is removed (issue #52: no lingering
+// activity-leak consent after removing the identity).
 // It is not an error if absent.
 func (c *Config) RemoveContact(name string) error {
 	address, existed := c.Contacts[name]
@@ -513,10 +514,17 @@ func (c *Config) RemoveContact(name string) error {
 	if existed && c.PreferredContactNames[address] == name {
 		delete(c.PreferredContactNames, address)
 	}
-	if existed {
+	delete(c.Contacts, name)
+	stillReferenced := false
+	for _, other := range c.Contacts {
+		if other == address {
+			stillReferenced = true
+			break
+		}
+	}
+	if existed && !stillReferenced {
 		delete(c.ReceiptContacts, address)
 	}
-	delete(c.Contacts, name)
 	delete(c.ContactVerifications, name)
 	if err := c.Save(); err != nil {
 		c.PreferredContactNames = oldPreferences
