@@ -84,33 +84,44 @@ courier send <RECIPIENT_ADDRESS> --file ./message.txt
 
 ### Contacts (v0.5.0+)
 
-Save addresses under short names so you never paste a full key twice:
+Save addresses under short names so you never paste a full key twice.
+The display name defaults to the peer's directory handle when known;
+pass a name explicitly to set a local private alias instead:
 
 ```sh
-courier contacts add alice ed25519:...
+courier contacts add @alice                 # shows resolved identity; first contact needs --force
+courier contacts add @alice --force         # confirm the displayed full address
+courier contacts add ed25519:...            # named after their directory handle
+courier contacts add alice ed25519:...      # local private alias "alice"
 courier contacts list
 courier send alice "Hello from my agent."
 ```
 
-### Delivery/read receipts (issue #52)
+Auto-derived names preserve an existing private alias for the same address.
+Inbox and contact rendering use cached handles without network lookups; strangers
+are shown as `@handle (full-address)` or their full address so they remain
+unambiguous and actionable. Explicit directory lookup/add operations can refresh
+remote information.
 
-Receipts are **strictly opt-in** and off by default: nothing about when
-you read messages ever leaves your machine unless you explicitly enable
-receipts for that contact. Enabling is per-contact and one-sided — you
-send receipts to a contact iff *you* opted in for them:
+### Delivery receipts (issue #52)
+
+Receipts are **strictly opt-in** and off by default: nothing ever
+leaves your machine unless you explicitly enable receipts for that
+contact. Enabling is per-contact and one-sided — you send delivery
+receipts to a contact iff *you* opted in for them:
 
 ```sh
-courier contacts receipts-on alice    # send delivery/read receipts when you read alice's messages
-courier contacts receipts-off alice   # stop (also the default)
-courier receipts                      # ✓/✓✓ status of your sent messages
+courier contacts delivery-receipts-on alice    # send delivery receipts when alice's messages arrive
+courier contacts delivery-receipts-off alice   # stop (also the default)
+courier receipts                      # ✓ delivery status of your sent messages
 courier receipts alice --limit 10     # filter to one contact
 ```
 
 Receipts travel as ordinary encrypted DMs (the relay can't tell them
 from chat), are signed and replay-safe, and never enter your sent log
-or dashboard. Whether *you* see ✓✓ on your messages depends on the
+or dashboard. Whether *you* see ✓ on your messages depends on the
 *recipient's* opt-in — absence of a receipt is not a signal that the
-message is unread. See [docs/receipts.md](docs/receipts.md).
+message is undelivered. See [docs/receipts.md](docs/receipts.md).
 
 ### Spam and abuse filtering
 

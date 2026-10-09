@@ -93,19 +93,14 @@ type groupState struct {
 	InboxCursor  int64                     `json:"inbox_cursor"`
 	ControlEpoch int64                     `json:"control_epoch"`
 	Removed      bool                      `json:"removed,omitempty"`
+	KeyPending   bool                      `json:"key_pending,omitempty"`
 }
 
 // groupsFilePath is ~/.courier/groups.json.
-func groupsFilePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".courier", "groups.json"), nil
-}
+func (s Context) groupsFilePath() (string, error) { return s.path("groups.json") }
 
-func loadGroupsLocked() (map[string]*groupState, error) {
-	p, err := groupsFilePath()
+func (s Context) loadGroupsLocked() (map[string]*groupState, error) {
+	p, err := s.groupsFilePath()
 	if err != nil {
 		return nil, err
 	}
@@ -123,8 +118,12 @@ func loadGroupsLocked() (map[string]*groupState, error) {
 	return gs, nil
 }
 
-func saveGroupsLocked(gs map[string]*groupState) error {
-	p, err := groupsFilePath()
+func (s Context) saveGroupsLocked(gs map[string]*groupState) error {
+	return s.saveGroupsWithPublication(gs, renamePublishedFile, syncPublishedDirectory)
+}
+
+func (s Context) saveGroupsWithPublication(gs map[string]*groupState, rename func(string, string) error, syncDir func(string) error) error {
+	p, err := s.groupsFilePath()
 	if err != nil {
 		return err
 	}
@@ -137,9 +136,18 @@ func saveGroupsLocked(gs map[string]*groupState) error {
 		return err
 	}
 	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
 	if _, err := tmp.Write(append(data, '\n')); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -150,30 +158,33 @@ func saveGroupsLocked(gs map[string]*groupState) error {
 		os.Remove(tmpName)
 		return err
 	}
-	return os.Rename(tmpName, p)
+	if err := rename(tmpName, p); err != nil {
+		return err
+	}
+	return syncDir(p)
 }
 
 // updateGroups performs an atomic read-modify-write of groups.json under
 // the cross-process config lock (same discipline as Config.Update).
-func updateGroups(fn func(map[string]*groupState) error) error {
-	return withConfigLock(func() error {
-		gs, err := loadGroupsLocked()
+func (s Context) updateGroups(fn func(map[string]*groupState) error) error {
+	return s.withConfigLock(func() error {
+		gs, err := s.loadGroupsLocked()
 		if err != nil {
 			return err
 		}
 		if err := fn(gs); err != nil {
 			return err
 		}
-		return saveGroupsLocked(gs)
+		return s.saveGroupsLocked(gs)
 	})
 }
 
 // loadGroups returns a copy of the local group records.
-func loadGroups() (map[string]*groupState, error) {
+func (s Context) loadGroups() (map[string]*groupState, error) {
 	var gs map[string]*groupState
-	if err := withConfigLock(func() error {
+	if err := s.withConfigLock(func() error {
 		var err error
-		gs, err = loadGroupsLocked()
+		gs, err = s.loadGroupsLocked()
 		return err
 	}); err != nil {
 		return nil, err
@@ -257,7 +268,7 @@ func (c *Client) postGroupControl(g *groupState, action, target string) (int64, 
 	if err := json.Unmarshal(data, &out); err != nil {
 		return 0, fmt.Errorf("bad relay response: %w", err)
 	}
-	err = updateGroups(func(gs map[string]*groupState) error {
+	err = c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
 		cur := gs[g.ID]
 		if cur == nil {
 			return fmt.Errorf("group %s disappeared", g.ID)
@@ -273,6 +284,9 @@ func (c *Client) postGroupControl(g *groupState, action, target string) (int64, 
 		case envelope.GroupControlRemove:
 			cur.Roster = removeFromRoster(cur.Roster, target)
 			delete(cur.Keys, target)
+			if err := c.rotateMyKey(cur); err != nil {
+				return err
+			}
 		case envelope.GroupControlTransferAdmin:
 			cur.Admin = target
 		}
@@ -299,16 +313,15 @@ func (c *Client) distributeMyKey(g *groupState) error {
 		if m == c.cfg.Address {
 			continue
 		}
-		if _, err := c.Send(m, string(raw)); err != nil {
+		if _, err := c.sendProtocolDM(m, string(raw)); err != nil {
 			return fmt.Errorf("distribute key to %s: %w", m, err)
 		}
 	}
 	return nil
 }
 
-// rotateMyKeyLocked generates a new sender key at the next epoch and DMs
-// it to the remaining members. Called after a removal so the removed
-// member cannot decrypt later messages.
+// rotateMyKey mutates only local state. Persist it before distributing the key;
+// delivery failure must never restore a key known to a removed member.
 func (c *Client) rotateMyKey(g *groupState) error {
 	sk, err := newSenderKey(g.MyEpoch + 1)
 	if err != nil {
@@ -317,7 +330,43 @@ func (c *Client) rotateMyKey(g *groupState) error {
 	g.MyKey = sk.Key
 	g.MyEpoch = sk.Epoch
 	g.Keys[c.cfg.Address] = sk
-	return c.distributeMyKey(g)
+	g.KeyPending = true
+	return nil
+}
+
+// retryGroupKey distributes an immutable, already committed snapshot outside
+// the config lock. Clear only that generation; newer rotations remain pending.
+func (c *Client) retryGroupKey(groupID string) error {
+	return c.retryGroupKeyWithSave(groupID, c.cfg.local().saveGroupsLocked)
+}
+
+func (c *Client) retryGroupKeyWithSave(groupID string, save func(map[string]*groupState) error) error {
+	var gs map[string]*groupState
+	err := c.cfg.local().withConfigLock(func() error {
+		var err error
+		gs, err = c.cfg.local().loadGroupsLocked()
+		if err != nil {
+			return err
+		}
+		return save(gs)
+	})
+	if err != nil {
+		return err
+	}
+	g := gs[groupID]
+	if g == nil || g.Removed || !g.KeyPending {
+		return nil
+	}
+	if err := c.distributeMyKey(g); err != nil {
+		return err
+	}
+	return c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
+		cur := gs[groupID]
+		if cur != nil && cur.MyEpoch == g.MyEpoch && cur.MyKey == g.MyKey {
+			cur.KeyPending = false
+		}
+		return nil
+	})
 }
 
 // ---- public API ----
@@ -369,7 +418,7 @@ func (c *Client) GroupCreate(name string, members []string) (*groupState, error)
 		Keys:         map[string]groupSenderKey{me: sk},
 		ControlEpoch: 1,
 	}
-	if err := updateGroups(func(gs map[string]*groupState) error {
+	if err := c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
 		gs[groupID] = g
 		return nil
 	}); err != nil {
@@ -394,7 +443,7 @@ func (c *Client) GroupAdd(groupID, addr string) error {
 	if _, err := crypto.ParseAddress(target); err != nil {
 		return err
 	}
-	gs, err := loadGroups()
+	gs, err := c.cfg.local().loadGroups()
 	if err != nil {
 		return err
 	}
@@ -432,7 +481,7 @@ func (c *Client) GroupAdd(groupID, addr string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := c.Send(target, string(raw)); err != nil {
+	if _, err := c.sendProtocolDM(target, string(raw)); err != nil {
 		return fmt.Errorf("send invite: %w", err)
 	}
 	return nil
@@ -446,7 +495,7 @@ func (c *Client) GroupRemove(groupID, addr string) error {
 	if err != nil {
 		return err
 	}
-	gs, err := loadGroups()
+	gs, err := c.cfg.local().loadGroups()
 	if err != nil {
 		return err
 	}
@@ -464,22 +513,15 @@ func (c *Client) GroupRemove(groupID, addr string) error {
 		return fmt.Errorf("cannot remove yourself; transfer adminship first")
 	}
 	if !inRoster(g.Roster, target) {
+		if g.KeyPending {
+			return c.retryGroupKey(groupID)
+		}
 		return fmt.Errorf("%s is not in the group", target)
 	}
 	if _, err := c.postGroupControl(g, envelope.GroupControlRemove, target); err != nil {
 		return err
 	}
-	// Forward secrecy on removal: rotate my sender key and distribute
-	// the new key to the remaining members. Every other remaining
-	// member rotates their own key when they observe the remove control
-	// in GroupInbox.
-	return updateGroups(func(gs map[string]*groupState) error {
-		cur := gs[groupID]
-		if cur == nil {
-			return fmt.Errorf("group %s disappeared", groupID)
-		}
-		return c.rotateMyKey(cur)
-	})
+	return c.retryGroupKey(groupID)
 }
 
 // GroupTransferAdmin transfers group adminship to addr (admin only).
@@ -488,7 +530,7 @@ func (c *Client) GroupTransferAdmin(groupID, addr string) error {
 	if err != nil {
 		return err
 	}
-	gs, err := loadGroups()
+	gs, err := c.cfg.local().loadGroups()
 	if err != nil {
 		return err
 	}
@@ -512,7 +554,7 @@ func (c *Client) GroupTransferAdmin(groupID, addr string) error {
 // GroupSend seals body under my current sender key and posts it to the
 // group. Returns the relay envelope id.
 func (c *Client) GroupSend(groupID, body string) (int64, error) {
-	gs, err := loadGroups()
+	gs, err := c.cfg.local().loadGroups()
 	if err != nil {
 		return 0, err
 	}
@@ -525,6 +567,9 @@ func (c *Client) GroupSend(groupID, body string) (int64, error) {
 	}
 	if !inRoster(g.Roster, c.cfg.Address) {
 		return 0, fmt.Errorf("you are not in the group roster")
+	}
+	if g.KeyPending {
+		return 0, fmt.Errorf("group key distribution pending; retry the group operation or receive group updates before sending")
 	}
 	id, err := c.cfg.Identity()
 	if err != nil {
@@ -617,7 +662,7 @@ type groupInboxResponse struct {
 // removal its forward secrecy even when the admin's own client is the
 // only one guaranteed online at removal time.
 func (c *Client) GroupInbox(groupID string) ([]Message, error) {
-	gs, err := loadGroups()
+	gs, err := c.cfg.local().loadGroups()
 	if err != nil {
 		return nil, err
 	}
@@ -628,6 +673,7 @@ func (c *Client) GroupInbox(groupID string) ([]Message, error) {
 	if g.Removed {
 		return nil, fmt.Errorf("you were removed from %s", groupID)
 	}
+	initialControlEpoch, initialMyEpoch := g.ControlEpoch, g.MyEpoch
 	hc, err := c.httpClient()
 	if err != nil {
 		return nil, err
@@ -657,7 +703,7 @@ func (c *Client) GroupInbox(groupID string) ([]Message, error) {
 		// proves I am no longer a member. Record it locally so the
 		// group shows as removed even though the control feed is
 		// unreadable.
-		_ = updateGroups(func(gs map[string]*groupState) error {
+		_ = c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
 			if cur := gs[groupID]; cur != nil {
 				cur.Removed = true
 			}
@@ -756,13 +802,42 @@ func (c *Client) GroupInbox(groupID string) ([]Message, error) {
 	}
 	if removed {
 		g.Removed = true
-		if err := updateGroups(func(gs map[string]*groupState) error {
+		if err := c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
+			cur := gs[groupID]
+			if cur == nil || cur.Removed || cur.ControlEpoch != initialControlEpoch || cur.MyEpoch != initialMyEpoch {
+				return fmt.Errorf("group state changed concurrently; retry")
+			}
 			gs[groupID] = g
 			return nil
 		}); err != nil {
 			return nil, err
 		}
 		return nil, fmt.Errorf("you were removed from %s", groupID)
+	}
+
+	// Commit the control/key changes before sending any key material. Refuse a
+	// stale snapshot rather than overwriting concurrently accepted controls/keys.
+	if err := c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
+		cur := gs[groupID]
+		if cur == nil || cur.Removed || cur.ControlEpoch != initialControlEpoch || cur.MyEpoch != initialMyEpoch {
+			return fmt.Errorf("group state changed concurrently; retry")
+		}
+		if cur.InboxCursor > g.InboxCursor {
+			g.InboxCursor = cur.InboxCursor
+		}
+		// Preserve peer keys accepted while the network request was in flight.
+		for member, key := range cur.Keys {
+			if inRoster(g.Roster, member) && key.Epoch > g.Keys[member].Epoch {
+				g.Keys[member] = key
+			}
+		}
+		gs[groupID] = g
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if err := c.retryGroupKey(groupID); err != nil {
+		return nil, fmt.Errorf("rekey after removal: %w", err)
 	}
 
 	// 2. Messages.
@@ -852,8 +927,14 @@ func (c *Client) GroupInbox(groupID string) ([]Message, error) {
 	}
 	c.recordSeen(seenConsumerInbox, newHashes)
 	g.InboxCursor = lastID
-	if err := updateGroups(func(gs map[string]*groupState) error {
-		gs[groupID] = g
+	if err := c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
+		cur := gs[groupID]
+		if cur == nil {
+			return fmt.Errorf("group %s disappeared", groupID)
+		}
+		if lastID > cur.InboxCursor {
+			cur.InboxCursor = lastID
+		}
 		return nil
 	}); err != nil {
 		return nil, err
@@ -863,7 +944,7 @@ func (c *Client) GroupInbox(groupID string) ([]Message, error) {
 
 // GroupList returns the local group records, oldest first.
 func (c *Client) GroupList() ([]*groupState, error) {
-	gs, err := loadGroups()
+	gs, err := c.cfg.local().loadGroups()
 	if err != nil {
 		return nil, err
 	}
@@ -887,7 +968,7 @@ func (c *Client) handleGroupDM(from string, p groupDMPayload) {
 		if err != nil || len(raw) != 32 || p.Epoch <= 0 {
 			return
 		}
-		_ = updateGroups(func(gs map[string]*groupState) error {
+		_ = c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
 			g := gs[p.Group]
 			if g == nil || g.Removed {
 				// Unknown group (the invite may not have arrived yet)
@@ -925,7 +1006,7 @@ func (c *Client) handleGroupDM(from string, p groupDMPayload) {
 			return
 		}
 		joined := false
-		_ = updateGroups(func(gs map[string]*groupState) error {
+		_ = c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
 			if _, ok := gs[p.Group]; ok {
 				return nil // idempotent: already joined
 			}
@@ -944,6 +1025,7 @@ func (c *Client) handleGroupDM(from string, p groupDMPayload) {
 				Keys:         keys,
 				InboxCursor:  p.Cursor,
 				ControlEpoch: 1,
+				KeyPending:   true,
 			}
 			joined = true
 			return nil
@@ -952,13 +1034,15 @@ func (c *Client) handleGroupDM(from string, p groupDMPayload) {
 			return
 		}
 		// Distribute my sender key to the other members. Best effort:
-		// a missed DM is repaired on the next removal rekey.
-		gs, err := loadGroups()
+		// a missed DM remains pending for the next group inbox sync.
+		gs, err := c.cfg.local().loadGroups()
 		if err != nil {
 			return
 		}
 		if g := gs[p.Group]; g != nil {
-			_ = c.distributeMyKey(g)
+			_ = c.retryGroupKey(g.ID)
 		}
 	}
 }
+
+func loadGroups() (map[string]*groupState, error) { return LegacyContext().loadGroups() }

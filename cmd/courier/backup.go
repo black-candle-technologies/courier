@@ -22,19 +22,19 @@ import (
 	"github.com/mattn/go-isatty"
 )
 
-func cmdBackup(args []string) error {
+func (scope command) cmdBackup(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: courier backup <create|restore|export-sync|import-sync>")
 	}
 	switch args[0] {
 	case "create":
-		return cmdBackupCreate(args[1:])
+		return scope.cmdBackupCreate(args[1:])
 	case "restore":
-		return cmdBackupRestore(args[1:])
+		return scope.cmdBackupRestore(args[1:])
 	case "export-sync":
-		return cmdBackupExportSync(args[1:])
+		return scope.cmdBackupExportSync(args[1:])
 	case "import-sync":
-		return cmdBackupImportSync(args[1:])
+		return scope.cmdBackupImportSync(args[1:])
 	default:
 		return fmt.Errorf("unknown backup subcommand %q (create|restore|export-sync|import-sync)", args[0])
 	}
@@ -133,12 +133,12 @@ func writeBackupFile(path string, raw []byte) error {
 	return nil
 }
 
-func cmdBackupCreate(args []string) error {
+func (scope command) cmdBackupCreate(args []string) error {
 	positionals, output, deviceName, passphraseEnv, _ := splitBackupArgs(args)
 	if len(positionals) != 0 {
 		return errors.New("usage: courier backup create [--output f] [--device-name n] [--passphrase-env VAR]")
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -161,12 +161,12 @@ func cmdBackupCreate(args []string) error {
 	return nil
 }
 
-func cmdBackupExportSync(args []string) error {
+func (scope command) cmdBackupExportSync(args []string) error {
 	positionals, output, deviceName, passphraseEnv, _ := splitBackupArgs(args)
 	if len(positionals) != 0 {
 		return errors.New("usage: courier backup export-sync [--output f] [--device-name n] [--passphrase-env VAR]")
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -190,7 +190,7 @@ func cmdBackupExportSync(args []string) error {
 	return nil
 }
 
-func cmdBackupRestore(args []string) error {
+func (scope command) cmdBackupRestore(args []string) error {
 	positionals, _, _, passphraseEnv, force := splitBackupArgs(args)
 	if len(positionals) != 1 {
 		return errors.New("usage: courier backup restore [--force] [--passphrase-env VAR] <backup-file>")
@@ -203,7 +203,7 @@ func cmdBackupRestore(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := client.RestoreBackup(pass, raw, force)
+	cfg, err := scope.context.RestoreBackup(pass, raw, force)
 	if err != nil {
 		return err
 	}
@@ -222,7 +222,7 @@ func cmdBackupRestore(args []string) error {
 	return nil
 }
 
-func cmdBackupImportSync(args []string) error {
+func (scope command) cmdBackupImportSync(args []string) error {
 	positionals, _, _, passphraseEnv, _ := splitBackupArgs(args)
 	if len(positionals) != 1 {
 		return errors.New("usage: courier backup import-sync [--passphrase-env VAR] <sync-file>")
@@ -239,7 +239,7 @@ func cmdBackupImportSync(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}

@@ -14,22 +14,52 @@ import (
 )
 
 func groupUsage() string {
-	return `usage:
-  courier group create --name <name> [addr...]  create a group (you become admin)
-  courier group add <group-id> <addr>            add a member (admin only)
-  courier group remove <group-id> <addr>        remove a member (admin only)
-  courier group transfer <group-id> <addr>      transfer adminship (admin only)
-  courier group send <group-id> <message|->     send to the group ("-" reads stdin)
-  courier group inbox <group-id>                read new group messages
-  courier group list                            list your groups
-  courier group show <group-id>                 show group details`
+	return `admin-managed encrypted groups (issue #32): Courier's
+multi-party primitive. The creator becomes the admin, and only the
+admin can add or remove members or transfer adminship. Membership
+changes are signed control messages; when a member is removed,
+remaining senders rotate keys after observing the removal in an inbox sync.
+
+usage:
+  courier group create --name <name> [addr...]
+      create a group; you become the admin. Addresses given are added
+      as initial members.
+      example: courier group create --name ops ed25519:AAA ed25519:BBB
+
+  courier group add <group-id> <addr>
+      add a member (admin only).
+
+  courier group remove <group-id> <addr>
+      remove a member (admin only). Each remaining sender must sync and rotate
+      before later messages exclude the removed member. The admin cannot remove
+      themselves — transfer adminship first.
+
+  courier group transfer <group-id> <addr>
+      transfer adminship to a current member (admin only). You lose
+      control rights immediately.
+
+  courier group send <group-id> <message|->
+      send to the group, sealed under your current sender key. "-"
+      reads the body from stdin.
+      example: courier group send grp_abc123 "deploy is green"
+
+  courier group inbox <group-id>
+      read new group messages. Syncs your direct inbox first (group
+      invitations and sender-key updates arrive as DMs), then applies
+      membership controls and decrypts group messages.
+
+  courier group list
+      list your groups, with admin and member counts.
+
+  courier group show <group-id>
+      show a group's name, admin, and full roster.`
 }
 
-func cmdGroup(args []string) error {
+func (scope command) cmdGroup(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("%s", groupUsage())
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -64,7 +94,7 @@ func cmdGroup(args []string) error {
 		if err := cl.GroupRemove(args[1], args[2]); err != nil {
 			return err
 		}
-		fmt.Printf("removed %s from %s (sender keys rotated)\n", args[2], args[1])
+		fmt.Printf("removed %s from %s (remaining senders must sync to rotate keys)\n", args[2], args[1])
 	case "transfer":
 		if len(args) != 3 {
 			return fmt.Errorf("usage: courier group transfer <group-id> <addr>")
@@ -173,7 +203,7 @@ func cmdGroupInbox(cl *client.Client, cfg *client.Config, groupID string) error 
 	})
 	if len(msgs) > 0 {
 		fmt.Println("--- direct messages ---")
-		printMessages(msgs)
+		printMessages(cl, msgs)
 	}
 	if skipped > 0 {
 		fmt.Fprintf(os.Stderr, "(%d direct message(s) failed signature/decryption and were dropped)\n", skipped)

@@ -10,11 +10,11 @@ import (
 	"github.com/black-candle-technologies/courier/internal/client"
 )
 
-func cmdDirectory(args []string) error {
+func (scope command) cmdDirectory(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: courier directory <register|update|unregister|transfer|lookup|search|reverse|request|introductions|forward|accept|dismiss>")
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}

@@ -309,7 +309,7 @@ func min(a, b int) int {
 //
 // Replay suppression is bypassed for exactly this envelope and nothing
 // else: the envelope is not marked seen, the inbox cursor is untouched,
-// no read receipts are sent, no shared-state events are applied, and no
+// no delivery receipts are sent, and no
 // protocol handlers run. The fetch is strictly read-only, so it is safe
 // to repeat and invisible to every other consumer.
 //
@@ -378,17 +378,17 @@ func (c *Client) FetchMessage(id int64) (Message, error) {
 	if _, ok := parseGroupDMPayload(plain); ok {
 		return Message{}, fmt.Errorf("message #%d is a group protocol message, not a chat message", id)
 	}
-	if _, ok := parseChannelDMPayload(plain); ok {
-		return Message{}, fmt.Errorf("message #%d is a channel protocol message, not a chat message", id)
-	}
 	if _, ok := parseReceiptDMPayload(plain); ok {
 		return Message{}, fmt.Errorf("message #%d is a receipt protocol message, not a chat message", id)
 	}
 	if _, ok := parseIntroductionPayload(plain); ok {
 		return Message{}, fmt.Errorf("message #%d is an introduction protocol message, not a chat message", id)
 	}
-	if _, ok := parseStatePayload(plain); ok {
-		return Message{}, fmt.Errorf("message #%d is a shared-state protocol message, not a chat message", id)
+	if isLegacyStatePayload(plain) {
+		return Message{}, fmt.Errorf("message #%d is a retired state protocol message, not a chat message", id)
+	}
+	if isLegacyChannelPayload(plain) {
+		return Message{}, fmt.Errorf("message #%d is a retired channel protocol message, not a chat message", id)
 	}
 	body, manifests, rinfo, expiresAt, bmeta := parseMessagePayload(plain)
 	// issue #53: an expired message is gone. The inbox consumes it

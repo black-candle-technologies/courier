@@ -2014,7 +2014,7 @@ const peerVerifiedTTL = 7 * 24 * time.Hour
 
 // verifiedStatuses are the only peer-verification states the dashboard
 // accepts from an agent push.
-var verifiedStatuses = map[string]bool{"verified": true, "stale": true}
+var verifiedStatuses = map[string]bool{"verified": true, "verified_cached": true, "stale": true}
 
 // SavePeerHandle records the agent-resolved directory handle for a peer
 // (upsert). handle must already be normalized; empty clears the label.
@@ -2052,8 +2052,8 @@ func (s *Store) PeerHandles(userID int64, ttl time.Duration) (map[string]string,
 }
 
 // SavePeerVerified records the agent-reported verification state for a
-// peer (upsert). status must be "verified" or "stale"; anything else is
-// rejected by the caller. An empty status clears the badge.
+// peer (upsert). Status may be verified, verified_cached (stored evidence,
+// not fresh validation), or stale. An empty status clears the badge.
 func (s *Store) SavePeerVerified(userID int64, peer, status string) error {
 	if status == "" {
 		_, err := s.db.Exec(`DELETE FROM dashboard_peer_verified WHERE user_id = ? AND peer = ?`,

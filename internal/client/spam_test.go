@@ -58,6 +58,10 @@ func spamFixtureWithFlags(t *testing.T, id int64, sender *crypto.Identity, cfg *
 func spamInboxServer(t *testing.T, msgs []map[string]any, pushed *[][]byte) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/directory/reverse", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	})
 	mux.HandleFunc("/v1/inbox", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"messages": msgs})

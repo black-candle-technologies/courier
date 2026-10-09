@@ -39,12 +39,8 @@ import (
 
 // configLockPath is the cross-process mutex for config read-modify-write
 // cycles.
-func configLockPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".courier", "config.lock"), nil
+func (s Context) configLockPath() (string, error) {
+	return s.path("config.lock")
 }
 
 // acquireConfigLock opens (creating) the lock file and takes an
@@ -54,8 +50,8 @@ func configLockPath() (string, error) {
 // will. The lock releases automatically if the process dies, because the
 // kernel drops the flock with the file description — a crashed process
 // can never wedge the config.
-func acquireConfigLock() (release func(), err error) {
-	p, err := configLockPath()
+func (s Context) acquireConfigLock() (release func(), err error) {
+	p, err := s.configLockPath()
 	if err != nil {
 		return nil, err
 	}
@@ -76,16 +72,34 @@ func acquireConfigLock() (release func(), err error) {
 	}, nil
 }
 
+func acquireConfigLock() (release func(), err error) { return LegacyContext().acquireConfigLock() }
+
 // withConfigLock runs fn while holding the in-process config mutex and an
 // exclusive flock on the config lock file. The mutex serializes goroutines
 // sharing a Config; the flock serializes Courier processes.
-func withConfigLock(fn func() error) error {
+func (s Context) withConfigLock(fn func() error) error {
 	configMu.Lock()
 	defer configMu.Unlock()
-	release, err := acquireConfigLock()
+	if s.principal != "" {
+		releaseRoot, err := s.installation().acquireConfigLock()
+		if err != nil {
+			return err
+		}
+		defer releaseRoot()
+		if err := s.checkMigrationCommitted(); err != nil {
+			return err
+		}
+		if err := s.checkBinding(false); err != nil {
+			return err
+		}
+	}
+	release, err := s.acquireConfigLock()
 	if err != nil {
 		return err
 	}
 	defer release()
+	if err := s.refuseMigrated(); err != nil {
+		return err
+	}
 	return fn()
 }

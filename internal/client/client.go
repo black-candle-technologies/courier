@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -67,6 +68,9 @@ type EncKey struct {
 // Config is the local agent identity, stored at ~/.courier/config.json.
 // The seed and encryption private keys never leave this file (mode 0600).
 type Config struct {
+	localContext    *Context
+	unsavedIdentity bool // only NewIdentity may initialize through contact mutation
+
 	Version          int               `json:"version"`
 	RelayURL         string            `json:"relay"`
 	Seed             string            `json:"seed"`                        // base64url 32-byte identity seed
@@ -77,10 +81,13 @@ type Config struct {
 	// issue #48 (phase 1): out-of-band contact verifications, keyed by
 	// contact name. A record pins the address + key epoch the safety
 	// number was computed over; if either changes, trust goes stale.
-	ContactVerifications map[string]ContactVerification `json:"contact_verifications,omitempty"`
-	EncKeys              []EncKey                       `json:"enc_keys,omitempty"`          // current first; lazily migrated
-	AutoUpdate           *bool                          `json:"auto_update,omitempty"`       // nil = unset: auto-install newer releases (v0.6.12+ default); false opts out
-	UpdateCheckedAt      int64                          `json:"update_checked_at,omitempty"` // unix seconds of last update check
+	// PreferredContactNames records explicitly chosen private display aliases,
+	// keyed by address. Other aliases and their verification records remain intact.
+	PreferredContactNames map[string]string              `json:"preferred_contact_names,omitempty"`
+	ContactVerifications  map[string]ContactVerification `json:"contact_verifications,omitempty"`
+	EncKeys               []EncKey                       `json:"enc_keys,omitempty"`          // current first; lazily migrated
+	AutoUpdate            *bool                          `json:"auto_update,omitempty"`       // nil = unset: auto-install newer releases (v0.6.12+ default); false opts out
+	UpdateCheckedAt       int64                          `json:"update_checked_at,omitempty"` // unix seconds of last update check
 	// v0.6.0: web dashboard account. Token is the push API token (the
 	// dashboard stores only its hash). DashboardCursor is the last
 	// courier message id pushed.
@@ -112,16 +119,11 @@ type Config struct {
 	SeenEnvelopeHashes []string `json:"seen_envelope_hashes,omitempty"` // deprecated: use the per-consumer sets
 	SeenInboxHashes    []string `json:"seen_inbox_hashes,omitempty"`
 	SeenPushHashes     []string `json:"seen_push_hashes,omitempty"`
-	// issue #49: SeenStateHashes covers `courier state sync`, the
-	// shared-state catch-up fetch. It starts empty on upgrade; the
-	// sync cursor is seeded from the inbox/push cursors, whose fetches
-	// already applied older state events.
-	SeenStateHashes []string `json:"seen_state_hashes,omitempty"`
-	// issue #52: per-contact delivery/read receipt opt-in, keyed by
-	// recipient address. Strictly opt-in: receipts never leak read
-	// activity unless the operator explicitly enabled them for the
-	// sender (`courier contacts receipts-on <name>`). Default off;
-	// cleared when the contact is removed.
+	// issue #52: per-contact delivery receipt opt-in, keyed by
+	// recipient address. Strictly opt-in: receipts never leave the
+	// machine unless the operator explicitly enabled them for the
+	// sender (`courier contacts delivery-receipts-on <name>`).
+	// Default off; cleared when the contact is removed.
 	ReceiptContacts map[string]bool `json:"receipt_contacts,omitempty"`
 	// Spam/abuse filtering (metadata-only; the relay never sees
 	// plaintext). DMPolicy is "open" (default, unset) or "contacts":
@@ -151,7 +153,9 @@ type Config struct {
 	// HandleRefreshAt is the last time refreshPeerHandles pushed a
 	// handles-only update; refreshed at most once per 24h so inactive
 	// threads get their labels without a message batch.
-	HandleRefreshAt int64 `json:"handle_refresh_at,omitempty"`
+	HandleRefreshAt      int64                         `json:"handle_refresh_at,omitempty"`
+	PendingPeerDiscovery map[string]PeerDiscoveryEntry `json:"pending_peer_discovery,omitempty"`
+	PublishedPeerTrust   map[string]string             `json:"published_peer_trust,omitempty"`
 	// Instant wake (issue #42). WakeCursor is the last envelope id the
 	// wake daemon observed. It is tracked separately from Cursor so
 	// observing a message never consumes it: a woken agent still sees
@@ -171,22 +175,25 @@ type HandleCacheEntry struct {
 	At     int64  `json:"at"`
 }
 
-func configPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".courier", "config.json"), nil
+func (s Context) configPath() (string, error) {
+	return s.path("config.json")
 }
 
+func configPath() (string, error) { return LegacyContext().configPath() }
+
 // ConfigExists reports whether an identity file exists (any version).
-func ConfigExists() bool {
-	p, err := configPath()
+func (s Context) ConfigExists() bool {
+	p, err := s.configPath()
 	if err != nil {
 		return false
 	}
 	_, err = os.Stat(p)
 	return err == nil
+}
+
+func ConfigExists() bool {
+	ctx, err := LegacyContext().ActiveContext()
+	return err == nil && ctx.ConfigExists()
 }
 
 // configMu serializes in-process config access across goroutines.
@@ -197,8 +204,11 @@ var configMu sync.Mutex
 
 // loadConfigRaw reads and parses the config file: version check and
 // defaults, but no migrations and no writes.
-func loadConfigRaw() (*Config, error) {
-	p, err := configPath()
+func (s Context) loadConfigRaw() (*Config, error) {
+	if err := s.refuseMigrated(); err != nil {
+		return nil, err
+	}
+	p, err := s.configPath()
 	if err != nil {
 		return nil, err
 	}
@@ -206,6 +216,20 @@ func loadConfigRaw() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("no courier identity: run `courier init` first (%w)", err)
 	}
+	c, err := decodeConfig(raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.validateConfig(c); err != nil {
+		return nil, err
+	}
+	c.localContext = &s
+	return c, nil
+}
+
+// decodeConfig applies the same compatibility checks and defaults to normal
+// loading and migration validation without changing the original file bytes.
+func decodeConfig(raw []byte) (*Config, error) {
 	var c Config
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("bad config: %w", err)
@@ -232,11 +256,6 @@ const (
 	// seenConsumerPush covers `courier dashboard push` — everything
 	// whose delivery target is the web dashboard.
 	seenConsumerPush
-	// seenConsumerState covers `courier state sync` — the shared-state
-	// catch-up fetch (issue #49). It never consumes inbox or
-	// dashboard-push messages: it only applies state events, which the
-	// other consumers apply idempotently on their own passes.
-	seenConsumerState
 )
 
 // migrateSeenSets applies the v0.9.2 lazy migration (issue #45): the
@@ -296,9 +315,15 @@ func migrateEncKeys(c *Config) error {
 }
 
 // LoadConfig reads the local identity.
-func LoadConfig() (*Config, error) {
-	c, err := loadConfigRaw()
+func (s Context) LoadConfig() (*Config, error) {
+	c, err := s.loadConfigRaw()
 	if err != nil {
+		return nil, err
+	}
+	if err := s.warnLegacyChannels(); err != nil {
+		return nil, err
+	}
+	if err := s.maintainLegacyState(); err != nil {
 		return nil, err
 	}
 	migrated := false
@@ -314,15 +339,33 @@ func LoadConfig() (*Config, error) {
 	}
 	if migrated {
 		// Best effort: persist the migration so it only happens once.
-		_ = c.Save()
+		_ = c.Update(func(*Config) error { return nil })
 	}
 	return c, nil
+}
+
+func LoadConfig() (*Config, error) {
+	ctx, err := LegacyContext().ActiveContext()
+	if err != nil {
+		return nil, err
+	}
+	return ctx.LoadConfig()
 }
 
 // saveAtomic writes the config via temp file + rename in the same
 // directory, so a crash can never leave a partially written config.
 func (c *Config) saveAtomic() error {
-	p, err := configPath()
+	return c.saveWithPublication(renamePublishedFile, syncPublishedDirectory)
+}
+
+func (c *Config) saveWithPublication(rename func(string, string) error, syncDir func(string) error) error {
+	if err := c.local().validateConfig(c); err != nil {
+		return err
+	}
+	if err := c.local().checkBinding(true); err != nil {
+		return err
+	}
+	p, err := c.local().configPath()
 	if err != nil {
 		return err
 	}
@@ -355,7 +398,10 @@ func (c *Config) saveAtomic() error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, p)
+	if err := rename(tmpName, p); err != nil {
+		return err
+	}
+	return syncDir(p)
 }
 
 // Save writes the config with mode 0600: atomically (temp file + rename)
@@ -367,7 +413,17 @@ func (c *Config) saveAtomic() error {
 // otherwise fields another process changed meanwhile (e.g. rotated
 // encryption keys) are silently clobbered.
 func (c *Config) Save() error {
-	return withConfigLock(func() error { return c.saveAtomic() })
+	configMu.Lock()
+	c.bindLegacyContext()
+	scope := c.local()
+	configMu.Unlock()
+	return scope.withConfigLock(func() error {
+		if err := c.saveAtomic(); err != nil {
+			return err
+		}
+		c.unsavedIdentity = false
+		return nil
+	})
 }
 
 // Update performs an atomic read-modify-write: it takes the cross-process
@@ -377,10 +433,33 @@ func (c *Config) Save() error {
 // mutating a stale in-memory Config and calling Save would clobber fields
 // another process wrote meanwhile (v0.6.11 F5).
 func (c *Config) Update(fn func(*Config) error) error {
-	return withConfigLock(func() error {
-		fresh, err := loadConfigRaw()
+	return c.updateWithSave(fn, false, (*Config).saveAtomic)
+}
+
+// updateWithSave shares the fresh-config transaction; only contact initialization
+// on an unsaved NewIdentity may create a missing file.
+func (c *Config) updateWithSave(fn func(*Config) error, initialize bool, save func(*Config) error) error {
+	configMu.Lock()
+	c.bindLegacyContext()
+	scope := c.local()
+	configMu.Unlock()
+	return scope.withConfigLock(func() error {
+		fresh, err := scope.loadConfigRaw()
+		if errors.Is(err, os.ErrNotExist) && initialize && c.unsavedIdentity {
+			// Clone all maps/slices so a failed mutation cannot alter the receiver.
+			raw, cloneErr := json.Marshal(c)
+			if cloneErr != nil {
+				return cloneErr
+			}
+			fresh = new(Config)
+			err = json.Unmarshal(raw, fresh)
+			fresh.localContext = &scope
+		}
 		if err != nil {
 			return err
+		}
+		if fresh.Address != c.Address || fresh.Seed != c.Seed {
+			return ErrContextMismatch
 		}
 		if len(fresh.EncKeys) == 0 {
 			if err := migrateEncKeys(fresh); err != nil {
@@ -393,10 +472,11 @@ func (c *Config) Update(fn func(*Config) error) error {
 		if err := fn(fresh); err != nil {
 			return err
 		}
-		if err := fresh.saveAtomic(); err != nil {
+		if err := save(fresh); err != nil {
 			return err
 		}
-		*c = *fresh
+		c.refreshState(fresh)
+		c.unsavedIdentity = false
 		return nil
 	})
 }
@@ -424,10 +504,11 @@ func NewIdentity(relayURL string) (*Config, error) {
 		return nil, err
 	}
 	return &Config{
-		Version:  ConfigVersion,
-		RelayURL: relayURL,
-		Seed:     base64.RawURLEncoding.EncodeToString(id.Seed[:]),
-		Address:  crypto.FormatAddress(id.EdPub[:]),
+		unsavedIdentity: true,
+		Version:         ConfigVersion,
+		RelayURL:        relayURL,
+		Seed:            base64.RawURLEncoding.EncodeToString(id.Seed[:]),
+		Address:         crypto.FormatAddress(id.EdPub[:]),
 		EncKeys: []EncKey{{
 			Pub:       base64.RawURLEncoding.EncodeToString(xpub[:]),
 			Priv:      base64.RawURLEncoding.EncodeToString(xpriv[:]),
@@ -450,32 +531,95 @@ func (c *Config) Identity() (*crypto.Identity, error) {
 
 var contactNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
-// AddContact stores name -> address after validating both.
+// AddContact stores an explicitly requested name-to-address mapping.
 func (c *Config) AddContact(name, address string) error {
-	if !contactNameRe.MatchString(name) {
-		return fmt.Errorf("bad contact name %q: use 1-32 chars, lowercase letters, digits, - and _, starting with a letter or digit", name)
-	}
-	if _, err := crypto.ParseAddress(address); err != nil {
-		return fmt.Errorf("bad address: %w", err)
-	}
-	if c.Contacts == nil {
-		c.Contacts = map[string]string{}
-	}
-	c.Contacts[name] = address
-	return c.Save()
+	_, err := c.addContact(name, address, false, false)
+	return err
 }
 
-// RemoveContact deletes a contact and its verification record (issue
-// #48: a removed contact's trust must not resurrect if re-added), plus
-// its receipt opt-in (issue #52: no lingering activity-leak consent).
-// It is not an error if absent.
-func (c *Config) RemoveContact(name string) error {
-	if addr, ok := c.Contacts[name]; ok {
-		delete(c.ReceiptContacts, addr)
+// AddContactAlias also makes the private alias the preferred display name.
+func (c *Config) AddContactAlias(name, address string) error {
+	_, err := c.addContact(name, address, true, false)
+	return err
+}
+
+// AddDiscoveredContact never replaces a saved alias on directory evidence alone.
+// It returns the actual saved name, including one concurrently saved elsewhere.
+func (c *Config) AddDiscoveredContact(name, address string) (string, error) {
+	return c.addContact(name, address, false, true)
+}
+
+func (c *Config) addContact(name, address string, prefer, discovered bool) (string, error) {
+	if !contactNameRe.MatchString(name) {
+		return "", fmt.Errorf("bad contact name %q: use 1-32 chars, lowercase letters, digits, - and _, starting with a letter or digit", name)
 	}
-	delete(c.Contacts, name)
-	delete(c.ContactVerifications, name)
-	return c.Save()
+	if _, err := crypto.ParseAddress(address); err != nil {
+		return "", fmt.Errorf("bad address: %w", err)
+	}
+	var oldAddress string
+	var replaced bool
+	savedName := name
+	if err := c.updateWithSave(func(fresh *Config) error {
+		if discovered {
+			if existing := fresh.ContactNameForAddress(address); existing != "" {
+				savedName = existing
+				return nil
+			}
+			if old, exists := fresh.Contacts[name]; exists && old != address {
+				return fmt.Errorf("contact %q already exists for a different address", name)
+			}
+		}
+		var err error
+		oldAddress, replaced, err = replaceContactLocked(fresh, name, address)
+		if err != nil {
+			return err
+		}
+		if fresh.PreferredContactNames[oldAddress] == name && oldAddress != address {
+			delete(fresh.PreferredContactNames, oldAddress)
+		}
+		if prefer {
+			if fresh.PreferredContactNames == nil {
+				fresh.PreferredContactNames = map[string]string{}
+			}
+			fresh.PreferredContactNames[address] = name
+		}
+		return nil
+	}, true, (*Config).saveAtomic); err != nil {
+		return "", err
+	}
+	if replaced && oldAddress != address {
+		if _, err := New(c).FSCleanupOrphan(oldAddress); err != nil {
+			return savedName, fmt.Errorf("contact saved, but could not erase replaced contact's FS session; retry with courier contacts retry-fs-cleanup %s: %w", oldAddress, err)
+		}
+	}
+	return savedName, nil
+}
+
+// RemoveContact changes fresh aliases and live trust in one config transaction.
+func (c *Config) RemoveContact(name string) error {
+	var address string
+	var existed bool
+	if err := c.Update(func(fresh *Config) error {
+		address, existed = fresh.Contacts[name]
+		if existed && fresh.PreferredContactNames[address] == name {
+			delete(fresh.PreferredContactNames, address)
+		}
+		delete(fresh.Contacts, name)
+		delete(fresh.ContactVerifications, name)
+		if existed {
+			clearOrphanReceipt(fresh, address)
+			fresh.HandleRefreshAt = 0
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if existed {
+		if _, err := New(c).FSCleanupOrphan(address); err != nil {
+			return fmt.Errorf("contact removed, but could not erase its FS session; retry with courier contacts retry-fs-cleanup %s: %w", address, err)
+		}
+	}
+	return nil
 }
 
 // LookupContact returns the address for a contact name.
@@ -666,23 +810,34 @@ func (c *Client) RotateKey() (published bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	epoch := time.Now().Unix()
-	// Monotonic epoch even within the same second as a previous rotation.
-	if len(c.cfg.EncKeys) > 0 && epoch <= c.cfg.EncKeys[0].Epoch {
-		epoch = c.cfg.EncKeys[0].Epoch + 1
-	}
-	c.cfg.EncKeys = append([]EncKey{{
-		Pub:       base64.RawURLEncoding.EncodeToString(pub[:]),
-		Priv:      base64.RawURLEncoding.EncodeToString(priv[:]),
-		Epoch:     epoch,
-		CreatedAt: time.Now().Unix(),
-	}}, c.cfg.EncKeys...)
-	if len(c.cfg.EncKeys) > maxRetainedKeys {
-		c.cfg.EncKeys = c.cfg.EncKeys[:maxRetainedKeys]
-	}
-	if err := c.cfg.Save(); err != nil {
+	fresh, err := c.cfg.local().IdentityStore().update(func(fresh *Config) error {
+		if fresh.Address != c.cfg.Address || fresh.Seed != c.cfg.Seed {
+			return ErrContextMismatch
+		}
+		// Legacy callers may supply an unsaved endpoint override. Preserve that
+		// established API while loading key history under the identity-wide lock.
+		if c.cfg.local().principal == "" {
+			fresh.RelayURL = c.cfg.RelayURL
+			fresh.RelayFingerprint = c.cfg.RelayFingerprint
+		}
+
+		epoch := time.Now().Unix()
+		if len(fresh.EncKeys) > 0 && epoch <= fresh.EncKeys[0].Epoch {
+			epoch = fresh.EncKeys[0].Epoch + 1
+		}
+		fresh.EncKeys = append([]EncKey{{Pub: base64.RawURLEncoding.EncodeToString(pub[:]), Priv: base64.RawURLEncoding.EncodeToString(priv[:]), Epoch: epoch, CreatedAt: time.Now().Unix()}}, fresh.EncKeys...)
+		if len(fresh.EncKeys) > maxRetainedKeys {
+			fresh.EncKeys = fresh.EncKeys[:maxRetainedKeys]
+		}
+		return nil
+	})
+	if err != nil {
 		return false, err
 	}
+
+	configMu.Lock()
+	c.cfg.refreshState(fresh)
+	configMu.Unlock()
 	if err := c.PublishKey(); err != nil {
 		return false, fmt.Errorf("key rotated locally but NOT published: %w (run `courier publish-key` to announce it)", err)
 	}
@@ -859,6 +1014,7 @@ func (c *Client) verifyKeyAnnouncement(addr crypto.ParsedAddress, address, x2551
 			}
 			if epoch > fresh.VerifiedKeyEpochs[address] {
 				fresh.VerifiedKeyEpochs[address] = epoch
+				fresh.HandleRefreshAt = 0
 			}
 			return nil
 		})
@@ -878,8 +1034,12 @@ type Client struct {
 	fsWarnPending map[string]string
 }
 
-// New returns a Client for cfg.
+// New returns a Client sharing cfg, for both legacy and named contexts.
+// Successful config updates remain visible to the caller. Neither Client nor
+// Config supports concurrent mutation; workers must load their own Config.
+// The captured Context is immutable and is never replaced during refresh.
 func New(cfg *Config) *Client {
+	cfg.bindLegacyContext()
 	return &Client{cfg: cfg}
 }
 
@@ -908,6 +1068,9 @@ func (c *Client) FSConsumeWarning(address string) string {
 // httpClient builds the transport, enforcing certificate pinning for
 // https relays. Plain http relays (custom/local) skip TLS.
 func (c *Client) httpClient() (*http.Client, error) {
+	if err := c.cfg.local().validateConfig(c.cfg); err != nil {
+		return nil, err
+	}
 	if !strings.HasPrefix(c.cfg.RelayURL, "https://") {
 		return &http.Client{Timeout: 30 * time.Second}, nil
 	}
@@ -956,6 +1119,9 @@ func pinnedTransport(fingerprint string) (*http.Transport, error) {
 // dashboardHTTPClient returns a pinned client for the dashboard, or an
 // error directing the agent to run `courier dashboard setup`.
 func (c *Client) dashboardHTTPClient() (*http.Client, error) {
+	if err := c.cfg.local().validateConfig(c.cfg); err != nil {
+		return nil, err
+	}
 	if c.cfg.DashboardToken == "" {
 		return nil, fmt.Errorf("no dashboard account configured; run `courier dashboard setup` first")
 	}
@@ -1057,7 +1223,7 @@ func (c *Client) SendReplyWithAttachments(toOrName, body string, attachPaths []s
 	}
 	var quote string
 	if replyTo > 0 {
-		quote, _ = LookupReplyParent(replyTo)
+		quote, _ = c.cfg.local().LookupReplyParent(replyTo)
 	}
 	return c.send(toOrName, body, attachPaths, replyTo, quote, true, 0, vhl.Tier0, nil)
 }
@@ -1097,7 +1263,7 @@ func (c *Client) SendFull(toOrName, body string, attachPaths []string, replyTo i
 	}
 	var quote string
 	if replyTo > 0 {
-		quote, _ = LookupReplyParent(replyTo)
+		quote, _ = c.cfg.local().LookupReplyParent(replyTo)
 	}
 	return c.send(toOrName, body, attachPaths, replyTo, quote, true, ttl, vhl.Tier0, nil)
 }
@@ -1132,6 +1298,9 @@ func (c *Client) sendProtocolDM(toOrName, body string) (int64, error) {
 }
 
 func (c *Client) send(toOrName, body string, attachPaths []string, replyTo int64, quote string, logSent bool, ttl time.Duration, tier vhl.Tier, att *vhl.Attestation) (int64, error) {
+	if err := c.cfg.local().maintainLegacyState(); err != nil {
+		return 0, err
+	}
 	// issue #142: resolve the recipient first. The outgoing
 	// attestation is built for a specific recipient, and a
 	// scope-bound session token only attests its own counterparty:
@@ -1166,7 +1335,7 @@ func (c *Client) send(toOrName, body string, attachPaths []string, replyTo int64
 	// until the peer accepts.
 	//
 	// FS applies only to human sends (logSent=true). Machine protocol
-	// traffic (group/channel/shared-state DMs, logSent=false) stays on
+	// traffic (group DMs, logSent=false) stays on
 	// legacy encryption by design, so protocol payloads never enter an
 	// FS session's ratchet.
 	var fsOut *fsSendOutput
@@ -1244,10 +1413,10 @@ func (c *Client) send(toOrName, body string, attachPaths []string, replyTo int64
 
 // sendSealed encrypts plain for address and posts it as a DM. sentLogBody
 // is the human-readable summary recorded in the local sent log (and shown
-// on the dashboard); it may differ from the plaintext, e.g. for protocol
-// payloads like shared-state events (issue #49). replyTo/quote thread
+// on the dashboard); it may differ from the plaintext for machine
+// protocol payloads. replyTo/quote thread
 // the sent log for human replies (issue #51). logSent=false skips the
-// sent log for machine protocol DMs (channel handshakes). expiresAt is
+// sent log for machine protocol DMs. expiresAt is
 // the issue #53 disappearing-message expiry (0 = never); the sent-log
 // entry is pruned once it passes.
 func (c *Client) sendSealed(address string, plain []byte, sentLogBody string, replyTo int64, quote string, logSent bool, expiresAt int64) (int64, error) {
@@ -1300,7 +1469,8 @@ func (c *Client) sendSealed(address string, plain []byte, sentLogBody string, re
 	// conversation. A logging failure must never fail the send itself.
 	// Protocol DMs skip the log: they are machine traffic, not chat.
 	if logSent {
-		_ = appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: sentLogBody, SentAt: sentAt, ReplyTo: replyTo, Quote: quote, ExpiresAt: expiresAt})
+		_ = c.cfg.local().appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: sentLogBody, SentAt: sentAt, ReplyTo: replyTo, Quote: quote, ExpiresAt: expiresAt})
+		_ = c.queuePeerDiscovery(address)
 	}
 	return out.ID, nil
 }
@@ -1420,20 +1590,18 @@ type SentEntry struct {
 // maxSentLog is the cap on the local sent log; older entries are dropped.
 const maxSentLog = 1000
 
-func sentLogPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".courier", "sent.jsonl"), nil
+func (s Context) sentLogPath() (string, error) {
+	return s.path("sent.jsonl")
 }
+
+func sentLogPath() (string, error) { return LegacyContext().sentLogPath() }
 
 // readSentLog returns all logged sent entries, oldest first. Expired
 // disappearing-message entries (issue #53) are pruned: they are
 // filtered from the result and the log file is rewritten without them
 // (best-effort; a rewrite failure still returns the filtered entries).
-func readSentLog() ([]SentEntry, error) {
-	p, err := sentLogPath()
+func (s Context) readSentLogLocked() ([]SentEntry, error) {
+	p, err := s.sentLogPath()
 	if err != nil {
 		return nil, err
 	}
@@ -1463,15 +1631,17 @@ func readSentLog() ([]SentEntry, error) {
 		out = append(out, e)
 	}
 	if pruned {
-		_ = rewriteSentLog(out)
+		_ = s.rewriteSentLogLocked(out)
 	}
 	return out, nil
 }
 
+func readSentLog() ([]SentEntry, error) { return LegacyContext().readSentLog() }
+
 // rewriteSentLog replaces the sent log with entries, preserving the
 // maxSentLog cap. Used to drop expired disappearing-message entries.
-func rewriteSentLog(entries []SentEntry) error {
-	p, err := sentLogPath()
+func (s Context) rewriteSentLogLocked(entries []SentEntry) error {
+	p, err := s.sentLogPath()
 	if err != nil {
 		return err
 	}
@@ -1509,30 +1679,23 @@ func rewriteSentLog(entries []SentEntry) error {
 }
 
 // appendSentLog records a sent message, pruning the log to maxSentLog.
-func appendSentLog(e SentEntry) error {
-	p, err := sentLogPath()
+func (s Context) appendSentLogLocked(e SentEntry) error {
+	p, err := s.sentLogPath()
 	if err != nil {
 		return err
 	}
-	entries, err := readSentLog()
+	entries, err := s.readSentLogLocked()
 	if err != nil {
 		return err
 	}
 	entries = append(entries, e)
-	if len(entries) > maxSentLog {
-		entries = entries[len(entries)-maxSentLog:]
-	}
-	var buf bytes.Buffer
-	for _, en := range entries {
-		line, _ := json.Marshal(en)
-		buf.Write(line)
-		buf.WriteByte('\n')
-	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(p, buf.Bytes(), 0o600)
+	return s.rewriteSentLogLocked(entries)
 }
+
+func appendSentLog(e SentEntry) error { return LegacyContext().appendSentLog(e) }
 
 // Message is one decrypted, signature-verified inbox message.
 type Message struct {
@@ -1814,7 +1977,7 @@ func (c *Client) classifyInbound(from string, senderFlags []string, body string,
 // the lastID contract. Delivered envelopes are marked seen so they are
 // never delivered twice (v0.6.11 F3).
 func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, int, error) {
-	msgs, lastID, skipped, filtered, _, _, err := c.inbox(after, limit, true, seenConsumerInbox)
+	msgs, lastID, skipped, filtered, _, err := c.inbox(after, limit, true, seenConsumerInbox)
 	return msgs, lastID, skipped, filtered, err
 }
 
@@ -1824,10 +1987,7 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, int, erro
 // acknowledges — so a failed batch's messages stay re-fetchable on
 // retry instead of being suppressed as replays while the cursor
 // advances past them (v0.6.11 F11). It returns the dedup hashes of the
-// delivered messages for that bookkeeping, plus the shared-state
-// events newly applied to the local log during this fetch (issue #49)
-// with their envelope metadata — the dashboard push announces those;
-// other consumers ignore them.
+// delivered messages for that bookkeeping.
 //
 // The consumer selects which replay-suppression set is used (issue
 // #45): inbox delivery and dashboard pushing are independent
@@ -1841,13 +2001,16 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, int, erro
 // dedup, never an attack, and the "no new messages." sentinel contract
 // depends on them staying silent. The three are reported separately so
 // routine delivery mechanics never look like an attack.
-func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsumer) ([]Message, int64, int, int, []string, []appliedStateEvent, error) {
+func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsumer) ([]Message, int64, int, int, []string, error) {
+	if err := c.cfg.local().maintainLegacyState(); err != nil {
+		return nil, after, 0, 0, nil, err
+	}
 	// v0.6.11 (F10): the inbox request is signed by the recipient, so
 	// the relay serves ciphertext only to the address owner. after and
 	// limit are covered by the signature to prevent cursor tampering.
 	inboxEnvs, err := c.fetchEnvelopePage(after, limit)
 	if err != nil {
-		return nil, after, 0, 0, nil, nil, err
+		return nil, after, 0, 0, nil, err
 
 	}
 	var out []Message
@@ -1855,9 +2018,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 	filtered := 0
 	lastID := after
 	var newHashes []string
-	// issue #49: shared-state events newly applied during this fetch,
-	// with envelope metadata for the dashboard push announcements.
-	var stateApplied []appliedStateEvent
+	var outputHashes []string
 	// issue #51: reply-cache entries for this fetch's deliveries,
 	// flushed once after the loop.
 	var cacheEntries []replyCacheEntry
@@ -1873,298 +2034,273 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		vfr = nil
 	}
 	for _, m := range inboxEnvs {
-		// Track the highest inspected envelope id regardless of
-		// outcome: the cursor must advance past undecryptable and
-		// replayed messages too (v0.6.11 F4).
-		if m.ID > lastID {
-			lastID = m.ID
-		}
-		// issue #32: skip envelope kinds this client does not
-		// understand (sent by newer clients) without stalling the
-		// cursor.
-		if m.Kind != "" && m.Kind != "dm" {
-			skipped++
-			continue
-		}
-		// v0.6.11 (F3): suppress replays independently of relay message
-		// ids — identical envelope bytes are never delivered twice to
-		// the same consumer. Replays are routine dedup, not failures
-		// (v0.9.1): they stay silent so the "no new messages." sentinel
-		// contract that poll-based wake scripts rely on holds.
-		// Suppression is per consumer (issue #45, v0.9.2): a message
-		// the dashboard pusher already pushed is still new to the
-		// inbox poller, and vice versa.
-		h := envelope.DedupHash(c.cfg.Address, m.From, m.Eph, m.Nonce, m.SentAt, m.Ct, m.Sig)
-		if seen[h] {
-			continue
-		}
-		// Issue #138: the envelope names its crypto suite. Absent means
-		// SuiteV1 (older relays). A suite this client does not understand
-		// is skipped loudly — never trial-decrypted as if it were v1.
-		suite := crypto.Suite(m.Suite)
-		if suite == "" {
-			suite = crypto.SuiteV1
-		}
-		if !crypto.ValidSuite(suite) {
-			skipped++
-			continue
-		}
-		// Blocklist and dismissed requests: messages from these senders
-		// are dropped at read time, before any decryption work. The
-		// cursor still advances past them (F4) and they are never marked
-		// seen, so unblocking/undismissing later plus `inbox --all`
-		// recovers them. Counted as filtered (the recipient's own
-		// choice), not as skipped (corrupt/forged).
-		if c.cfg.IsBlocked(m.From) || c.cfg.IsDismissed(m.From) {
-			filtered++
-			continue
-		}
-		plain, err := c.openEnvelope(m)
-		if err != nil {
-			skipped++ // forged, corrupted, or undecryptable: drop
-			continue
-		}
+		func() {
+			// Track the highest inspected envelope id regardless of
+			// outcome: the cursor must advance past undecryptable and
+			// replayed messages too (v0.6.11 F4).
+			if m.ID > lastID {
+				lastID = m.ID
+			}
+			// issue #32: skip envelope kinds this client does not
+			// understand (sent by newer clients) without stalling the
+			// cursor.
+			if m.Kind != "" && m.Kind != "dm" {
+				skipped++
+				return
+			}
+			// v0.6.11 (F3): suppress replays independently of relay message
+			// ids — identical envelope bytes are never delivered twice to
+			// the same consumer. Replays are routine dedup, not failures
+			// (v0.9.1): they stay silent so the "no new messages." sentinel
+			// contract that poll-based wake scripts rely on holds.
+			// Suppression is per consumer (issue #45, v0.9.2): a message
+			// the dashboard pusher already pushed is still new to the
+			// inbox poller, and vice versa.
+			h := envelope.DedupHash(c.cfg.Address, m.From, m.Eph, m.Nonce, m.SentAt, m.Ct, m.Sig)
+			if seen[h] {
+				return
+			}
+			// Issue #138: the envelope names its crypto suite. Absent means
+			// SuiteV1 (older relays). A suite this client does not understand
+			// is skipped loudly — never trial-decrypted as if it were v1.
+			suite := crypto.Suite(m.Suite)
+			if suite == "" {
+				suite = crypto.SuiteV1
+			}
+			if !crypto.ValidSuite(suite) {
+				skipped++
+				return
+			}
+			// Blocklist and dismissed requests: messages from these senders
+			// are dropped at read time, before any decryption work. The
+			// cursor still advances past them (F4) and they are never marked
+			// seen, so unblocking/undismissing later plus `inbox --all`
+			// recovers them. Counted as filtered (the recipient's own
+			// choice), not as skipped (corrupt/forged).
+			if c.cfg.IsBlocked(m.From) || c.cfg.IsDismissed(m.From) {
+				filtered++
+				return
+			}
+			plain, err := c.openEnvelope(m)
+			if err != nil {
+				skipped++ // forged, corrupted, or undecryptable: drop
+				return
+			}
 
-		// issue #50: forward-secrecy frames are consumed by the FS
-		// layer and never surface as chat messages. Handshake frames
-		// (init/accept) are answered silently; message frames are
-		// decrypted into the inner plaintext, which is then dispatched
-		// exactly like a legacy DM below. Frames that fail decryption
-		// count as skipped (genuine failures), matching the existing
-		// docstring.
-		var fsWrapKey *[32]byte
-		if fp, ok := parseFSPayload(plain); ok {
-			switch fp.Type {
-			case fsTypeInit, fsTypeAccept:
-				c.handleFSHandshake(m.From, fp)
-				seen[h] = true
-				newHashes = append(newHashes, h)
-				continue
-			case fsTypeMsg:
-				inner, wk, ferr := c.fsDecryptMessage(m.From, fp)
-				if ferr != nil {
-					skipped++
-					continue
+			// issue #50: forward-secrecy frames are consumed by the FS
+			// layer and never surface as chat messages. Handshake frames
+			// (init/accept) are answered silently; message frames are
+			// decrypted into the inner plaintext, which is then dispatched
+			// exactly like a legacy DM below. Frames that fail decryption
+			// count as skipped (genuine failures), matching the existing
+			// docstring.
+			var fsWrapKey *[32]byte
+			if fp, ok := parseFSPayload(plain); ok {
+				switch fp.Type {
+				case fsTypeInit, fsTypeAccept:
+					c.handleFSHandshake(m.From, fp)
+					seen[h] = true
+					newHashes = append(newHashes, h)
+					return
+				case fsTypeMsg:
+					inner, wk, ferr := c.fsDecryptMessage(m.From, fp)
+					if ferr != nil {
+						skipped++
+						return
+					}
+					plain = inner
+					fsWrapKey = wk           // attachment data-key unwrap, below
+					defer crypto.Zero(wk[:]) // erase on every per-envelope exit
 				}
-				plain = inner
-				fsWrapKey = wk // attachment data-key unwrap, below
 			}
-		}
 
-		// issue #32: group protocol direct messages (sender-key
-		// distributions and group invitations) are consumed by the
-		// group layer and never surface as chat messages.
-		if gp, ok := parseGroupDMPayload(plain); ok {
-			c.handleGroupDM(m.From, gp)
-			seen[h] = true
-			newHashes = append(newHashes, h)
-			continue
-		}
-		// issue #48: channel protocol direct messages (join requests
-		// and accepts, channel messages, rekeys, leaves) are consumed
-		// by the channel layer and never surface as chat messages.
-		if cp, ok := parseChannelDMPayload(plain); ok {
-			c.handleChannelDM(m.From, cp)
-			seen[h] = true
-			newHashes = append(newHashes, h)
-			continue
-		}
-		// issue #52: receipt protocol direct messages are consumed by
-		// the receipt layer and never surface as chat messages.
-		if rp, ok := parseReceiptDMPayload(plain); ok {
-			c.handleReceiptDM(m.From, rp)
-			seen[h] = true
-			newHashes = append(newHashes, h)
-			continue
-		}
-		// issue #142: VHL protocol frames (approval requests,
-		// attestations, revocations) are consumed by the VHL layer
-		// and never surface as chat messages. Payloads that fail
-		// frame parsing fall through as ordinary messages — never
-		// silently swallowed.
-		if vf, ok := vhl.ParseFrame(plain); ok {
-			// issue #142 review: VHL frames from a held or
-			// relay-reported sender are not applied to protocol
-			// state — a quarantined stranger must not stuff the
-			// bounded request/attestation queues and evict
-			// legitimate records (same gate as the shared-state
-			// path). Their frames fall through to normal
-			// delivery as held messages below. Revocation frames
-			// are the exception: they are self-verifying (the
-			// signature must come from an enrolled approver
-			// key), so they are always honored.
-			if vf.Type == vhl.FrameRevoke || (!c.cfg.HoldForReview(m.From) && !slices.Contains(m.SenderFlags, "reported")) {
-				c.handleVHLFrame(m.From, vf, m.ID, vfr)
+			// issue #32: group protocol direct messages (sender-key
+			// distributions and group invitations) are consumed by the
+			// group layer and never surface as chat messages.
+			if gp, ok := parseGroupDMPayload(plain); ok {
+				c.handleGroupDM(m.From, gp)
 				seen[h] = true
 				newHashes = append(newHashes, h)
-				continue
+				return
 			}
-		}
-		// issue #39: introduction protocol DMs are consumed by the
-		// introduction layer and never surface as chat messages (same
-		// as group-control DMs, issue #32). Valid payloads are recorded
-		// as pending introductions, listed via
-		// `courier directory introductions`. Payloads that fail
-		// validation (bad signature, unknown parties) fall through as
-		// ordinary messages — never silently swallowed.
-		if ip, ok := parseIntroductionPayload(plain); ok {
-			if _, rec := c.recordIntroduction(m.From, m.ID, ip); rec {
+			// issue #52: receipt protocol direct messages are consumed by
+			// the receipt layer and never surface as chat messages.
+			if rp, ok := parseReceiptDMPayload(plain); ok {
+				c.handleReceiptDM(m.From, rp)
 				seen[h] = true
 				newHashes = append(newHashes, h)
-				continue
+				return
 			}
-		}
-		// issue #49: shared-agent-state payloads are consumed by the
-		// state layer and never surface as chat messages (same as
-		// group-control DMs, issue #32). Events are appended to the
-		// per-peer log; application is idempotent, so every consumer
-		// (inbox, dashboard push, state sync) applies them on its own
-		// pass. A sender held for review does not get events applied:
-		// the payload falls through as an ordinary message instead, so
-		// a quarantined stranger cannot write into the shared log.
-		if sp, ok := parseStatePayload(plain); ok {
-			if c.cfg.HoldForReview(m.From) || slices.Contains(m.SenderFlags, "reported") {
-				// fall through to normal delivery below
-			} else {
-				applied, aerr := c.applyStateEvents(m.From, m.From, sp.Events)
-				_ = aerr // best effort: the cursor must advance regardless
-				if consumer == seenConsumerPush {
-					for _, ev := range applied {
-						stateApplied = append(stateApplied, appliedStateEvent{
-							From: m.From, EnvelopeID: m.ID,
-							SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
-							Hash: h, Event: ev,
-						})
+			// issue #142: VHL protocol frames (approval requests,
+			// attestations, revocations) are consumed by the VHL layer
+			// and never surface as chat messages. Payloads that fail
+			// frame parsing fall through as ordinary messages — never
+			// silently swallowed.
+			if vf, ok := vhl.ParseFrame(plain); ok {
+				// issue #142 review: VHL frames from a held or
+				// relay-reported sender are not applied to protocol
+				// state — a quarantined stranger must not stuff the
+				// bounded request/attestation queues and evict
+				// legitimate records (same gate as the shared-state
+				// path). Their frames fall through to normal
+				// delivery as held messages below. Revocation frames
+				// are the exception: they are self-verifying (the
+				// signature must come from an enrolled approver
+				// key), so they are always honored.
+				if vf.Type == vhl.FrameRevoke || (!c.cfg.HoldForReview(m.From) && !slices.Contains(m.SenderFlags, "reported")) {
+					c.handleVHLFrame(m.From, vf, m.ID, vfr)
+					seen[h] = true
+					newHashes = append(newHashes, h)
+					return
+				}
+			}
+			// issue #39: introduction protocol DMs are consumed by the
+			// introduction layer and never surface as chat messages (same
+			// as group-control DMs, issue #32). Valid payloads are recorded
+			// as pending introductions, listed via
+			// `courier directory introductions`. Payloads that fail
+			// validation (bad signature, unknown parties) fall through as
+			// ordinary messages — never silently swallowed.
+			if ip, ok := parseIntroductionPayload(plain); ok {
+				if _, rec := c.recordIntroduction(m.From, m.ID, ip); rec {
+					seen[h] = true
+					newHashes = append(newHashes, h)
+					return
+				}
+			}
+			// Split a decrypted payload into its body text, attachment
+			// manifests, reply threading metadata (issue #51), and
+			// disappearing-message expiry (issue #53). Manifests are
+			// validated and their data keys are unwrapped with this
+			// recipient's keys; a manifest whose key cannot be opened is
+			// kept with KeyError set, so the message is still delivered
+			// and the failure is visible, never silent.
+			if isLegacyStatePayload(plain) || isLegacyChannelPayload(plain) {
+				seen[h] = true
+				newHashes = append(newHashes, h)
+				return
+			}
+			body, manifests, rinfo, expiresAt, bmeta := parseMessagePayload(plain)
+			// issue #53: a message already expired at fetch time is
+			// consumed silently — dropped, never delivered to the inbox,
+			// the dashboard, or the request queue. The cursor still
+			// advances past it and it is marked seen, so it is not
+			// re-derived on every fetch.
+			if stateExpired(time.Now().Unix(), expiresAt) {
+				seen[h] = true
+				newHashes = append(newHashes, h)
+				return
+			}
+			atts := c.unwrapAttachmentKeys(manifests, fsWrapKey)
+			// The FS wrap key exists only for this message's manifests;
+			// erase it now that the data keys are extracted.
+			if fsWrapKey != nil {
+				crypto.Zero(fsWrapKey[:])
+				fsWrapKey = nil
+			}
+			msg := Message{
+				ID: m.ID, From: m.From, Body: body,
+				SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
+				Attachments: atts, ExpiresAt: expiresAt,
+				ReplyTo: rinfo.To, ReplyQuote: rinfo.Quote,
+				Bridge: bmeta,
+			}
+			// Shared inbound classification (bridge attribution, flags,
+			// hold/request policy) — the same helper FetchMessage uses, so
+			// the delivery paths cannot drift.
+			bridged, flags, hold, _ := c.classifyInbound(m.From, m.SenderFlags, body, bmeta)
+			msg.Bridged, msg.Flags = bridged, flags
+			// issue #142: VHL verification. The tier tag and inline
+			// attestation ride inside the E2E plaintext, so they are
+			// sender-authenticated — a claimed tier can neither be
+			// stripped nor upgraded in transit. An attested message is
+			// flagged; a claimed tier without a valid attestation is
+			// held for review (never acted on, never silently dropped).
+			// The required-tier floor applies to every DM, including
+			// untagged Tier 0: without this a sender could omit the
+			// tier tag to dodge the floor (issue #142 review).
+			if tier, att := parseVHLPayload(plain); tier != vhl.Tier0 || att != nil || (vfr != nil && vfr.RequiredTier > vhl.Tier0) {
+				out := c.vhlEvaluateInbound(vfr, tier, []byte(body), att, m.ID)
+				// issue #142 review: make the Tier 2
+				// replay-check-and-consume atomic across processes.
+				// Evaluate marks only the fetch-local set; two
+				// concurrent fetches (inbox CLI vs. dashboard push)
+				// could otherwise evaluate the same attestation
+				// against empty snapshots and both verdict attested.
+				// A consume that finds the id or the approval nonce
+				// already taken in a different envelope downgrades the
+				// verdict to a replay hold.
+				if out.Verdict == vhl.VerdictAttested && tier == vhl.Tier2 && att != nil {
+					replayed, cerr := c.cfg.local().vhlConsumeAttestation(att.ID, att.Approver, att.ApprovalNonce, m.ID)
+					switch {
+					case cerr != nil:
+						// Fail closed: without a committed replay mark,
+						// another consumer could accept the same
+						// attestation. The message is held for review,
+						// never delivered as attested.
+						out.Verdict = vhl.VerdictInvalid
+						out.Reason = "vhl-unavailable"
+					case replayed:
+						out.Verdict = vhl.VerdictInvalid
+						out.Reason = "replay"
 					}
 				}
-				seen[h] = true
-				newHashes = append(newHashes, h)
-				continue
-			}
-		}
-		// Split a decrypted payload into its body text, attachment
-		// manifests, reply threading metadata (issue #51), and
-		// disappearing-message expiry (issue #53). Manifests are
-		// validated and their data keys are unwrapped with this
-		// recipient's keys; a manifest whose key cannot be opened is
-		// kept with KeyError set, so the message is still delivered
-		// and the failure is visible, never silent.
-		body, manifests, rinfo, expiresAt, bmeta := parseMessagePayload(plain)
-		// issue #53: a message already expired at fetch time is
-		// consumed silently — dropped, never delivered to the inbox,
-		// the dashboard, or the request queue. The cursor still
-		// advances past it and it is marked seen, so it is not
-		// re-derived on every fetch.
-		if stateExpired(time.Now().Unix(), expiresAt) {
-			seen[h] = true
-			newHashes = append(newHashes, h)
-			continue
-		}
-		atts := c.unwrapAttachmentKeys(manifests, fsWrapKey)
-		// The FS wrap key exists only for this message's manifests;
-		// erase it now that the data keys are extracted.
-		if fsWrapKey != nil {
-			crypto.Zero(fsWrapKey[:])
-			fsWrapKey = nil
-		}
-		msg := Message{
-			ID: m.ID, From: m.From, Body: body,
-			SentAt: m.SentAt, ReceivedAt: m.ReceivedAt,
-			Attachments: atts, ExpiresAt: expiresAt,
-			ReplyTo: rinfo.To, ReplyQuote: rinfo.Quote,
-			Bridge: bmeta,
-		}
-		// Shared inbound classification (bridge attribution, flags,
-		// hold/request policy) — the same helper FetchMessage uses, so
-		// the delivery paths cannot drift.
-		bridged, flags, hold, _ := c.classifyInbound(m.From, m.SenderFlags, body, bmeta)
-		msg.Bridged, msg.Flags = bridged, flags
-		// issue #142: VHL verification. The tier tag and inline
-		// attestation ride inside the E2E plaintext, so they are
-		// sender-authenticated — a claimed tier can neither be
-		// stripped nor upgraded in transit. An attested message is
-		// flagged; a claimed tier without a valid attestation is
-		// held for review (never acted on, never silently dropped).
-		// The required-tier floor applies to every DM, including
-		// untagged Tier 0: without this a sender could omit the
-		// tier tag to dodge the floor (issue #142 review).
-		if tier, att := parseVHLPayload(plain); tier != vhl.Tier0 || att != nil || (vfr != nil && vfr.RequiredTier > vhl.Tier0) {
-			out := c.vhlEvaluateInbound(vfr, tier, []byte(body), att, m.ID)
-			// issue #142 review: make the Tier 2
-			// replay-check-and-consume atomic across processes.
-			// Evaluate marks only the fetch-local set; two
-			// concurrent fetches (inbox CLI vs. dashboard push)
-			// could otherwise evaluate the same attestation
-			// against empty snapshots and both verdict attested.
-			// A consume that finds the id or the approval nonce
-			// already taken in a different envelope downgrades the
-			// verdict to a replay hold.
-			if out.Verdict == vhl.VerdictAttested && tier == vhl.Tier2 && att != nil {
-				replayed, cerr := vhlConsumeAttestation(att.ID, att.Approver, att.ApprovalNonce, m.ID)
-				switch {
-				case cerr != nil:
-					// Fail closed: without a committed replay mark,
-					// another consumer could accept the same
-					// attestation. The message is held for review,
-					// never delivered as attested.
-					out.Verdict = vhl.VerdictInvalid
-					out.Reason = "vhl-unavailable"
-				case replayed:
-					out.Verdict = vhl.VerdictInvalid
-					out.Reason = "replay"
+				msg.VHL = &VHLStatus{
+					Tier: int(tier), Verdict: out.Verdict.String(),
+					Approver: out.Approver, Reason: out.Reason,
+				}
+				switch out.Verdict {
+				case vhl.VerdictAttested:
+					flags = append(flags, "vhl_attested")
+					msg.Flags = flags
+				case vhl.VerdictMissing, vhl.VerdictInvalid:
+					hold = true
+					flags = append(flags, "vhl_unverified")
+					msg.Flags = flags
 				}
 			}
-			msg.VHL = &VHLStatus{
-				Tier: int(tier), Verdict: out.Verdict.String(),
-				Approver: out.Approver, Reason: out.Reason,
+			// Hold rule: a message becomes a request (held for review,
+			// never delivered to the inbox or dashboard) when the
+			// recipient's contacts-only policy quarantines a first contact,
+			// or when the relay reports the sender is currently throttled
+			// for spam — even under the open policy. Held messages are not
+			// marked seen, so review re-derives them; the empty hash keeps
+			// outputHashes parallel to out for DashboardPush.
+			if hold {
+				msg.Request = true
+				out = append(out, msg)
+				outputHashes = append(outputHashes, "")
+				newHashes = append(newHashes, "")
+				return
 			}
-			switch out.Verdict {
-			case vhl.VerdictAttested:
-				flags = append(flags, "vhl_attested")
-				msg.Flags = flags
-			case vhl.VerdictMissing, vhl.VerdictInvalid:
-				hold = true
-				flags = append(flags, "vhl_unverified")
-				msg.Flags = flags
-			}
-		}
-		// issue #51: remember this delivery in the reply cache so a
-		// later reply to it can quote the parent without a relay
-		// round-trip. Best effort; delivery never depends on it.
-		cacheEntries = append(cacheEntries, replyCacheEntry{
-			CourierID: m.ID, From: m.From,
-			Snippet: truncateQuote(body), SentAt: m.SentAt,
-		})
-		// Hold rule: a message becomes a request (held for review,
-		// never delivered to the inbox or dashboard) when the
-		// recipient's contacts-only policy quarantines a first contact,
-		// or when the relay reports the sender is currently throttled
-		// for spam — even under the open policy. Held messages are not
-		// marked seen, so review re-derives them; the empty hash keeps
-		// newHashes parallel to out for DashboardPush.
-		if hold {
-			msg.Request = true
+			_ = c.queuePeerDiscovery(m.From)
+			// issue #51: remember this delivery in the reply cache so a
+			// later reply to it can quote the parent without a relay
+			// round-trip. Best effort; delivery never depends on it.
+			cacheEntries = append(cacheEntries, replyCacheEntry{
+				CourierID: m.ID, From: m.From,
+				Snippet: truncateQuote(body), SentAt: m.SentAt, ExpiresAt: expiresAt,
+			})
+
 			out = append(out, msg)
-			newHashes = append(newHashes, "")
-			continue
-		}
-		out = append(out, msg)
-		// issue #52: opt-in delivery receipt. Fires only for the inbox
-		// consumer on first delivery — never for dashboard pushes,
-		// state syncs, or review re-derivations (markSeen=false) — and
-		// only when this agent explicitly opted into receipts for the
-		// sender. Held requests continue above, so they never generate
-		// receipts. The receipt is a signed protocol DM excluded from
-		// the sent log; best effort, never fatal to delivery.
-		if consumer == seenConsumerInbox && markSeen && c.cfg.ReceiptsEnabledFor(m.From) {
-			c.sendDeliveryReceipt(m.From, m.ID)
-		}
-		// Only successfully delivered messages are marked seen: a
-		// message that fails verification or decryption now may become
-		// readable later (e.g. after the sender's key announcement
-		// arrives), and must not be suppressed.
-		seen[h] = true
-		newHashes = append(newHashes, h)
+			outputHashes = append(outputHashes, h)
+			// issue #52: opt-in delivery receipt. Fires only for the inbox
+			// consumer on first delivery — never for dashboard pushes,
+			// state syncs, or review re-derivations (markSeen=false) — and
+			// only when this agent explicitly opted into receipts for the
+			// sender. Held requests continue above, so they never generate
+			// receipts. The receipt is a signed protocol DM excluded from
+			// the sent log; best effort, never fatal to delivery.
+			if consumer == seenConsumerInbox && markSeen && c.cfg.ReceiptsEnabledFor(m.From) {
+				c.sendDeliveryReceipt(m.From, m.ID)
+			}
+			// Only successfully delivered messages are marked seen: a
+			// message that fails verification or decryption now may become
+			// readable later (e.g. after the sender's key announcement
+			// arrives), and must not be suppressed.
+			seen[h] = true
+			newHashes = append(newHashes, h)
+		}()
 	}
 	// issue #51: resolve reply quotes. A locally-known parent snippet
 	// (my sent log, or an earlier delivery on this machine) is this
@@ -2184,11 +2320,13 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// comes first: a parent and its reply can arrive together.
 		local := make(map[int64]string)
 		for _, m := range out {
-			if m.Body != "" {
+			// A held or now-expired parent must not escape through an accepted
+			// reply, including a dashboard batch that omits the parent itself.
+			if !m.Request && !stateExpired(time.Now().Unix(), m.ExpiresAt) && m.Body != "" {
 				local[m.ID] = truncateQuote(m.Body)
 			}
 		}
-		if sent, err := readSentLog(); err == nil {
+		if sent, err := c.cfg.local().readSentLog(); err == nil {
 			for _, e := range sent {
 				if e.Body != "" {
 					if _, ok := local[e.CourierID]; !ok {
@@ -2197,7 +2335,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 				}
 			}
 		}
-		for _, e := range readReplyCache() {
+		for _, e := range c.cfg.local().readReplyCache() {
 			if e.Snippet != "" {
 				if _, ok := local[e.CourierID]; !ok {
 					local[e.CourierID] = e.Snippet
@@ -2213,24 +2351,24 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		}
 	}
 	// Best-effort reply cache write; delivery never depends on it.
-	writeReplyCache(cacheEntries)
+	c.cfg.local().writeReplyCache(cacheEntries)
 	// issue #142: persist attestation ids consumed during this
 	// fetch (replay guard) and any revocations applied. Best
 	// effort: delivery already happened; a failure here only risks
 	// re-evaluating an already-seen attestation, which the
 	// envelope-aware replay check tolerates.
-	_ = vhlMergeSeen(vfr)
+	_ = c.cfg.local().vhlMergeSeen(vfr)
 	if markSeen {
 		c.recordSeen(consumer, newHashes)
 	}
-	return out, lastID, skipped, filtered, newHashes, stateApplied, nil
+	return out, lastID, skipped, filtered, outputHashes, nil
 }
 
 // InboxReview re-derives the messages currently held as requests,
 // without advancing the inbox cursor or marking anything seen. Review
 // is read-only: it never changes delivery state.
 func (c *Client) InboxReview(limit int) ([]Message, error) {
-	msgs, _, _, _, _, _, err := c.inbox(0, limit, false, seenConsumerInbox)
+	msgs, _, _, _, _, err := c.inbox(0, limit, false, seenConsumerInbox)
 	if err != nil {
 		return nil, err
 	}
@@ -2287,7 +2425,17 @@ func (c *Client) AcceptRequest(id int64, asName string) ([]Message, error) {
 	if slices.Contains(req.Flags, "first_contact") && senderAddr(c.cfg, sender) == "" {
 		name := asName
 		if name == "" {
-			name = c.requestContactName(sender)
+			// #146: the display name defaults to the known directory
+			// handle; the generated name is the fallback.
+			h, err := c.LookupPeerHandle(sender)
+			if err != nil {
+				return nil, fmt.Errorf("resolve sender handle: retry or supply --as: %w", err)
+			}
+			if h != "" && contactNameRe.MatchString(h) {
+				name = h
+			} else {
+				name = c.requestContactName(sender)
+			}
 		} else if !contactNameRe.MatchString(name) {
 			return nil, fmt.Errorf("bad contact name %q: use 1-32 chars, lowercase letters, digits, - and _, starting with a letter or digit", asName)
 		}
@@ -2393,8 +2541,6 @@ func (c *Client) seenSet(which seenConsumer) map[string]bool {
 	switch which {
 	case seenConsumerPush:
 		stored = c.cfg.SeenPushHashes
-	case seenConsumerState:
-		stored = c.cfg.SeenStateHashes
 	default:
 		stored = c.cfg.SeenInboxHashes
 	}
@@ -2419,8 +2565,6 @@ func (c *Client) recordSeen(which seenConsumer, hashes []string) {
 		switch which {
 		case seenConsumerPush:
 			fresh.SeenPushHashes = unionSeen(fresh.SeenPushHashes, hashes)
-		case seenConsumerState:
-			fresh.SeenStateHashes = unionSeen(fresh.SeenStateHashes, hashes)
 		default:
 			fresh.SeenInboxHashes = unionSeen(fresh.SeenInboxHashes, hashes)
 		}
@@ -2469,8 +2613,7 @@ func (c *Client) MaybeUpdateCheck(current string) {
 		return
 	}
 	rel, err := update.Latest()
-	c.cfg.UpdateCheckedAt = now
-	_ = c.cfg.Save()
+	_ = c.cfg.Update(func(fresh *Config) error { fresh.UpdateCheckedAt = now; return nil })
 	if err != nil {
 		return
 	}
@@ -2530,6 +2673,9 @@ func GenerateTempPassword() (string, error) {
 // otherwise it falls back to TOFU, printing the fingerprint for the
 // user to verify.
 func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassword string, err error) {
+	if err := c.cfg.local().validateConfig(c.cfg); err != nil {
+		return "", err
+	}
 	if !dashboardUsernameRe.MatchString(username) {
 		return "", fmt.Errorf("username must be 3-32 chars: lowercase letters, digits, - and _")
 	}
@@ -2605,10 +2751,14 @@ func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassw
 	if err := json.Unmarshal(raw, &out); err != nil || out.APIToken == "" {
 		return "", fmt.Errorf("register: bad response")
 	}
-	c.cfg.DashboardUser = out.Username
-	c.cfg.DashboardToken = out.APIToken
-	c.cfg.DashboardFingerprint = fp
-	if err := c.cfg.Save(); err != nil {
+	dashboardURL := c.cfg.DashboardURL
+	if err := c.cfg.Update(func(fresh *Config) error {
+		fresh.DashboardURL = dashboardURL
+		fresh.DashboardUser = out.Username
+		fresh.DashboardToken = out.APIToken
+		fresh.DashboardFingerprint = fp
+		return nil
+	}); err != nil {
 		return "", fmt.Errorf("save config: %w", err)
 	}
 	return tempPassword, nil
@@ -2732,7 +2882,7 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 	// suppressed as replays while the cursor advances past them.
 	// The push consumer uses its own replay set (issue #45): envelopes
 	// the inbox poller already delivered are still new to the pusher.
-	msgs, lastID, _, _, hashes, stateEvents, err := c.inbox(c.cfg.DashboardCursor, 200, false, seenConsumerPush)
+	msgs, lastID, _, _, hashes, err := c.inbox(c.cfg.DashboardCursor, 200, false, seenConsumerPush)
 	if err != nil {
 		return 0, err
 	}
@@ -2748,23 +2898,11 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 			ExpiresAt: m.ExpiresAt, Bridged: m.Bridged,
 		}})
 	}
-	// issue #49: newly applied shared-state events are announced to
-	// the dashboard as human-readable summaries, so the user sees
-	// their agent's notes and tasks. The envelope hash rides along so
-	// the push consumer's replay bookkeeping covers the state message
-	// exactly like a chat message.
-	for _, a := range stateEvents {
-		items = append(items, pushItem{hash: a.Hash, msg: pushMsg{
-			CourierID: a.EnvelopeID, From: a.From,
-			Body:   stateSummary(a.From, a.Event),
-			SentAt: a.SentAt, ReceivedAt: a.ReceivedAt,
-		}})
-	}
 	// Outbound messages, oldest first, from the local sent log.
 	// readSentLog already pruned expired disappearing-message entries;
 	// skip any that expired since (best-effort prune above) rather than
 	// pushing a message that is already gone.
-	if sent, err := readSentLog(); err == nil {
+	if sent, err := c.cfg.local().readSentLog(); err == nil {
 		now := time.Now().Unix()
 		for _, e := range sent {
 			if e.CourierID <= c.cfg.DashboardSentCursor {
@@ -2837,69 +2975,79 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 }
 
 // refreshPeerHandles pushes a handles-only update for every cached peer
-// whose label may be stale, at most once per 24h. Without this, threads
-// with no new messages would never get (or lose) their @handle label,
-// because handles are otherwise only attached to message batches.
+// using only locally cached evidence, at most once per 24h. Directory
+// outages must not block dashboard delivery. Expired labels are omitted;
+// the dashboard applies its own label TTL. Explicit discovery and the
+// bounded follow-mode worker refresh the cache independently.
 func (c *Client) refreshPeerHandles(hc *http.Client) {
-	if time.Now().Unix()-c.cfg.HandleRefreshAt < 24*3600 {
+	// Build each push from disk: the delivery client's contact snapshot can
+	// predate a removal, rebind, or verification in another process.
+	cfg, err := c.cfg.local().LoadConfig()
+	if err != nil {
 		return
 	}
-	peers := make([]string, 0, len(c.cfg.HandleCache))
-	for peer := range c.cfg.HandleCache {
-		peers = append(peers, peer)
+	if cfg.Address != c.cfg.Address || cfg.Seed != c.cfg.Seed || cfg.RelayURL != c.cfg.RelayURL || (cfg.RelayFingerprint != c.cfg.RelayFingerprint && !sameCertificatePin(cfg.RelayFingerprint, c.cfg.RelayFingerprint)) || cfg.DashboardURL != c.cfg.DashboardURL || cfg.DashboardFingerprint != c.cfg.DashboardFingerprint || cfg.DashboardToken != c.cfg.DashboardToken {
+		return
 	}
-	// Also cover named contacts: their handles may have been registered
-	// after the last refresh.
-	for _, addr := range c.cfg.Contacts {
-		peers = append(peers, addr)
+	current := cachedDashboardTrust(cfg)
+	if time.Now().Unix()-cfg.HandleRefreshAt < 24*3600 && maps.Equal(current, cfg.PublishedPeerTrust) {
+		return
 	}
 	handles := map[string]string{}
-	seen := map[string]bool{}
-	for _, peer := range peers {
-		if seen[peer] {
-			continue
-		}
-		seen[peer] = true
-		if h := c.PeerHandle(peer); h != "" {
-			handles[peer] = h
+	for peer, entry := range cfg.HandleCache {
+		if time.Now().Unix()-entry.At < 24*3600 {
+			handles[peer] = entry.Handle
 		}
 	}
-	// issue #48: push contact trust states alongside the handle labels.
-	// Only contacts carry verification; verified/stale peers get a
-	// badge in the dashboard, unverified peers get none.
-	verified := map[string]string{}
-	for name := range c.cfg.Contacts {
-		addr, err := c.cfg.LookupContact(name)
-		if err != nil {
-			continue
-		}
-		if st, _ := c.ContactTrust(name); st == TrustVerified || st == TrustStale {
-			verified[addr] = st.String()
+	verified := maps.Clone(current)
+	for peer := range cfg.PublishedPeerTrust {
+		if _, exists := current[peer]; !exists {
+			verified[peer] = ""
 		}
 	}
-	// Mark the refresh even when there is nothing to push, so a peer
-	// set with no listed handles does not retry every minute.
-	_ = c.cfg.Update(func(fresh *Config) error {
-		fresh.HandleRefreshAt = time.Now().Unix()
-		return nil
-	})
-	if len(handles) == 0 {
+	markRefreshed := func() {
+		_ = cfg.Update(func(fresh *Config) error {
+			// Record exactly what this successful request published. If local
+			// evidence changed in flight, the next pass must correct that view.
+			if fresh.PublishedPeerTrust == nil {
+				fresh.PublishedPeerTrust = map[string]string{}
+			}
+			// Preserve pending clears or other push evidence created while this
+			// request was in flight but not represented in its payload.
+			for peer := range verified {
+				if status, exists := current[peer]; exists {
+					fresh.PublishedPeerTrust[peer] = status
+				} else {
+					delete(fresh.PublishedPeerTrust, peer)
+				}
+			}
+			fresh.HandleRefreshAt = 0
+			if maps.Equal(fresh.HandleCache, cfg.HandleCache) && maps.Equal(cachedDashboardTrust(fresh), current) && maps.Equal(fresh.PublishedPeerTrust, current) {
+				fresh.HandleRefreshAt = time.Now().Unix()
+			}
+			return nil
+		})
+	}
+	if len(handles) == 0 && len(verified) == 0 {
+		markRefreshed()
 		return
 	}
-	body, _ := json.Marshal(map[string]any{
-		"messages": []any{},
-		"handles":  handles,
-		"verified": verified,
-	})
-	req, _ := http.NewRequest(http.MethodPost, c.cfg.DashboardURL+"/v1/dashboard/push", bytes.NewReader(body))
+	body, _ := json.Marshal(map[string]any{"messages": []any{}, "handles": handles, "verified": verified})
+	req, err := http.NewRequest(http.MethodPost, cfg.DashboardURL+"/v1/dashboard/push", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.cfg.DashboardToken)
+	req.Header.Set("Authorization", "Bearer "+cfg.DashboardToken)
 	resp, err := hc.Do(req)
 	if err != nil {
 		return
 	}
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
 	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		markRefreshed()
+	}
 }
 
 // pushBatch POSTs one bounded batch of messages to the dashboard and
@@ -2919,8 +3067,8 @@ func (c *Client) pushBatch(hc *http.Client, batch []pushItem) (stored int, inbox
 		}
 	}
 	// issue #39: attach listed handles for the batch's peers so the
-	// dashboard can display them. PeerHandle is cached (24h TTL), so the
-	// per-minute push does not query the directory for every thread.
+	// dashboard can display them. Rendering must not perform directory I/O:
+	// serial cache misses could otherwise delay a batch by 30s per peer.
 	handles := map[string]string{}
 	for _, it := range batch {
 		peer := it.msg.From
@@ -2930,7 +3078,7 @@ func (c *Client) pushBatch(hc *http.Client, batch []pushItem) (stored int, inbox
 		if _, done := handles[peer]; done {
 			continue
 		}
-		if h := c.PeerHandle(peer); h != "" {
+		if h := c.CachedPeerHandle(peer); h != "" {
 			handles[peer] = h
 		}
 	}
@@ -2963,4 +3111,53 @@ func (c *Client) pushBatch(hc *http.Client, batch []pushItem) (stored int, inbox
 	}
 	_ = json.Unmarshal(raw, &out)
 	return out.Stored, inboxMax, sentMax, nil
+}
+
+func (s Context) readSentLog() (entries []SentEntry, err error) {
+	err = s.withConfigLock(func() error { var e error; entries, e = s.readSentLogLocked(); return e })
+	return
+}
+
+func (s Context) appendSentLog(e SentEntry) error {
+	return s.withConfigLock(func() error { return s.appendSentLogLocked(e) })
+}
+
+// refreshState deliberately leaves the captured context immutable.
+// The caller holds configMu; only persisted fields are refreshed.
+func (c *Config) refreshState(fresh *Config) {
+	c.Version = fresh.Version
+	c.RelayURL = fresh.RelayURL
+	c.Seed = fresh.Seed
+	c.Address = fresh.Address
+	c.Cursor = fresh.Cursor
+	c.RelayFingerprint = fresh.RelayFingerprint
+	c.Contacts = fresh.Contacts
+	c.PreferredContactNames = fresh.PreferredContactNames
+	c.ContactVerifications = fresh.ContactVerifications
+	c.EncKeys = fresh.EncKeys
+	c.AutoUpdate = fresh.AutoUpdate
+	c.UpdateCheckedAt = fresh.UpdateCheckedAt
+	c.DashboardURL = fresh.DashboardURL
+	c.DashboardUser = fresh.DashboardUser
+	c.DashboardToken = fresh.DashboardToken
+	c.DashboardFingerprint = fresh.DashboardFingerprint
+	c.DashboardCursor = fresh.DashboardCursor
+	c.DashboardSentCursor = fresh.DashboardSentCursor
+	c.VerifiedKeyEpochs = fresh.VerifiedKeyEpochs
+	c.SeenEnvelopeHashes = fresh.SeenEnvelopeHashes
+	c.SeenInboxHashes = fresh.SeenInboxHashes
+	c.SeenPushHashes = fresh.SeenPushHashes
+	c.ReceiptContacts = fresh.ReceiptContacts
+	c.DMPolicy = fresh.DMPolicy
+	c.Blocked = fresh.Blocked
+	c.Dismissed = fresh.Dismissed
+	c.DirectoryHandle = fresh.DirectoryHandle
+	c.DirectoryEpoch = fresh.DirectoryEpoch
+	c.Introductions = fresh.Introductions
+	c.HandleCache = fresh.HandleCache
+	c.PendingPeerDiscovery = fresh.PendingPeerDiscovery
+	c.PublishedPeerTrust = fresh.PublishedPeerTrust
+	c.HandleRefreshAt = fresh.HandleRefreshAt
+	c.WakeCursor = fresh.WakeCursor
+	c.BridgeGateways = fresh.BridgeGateways
 }

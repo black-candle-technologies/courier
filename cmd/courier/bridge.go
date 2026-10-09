@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/bridge"
-	"github.com/black-candle-technologies/courier/internal/client"
 )
 
 // defaultBridgeDB is the production bridge.db path. Overridable with
@@ -30,7 +29,7 @@ func openBridgeStore(dbPath string) (*bridge.Store, error) {
 	return bridge.OpenStore(dbPath)
 }
 
-func cmdBridge(args []string) error {
+func (scope command) cmdBridge(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: courier bridge <token|audit|trust>")
 	}
@@ -40,7 +39,7 @@ func cmdBridge(args []string) error {
 	case "audit":
 		return cmdBridgeAudit(args[1:])
 	case "trust":
-		return cmdBridgeTrust(args[1:])
+		return scope.cmdBridgeTrust(args[1:])
 	default:
 		return fmt.Errorf("unknown bridge subcommand %q (token|audit|trust)", args[0])
 	}
@@ -308,13 +307,13 @@ func cmdBridgeAudit(args []string) error {
 	return nil
 }
 
-func cmdBridgeTrust(args []string) error {
+func (scope command) cmdBridgeTrust(args []string) error {
 	fs := flag.NewFlagSet("trust", flag.ContinueOnError)
 	remove := fs.Bool("remove", false, "unpin the address")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}

@@ -37,11 +37,11 @@ type vhlChallengeClient interface {
 	VHLMintChallenge(action []byte) (*vhl.Challenge, string, error)
 }
 
-func cmdVHL(args []string) error {
+func (scope command) cmdVHL(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: courier vhl <approver|enroll-webauthn|rp|session|request|approve|attestations|challenge|policy> [args]")
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}

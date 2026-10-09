@@ -22,19 +22,19 @@ import (
 	"github.com/black-candle-technologies/courier/internal/client"
 )
 
-func cmdAttachments(args []string) error {
+func (scope command) cmdAttachments(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: courier attachments <fetch>")
 	}
 	switch args[0] {
 	case "fetch":
-		return cmdAttachmentsFetch(args[1:])
+		return scope.cmdAttachmentsFetch(args[1:])
 	default:
 		return fmt.Errorf("unknown attachments subcommand %q (fetch)", args[0])
 	}
 }
 
-func cmdAttachmentsFetch(args []string) error {
+func (scope command) cmdAttachmentsFetch(args []string) error {
 	fs := flag.NewFlagSet("attachments fetch", flag.ContinueOnError)
 	msgID := fs.Int64("message", 0, "relay id of the already-delivered message to re-fetch")
 	attachDir := fs.String("attachments-dir", "", "download and verify attachments into this directory (required)")
@@ -47,7 +47,7 @@ func cmdAttachmentsFetch(args []string) error {
 	if *attachDir == "" {
 		return errors.New("--attachments-dir <dir> is required")
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}

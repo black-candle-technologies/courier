@@ -44,6 +44,9 @@ func encodeBridgedBody(wrappedBody string, meta *bridge.BridgeMeta) ([]byte, err
 // standard sealed box. It is recorded in the local sent log like any
 // DM so the dashboard threads it.
 func (c *Client) SendBridged(address, wrappedBody string, meta *bridge.BridgeMeta) (int64, error) {
+	if err := c.cfg.local().maintainLegacyState(); err != nil {
+		return 0, err
+	}
 	if _, err := crypto.ParseAddress(address); err != nil {
 		return 0, fmt.Errorf("bad recipient address: %w", err)
 	}
@@ -96,25 +99,29 @@ func (c *Config) AddBridgeGateway(addr string) error {
 	if _, err := crypto.ParseAddress(addr); err != nil {
 		return fmt.Errorf("bad bridge address: %w", err)
 	}
-	for _, a := range c.BridgeGateways {
-		if a == addr {
-			return nil
+	return c.Update(func(fresh *Config) error {
+		for _, a := range fresh.BridgeGateways {
+			if a == addr {
+				return nil
+			}
 		}
-	}
-	c.BridgeGateways = append(c.BridgeGateways, addr)
-	return c.Save()
+		fresh.BridgeGateways = append(fresh.BridgeGateways, addr)
+		return nil
+	})
 }
 
 // RemoveBridgeGateway unpins addr. It is not an error if absent.
 func (c *Config) RemoveBridgeGateway(addr string) error {
-	kept := c.BridgeGateways[:0]
-	for _, a := range c.BridgeGateways {
-		if a != addr {
-			kept = append(kept, a)
+	return c.Update(func(fresh *Config) error {
+		kept := fresh.BridgeGateways[:0]
+		for _, a := range fresh.BridgeGateways {
+			if a != addr {
+				kept = append(kept, a)
+			}
 		}
-	}
-	c.BridgeGateways = kept
-	return c.Save()
+		fresh.BridgeGateways = kept
+		return nil
+	})
 }
 
 // isPinnedBridgeGateway reports whether addr is in this client's pinned

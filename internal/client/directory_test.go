@@ -271,9 +271,11 @@ func TestAcceptIntroductionAddsContact(t *testing.T) {
 	if _, rec := bobClient.recordIntroduction(addrOf(carolID), 7, p); !rec {
 		t.Fatal("setup: introduction not recorded")
 	}
-	// Point at the fake relay after recordIntroduction: the config
-	// Update inside recordIntroduction reloads from disk (F5).
-	bobClient.cfg.RelayURL = ts.URL
+	// Contact acceptance uses a fresh config transaction. Persist the fixture
+	// relay so that transaction retains the intended disposable endpoint.
+	if err := bobClient.cfg.Update(func(fresh *Config) error { fresh.RelayURL = ts.URL; return nil }); err != nil {
+		t.Fatal(err)
+	}
 	pending := bobClient.PendingIntroductions()
 	if len(pending) != 1 {
 		t.Fatalf("setup: want 1 pending, got %d", len(pending))
@@ -408,12 +410,33 @@ func TestForwardIntroductionRequest(t *testing.T) {
 func TestPeerHandleCache(t *testing.T) {
 	_, carolID, _ := introIdentities(t)
 	carol := introClient(t, carolID, map[string]string{})
-	// No relay: reverse fails, PeerHandle returns "" and caches it.
+	// No relay: a transport failure is not authoritative negative knowledge.
 	if h := carol.PeerHandle("ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); h != "" {
 		t.Fatalf("want empty handle, got %q", h)
 	}
-	if carol.cfg.HandleCache == nil {
-		t.Fatal("cache not populated")
+	if len(carol.cfg.HandleCache) != 0 {
+		t.Fatal("transport failure cached")
+	}
+}
+
+func TestPeerHandleCachesAuthoritativeMiss(t *testing.T) {
+	_, id, bob := introIdentities(t)
+	c := introClient(t, id, map[string]string{})
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"results":[]}`))
+	}))
+	defer srv.Close()
+	c.cfg.RelayURL = srv.URL
+	if err := c.cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	c.PeerHandle(addrOf(bob))
+	c.PeerHandle(addrOf(bob))
+	if calls != 1 {
+		t.Fatal("authoritative miss not cached", calls)
 	}
 }
 
@@ -505,4 +528,87 @@ func TestVerifyDirectoryProfile(t *testing.T) {
 
 func b64enc(b []byte) string {
 	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// seedHandleCache stores a fresh directory-handle cache entry, so tests
+// can exercise handle-dependent behavior without a relay.
+func seedHandleCache(t *testing.T, cfg *Config, address, handle string) {
+	t.Helper()
+	if err := cfg.Update(func(fresh *Config) error {
+		if fresh.HandleCache == nil {
+			fresh.HandleCache = map[string]HandleCacheEntry{}
+		}
+		fresh.HandleCache[address] = HandleCacheEntry{Handle: handle, At: time.Now().Unix()}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestContactDisplayName: #146 — the display name defaults to the
+// known directory handle; the local alias is the optional override.
+func TestContactDisplayName(t *testing.T) {
+	_, carolID, bob := introIdentities(t)
+	bobAddr := addrOf(bob)
+
+	// Explicit alias wins over a cached handle.
+	aliased := introClient(t, carolID, map[string]string{"bobby": bobAddr})
+	seedHandleCache(t, aliased.cfg, bobAddr, "bob")
+	if got := aliased.ContactDisplayName(bobAddr); got != "bobby" {
+		t.Fatalf("alias must win over handle: got %q", got)
+	}
+
+	// No contact: the cached directory handle.
+	plain := introClient(t, carolID, map[string]string{})
+	seedHandleCache(t, plain.cfg, bobAddr, "bob")
+	if got := plain.ContactDisplayName(bobAddr); got != "@bob ("+bobAddr+")" {
+		t.Fatalf("want cached handle, got %q", got)
+	}
+
+	// Contact named after the handle displays the handle.
+	named := introClient(t, carolID, map[string]string{"bob": bobAddr})
+	if got := named.ContactDisplayName(bobAddr); got != "bob" {
+		t.Fatalf("handle-as-name: got %q", got)
+	}
+
+	// Nothing known: full actionable address, with no network lookup.
+	unknown := "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	if got := plain.ContactDisplayName(unknown); got != unknown {
+		t.Fatalf("want full address, got %q", got)
+	}
+}
+
+func TestContactDisplayIsLocalAndUnambiguous(t *testing.T) {
+	_, id, bob := introIdentities(t)
+	addr := addrOf(bob)
+	c := introClient(t, id, map[string]string{"alice": "ed25519:local", "zulu": addr, "beta": addr})
+	for i := 0; i < 100; i++ {
+		if got := c.ContactDisplayName(addr); got != "beta" {
+			t.Fatalf("nondeterministic alias %q", got)
+		}
+	}
+	stranger := "ed25519:stranger"
+	seedHandleCache(t, c.cfg, stranger, "alice")
+	if got := c.ContactDisplayName(stranger); got != "@alice ("+stranger+")" {
+		t.Fatal("remote handle impersonates alias", got)
+	}
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(429) }))
+	defer srv.Close()
+	c.cfg.RelayURL = srv.URL
+	for i := 0; i < 100; i++ {
+		c.ContactDisplayName("unknown")
+		c.CachedPeerHandle(addr)
+	}
+	if calls != 0 {
+		t.Fatal("display accessed network", calls)
+	}
+	c.PeerHandle(addr)
+	c.PeerHandle(addr)
+	if calls != 2 {
+		t.Fatal("transient failure was cached", calls)
+	}
+	if _, ok := c.cfg.HandleCache[addr]; ok {
+		t.Fatal("negative cache contains transient error")
+	}
 }

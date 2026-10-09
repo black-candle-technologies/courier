@@ -8,6 +8,7 @@
 package client
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -45,6 +46,13 @@ type DirectoryProfile struct {
 // against. A profile that verifies neither way is rejected outright —
 // the client never resolves a handle to an unverified address.
 func verifyDirectoryProfile(p *DirectoryProfile) error {
+	if p == nil {
+		return fmt.Errorf("missing directory profile")
+	}
+	handle, err := envelope.NormalizeHandle(p.Handle)
+	if err != nil || handle != p.Handle {
+		return fmt.Errorf("directory profile has noncanonical handle")
+	}
 	addrEd, err := crypto.ParseAddress(p.Address)
 	if err != nil {
 		return fmt.Errorf("bad profile address: %w", err)
@@ -324,6 +332,10 @@ func (c *Client) DirectoryTransfer(handle, toAddress string) error {
 // signedDirectoryGet performs an identity-signed directory query
 // (lookup/search/reverse), binding the query to the querier (T2).
 func (c *Client) signedDirectoryGet(op, query string, params url.Values) ([]byte, int, error) {
+	return c.signedDirectoryGetContext(context.Background(), op, query, params)
+}
+
+func (c *Client) signedDirectoryGetContext(ctx context.Context, op, query string, params url.Values) ([]byte, int, error) {
 	hc, err := c.httpClient()
 	if err != nil {
 		return nil, 0, err
@@ -341,7 +353,11 @@ func (c *Client) signedDirectoryGet(op, query string, params url.Values) ([]byte
 	params.Set("querier", c.cfg.Address)
 	params.Set("ts", fmt.Sprintf("%d", ts))
 	params.Set("sig", base64.RawURLEncoding.EncodeToString(sig))
-	resp, err := hc.Get(c.cfg.RelayURL + "/v1/directory/" + op + "?" + params.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.RelayURL+"/v1/directory/"+op+"?"+params.Encode(), nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("relay unreachable: %w", err)
 	}
@@ -383,6 +399,9 @@ func (c *Client) DirectoryLookup(handle string) (*DirectoryProfile, error) {
 	if err := verifyDirectoryProfile(&p); err != nil {
 		return nil, err
 	}
+	if p.Handle != handle {
+		return nil, fmt.Errorf("directory lookup returned a different handle")
+	}
 	return &p, nil
 }
 
@@ -419,12 +438,16 @@ func (c *Client) DirectorySearch(prefix string) ([]DirectoryProfile, error) {
 // DirectoryReverse returns the listed (non-private) handle(s) for an
 // address the querier already knows. Used for dashboard handle display.
 func (c *Client) DirectoryReverse(address string) ([]DirectoryProfile, error) {
+	return c.directoryReverseContext(context.Background(), address)
+}
+
+func (c *Client) directoryReverseContext(ctx context.Context, address string) ([]DirectoryProfile, error) {
 	if _, err := crypto.ParseAddress(address); err != nil {
 		return nil, err
 	}
 	params := url.Values{}
 	params.Set("address", address)
-	data, code, err := c.signedDirectoryGet("reverse", address, params)
+	data, code, err := c.signedDirectoryGetContext(ctx, "reverse", address, params)
 	if err != nil {
 		return nil, err
 	}
@@ -438,6 +461,9 @@ func (c *Client) DirectoryReverse(address string) ([]DirectoryProfile, error) {
 		return nil, fmt.Errorf("bad relay response: %w", err)
 	}
 	for i := range rout.Results {
+		if rout.Results[i].Address != address {
+			return nil, fmt.Errorf("directory reverse returned a different address")
+		}
 		if err := verifyDirectoryProfile(&rout.Results[i]); err != nil {
 			return nil, err
 		}
@@ -445,31 +471,57 @@ func (c *Client) DirectoryReverse(address string) ([]DirectoryProfile, error) {
 	return rout.Results, nil
 }
 
-// PeerHandle resolves a peer address to a display handle for the
-// dashboard, with a 24h local cache so the per-minute push does not
-// query the relay for every thread.
+// PeerHandle explicitly resolves a peer address, using a 24h cache.
+// Rendering uses CachedPeerHandle instead so directory I/O cannot block it.
 func (c *Client) PeerHandle(address string) string {
+	handle, _ := c.LookupPeerHandle(address)
+	return handle
+}
+
+// LookupPeerHandle resolves a cached or verified directory handle. An empty
+// result with no error means no public handle; lookup failures remain errors.
+func (c *Client) LookupPeerHandle(address string) (string, error) {
 	if c.cfg.HandleCache != nil {
 		if e, ok := c.cfg.HandleCache[address]; ok &&
 			time.Now().Unix()-e.At < 24*3600 {
-			return e.Handle
+			return e.Handle, nil
 		}
 	}
 	profiles, err := c.DirectoryReverse(address)
+	if err != nil {
+		return "", err
+	} // Transient/network/verification failures are not negative knowledge.
 	handle := ""
 	if err == nil && len(profiles) > 0 {
 		handle = profiles[0].Handle
 	}
-	_ = c.cfg.Update(func(fresh *Config) error {
+	if err := c.cachePeerHandle(address, handle); err != nil {
+		return "", err
+	}
+	return handle, nil
+}
+
+// CacheDirectoryProfile saves freshly signature-verified discovery evidence.
+// It does not create a trusted contact or override a private alias.
+func (c *Client) CacheDirectoryProfile(profile *DirectoryProfile) error {
+	if err := verifyDirectoryProfile(profile); err != nil {
+		return err
+	}
+	return c.cachePeerHandle(profile.Address, profile.Handle)
+}
+
+func (c *Client) cachePeerHandle(address, handle string) error {
+	return c.cfg.Update(func(fresh *Config) error {
 		if fresh.HandleCache == nil {
 			fresh.HandleCache = make(map[string]HandleCacheEntry)
 		}
+		fresh.HandleRefreshAt = 0
 		fresh.HandleCache[address] = HandleCacheEntry{Handle: handle, At: time.Now().Unix()}
 		// Bound the cache; drop oldest beyond 500 entries.
 		if len(fresh.HandleCache) > 500 {
 			oldest, oldestK := time.Now().Unix(), ""
 			for k, v := range fresh.HandleCache {
-				if v.At < oldest {
+				if oldestK == "" || v.At < oldest {
 					oldest, oldestK = v.At, k
 				}
 			}
@@ -479,7 +531,6 @@ func (c *Client) PeerHandle(address string) string {
 		}
 		return nil
 	})
-	return handle
 }
 
 // ResolveHandleTarget accepts "@handle" or "handle:<name>" and resolves
@@ -711,18 +762,33 @@ func (c *Client) recordIntroduction(from string, envelopeID int64, p introductio
 // contactNameFor returns the contact name for an address, or a
 // truncated address when unknown.
 func (c *Client) contactNameFor(address string) string {
-	for name, addr := range c.cfg.Contacts {
-		if addr == address {
-			return name
-		}
+	if name := c.cfg.ContactNameForAddress(address); name != "" {
+		return name
 	}
 	return shortAddr(address)
 }
 
-// ContactDisplayName returns the contact name for an address, or a
-// truncated address when unknown. Exported for CLI display.
+// ContactDisplayName returns the display name for an address, for the
+// CLI's contacts list/show, send, and inbox output. The order is
+// deliberate (#146: display defaults to the directory handle; the
+// local alias is the optional override):
+//
+//  1. the local address-book name when the address is a contact —
+//     either a handle taken as the name at add time or an explicit
+//     private alias;
+//  2. the peer's known directory handle (cache only)
+//     when the address is not a contact;
+//  3. the full actionable address as the last resort.
+//
+// Exported for CLI display.
 func (c *Client) ContactDisplayName(address string) string {
-	return c.contactNameFor(address)
+	if name := c.cfg.ContactNameForAddress(address); name != "" {
+		return name
+	}
+	if h := c.CachedPeerHandle(address); h != "" {
+		return fmt.Sprintf("@%s (%s)", h, address)
+	}
+	return address
 }
 
 func shortAddr(address string) string {
@@ -902,4 +968,14 @@ func (c *Client) AcceptIntroduction(id, greet string) error {
 		return fmt.Errorf("contact added as %q, but the greeting failed to send: %w", name, err)
 	}
 	return c.DismissIntroduction(pi.ID)
+}
+
+// CachedPeerHandle never performs network I/O; rendering local views must not
+// generate serial directory requests or turn transient failures into cache misses.
+func (c *Client) CachedPeerHandle(address string) string {
+	e, ok := c.cfg.HandleCache[address]
+	if ok && time.Now().Unix()-e.At < 24*3600 {
+		return e.Handle
+	}
+	return ""
 }

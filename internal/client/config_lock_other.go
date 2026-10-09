@@ -2,6 +2,8 @@
 
 package client
 
+import "fmt"
+
 // withConfigLock on platforms with neither unix flock nor the Windows
 // LockFileEx implementation (e.g. plan9, js/wasm): cross-process config
 // locking degrades to the in-process mutex only. Atomic save (temp file +
@@ -17,8 +19,18 @@ package client
 //
 // Courier's supported server and agent deployments are unix, and a
 // Windows binary is published; both have real locks.
-func withConfigLock(fn func() error) error {
+func (s Context) withConfigLock(fn func() error) error {
+	if s.principal != "" {
+		return fmt.Errorf("named contexts require cross-process locks")
+	}
 	configMu.Lock()
 	defer configMu.Unlock()
+	if err := s.refuseMigrated(); err != nil {
+		return err
+	}
 	return fn()
+}
+
+func (s Context) acquireConfigLock() (func(), error) {
+	return nil, fmt.Errorf("cross-process locks unavailable on this platform")
 }

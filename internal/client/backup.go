@@ -33,6 +33,9 @@ func defaultDeviceName() string {
 
 // backupPayload builds the inner envelope from the live config.
 func (c *Config) backupPayload(kind, device string) (*crypto.BackupPayload, error) {
+	if err := c.local().validateConfig(c); err != nil {
+		return nil, err
+	}
 	if kind != crypto.BackupKindBackup && kind != crypto.BackupKindSync {
 		return nil, fmt.Errorf("bad backup kind %q", kind)
 	}
@@ -99,7 +102,7 @@ func DecryptBackup(passphrase, raw []byte) (*crypto.BackupPayload, error) {
 // cursors) starts fresh. Callers should best-effort PublishKey after a
 // restore so the relay directory holds the current key announcement,
 // and import a fresh sync from an active device when one is available.
-func RestoreBackup(passphrase, raw []byte, force bool) (*Config, error) {
+func (s Context) RestoreBackup(passphrase, raw []byte, force bool) (*Config, error) {
 	p, err := crypto.OpenBackup(passphrase, raw)
 	if err != nil {
 		return nil, err
@@ -108,9 +111,9 @@ func RestoreBackup(passphrase, raw []byte, force bool) (*Config, error) {
 		return nil, fmt.Errorf("not a backup envelope (kind %q): `backup restore` needs a backup, `backup import-sync` merges sync envelopes", p.Kind)
 	}
 	var out *Config
-	err = withConfigLock(func() error {
-		if ConfigExists() && !force {
-			existing, cfgErr := loadConfigRaw()
+	err = s.withConfigLock(func() error {
+		if s.ConfigExists() && !force {
+			existing, cfgErr := s.loadConfigRaw()
 			addr := ""
 			if cfgErr == nil {
 				addr = existing.Address
@@ -131,6 +134,7 @@ func RestoreBackup(passphrase, raw []byte, force bool) (*Config, error) {
 			})
 		}
 		out = &Config{
+			localContext:     &s,
 			Version:          ConfigVersion,
 			RelayURL:         relayURL,
 			RelayFingerprint: p.RelayFingerprint,
@@ -152,15 +156,23 @@ func RestoreBackup(passphrase, raw []byte, force bool) (*Config, error) {
 		// session tokens, challenges, the replay set, and
 		// revocations all belong to the old device. Approval
 		// authority must be re-enrolled on the new device.
-		if err := removeVHLState(); err != nil {
+		if err := s.removeVHLState(); err != nil {
 			return err
 		}
-		return removeFSState()
+		return s.removeFSState()
 	})
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+func RestoreBackup(passphrase, raw []byte, force bool) (*Config, error) {
+	scope, err := LegacyContext().ActiveContext()
+	if err != nil {
+		return nil, err
+	}
+	return scope.RestoreBackup(passphrase, raw, force)
 }
 
 func addrSuffix(addr string) string {
@@ -187,6 +199,12 @@ func (c *Config) MergeSyncKeys(p *crypto.BackupPayload) (added int, err error) {
 	}
 	if p.Kind != crypto.BackupKindSync {
 		return 0, fmt.Errorf("not a sync envelope (kind %q): `backup import-sync` merges sync envelopes, `backup restore` installs backups", p.Kind)
+	}
+	if scope := c.local(); scope.principal != "" {
+		origin, e := NormalizeRelayOrigin(p.RelayURL)
+		if e != nil || origin != scope.binding.Endpoint || !sameCertificatePin(p.RelayFingerprint, scope.binding.Pin) {
+			return 0, ErrContextMismatch
+		}
 	}
 	err = c.Update(func(fresh *Config) error {
 		if fresh.Address != p.Address {

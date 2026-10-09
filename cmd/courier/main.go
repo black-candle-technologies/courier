@@ -16,6 +16,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/client"
+	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/store"
 	"github.com/black-candle-technologies/courier/internal/update"
 	"github.com/black-candle-technologies/courier/internal/version"
@@ -40,73 +42,75 @@ import (
 // build time via ldflags -X; see docs/versions.md.
 
 func main() {
+	scope, args, selectErr := selectCommand(os.Args[1:])
+	if selectErr != nil {
+		fmt.Fprintln(os.Stderr, selectErr)
+		os.Exit(1)
+	}
+	os.Args = append([]string{os.Args[0]}, args...)
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
 	}
 	// v0.5.0+: opportunistic update check (at most once per 12h). Notices
 	// go to stderr so stdout stays machine-readable (stdio/serve).
-	if os.Args[1] != "update" && client.ConfigExists() {
-		if cfg, err := client.LoadConfig(); err == nil {
+	if commandNeedsIdentity(args) && os.Args[1] != "context" && scope.context.ConfigExists() {
+		if cfg, err := scope.context.LoadConfig(); err == nil {
 			client.New(cfg).MaybeUpdateCheck(version.Client)
 		}
 	}
 	var err error
 	switch os.Args[1] {
+	case "context":
+		err = scope.cmdContext(os.Args[2:])
 	case "init":
-		err = cmdInit(os.Args[2:])
+		err = scope.cmdInit(os.Args[2:])
 	case "address", "key":
-		err = cmdAddress()
+		err = scope.cmdAddress()
 	case "send":
-		err = cmdSend(os.Args[2:])
+		err = scope.cmdSend(os.Args[2:])
 	case "inbox":
-		err = cmdInbox(os.Args[2:])
+		err = scope.cmdInbox(os.Args[2:])
 	case "attachments":
-		err = cmdAttachments(os.Args[2:])
+		err = scope.cmdAttachments(os.Args[2:])
 	case "wake":
-		err = cmdWake(os.Args[2:])
+		err = scope.cmdWake(os.Args[2:])
 	case "stdio":
-		err = cmdStdio()
+		err = scope.cmdStdio()
 	case "serve":
-		err = cmdServe(os.Args[2:])
+		err = scope.cmdServe(os.Args[2:])
 	case "contacts":
-		err = cmdContacts(os.Args[2:])
+		err = scope.cmdContacts(os.Args[2:])
 	case "receipts":
-		err = cmdReceipts(os.Args[2:])
+		err = scope.cmdReceipts(os.Args[2:])
 	case "block":
-		err = cmdBlock(os.Args[2:])
+		err = scope.cmdBlock(os.Args[2:])
 	case "unblock":
-		err = cmdUnblock(os.Args[2:])
+		err = scope.cmdUnblock(os.Args[2:])
 	case "report-spam":
-		err = cmdReportSpam(os.Args[2:])
+		err = scope.cmdReportSpam(os.Args[2:])
 	case "request":
-		err = cmdRequest(os.Args[2:])
+		err = scope.cmdRequest(os.Args[2:])
 	case "directory":
-		err = cmdDirectory(os.Args[2:])
+		err = scope.cmdDirectory(os.Args[2:])
 	case "group":
-		err = cmdGroup(os.Args[2:])
-	case "state":
-		err = cmdState(os.Args[2:])
-	case "channel":
-		err = cmdChannel(os.Args[2:])
+		err = scope.cmdGroup(os.Args[2:])
 	case "rotate":
-		err = cmdRotate(os.Args[2:])
-	case "fs":
-		err = cmdFS(os.Args[2:])
+		err = scope.cmdRotate(os.Args[2:])
 	case "vhl":
-		err = cmdVHL(os.Args[2:])
+		err = scope.cmdVHL(os.Args[2:])
 	case "publish-key":
-		err = cmdPublishKey()
+		err = scope.cmdPublishKey()
 	case "backup":
-		err = cmdBackup(os.Args[2:])
+		err = scope.cmdBackup(os.Args[2:])
 	case "update":
-		err = cmdUpdate()
+		err = scope.cmdUpdate()
 	case "dashboard":
-		err = cmdDashboard(os.Args[2:])
+		err = scope.cmdDashboard(os.Args[2:])
 	case "bridge":
-		err = cmdBridge(os.Args[2:])
+		err = scope.cmdBridge(os.Args[2:])
 	case "config":
-		err = cmdConfig(os.Args[2:])
+		err = scope.cmdConfig(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println("courier", version.Client)
 	default:
@@ -157,34 +161,31 @@ func usage() {
   courier block list                     list blocked senders
   courier unblock <address|contact>      unblock a sender
   courier report-spam <message-id>       report a message as spam (throttles repeat offenders)
-  courier contacts add <name> <address>  save a contact
+  courier contacts add <address|@handle> [--force]   save a contact (uses their directory handle as the name)
+  courier contacts add <name> <address>  save a contact with a local private alias (overrides the handle)
   courier contacts list                  list contacts (with trust state)
   courier contacts show <name>           show a contact's address and trust state
   courier contacts verify <name> [--yes] verify a contact out of band (safety number)
   courier contacts unverify <name>       clear a contact's verification
-  courier contacts receipts-on <name>    opt into delivery/read receipts for a contact
-  courier contacts receipts-off <name>   opt out of delivery/read receipts (default)
+  courier contacts delivery-receipts-on <name>    opt into delivery receipts for a contact
+  courier contacts delivery-receipts-off <name>   opt out of delivery receipts (default)
+  courier contacts start-fs <name>           explicitly probe a private FS-capable peer
+  courier contacts require-fs-on <name>      require forward secrecy: sends fail
+                                         rather than fall back to legacy (default off)
+  courier contacts require-fs-off <name>    clear the require-forward-secrecy policy
+  courier contacts retry-fs-cleanup <address>  retry erasure for a former contact
   courier contacts remove <name>         delete a contact
-  courier receipts [contact] [--limit N] show delivery/read status of sent messages
+  courier receipts [contact] [--limit N] show delivery status of sent messages
   courier group create --name <name> [addr...]
                                          create an encrypted group (you are admin)
+  courier group add <group-id> <addr>    add a member (admin only)
+  courier group remove <group-id> <addr> remove a member (admin only; sender keys rotate)
+  courier group transfer <group-id> <addr>
+                                         transfer adminship to a member (admin only)
   courier group send <group-id> <msg>    send a message to the group
   courier group inbox <group-id>         read new group messages
-  courier state note add <peer> --title <t>
-                                         share a note with a collaborator
-  courier state task add <peer> --title <t> [--assignee <a>]
-                                         share a task (state machine: assign/done/reopen)
-  courier state list <peer>              list shared notes + tasks
-  courier state sync <peer>              catch-up: fetch and apply missed state events
-  courier channel create <name>          create a private channel (you are admin)
-  courier channel invite <channel-id>    mint a one-time out-of-band join code
-  courier channel join <inviter> <code>   join a private channel via OOB code
-  courier channel send <channel-id> <msg> send a message to the channel
-  courier channel inbox <channel-id>     read channel messages
-  courier channel list                   list your private channels
-  courier channel remove <channel-id> <addr|contact>
-                                         remove a member (admin; rotates the channel key)
-  courier channel leave <channel-id>     leave a private channel
+  courier group list                     list your groups
+  courier group show <group-id>          show group details and roster
   courier directory register <handle> [--visibility public|unlisted|private]
       [--caps a,b] [--policy open|contacts]
                                          claim a handle (first-come, signed)
@@ -204,12 +205,6 @@ func usage() {
   courier directory dismiss <id>         dismiss a pending introduction
   courier rotate                         rotate encryption key (durable crypto)
   courier publish-key                    re-announce your encryption key
-  courier fs status [<peer>]             show forward-secrecy sessions
-  courier fs start <peer>                initiate a forward-secrecy handshake
-  courier fs on <peer>                   mark a peer FS-capable and initiate
-  courier fs off <peer>                  disable FS for a peer (erases session)
-  courier fs rekey <peer>                rotate the FS ratchet on next send
-  courier fs forget <peer>               erase the FS session for a peer
   courier vhl approver add <address> [--name N]
                                          enroll a human approver (interactive confirm)
   courier vhl enroll-webauthn [--device LABEL]
@@ -268,7 +263,10 @@ Your address is your public key: share it so others can message you.
 Your private key never leaves ~/.courier/config.json.`)
 }
 
-func cmdInit(args []string) error {
+func (scope command) cmdInit(args []string) error {
+	if scope.context.Principal() != "" {
+		return fmt.Errorf("named identity creation and pin migration require separate explicit provisioning; init is legacy-only")
+	}
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	relay := fs.String("relay", "", "relay URL (default "+client.DefaultRelay+")")
 	force := fs.Bool("force", false, "overwrite existing identity")
@@ -278,7 +276,7 @@ func cmdInit(args []string) error {
 	}
 
 	if *repin {
-		cfg, err := client.LoadConfig()
+		cfg, err := scope.context.LoadConfig()
 		if err != nil {
 			return err
 		}
@@ -286,8 +284,13 @@ func cmdInit(args []string) error {
 		if err != nil {
 			return err
 		}
-		cfg.RelayFingerprint = fp
-		if err := cfg.Save(); err != nil {
+		if err := cfg.Update(func(fresh *client.Config) error {
+			if fresh.RelayURL != cfg.RelayURL {
+				return client.ErrContextMismatch
+			}
+			fresh.RelayFingerprint = fp
+			return nil
+		}); err != nil {
 			return err
 		}
 		fmt.Println("pinned relay certificate:")
@@ -296,8 +299,8 @@ func cmdInit(args []string) error {
 		return nil
 	}
 
-	if client.ConfigExists() && !*force {
-		cfg, err := client.LoadConfig()
+	if scope.context.ConfigExists() && !*force {
+		cfg, err := scope.context.LoadConfig()
 		if err != nil {
 			// v0.1.0 identity (or corrupt config): tell the user how to migrate.
 			fmt.Println(err)
@@ -379,8 +382,8 @@ func dashboardSetupDirective() string {
   4. Keep messages flowing with:  courier dashboard push --follow`
 }
 
-func cmdAddress() error {
-	cfg, err := client.LoadConfig()
+func (scope command) cmdAddress() error {
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -388,7 +391,7 @@ func cmdAddress() error {
 	return nil
 }
 
-func cmdSend(args []string) error {
+func (scope command) cmdSend(args []string) error {
 	fs := flag.NewFlagSet("send", flag.ContinueOnError)
 	file := fs.String("file", "", "read message body from file")
 	var attach stringSliceFlag
@@ -417,7 +420,7 @@ func cmdSend(args []string) error {
 			return fmt.Errorf("invalid --reply-to %q: want a positive message id", replyToVal)
 		}
 		replyTo = n
-		if _, ok := client.LookupReplyParent(replyTo); !ok {
+		if _, ok := scope.context.LookupReplyParent(replyTo); !ok {
 			fmt.Fprintf(os.Stderr, "warning: parent message #%d not found locally; sending reply reference anyway\n", replyTo)
 		}
 	}
@@ -448,11 +451,13 @@ func cmdSend(args []string) error {
 	if strings.TrimSpace(body) == "" {
 		return fmt.Errorf("refusing to send an empty message")
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
 	cl := client.New(cfg)
+	resolvedHandle := ""
+	var resolvedProfile *client.DirectoryProfile
 	// Contact discovery (issue #39): @handle and handle:<name> resolve
 	// via the directory. The resolved address is always shown; sending
 	// to a handle for the first time, or to a contacts-policy handle,
@@ -460,6 +465,8 @@ func cmdSend(args []string) error {
 	if addr, profile, isHandle, herr := cl.ResolveHandleTarget(address); herr != nil {
 		return fmt.Errorf("handle resolution failed: %w", herr)
 	} else if isHandle {
+		resolvedHandle = profile.Handle
+		resolvedProfile = profile
 		fmt.Fprintf(os.Stderr, "resolved @%s -> %s\n", profile.Handle, addr)
 		firstContact := cfg.IsFirstContact(addr)
 		contactsOnly := profile.ContactPolicy == "contacts"
@@ -524,7 +531,21 @@ func cmdSend(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("sent (id %d)", id)
+	if resolvedProfile != nil {
+		if cacheErr := cl.CacheDirectoryProfile(resolvedProfile); cacheErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: message delivered, but could not cache recipient handle: %v\n", cacheErr)
+		}
+	}
+	// #146: confirm who the message went to — handle by default,
+	// private alias when one is set.
+	display := address
+	if resolved, rerr := cfg.ResolveRecipient(address); rerr == nil {
+		display = cl.ContactDisplayName(resolved)
+		if existingContactAlias(cfg, resolved) == "" && resolvedHandle != "" {
+			display = fmt.Sprintf("@%s (%s)", resolvedHandle, resolved)
+		}
+	}
+	fmt.Printf("sent to %s (id %d)", display, id)
 	if replyTo > 0 {
 		fmt.Printf(" in reply to #%d", replyTo)
 	}
@@ -537,9 +558,9 @@ func cmdSend(args []string) error {
 	fmt.Println()
 	// issue #52: receipts for my messages depend on the *recipient's*
 	// opt-in, which is their private state. Note mine, which controls
-	// the receipts I send when reading their replies.
+	// the delivery receipts I send for their messages.
 	if resolved, rerr := cfg.ResolveRecipient(address); rerr == nil && cfg.ReceiptsEnabledFor(resolved) {
-		fmt.Fprintf(os.Stderr, "receipts on for this contact — delivery/read status in `courier receipts`\n")
+		fmt.Fprintf(os.Stderr, "delivery receipts enabled for incoming messages from this contact\n")
 	}
 	return nil
 }
@@ -686,7 +707,11 @@ func (s *stringSliceFlag) Set(v string) error {
 	return nil
 }
 
-func printMessages(msgs []client.Message) {
+// printMessages renders inbox-style messages. The sender line shows
+// the display name — handle by default, private alias when set
+// (#146) — resolved through the client so directory handles work for
+// non-contacts too.
+func printMessages(cl *client.Client, msgs []client.Message) {
 	for _, m := range msgs {
 		ts := time.Unix(m.ReceivedAt, 0).UTC().Format("2006-01-02 15:04:05Z")
 		flagStr := ""
@@ -697,7 +722,7 @@ func printMessages(msgs []client.Message) {
 		if m.ExpiresAt != 0 {
 			flagStr += fmt.Sprintf(" [expires %s]", time.Unix(m.ExpiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"))
 		}
-		fmt.Printf("[#%d] from %s at %s%s\n", m.ID, m.From, ts, flagStr)
+		fmt.Printf("[#%d] from %s at %s%s\n", m.ID, cl.ContactDisplayName(m.From), ts, flagStr)
 		// issue #142: VHL attestation status renders as a typed badge,
 		// not body text — an unverified claim must look unverified,
 		// never like a reviewed message.
@@ -749,11 +774,11 @@ func formatReplyQuote(q string) string {
 // separate from the normal inbox. Each request carries its
 // machine-readable flag reasons and the commands to accept or dismiss
 // it. Requests are held, never silently dropped.
-func printRequests(reqs []client.Message) {
+func printRequests(cl *client.Client, reqs []client.Message) {
 	fmt.Printf("Message requests (%d) — held for review, not in your inbox.\n", len(reqs))
 	fmt.Printf("Accept with `courier request accept <id>` (--as <name> to name the contact);\n")
 	fmt.Printf("dismiss with `courier request dismiss <id>`.\n\n")
-	printMessages(reqs)
+	printMessages(cl, reqs)
 }
 
 // saveAttachment writes verified attachment data into dir, never
@@ -800,7 +825,7 @@ func saveAttachment(dir string, filename string, data []byte) (string, error) {
 	}
 }
 
-func cmdInbox(args []string) error {
+func (scope command) cmdInbox(args []string) error {
 	fs := flag.NewFlagSet("inbox", flag.ContinueOnError)
 	all := fs.Bool("all", false, "show all messages, not just new ones")
 	limit := fs.Int("limit", 50, "max messages per fetch")
@@ -812,7 +837,7 @@ func cmdInbox(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -830,7 +855,7 @@ func cmdInbox(args []string) error {
 			fmt.Println("no message requests.")
 			return nil
 		}
-		printRequests(held)
+		printRequests(cl, held)
 		return nil
 	}
 	after := cfg.Cursor
@@ -868,15 +893,10 @@ func cmdInbox(args []string) error {
 			return false, nil
 		}
 		if len(delivered) > 0 {
-			printMessages(delivered)
-			// issue #52: printing the messages counts as reading them.
-			// Fire read receipts for contacts this agent explicitly
-			// opted into (best effort, silent). The 60s inbox poller
-			// counts as a read too — the agent reading is reading.
-			cl.SendReadReceipts(delivered)
+			printMessages(cl, delivered)
 		}
 		if len(reqs) > 0 {
-			printRequests(reqs)
+			printRequests(cl, reqs)
 		}
 		if *attachDir != "" {
 			for _, m := range delivered {
@@ -976,8 +996,8 @@ func toStdioMessage(m client.Message) stdioMessage {
 	}
 }
 
-func cmdStdio() error {
-	cfg, err := client.LoadConfig()
+func (scope command) cmdStdio() error {
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1029,10 +1049,6 @@ func cmdStdio() error {
 				sm = append(sm, toStdioMessage(m))
 			}
 			reply(stdioResp{ID: req.ID, OK: true, Messages: sm})
-			// issue #52: returning the messages to the harness counts
-			// as reading them. Fire read receipts for opted-in
-			// contacts (best effort, silent).
-			cl.SendReadReceipts(msgs)
 		case "health":
 			if err := cl.Ping(); err != nil {
 				reply(stdioResp{ID: req.ID, OK: false, Error: err.Error()})
@@ -1052,13 +1068,13 @@ func bytesTrimSpace(b []byte) []byte {
 
 // ---- serve: each client runs their own local server ----
 
-func cmdServe(args []string) error {
+func (scope command) cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	listen := fs.String("listen", "127.0.0.1:8471", "local listen address")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1113,27 +1129,91 @@ func writeSvcJSON(w http.ResponseWriter, code int, v any) {
 
 // ---- v0.5.0: contacts ----
 
-func cmdContacts(args []string) error {
+func (scope command) cmdContacts(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|receipts-on|receipts-off|remove>")
+		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|start-fs|require-fs-on|require-fs-off|retry-fs-cleanup|remove>")
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
 	cl := client.New(cfg)
 	switch args[0] {
 	case "add":
-		if len(args) != 3 {
-			return fmt.Errorf("usage: courier contacts add <name> <address>")
+		args, force := stripForce(args)
+		// #146: the display name defaults to the known directory
+		// handle; a local alias is the optional private override.
+		// `contacts add <address>` names the contact after the
+		// peer's directory handle; `contacts add <name> <address>`
+		// stores <name> as the alias.
+		var name, address string
+		switch len(args) {
+		case 2:
+			// `contacts add @handle` resolves the handle, then
+			// stores the contact under it — no separate name and
+			// no manual directory lookup needed.
+			if addr, profile, isHandle, herr := cl.ResolveHandleTarget(args[1]); herr != nil {
+				return fmt.Errorf("handle resolution failed: %w", herr)
+			} else if isHandle {
+				address, name = addr, profile.Handle
+				fmt.Fprintf(os.Stderr, "resolved @%s -> %s\n", profile.Handle, addr)
+				known := false
+				for _, saved := range cfg.Contacts {
+					if saved == addr {
+						known = true
+						break
+					}
+				}
+				if !known && !force {
+					return fmt.Errorf("re-run with --force to confirm the contact identity")
+				}
+				if err := cl.CacheDirectoryProfile(profile); err != nil {
+					return err
+				}
+			} else {
+				address = args[1]
+				if _, err := crypto.ParseAddress(address); err != nil {
+					return fmt.Errorf("bad address %q: usage: courier contacts add <address|@handle> [--force] | courier contacts add <name> <address>", address)
+				}
+				handle, err := cl.LookupPeerHandle(address)
+				if err != nil {
+					return fmt.Errorf("directory handle lookup failed; retry or supply an explicit name: %w", err)
+				}
+				if existing := existingContactAlias(cfg, address); existing != "" {
+					fmt.Printf("contact already saved as %q.\n", existing)
+					return nil
+				}
+				if handle == "" {
+					return fmt.Errorf("no directory handle known for that address — add it with an explicit name: courier contacts add <name> <address>")
+				}
+				name = handle
+			}
+			if existing := existingContactAlias(cfg, address); existing != "" {
+				fmt.Printf("contact already saved as %q.\n", existing)
+				return nil
+			}
+			// Never repoint an existing name at a different
+			// address silently (e.g. a transferred handle).
+			if addr, ok := cfg.Contacts[name]; ok && addr != address {
+				return fmt.Errorf("contact %q already exists for a different address", name)
+			}
+		case 3:
+			name, address = args[1], args[2]
+		default:
+			return fmt.Errorf("usage: courier contacts add <address|@handle> [--force] | courier contacts add <name> <address>")
 		}
-		if err := cfg.AddContact(args[1], args[2]); err != nil {
+		if len(args) == 3 {
+			err = cfg.AddContactAlias(name, address)
+		} else {
+			name, err = cfg.AddDiscoveredContact(name, address)
+		}
+		if err != nil {
 			return err
 		}
-		fmt.Printf("contact %q saved.\n", args[1])
+		fmt.Printf("contact %q saved.\n", name)
 	case "list":
 		if len(cfg.Contacts) == 0 {
-			fmt.Println("no contacts yet. Add one with: courier contacts add <name> <address>")
+			fmt.Println("no contacts yet. Add one with: courier contacts add <address> (or courier contacts add <name> <address>)")
 			return nil
 		}
 		names := make([]string, 0, len(cfg.Contacts))
@@ -1142,24 +1222,32 @@ func cmdContacts(args []string) error {
 		}
 		sort.Strings(names)
 		for _, n := range names {
-			st, _ := cl.ContactTrust(n)
+			st, _ := cl.CachedContactTrust(n)
 			var badge string
 			switch st {
 			case client.TrustVerified:
-				badge = "✓ verified"
+				badge = "✓ verified (cached; keys not revalidated)"
 			case client.TrustStale:
 				badge = "⚠ stale"
 			default:
 				badge = "• unverified"
 			}
-			// issue #52: receipt opt-in badge. Receipts are strictly
-			// opt-in; the badge shows this agent's own choice, which
-			// controls whether read activity leaks to this contact.
+			// issue #52: delivery-receipt opt-in badge. Receipts are
+			// strictly opt-in; the badge shows this agent's own choice,
+			// which controls whether delivery receipts go to this
+			// contact.
 			receipts := ""
 			if cfg.ReceiptsEnabledFor(cfg.Contacts[n]) {
 				receipts = " ✉ receipts"
 			}
-			fmt.Printf("%-24s %-12s%s %s\n", n, badge, receipts, cfg.Contacts[n])
+			// #146: the stored name is the handle by default, or an
+			// explicit private alias. Show the directory handle
+			// alongside when an alias shadows it.
+			display := n
+			if h := cl.CachedPeerHandle(cfg.Contacts[n]); h != "" && h != n {
+				display = fmt.Sprintf("%s (@%s)", n, h)
+			}
+			fmt.Printf("%-32s %-12s%s %s\n", display, badge, receipts, cfg.Contacts[n])
 		}
 	case "show":
 		if len(args) != 2 {
@@ -1170,17 +1258,49 @@ func cmdContacts(args []string) error {
 			return err
 		}
 		fmt.Println(addr)
+		// #146: display defaults to the directory handle; the stored
+		// name is either that handle or an explicit private alias.
+		// Surface the handle when an alias shadows it.
+		if h := cl.CachedPeerHandle(addr); h != "" && h != args[1] {
+			fmt.Printf("handle: @%s\n", h)
+		}
 		st, detail := cl.ContactTrust(args[1])
 		fmt.Printf("trust: %s (%s)\n", st, detail)
-		// issue #52: this agent's receipt opt-in for the contact.
-		// On: this agent sends delivery/read receipts when it reads
-		// the contact's messages (read activity leaks to them).
+		// issue #52: this agent's delivery-receipt opt-in for the contact.
+		// On: this agent sends delivery receipts when the contact's
+		// messages are delivered to its inbox.
 		// Off (default): nothing is ever sent.
 		onOff := "off"
 		if cfg.ReceiptsEnabledFor(addr) {
 			onOff = "on"
 		}
 		fmt.Printf("receipts: %s\n", onOff)
+		// #146: forward secrecy is fully automatic — no `courier fs`
+		// commands. Show whether an FS session is established, and
+		// whether the per-contact fail-closed policy is set (#327).
+		fsActive, err := cl.FSActive(args[1])
+		if err != nil {
+			return err
+		}
+		fsRequired, err := cl.FSRequired(args[1])
+		if err != nil {
+			return err
+		}
+		fsState := "inactive"
+		if fsActive {
+			fsState = "active"
+		}
+		suspected, err := cl.FSDowngradeSuspected(args[1])
+		if err != nil {
+			return err
+		}
+		if suspected {
+			fsState += " (DOWNGRADE SUSPECTED)"
+		}
+		if fsRequired {
+			fsState += " (required: sends fail closed without a session)"
+		}
+		fmt.Printf("forward secrecy: %s\n", fsState)
 		if rec, ok := cfg.StoredVerification(args[1]); ok {
 			fmt.Printf("verified: %s\n", time.Unix(rec.VerifiedAt, 0).Format(time.RFC3339))
 			fmt.Printf("safety number: %s\n", rec.SafetyNumber)
@@ -1220,11 +1340,11 @@ func cmdContacts(args []string) error {
 			return err
 		}
 		fmt.Printf("verification for %q cleared.\n", args[1])
-	case "receipts-on", "receipts-off":
-		// issue #52: the explicit opt-in (or opt-out) for
-		// delivery/read receipts with one contact. Enabling means
-		// this agent sends receipts — leaking its own read activity —
-		// when it reads the contact's messages. Default is off.
+	case "delivery-receipts-on", "delivery-receipts-off":
+		// issue #52: the explicit opt-in (or opt-out) for delivery
+		// receipts with one contact. Enabling means this agent sends
+		// delivery receipts when the contact's messages arrive.
+		// Default is off.
 		if len(args) != 2 {
 			return fmt.Errorf("usage: courier contacts %s <name>", args[0])
 		}
@@ -1232,36 +1352,83 @@ func cmdContacts(args []string) error {
 		if err != nil {
 			return err
 		}
-		on := args[0] == "receipts-on"
+		on := args[0] == "delivery-receipts-on"
 		if err := cfg.SetReceiptsOptIn(addr, on); err != nil {
 			return err
 		}
 		if on {
-			fmt.Printf("receipts on for %q: delivery/read receipts will be sent when you read their messages.\n", args[1])
+			fmt.Printf("delivery receipts on for %q: receipts will be sent when their messages are delivered.\n", args[1])
 		} else {
-			fmt.Printf("receipts off for %q.\n", args[1])
+			fmt.Printf("delivery receipts off for %q.\n", args[1])
 		}
+	case "start-fs":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: courier contacts start-fs <name>")
+		}
+		if err := cl.FSStart(args[1]); err != nil {
+			return err
+		}
+		fmt.Println("FS bootstrap requested; poll both inboxes to complete the handshake. Send policy is unchanged.")
+	case "require-fs-on", "require-fs-off":
+		// #146 (per #327): the per-contact fail-closed policy.
+		// Opting a contact in means sends to them refuse legacy
+		// encryption — without an established FS session the send
+		// fails instead of falling back. The handshake is still
+		// retried automatically on the next send. Default is off
+		// (fail-open).
+		if len(args) != 2 {
+			return fmt.Errorf("usage: courier contacts %s <name>", args[0])
+		}
+		on := args[0] == "require-fs-on"
+		if err := cl.FSRequire(args[1], on); err != nil {
+			return err
+		}
+		if on {
+			fmt.Printf("forward secrecy required for %q: sends will fail rather than fall back to legacy encryption until an FS session is established.\n", args[1])
+		} else {
+			fmt.Printf("forward secrecy no longer required for %q (fail-open default).\n", args[1])
+		}
+	case "retry-fs-cleanup":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: courier contacts retry-fs-cleanup <address>")
+		}
+		cleaned, err := cl.FSCleanupOrphan(args[1])
+		if err != nil {
+			return err
+		}
+		if !cleaned {
+			return fmt.Errorf("FS state retained: a saved contact still references that address")
+		}
+		fmt.Println("former contact FS state erased.")
 	case "remove", "rm", "delete":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: courier contacts remove <name>")
 		}
+		if _, err := cfg.LookupContact(args[1]); err != nil {
+			return err
+		}
 		if err := cfg.RemoveContact(args[1]); err != nil {
 			return err
 		}
+
 		fmt.Printf("contact %q removed.\n", args[1])
 	default:
-		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|receipts-on|receipts-off|remove)", args[0])
+		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|start-fs|require-fs-on|require-fs-off|retry-fs-cleanup|remove)", args[0])
 	}
 	return nil
 }
 
-// ---- delivery/read receipts CLI (issue #52) ----
+func cmdContacts(args []string) error {
+	return (command{context: client.LegacyContext()}).cmdContacts(args)
+}
 
-// cmdReceipts shows receipt status for sent messages, newest first:
-// ✓ delivered, ✓✓ read, or "no receipt yet". Receipts only arrive
-// from peers who opted in on their side — absence of a receipt is not
-// a signal that the message is unread.
-func cmdReceipts(args []string) error {
+// ---- delivery receipts CLI (issue #52) ----
+
+// cmdReceipts shows delivery status for sent messages, newest first:
+// ✓ delivered, or "no receipt yet". Receipts only arrive from peers
+// who opted in on their side — absence of a receipt is not a signal
+// that the message is undelivered.
+func (scope command) cmdReceipts(args []string) error {
 	fs := flag.NewFlagSet("receipts", flag.ContinueOnError)
 	limit := fs.Int("limit", 20, "max sent messages to show")
 	if err := fs.Parse(args); err != nil {
@@ -1275,7 +1442,7 @@ func cmdReceipts(args []string) error {
 	if len(rest) == 1 {
 		filter = rest[0]
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1304,15 +1471,12 @@ func cmdReceipts(args []string) error {
 		}
 		ts := time.Unix(in.SentAt, 0).UTC().Format("2006-01-02 15:04:05Z")
 		status := "· no receipt yet"
-		switch {
-		case in.ReadAt > 0:
-			status = "✓✓ read " + time.Unix(in.ReadAt, 0).UTC().Format("2006-01-02 15:04:05Z")
-		case in.DeliveryAt > 0:
+		if in.DeliveryAt > 0 {
 			status = "✓ delivered " + time.Unix(in.DeliveryAt, 0).UTC().Format("2006-01-02 15:04:05Z")
 		}
 		fmt.Printf("[#%d → %s] %q at %s — %s\n", in.CourierID, peer, body, ts, status)
 	}
-	fmt.Println("(✓ delivered · ✓✓ read · no receipt is not a signal: the recipient may simply not have receipts enabled for you)")
+	fmt.Println("(✓ delivered · no receipt is not a signal: the recipient may simply not have receipts enabled for you)")
 	return nil
 }
 
@@ -1322,8 +1486,8 @@ func cmdReceipts(args []string) error {
 // Blocking is per-recipient and local: blocked messages are dropped at
 // inbox time, and nothing about the recipient's relationships leaves
 // the machine.
-func cmdBlock(args []string) error {
-	cfg, err := client.LoadConfig()
+func (scope command) cmdBlock(args []string) error {
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1354,11 +1518,11 @@ func cmdBlock(args []string) error {
 }
 
 // cmdUnblock removes a sender from the blocklist.
-func cmdUnblock(args []string) error {
+func (scope command) cmdUnblock(args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: courier unblock <address|contact>")
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1379,7 +1543,7 @@ func cmdUnblock(args []string) error {
 // cmdReportSpam files a signed spam report with the relay. Reports are
 // idempotent per (sender, reporter): only distinct reporters count
 // toward the relay's throttle threshold.
-func cmdReportSpam(args []string) error {
+func (scope command) cmdReportSpam(args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: courier report-spam <message-id>")
 	}
@@ -1387,7 +1551,7 @@ func cmdReportSpam(args []string) error {
 	if err != nil || id <= 0 {
 		return fmt.Errorf("bad message id %q", args[0])
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1403,11 +1567,11 @@ func cmdReportSpam(args []string) error {
 // cmdRequest manages held message requests: list (review), accept
 // (release + optionally add the sender to contacts), dismiss (suppress
 // future requests from the sender), undismiss (reverse a dismissal).
-func cmdRequest(args []string) error {
+func (scope command) cmdRequest(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: courier request <list|accept|dismiss|undismiss>")
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1422,7 +1586,7 @@ func cmdRequest(args []string) error {
 			fmt.Println("no message requests.")
 			return nil
 		}
-		printRequests(held)
+		printRequests(cl, held)
 		return nil
 	case "accept":
 		if len(args) < 2 || len(args) > 4 {
@@ -1450,8 +1614,8 @@ func cmdRequest(args []string) error {
 			return nil
 		}
 		fmt.Printf("request #%d accepted from %s; released %d message(s):\n\n",
-			id, released[0].From, len(released))
-		printMessages(released)
+			id, cl.ContactDisplayName(released[0].From), len(released))
+		printMessages(cl, released)
 		return nil
 	case "dismiss":
 		if len(args) != 2 {
@@ -1491,12 +1655,12 @@ func cmdRequest(args []string) error {
 
 // ---- v0.5.0: key rotation ----
 
-func cmdRotate(args []string) error {
+func (scope command) cmdRotate(args []string) error {
 	fs := flag.NewFlagSet("rotate", flag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1513,8 +1677,8 @@ func cmdRotate(args []string) error {
 	return nil
 }
 
-func cmdPublishKey() error {
-	cfg, err := client.LoadConfig()
+func (scope command) cmdPublishKey() error {
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1527,7 +1691,7 @@ func cmdPublishKey() error {
 
 // ---- v0.5.0: self-update ----
 
-func cmdUpdate() error {
+func (scope command) cmdUpdate() error {
 	fmt.Println("checking for updates...")
 	rel, err := update.Latest()
 	if err != nil {
@@ -1563,8 +1727,8 @@ func cmdUpdate() error {
 
 // ---- v0.5.0: config ----
 
-func cmdConfig(args []string) error {
-	cfg, err := client.LoadConfig()
+func (scope command) cmdConfig(args []string) error {
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1602,8 +1766,7 @@ func cmdConfig(args []string) error {
 			if err != nil {
 				return fmt.Errorf("auto_update must be true or false")
 			}
-			cfg.AutoUpdate = &v
-			if err := cfg.Save(); err != nil {
+			if err := cfg.Update(func(fresh *client.Config) error { fresh.AutoUpdate = &v; return nil }); err != nil {
 				return err
 			}
 			fmt.Printf("auto_update=%v\n", v)
@@ -1617,8 +1780,7 @@ func cmdConfig(args []string) error {
 			if !strings.HasPrefix(u, "https://") {
 				return fmt.Errorf("relay must be an https:// URL")
 			}
-			cfg.RelayURL = u
-			if err := cfg.Save(); err != nil {
+			if err := cfg.Update(func(fresh *client.Config) error { fresh.RelayURL = u; return nil }); err != nil {
 				return err
 			}
 			fmt.Printf("relay=%s\n", u)
@@ -1651,17 +1813,17 @@ func cmdConfig(args []string) error {
 
 // ---- v0.6.0: dashboard ----
 
-func cmdDashboard(args []string) error {
+func (scope command) cmdDashboard(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: courier dashboard <setup|push|status|set-admin> [args]")
 	}
 	switch args[0] {
 	case "setup":
-		return cmdDashboardSetup(args[1:])
+		return scope.cmdDashboardSetup(args[1:])
 	case "push":
-		return cmdDashboardPush(args[1:])
+		return scope.cmdDashboardPush(args[1:])
 	case "status":
-		return cmdDashboardStatus()
+		return scope.cmdDashboardStatus()
 	case "set-admin":
 		return cmdDashboardSetAdmin(args[1:])
 	default:
@@ -1672,7 +1834,7 @@ func cmdDashboard(args []string) error {
 // cmdDashboardSetup registers the dashboard user. The agent obtains a
 // username from its user, then runs this; it prints a temporary password
 // exactly once for the agent to hand to the user.
-func cmdDashboardSetup(args []string) error {
+func (scope command) cmdDashboardSetup(args []string) error {
 	fs := flag.NewFlagSet("dashboard setup", flag.ContinueOnError)
 	username := fs.String("username", "", "dashboard login username (3-32 chars: a-z, 0-9, -, _)")
 	dashURL := fs.String("dashboard-url", "", "dashboard URL (default "+client.DefaultDashboardURL+")")
@@ -1692,7 +1854,7 @@ func cmdDashboardSetup(args []string) error {
 		}
 		name = line
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1718,19 +1880,27 @@ func cmdDashboardSetup(args []string) error {
 
 // cmdDashboardPush forwards newly decrypted inbox messages to the
 // dashboard. With --follow it runs as a poller.
-func cmdDashboardPush(args []string) error {
+func (scope command) cmdDashboardPush(args []string) error {
 	fs := flag.NewFlagSet("dashboard push", flag.ContinueOnError)
 	follow := fs.Bool("follow", false, "keep polling for new messages")
 	interval := fs.Duration("interval", 30*time.Second, "poll interval with --follow")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
 	c := client.New(cfg)
 	pushOnce := func() error {
+		fresh, err := scope.context.LoadConfig()
+		if err != nil {
+			return err
+		}
+		if fresh.Address != cfg.Address || fresh.Seed != cfg.Seed || fresh.RelayURL != cfg.RelayURL || fresh.RelayFingerprint != cfg.RelayFingerprint {
+			return client.ErrContextMismatch
+		}
+		c = client.New(fresh)
 		n, err := c.DashboardPush()
 		if err != nil {
 			return err
@@ -1744,6 +1914,11 @@ func cmdDashboardPush(args []string) error {
 	if !*follow {
 		return nil
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	metadataClient := c
+	go func() { defer close(done); metadataClient.RunDashboardMetadataRefresh(ctx) }()
+	defer func() { cancel(); <-done }()
 	t := time.NewTicker(*interval)
 	defer t.Stop()
 	for range t.C {
@@ -1754,8 +1929,8 @@ func cmdDashboardPush(args []string) error {
 	return nil
 }
 
-func cmdDashboardStatus() error {
-	cfg, err := client.LoadConfig()
+func (scope command) cmdDashboardStatus() error {
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1814,3 +1989,10 @@ func cmdDashboardSetAdmin(args []string) error {
 	}
 	return nil
 }
+
+func existingContactAlias(cfg *client.Config, address string) string {
+	return cfg.ContactNameForAddress(address)
+}
+
+// Legacy command adapter retained for existing command-level fixtures.
+func cmdSend(args []string) error { return (command{context: client.LegacyContext()}).cmdSend(args) }

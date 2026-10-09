@@ -25,16 +25,16 @@ import (
 	"github.com/black-candle-technologies/courier/internal/client"
 )
 
-func cmdWake(args []string) error {
+func (scope command) cmdWake(args []string) error {
 	if len(args) > 0 && args[0] == "install" {
-		return cmdWakeInstall(args[1:])
+		return scope.cmdWakeInstall(args[1:])
 	}
 	fs := flag.NewFlagSet("wake", flag.ContinueOnError)
 	cooldown := fs.Duration("cooldown", client.DefaultWakeCooldown,
 		"minimum interval between wake actions from the same sender")
 	maxPerMin := fs.Int("max-per-minute", client.DefaultMaxWakeActionsPerMinute,
 		"maximum wake actions per minute across all senders")
-	pidfile := fs.String("pidfile", client.DefaultWakePIDFile(),
+	pidfile := fs.String("pidfile", scope.context.DefaultWakePIDFile(),
 		"pidfile locked while the daemon runs (empty disables)")
 	// Issue #97: when the wake command does more than read-only
 	// ingestion, bridged (non-E2E, untrusted-input) messages can be
@@ -50,7 +50,7 @@ func cmdWake(args []string) error {
 	if len(command) == 0 {
 		return fmt.Errorf("no wake command given: run `courier wake -- <command> [args...]`")
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -71,11 +71,14 @@ func cmdWake(args []string) error {
 // cmdWakeInstall writes a systemd user unit that runs the wake daemon
 // persistently. Installing is the explicit opt-in: wake never starts
 // on its own.
-func cmdWakeInstall(args []string) error {
+func (scope command) cmdWakeInstall(args []string) error {
+	if scope.context.Principal() != "" {
+		return fmt.Errorf("named-context service installation is not enabled; start courier --host HOST wake explicitly")
+	}
 	fs := flag.NewFlagSet("wake install", flag.ContinueOnError)
 	cooldown := fs.Duration("cooldown", client.DefaultWakeCooldown,
 		"minimum interval between wake actions from the same sender")
-	pidfile := fs.String("pidfile", client.DefaultWakePIDFile(),
+	pidfile := fs.String("pidfile", scope.context.DefaultWakePIDFile(),
 		"pidfile locked while the daemon runs (empty disables)")
 	// Issue #97: persisted into the generated unit so installed
 	// daemons keep the operator's bridged-dispatch choice.
@@ -146,6 +149,10 @@ The daemon will run: courier wake -- %s
 Logs: journalctl --user -u courier-wake -f
 `, unitPath, strings.Join(command, " "))
 	return nil
+}
+
+func cmdWakeInstall(args []string) error {
+	return (command{context: client.LegacyContext()}).cmdWakeInstall(args)
 }
 
 func systemdUserDir() (string, error) {

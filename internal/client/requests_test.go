@@ -1,9 +1,11 @@
 package client
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/black-candle-technologies/courier/internal/crypto"
 )
@@ -283,5 +285,80 @@ func TestRequestDismissSuppresses(t *testing.T) {
 	}
 	if len(held) != 1 {
 		t.Fatal("undismiss must surface the request again")
+	}
+}
+
+// TestAcceptRequestPrefersHandle: #146 — accepting a first-contact
+// request names the new contact after the known directory handle
+// instead of generating a "new-xxxx" name.
+func TestAcceptRequestPrefersHandle(t *testing.T) {
+	sender, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	senderAddrStr := crypto.FormatAddress(sender.EdPub[:])
+	var pushed [][]byte
+	cfg, cl := spamTestRecipient(t)
+	env := spamFixture(t, 41, sender, cfg, "hello? first")
+	srv := spamInboxServer(t, []map[string]any{env}, &pushed)
+	if err := cfg.Update(func(fresh *Config) error {
+		fresh.RelayURL = srv.URL
+		fresh.DMPolicy = DMPolicyContacts
+		if fresh.HandleCache == nil {
+			fresh.HandleCache = map[string]HandleCacheEntry{}
+		}
+		fresh.HandleCache[senderAddrStr] = HandleCacheEntry{Handle: "sam", At: time.Now().Unix()}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	held, err := cl.InboxReview(50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(held) != 1 {
+		t.Fatalf("want 1 held request, got %d", len(held))
+	}
+	if _, err := cl.AcceptRequest(41, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := senderAddr(cfg, senderAddrStr); got != "sam" {
+		t.Fatalf("want contact named after handle %q, got %q", "sam", got)
+	}
+}
+
+func TestRequestAcceptRetriesTransientHandleFailure(t *testing.T) {
+	sender, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := crypto.FormatAddress(sender.EdPub[:])
+	cfg, cl := spamTestRecipient(t)
+	var pushed [][]byte
+	base := spamInboxServer(t, []map[string]any{spamFixture(t, 91, sender, cfg, "hello")}, &pushed)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/directory/reverse" {
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+			return
+		}
+		base.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	pointAtServer(t, cfg, srv)
+	if err := cfg.Update(func(fresh *Config) error { fresh.DMPolicy = DMPolicyContacts; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cl.AcceptRequest(91, ""); err == nil {
+		t.Fatal("transient lookup silently created fallback")
+	}
+	if senderAddr(cfg, address) != "" {
+		t.Fatal("failed lookup persisted an alias")
+	}
+	if msgs, err := cl.AcceptRequest(91, "explicit"); err != nil || len(msgs) != 1 {
+		t.Fatalf("explicit alias cannot recover: %v %v", msgs, err)
+	}
+	if cfg.Contacts["explicit"] != address {
+		t.Fatal("explicit alias missing")
 	}
 }

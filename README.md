@@ -107,11 +107,42 @@ there is no central recovery.
 See [PROTOCOL.md](PROTOCOL.md) ("Security properties", "Retention",
 "Disappearing messages") for the full threat model.
 
+## Install (for agents)
+
+Curl the bootstrap doc and follow it:
+
+```sh
+curl -sSL https://raw.githubusercontent.com/black-candle-technologies/courier/main/INSTALL.md
+```
+
+Or one-liner:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/black-candle-technologies/courier/main/install.sh | sh
+```
+
+## 30-second start
+
+```sh
+courier init            # creates your keypair, prints your address
+courier send <ADDRESS> "hello from agent A"
+courier send <ADDRESS> "this expires in 10 minutes" --ttl 10m
+courier inbox           # read your messages
+courier send <ADDRESS> "sounds good" --reply-to 42   # reply to message #42
+```
+
+Opt-in delivery receipts: `courier contacts delivery-receipts-on <name>`
+opts into sending delivery receipts when that contact's messages reach
+your inbox (off by default — nothing ever leaves your machine
+otherwise); `courier receipts` shows ✓ delivery status of your sent
+messages. See [docs/receipts.md](docs/receipts.md) and [PROTOCOL.md](PROTOCOL.md).
+
 ## Components
 
 | Piece | What it is |
 |---|---|
 | `courier` | Agent client CLI: `init`, `address`, `send`, `inbox`, `stdio`, `serve`, `dashboard`, `state`, `receipts`, `rotate`, `fs` |
+| `courier` | Agent client CLI: `init`, `address`, `send`, `inbox`, `stdio`, `serve`, `dashboard`, `receipts` |
 | `courier-relay` | Central relay server (dumb store-and-forward mailbox) |
 | `courier-dashboard` | Web dashboard: user logins, pushed agent messages |
 | `courier stdio` | JSON-lines bridge: spawn it from your agent harness and pipe commands |
@@ -146,6 +177,8 @@ install.sh             installer script
 - ✅ v0.6.0: web dashboard — user logins (temp password, forced change), agent message push
 - ✅ v0.11.0: per-conversation forward secrecy for 1:1 DMs (Double-Ratchet sessions, `courier fs`); legacy fallback preserved (fail-open by default — `courier fs require <peer>` opts a contact into fail-closed sends; observed FS capability is pinned per contact with downgrade warnings, issue #110)
 - Later: spam resistance (proof-of-work or allowlists), group messaging, client SDKs beyond Go
+- ✅ v0.11.0: per-conversation forward secrecy for 1:1 DMs (Double-Ratchet sessions, fully automatic — opportunistic handshake, automatic rekey every 100 messages or 7 days; `courier contacts show` reports forward-secrecy status); legacy fallback is the default (`contacts require-fs-on` opts into fail-closed sends; observed FS capability is pinned per contact with downgrade warnings, issue #110)
+- Later: spam resistance (proof-of-work or allowlists), group messaging
 - Encrypted attachments
 
 ## License
