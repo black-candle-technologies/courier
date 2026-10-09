@@ -35,6 +35,7 @@ import (
 	"github.com/black-candle-technologies/courier/internal/bridge"
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/envelope"
+	"github.com/black-candle-technologies/courier/internal/transport"
 	"github.com/black-candle-technologies/courier/internal/update"
 	"github.com/black-candle-technologies/courier/internal/vhl"
 )
@@ -71,13 +72,16 @@ type Config struct {
 	localContext    *Context
 	unsavedIdentity bool // only NewIdentity may initialize through contact mutation
 
-	Version          int               `json:"version"`
-	RelayURL         string            `json:"relay"`
-	Seed             string            `json:"seed"`                        // base64url 32-byte identity seed
-	Address          string            `json:"address"`                     // ed25519:<base64url> (the public address)
-	Cursor           int64             `json:"cursor"`                      // last inbox message id seen
-	RelayFingerprint string            `json:"relay_fingerprint,omitempty"` // hex SHA256 of relay cert
-	Contacts         map[string]string `json:"contacts,omitempty"`          // name -> ed25519:<base64url> address
+	RelayTransport     string            `json:"relay_transport,omitempty"`
+	DashboardTransport string            `json:"dashboard_transport,omitempty"`
+	TransportReviewed  bool              `json:"transport_reviewed,omitempty"`
+	Version            int               `json:"version"`
+	RelayURL           string            `json:"relay"`
+	Seed               string            `json:"seed"`                        // base64url 32-byte identity seed
+	Address            string            `json:"address"`                     // ed25519:<base64url> (the public address)
+	Cursor             int64             `json:"cursor"`                      // last inbox message id seen
+	RelayFingerprint   string            `json:"relay_fingerprint,omitempty"` // hex SHA256 of relay cert
+	Contacts           map[string]string `json:"contacts,omitempty"`          // name -> ed25519:<base64url> address
 	// issue #48 (phase 1): out-of-band contact verifications, keyed by
 	// contact name. A record pins the address + key epoch the safety
 	// number was computed over; if either changes, trust goes stale.
@@ -239,6 +243,9 @@ func decodeConfig(raw []byte) (*Config, error) {
 	}
 	if c.RelayURL == "" {
 		c.RelayURL = DefaultRelay
+	}
+	if err := c.validateTransport(); err != nil {
+		return nil, err
 	}
 	return &c, nil
 }
@@ -1081,7 +1088,7 @@ func (c *Client) httpClient() (*http.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &http.Client{Timeout: 30 * time.Second, Transport: tr}, nil
+	return &http.Client{Timeout: 30 * time.Second, Transport: tr, CheckRedirect: transport.NoRedirect}, nil
 }
 
 // pinnedTransport builds an HTTP transport that pins the server's TLS
@@ -1093,10 +1100,8 @@ func pinnedTransport(fingerprint string) (*http.Transport, error) {
 		return nil, fmt.Errorf("bad pinned fingerprint; verify and re-pin")
 	}
 	return &http.Transport{
-		// Honor HTTPS_PROXY etc. so agents behind egress proxies can
-		// reach the server. The proxy only tunnels bytes (CONNECT);
-		// TLS still terminates at the server and the pin below applies
-		// end-to-end.
+		// Honor the configured proxy. Only a byte-passthrough proxy can
+		// satisfy the original relay pin; TLS interception fails closed.
 		Proxy: http.ProxyFromEnvironment,
 		TLSClientConfig: &tls.Config{
 			// Certificate authority validation is skipped: trust comes
@@ -1135,7 +1140,7 @@ func (c *Client) dashboardHTTPClient() (*http.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &http.Client{Timeout: 30 * time.Second, Transport: tr}, nil
+	return &http.Client{Timeout: 30 * time.Second, Transport: tr, CheckRedirect: transport.NoRedirect}, nil
 }
 
 // FetchRelayFingerprint dials an https relay and returns the hex SHA256 of
@@ -1155,7 +1160,7 @@ func FetchRelayFingerprint(relayURL string) (string, error) {
 		Proxy:           http.ProxyFromEnvironment,
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	hc := &http.Client{Transport: tr, Timeout: 30 * time.Second}
+	hc := &http.Client{Transport: tr, Timeout: 30 * time.Second, CheckRedirect: transport.NoRedirect}
 	resp, err := hc.Get(relayURL + "/v1/health")
 	if err != nil {
 		return "", fmt.Errorf("relay unreachable: %w", err)
@@ -2626,6 +2631,7 @@ func (c *Client) MaybeUpdateCheck(current string) {
 			return
 		}
 		fmt.Fprintf(os.Stderr, "courier auto-updated to %s (this run used the previous version)\n", rel.Tag)
+		fmt.Fprintln(os.Stderr, "Transport settings and pins preserved; cloud transport unavailable. Run courier update interactively to review transport settings.")
 		if c.cfg.DashboardToken == "" {
 			fmt.Fprintf(os.Stderr, "new in this release: web dashboard — run `courier dashboard setup --username <name>` to create your user's login\n")
 		}
@@ -2685,6 +2691,16 @@ func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassw
 	if c.cfg.DashboardURL == "" {
 		c.cfg.DashboardURL = DefaultDashboardURL
 	}
+	if _, err := transport.Resolve(transport.DirectTLS, c.cfg.DashboardURL); err != nil {
+		return "", err
+	}
+	want := c.expectedDashboardFingerprint(expectedFingerprint)
+	if want == "" {
+		return "", fmt.Errorf("dashboard setup requires --fingerprint from an independently trusted source")
+	}
+	if _, err := pinnedTransport(want); err != nil {
+		return "", err
+	}
 	tempPassword, err = GenerateTempPassword()
 	if err != nil {
 		return "", err
@@ -2705,13 +2721,12 @@ func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassw
 	// provided fingerprint always wins; otherwise, when the dashboard
 	// shares the relay's host (the documented deployment shares the
 	// relay's certificate), the fetched fingerprint must equal the
-	// already-pinned relay fingerprint. Anything else is TOFU with the
-	// fingerprint printed for human verification.
+	// already-pinned relay fingerprint. Without either trust anchor setup
+	// is rejected before discovery or account registration.
 	fp, err := FetchRelayFingerprint(c.cfg.DashboardURL)
 	if err != nil {
 		return "", fmt.Errorf("dashboard unreachable: %w", err)
 	}
-	want := c.expectedDashboardFingerprint(expectedFingerprint)
 	fmt.Fprintf(os.Stderr, "dashboard certificate SHA256: %s\n", fp)
 	if want != "" && !strings.EqualFold(fp, want) {
 		return "", fmt.Errorf("dashboard certificate mismatch: got SHA256 %s, want %s; refusing to register (possible MITM or rotated certificate — verify and re-run with --fingerprint)", fp, want)
@@ -2727,7 +2742,7 @@ func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassw
 		"address":  c.cfg.Address,
 		"sig":      base64.RawURLEncoding.EncodeToString(sig),
 	})
-	resp, err := (&http.Client{Timeout: 30 * time.Second, Transport: hc}).Post(
+	resp, err := (&http.Client{Timeout: 30 * time.Second, Transport: hc, CheckRedirect: transport.NoRedirect}).Post(
 		c.cfg.DashboardURL+"/v1/dashboard/register", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("register: %w", err)
@@ -2986,7 +3001,7 @@ func (c *Client) refreshPeerHandles(hc *http.Client) {
 	if err != nil {
 		return
 	}
-	if cfg.Address != c.cfg.Address || cfg.Seed != c.cfg.Seed || cfg.RelayURL != c.cfg.RelayURL || (cfg.RelayFingerprint != c.cfg.RelayFingerprint && !sameCertificatePin(cfg.RelayFingerprint, c.cfg.RelayFingerprint)) || cfg.DashboardURL != c.cfg.DashboardURL || cfg.DashboardFingerprint != c.cfg.DashboardFingerprint || cfg.DashboardToken != c.cfg.DashboardToken {
+	if cfg.RelayTransport != c.cfg.RelayTransport || cfg.DashboardTransport != c.cfg.DashboardTransport || cfg.Address != c.cfg.Address || cfg.Seed != c.cfg.Seed || cfg.RelayURL != c.cfg.RelayURL || (cfg.RelayFingerprint != c.cfg.RelayFingerprint && !sameCertificatePin(cfg.RelayFingerprint, c.cfg.RelayFingerprint)) || cfg.DashboardURL != c.cfg.DashboardURL || cfg.DashboardFingerprint != c.cfg.DashboardFingerprint || cfg.DashboardToken != c.cfg.DashboardToken {
 		return
 	}
 	current := cachedDashboardTrust(cfg)
@@ -3125,6 +3140,9 @@ func (s Context) appendSentLog(e SentEntry) error {
 // refreshState deliberately leaves the captured context immutable.
 // The caller holds configMu; only persisted fields are refreshed.
 func (c *Config) refreshState(fresh *Config) {
+	c.RelayTransport = fresh.RelayTransport
+	c.DashboardTransport = fresh.DashboardTransport
+	c.TransportReviewed = fresh.TransportReviewed
 	c.Version = fresh.Version
 	c.RelayURL = fresh.RelayURL
 	c.Seed = fresh.Seed

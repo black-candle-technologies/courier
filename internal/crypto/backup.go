@@ -88,6 +88,7 @@ type BackupPayload struct {
 	Device           string         `json:"device,omitempty"` // producing device's name
 	Address          string         `json:"address"`          // ed25519:<base64url>
 	RelayURL         string         `json:"relay_url,omitempty"`
+	RelayTransport   string         `json:"relay_transport,omitempty"`
 	RelayFingerprint string         `json:"relay_fingerprint,omitempty"`
 	Seed             string         `json:"seed"`     // base64url 32-byte identity seed
 	EncKeys          []BackupEncKey `json:"enc_keys"` // live keypairs, current first

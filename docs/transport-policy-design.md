@@ -1,7 +1,8 @@
 # Transport configuration: design review checkpoint
 
-Status: proposal only; no new transport is implemented or enabled. This change
-requires parent security review before protocol implementation. A cloud mode
+Status: configuration/setup scaffolding accepted by independent security review
+through the parent handoff. No new wire transport is implemented or enabled.
+Protocol implementation still requires a separate reviewed design. A cloud mode
 additionally requires independently reviewed design and verified platform support.
 
 ## Base and scope
@@ -152,3 +153,31 @@ migration, without changing existing trust anchors automatically.
 
 No merge, production test, deployment, identity migration or enabled cloud
 transport is authorized by this proposal.
+
+## Implemented first increment and remaining gates
+
+The scaffold implements separate relay/dashboard policy fields, direct-TLS relay
+CLI validation, pre-I/O unavailable-mode rejection, explicit fresh setup, verified
+bootstrap/repin, a once-per-install interactive keep/cancel upgrade review, and
+noninteractive preservation. Transport review reads config without lazy migrations;
+recording acknowledgement uses the existing locked atomic update path. Invalid
+manifests do not prevent executable updates. The installer and automatic updater
+provide nonblocking guidance rather than reading stdin.
+
+New plaintext setup is not exposed; existing omitted-policy non-HTTPS configs
+retain their historical behavior. Pinned HTTPS clients and bootstrap now reject
+redirects to prevent cross-origin or plaintext downgrade; this is an intentional
+compatibility tightening. No pin verifier, TLS hostname behavior or default relay
+port changed. Dashboard bootstrap now requires an expected independent fingerprint
+or the already pinned relay certificate under the existing shared-host rule.
+
+Older binaries ignore new config fields. That is acceptable only for this
+increment because explicit direct-tls has the same existing leaf-pin behavior and
+no alternate mode can be persisted by these commands. It is NOT downgrade
+resistance: an older executable may ignore a manually injected future mode and
+retains older redirect/bootstrap behavior. A future transport requires a separately
+reviewed version/format barrier and rollback policy before it can be enabled.
+
+The requirements above for cloud support, complete authenticated responses,
+metadata confidentiality and negotiation remain unimplemented and blocked. No
+actual dot-cloud compatibility or live identity test has been performed.

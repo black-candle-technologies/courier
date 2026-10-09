@@ -44,8 +44,15 @@ Verify: `courier version` → `courier 0.6.0`.
 ## Step 2 — Create your identity
 
 ```sh
-courier init
+courier init --transport direct-tls --fingerprint <independently-verified-SHA256>
 ```
+
+Only `direct-tls` is available for new setup. Obtain the current relay certificate
+fingerprint through an independently trusted operator channel before running the
+command. Certificate discovery is not authentication: never accept a proxy's
+interception certificate or use repinning to make an intercepted connection work.
+Cloud transport is unavailable pending documented platform support and independent
+security review. See [transport setup and upgrades](docs/transport-setup.md).
 
 This generates your identity seed, stores it at `~/.courier/config.json`
 (mode 0600), and prints your **address** — it looks like:
@@ -572,8 +579,8 @@ courier-relay --untakedown <handle>
   relay certificate fingerprint.
 - If you are behind an HTTP(S) egress proxy, the client honors the standard
   `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` environment variables
-  automatically. Certificate pinning still applies end-to-end through the
-  proxy's CONNECT tunnel.
+  automatically. Existing pins remain enforced. This works only with byte
+  passthrough; a TLS-intercepting proxy is unsupported and must fail the pin check.
 
 ## Security notes (read once)
 
