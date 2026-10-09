@@ -196,3 +196,32 @@ func TestBridgedSendMaintainsLegacyStateAfterStartup(t *testing.T) {
 		t.Fatalf("gateway retained expired state: %s %v", b, err)
 	}
 }
+
+func TestFSRetiredAndExpiredPayloadsStayOutOfChat(t *testing.T) {
+	h := newFSHarness(t)
+	h.asAlice(func() {
+		if err := h.alice.sendFSInit(h.bobCfg.Address); err != nil {
+			t.Fatal(err)
+		}
+	})
+	h.bobInbox(t)
+	h.aliceInbox(t)
+	for _, body := range []string{`{"cs":1,"t":"state","v":99,"events":[]}`, `{"cc":2,"t":"msg","v":99}`, `{"v":1,"body":"expired","expires_at":1}`} {
+		h.asAlice(func() {
+			if _, err := h.alice.Send(h.bobCfg.Address, body); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if msgs := h.bobInbox(t); len(msgs) != 0 {
+			t.Fatalf("protocol or expired FS plaintext became chat: %+v", msgs)
+		}
+	}
+	h.asAlice(func() {
+		if _, err := h.alice.Send(h.bobCfg.Address, "live control"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if msgs := h.bobInbox(t); len(msgs) != 1 || msgs[0].Body != "live control" {
+		t.Fatalf("FS session failed after consumed frames: %+v", msgs)
+	}
+}
