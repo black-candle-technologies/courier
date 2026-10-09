@@ -929,9 +929,10 @@ behavior.
 
 ### 15.2 Negotiation
 
-FS starts only with **positive knowledge** that the peer supports it
-— the client never probes unknown peers (a probe is a protocol DM a
-legacy client would display as chat garbage):
+Automatic FS initiation needs **positive knowledge** that the peer
+supports it. Unknown peers are not automatically probed: a legacy
+client would display the handshake protocol DM as chat garbage.
+Automatic initiation uses:
 
 1. **Directory capability:** the peer's directory profile lists the
    `fs` capability token (v0.11.0+ clients auto-include it on
@@ -944,12 +945,16 @@ legacy client would display as chat garbage):
    no prompt.
 
 Peers with private handles (or no handle) cannot advertise `fs`
-through the directory; for them FS starts when they initiate (inbound
-proof) or once a handshake has been observed.
+through the directory. An operator who knows that a saved contact
+supports FS can authorize a probe with `courier contacts start-fs
+<name>` without changing send policy. `require-fs-on` also authorizes
+probes while enforcing fail-closed sends. Otherwise private peers
+bootstrap through inbound proof or prior handshake memory. Both
+peers must poll their inboxes to complete the exchange.
 
-There are no manual FS controls (#146): no opt-out, no per-peer
-modes. `courier contacts remove` erases the peer's FS session as part
-of contact removal.
+There is no legacy-only opt-out or `courier fs` command tree (#146).
+The remaining contact controls are listed in §15.8. Removing the last
+alias for a peer erases its FS session and policy.
 
 ### 15.3 Handshake (X3DH-shaped, no prekeys)
 The initiator generates `rk0` (32 random bytes), an ephemeral X25519
@@ -1036,7 +1041,7 @@ Standard Signal-shaped, per conversation (`crypto.FSRootStep`,
 - **Symmetric step** (every message)
 ### 15.5 Fail-open negotiation (stated plainly)
 
-**FS is opportunistic, not enforced.** This is the standard
+**FS is opportunistic by default; require-fs enforces fail-closed sends.** This is the standard
 opportunistic-encryption trade-off (cf. STARTTLS), and the spec states
 it without euphemism:
 
@@ -1102,10 +1107,23 @@ sent over FS, only their relay-side metadata (blob id, size, timing).
 
 ### 15.8 CLI
 
-There are no `courier fs` commands (#146) — forward secrecy is fully
-automatic. `courier contacts show <name>` reports `forward secrecy:
-active/inactive` for the peer, and `courier contacts remove <name>`
-erases the peer's FS session as part of contact removal.
+There are no `courier fs` commands (#146). Contact controls are:
+
+- `courier contacts start-fs <name>` explicitly probes a saved FS-capable
+  contact, including private/no-handle peers, without changing send
+  policy. Active sessions are preserved under the session lock. A
+  repeated command restarts a pending handshake with a fresh init;
+  both peers must poll their inboxes before FS becomes active.
+- `courier contacts require-fs-on <name>` opts into fail-closed sends
+  and authorizes handshake probes. Sends fail until a session exists.
+- `courier contacts require-fs-off <name>` restores opportunistic
+  fallback; it does not erase the session or capability pins.
+- `courier contacts show <name>` reports session and policy status.
+- `courier contacts remove <name>` erases the peer's FS state after
+  the last local alias is removed successfully.
+
+Explicit probing requires the operator to know that the peer supports
+FS; legacy clients can display the probe as raw protocol text.
 
 ## 16. Group messaging (issue #32)
 
