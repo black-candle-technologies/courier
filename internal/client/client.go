@@ -2269,7 +2269,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 				}
 			}
 		}
-		for _, e := range readReplyCache() {
+		for _, e := range c.cfg.local().readReplyCache() {
 			if e.Snippet != "" {
 				if _, ok := local[e.CourierID]; !ok {
 					local[e.CourierID] = e.Snippet

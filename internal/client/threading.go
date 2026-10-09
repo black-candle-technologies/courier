@@ -155,6 +155,14 @@ func (s Context) replyCachePath() (string, error) {
 // corrupt file yields no entries, never an error: the cache is a
 // best-effort accelerator.
 func (s Context) readReplyCache() []replyCacheEntry {
+	var entries []replyCacheEntry
+	if err := s.withConfigLock(func() error { entries = s.readReplyCacheLocked(); return nil }); err != nil {
+		return nil
+	}
+	return entries
+}
+
+func (s Context) readReplyCacheLocked() []replyCacheEntry {
 	p, err := s.replyCachePath()
 	if err != nil {
 		return nil
@@ -195,7 +203,7 @@ func (s Context) writeReplyCacheLocked(entries []replyCacheEntry) {
 		_, ok := merged[id]
 		return ok
 	}
-	for _, e := range s.readReplyCache() {
+	for _, e := range s.readReplyCacheLocked() {
 		if !seen(e.CourierID) {
 			order = append(order, e.CourierID)
 		}
@@ -256,7 +264,11 @@ func (s Context) LookupReplyParent(replyTo int64) (quote string, ok bool) {
 }
 
 func LookupReplyParent(replyTo int64) (quote string, ok bool) {
-	return LegacyContext().LookupReplyParent(replyTo)
+	scope, err := LegacyContext().ActiveContext()
+	if err != nil {
+		return "", false
+	}
+	return scope.LookupReplyParent(replyTo)
 }
 
 func (s Context) writeReplyCache(entries []replyCacheEntry) {

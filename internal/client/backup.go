@@ -168,7 +168,11 @@ func (s Context) RestoreBackup(passphrase, raw []byte, force bool) (*Config, err
 }
 
 func RestoreBackup(passphrase, raw []byte, force bool) (*Config, error) {
-	return LegacyContext().RestoreBackup(passphrase, raw, force)
+	scope, err := LegacyContext().ActiveContext()
+	if err != nil {
+		return nil, err
+	}
+	return scope.RestoreBackup(passphrase, raw, force)
 }
 
 func addrSuffix(addr string) string {
