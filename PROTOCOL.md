@@ -1825,9 +1825,16 @@ Two paths (`internal/dashboard/dashboard.go`,
 
 At most 200 messages per push; bodies over 256 KiB are skipped.
 Messages are deduplicated per user by `courier_id`; the agent
-advances its local cursor past every attempted push. `handles` and
+advances its local cursor only after a successful push. `handles` and
 `verified` are the agent-reported peer labels (§17.6, §18). Each
 push also sweeps already-expired `expires_at` rows (§21).
+
+Dashboard batches and periodic label updates use only unexpired local
+handle-cache entries. They never query the directory during rendering;
+unknown or expired labels are omitted while messages retain full peer
+addresses. Explicit contact discovery or request acceptance can refresh
+verified handle evidence independently. A transient lookup failure never
+creates an authoritative empty handle entry.
 
 ### 24.4 Security properties
 
