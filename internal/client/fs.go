@@ -966,6 +966,11 @@ func (c *Client) sendFSInitGuarded(address string, preserveActive bool) error {
 			skipped = true
 			return nil
 		}
+		// Explicit start-fs bypasses fsPrepareSend's attempt clock. Persist its
+		// fresh probe with the pending session so immediate sends recognize it.
+		if preserveActive {
+			ff.LastInitAt[address] = now
+		}
 		ff.Sessions[address] = &fsSession{
 			Peer: address, SID: p.SID, Initiator: true, Established: false,
 			InitID: p.InitID, RK0: p.RK0, EphPriv: b64fs.EncodeToString(ephPriv[:]),

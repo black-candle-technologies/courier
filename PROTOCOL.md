@@ -69,7 +69,7 @@ sender's Ed25519 identity key under a domain-separated canonical form
   shown to the user. Legacy clients render their JSON as chat text
   (harmless degradation, §27).
 - **Consumer.** One of the client's independent inbox readers. The
-  implementation has three: the interactive inbox poller, the dashboard
+  implementation has two: the interactive inbox poller and the dashboard
   pusher. Each keeps its own seen set and
   cursor (§10.2).
 - **Bridge identity.** The Courier identity held by the ChatGPT-web
