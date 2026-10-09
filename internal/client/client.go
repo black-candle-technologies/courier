@@ -2798,9 +2798,10 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 }
 
 // refreshPeerHandles pushes a handles-only update for every cached peer
-// whose label may be stale, at most once per 24h. Without this, threads
-// with no new messages would never get (or lose) their @handle label,
-// because handles are otherwise only attached to message batches.
+// using only locally cached evidence, at most once per 24h. Directory
+// outages must not block dashboard delivery. Expired labels are omitted;
+// the dashboard applies its own label TTL. Explicit discovery refreshes
+// the local cache independently of dashboard rendering.
 func (c *Client) refreshPeerHandles(hc *http.Client) {
 	if time.Now().Unix()-c.cfg.HandleRefreshAt < 24*3600 {
 		return
@@ -2809,8 +2810,8 @@ func (c *Client) refreshPeerHandles(hc *http.Client) {
 	for peer := range c.cfg.HandleCache {
 		peers = append(peers, peer)
 	}
-	// Also cover named contacts: their handles may have been registered
-	// after the last refresh.
+	// Also cover named contacts whose cached label changed since the
+	// last dashboard update.
 	for _, addr := range c.cfg.Contacts {
 		peers = append(peers, addr)
 	}
@@ -2821,7 +2822,7 @@ func (c *Client) refreshPeerHandles(hc *http.Client) {
 			continue
 		}
 		seen[peer] = true
-		if h := c.PeerHandle(peer); h != "" {
+		if h := c.CachedPeerHandle(peer); h != "" {
 			handles[peer] = h
 		}
 	}
@@ -2880,8 +2881,8 @@ func (c *Client) pushBatch(hc *http.Client, batch []pushItem) (stored int, inbox
 		}
 	}
 	// issue #39: attach listed handles for the batch's peers so the
-	// dashboard can display them. PeerHandle is cached (24h TTL), so the
-	// per-minute push does not query the directory for every thread.
+	// dashboard can display them. Rendering must not perform directory I/O:
+	// serial cache misses could otherwise delay a batch by 30s per peer.
 	handles := map[string]string{}
 	for _, it := range batch {
 		peer := it.msg.From
@@ -2891,7 +2892,7 @@ func (c *Client) pushBatch(hc *http.Client, batch []pushItem) (stored int, inbox
 		if _, done := handles[peer]; done {
 			continue
 		}
-		if h := c.PeerHandle(peer); h != "" {
+		if h := c.CachedPeerHandle(peer); h != "" {
 			handles[peer] = h
 		}
 	}
