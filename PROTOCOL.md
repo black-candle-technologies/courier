@@ -836,7 +836,7 @@ The envelope ciphertext decrypts to one of (dispatch order in
    receipts `{"cr": 3, ...}` (§19). Recognized types are consumed
    silently; unknown `cg`/`cr` values fall through as ordinary
    chat — never silently swallowed. VHL frames (§28) and verified
-   introductions (§25) are handled next under their validation and
+   introductions (§17) are handled next under their validation and
    review policies.
 3. **Retired protocols**: state `{"cs":1,"t":"state",...}` (any
    version) and recognized channel `{"cc":2,...}` frames are consumed
