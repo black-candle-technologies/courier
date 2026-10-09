@@ -150,9 +150,8 @@ func TestContextDashboardSetupRefreshesCallerAndPreservesRotation(t *testing.T) 
 				_, _ = w.Write([]byte(`{"username":"fixture-user","api_token":"fixture-token"}`))
 			}))
 			defer server.Close()
-			cfg.DashboardURL = server.URL
 			pin := sha256.Sum256(server.Certificate().Raw)
-			if _, err := New(cfg).DashboardSetup("fixture-user", hex.EncodeToString(pin[:])); err != nil {
+			if _, err := New(cfg).DashboardSetupAt("fixture-user", hex.EncodeToString(pin[:]), server.URL); err != nil {
 				t.Fatal(err)
 			}
 			if cfg.DashboardUser != "fixture-user" || cfg.DashboardURL != server.URL || cfg.DashboardToken != "fixture-token" {

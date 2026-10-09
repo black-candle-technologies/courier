@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/crypto"
+	"github.com/black-candle-technologies/courier/internal/transport"
 )
 
 // This file implements the client side of identity backup and
@@ -66,6 +67,7 @@ func (c *Config) backupPayload(kind, device string) (*crypto.BackupPayload, erro
 		Address:          c.Address,
 		RelayURL:         c.RelayURL,
 		RelayFingerprint: c.RelayFingerprint,
+		RelayTransport:   c.RelayTransport,
 		Seed:             base64.RawURLEncoding.EncodeToString(seedRaw),
 		EncKeys:          keys,
 	}, nil
@@ -138,6 +140,7 @@ func (s Context) RestoreBackup(passphrase, raw []byte, force bool) (*Config, err
 			Version:          ConfigVersion,
 			RelayURL:         relayURL,
 			RelayFingerprint: p.RelayFingerprint,
+			RelayTransport:   p.RelayTransport,
 			Seed:             p.Seed,
 			Address:          p.Address,
 			EncKeys:          keys,
@@ -195,6 +198,9 @@ func addrSuffix(addr string) string {
 // monotonic in time. Returns the number of keys the sync added.
 func (c *Config) MergeSyncKeys(p *crypto.BackupPayload) (added int, err error) {
 	if err := p.Validate(); err != nil {
+		return 0, err
+	}
+	if _, err := transport.Resolve(p.RelayTransport, p.RelayURL); err != nil {
 		return 0, err
 	}
 	if p.Kind != crypto.BackupKindSync {
