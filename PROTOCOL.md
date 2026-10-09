@@ -16,7 +16,8 @@ core. §9 is the relay API reference. §10–§14 cover messaging machinery
 every endpoint relies on. §15–§23 specify optional protocol layers that
 ride inside ordinary envelopes. §24 covers the bridge boundary, §25 the
 dashboard, §26–§27 the security properties stated honestly, §28
-versioning. Appendix A is the canonical signature-domain registry;
+versioning; §29 specifies Verified Human in the Loop. Appendix A is
+the canonical signature-domain registry;
 Appendix B lists pending changes.
 
 ## 1. Overview
@@ -837,7 +838,10 @@ The envelope ciphertext decrypts to one of (dispatch order in
    (§20). Recognized types are consumed silently; unknown
    `cg`/`cs`/`cr` values fall through as ordinary chat — never
    silently swallowed.
-3. **Versioned chat payloads**:
+3. **Retired channel frames**: recognized `{"cc":2,...}` payloads
+   are consumed silently before chat decoding (§28); the discriminator
+   is reserved and must not be reused.
+4. **Versioned chat payloads**:
    - **Raw text** — plain messages. Old clients render everything as
      text; this is the compatible baseline.
    - **v1** (`{"v": 1, "body": ..., "attachments": [...],
@@ -847,7 +851,7 @@ The envelope ciphertext decrypts to one of (dispatch order in
    - **v2** (`{"v": 2, "body": ..., "reply_to"?, "quote"?,
      "attachments"?, "expires_at"?, "bridge"?}`) — reply threading
      (§21), plus attachments/expiry, plus bridge attribution (§24).
-4. Anything else renders as raw text (harmless degradation, §28).
+5. Anything else renders as raw text (harmless degradation, §28).
 
 `encodeMessageBody` (`internal/client/threading.go`) picks the
 minimal form: raw text for plain messages, v1 when attachments or a
@@ -2053,35 +2057,6 @@ Carried over from prior disclosures; each is tracked:
 cache insertion, dashboard publication, or channel mutation. Explicit fetch
 refuses these protocol frames. See [legacy archive retirement](docs/legacy-channel-retirement.md).
 
-## Appendix A. Canonical signature-domain registry
-
-All domains are defined in `internal/envelope/envelope.go`. `0x00`
-separates variable-length fields; `be64` is big-endian uint64.
-
-| Domain | Signed by | Covers |
-|---|---|---|
-| `courier-envelope-sig-v1` | DM sender | `to(32) \|\| from(32) \|\| eph(32) \|\| nonce(24) \|\| be64(sent_at) \|\| ct` |
-| `courier-group-envelope-v1` | group sender | `SHA256("courier-group-id-v1"\x00 \|\| groupID) \|\| from(32) \|\| be64(key_epoch) \|\| eph(32) \|\| nonce(24) \|\| be64(sent_at) \|\| ct` |
-| `courier-group-control-v1` | group admin | `groupID \|\| 0x00 \|\| action \|\| 0x00 \|\| target \|\| 0x00 \|\| admin \|\| 0x00 \|\| be64(epoch)` |
-| `courier-group-inbox-req-v1` | group member | `groupID \|\| 0x00 \|\| member(32) \|\| be64(after) \|\| be64(limit) \|\| be64(ts)` |
-| `courier-key-announce-v1` | identity owner | `address(32) \|\| x25519_pub(32) \|\| be64(epoch)` |
-| `courier-inbox-req-v1` | recipient | `address(32) \|\| be64(after) \|\| be64(limit) \|\| be64(ts)` |
-| `courier-subscribe-req-v1` | recipient | `address(32) \|\| be64(cursor) \|\| be64(ts)` |
-| `courier-spam-report-v1` | reporter | `reporter(32) \|\| be64(envelope_id) \|\| be64(ts)` |
-| `courier-blob-upload-v1` | uploader | `from(32) \|\| to(32) \|\| blob_id(32) \|\| be64(size) \|\| be64(ts)` |
-| `courier-blob-req-v1` | recipient | `address(32) \|\| blob_id(32) \|\| be64(ts)` |
-| `courier-dashboard-register-v1` | identity owner | `username \|\| 0x00 \|\| address(32)` |
-| `courier-directory-register-v1` | handle owner | `handle \|\| 0x00 \|\| address(32) \|\| be64(epoch) \|\| 0x00 \|\| visibility \|\| 0x00 \|\| contact_policy \|\| 0x00 \|\| capabilities joined by 0x00` |
-| `courier-directory-transfer-v1` | current holder | `handle \|\| 0x00 \|\| new_address(32) \|\| be64(epoch)` |
-| `courier-directory-deregister-v1` | handle owner | `handle \|\| 0x00 \|\| address(32) \|\| be64(epoch)` |
-| `courier-directory-query-v1` | querier | `querier(32) \|\| 0x00 \|\| op \|\| 0x00 \|\| query \|\| 0x00 \|\| be64(ts)` |
-| `courier-introduction-req-v1` | requester | `requester(32) \|\| introducer(32) \|\| handle \|\| 0x00 \|\| be64(ts)` |
-| `courier-introduction-v1` | introducer | `introducer(32) \|\| subject(32) \|\| recipient(32) \|\| be64(ts)` |
-
-Safety numbers (not a signature) use the hash domain
-`courier-safety-v1` over both parties' Ed25519 keys, X25519 keys,
-and key epochs (§18).
-
 ## 29. Verified Human in the Loop (issue #142)
 
 VHL lets a **receiver** verify that a message an agent sent was
@@ -2464,6 +2439,35 @@ an approver enrollment).
   dashboard session is visible to the relay's login gate. No proxy
   or production routing changes are part of this change — that is
   separate deploy work.
+
+## Appendix A. Canonical signature-domain registry
+
+All domains are defined in `internal/envelope/envelope.go`. `0x00`
+separates variable-length fields; `be64` is big-endian uint64.
+
+| Domain | Signed by | Covers |
+|---|---|---|
+| `courier-envelope-sig-v1` | DM sender | `to(32) \|\| from(32) \|\| eph(32) \|\| nonce(24) \|\| be64(sent_at) \|\| ct` |
+| `courier-group-envelope-v1` | group sender | `SHA256("courier-group-id-v1"\x00 \|\| groupID) \|\| from(32) \|\| be64(key_epoch) \|\| eph(32) \|\| nonce(24) \|\| be64(sent_at) \|\| ct` |
+| `courier-group-control-v1` | group admin | `groupID \|\| 0x00 \|\| action \|\| 0x00 \|\| target \|\| 0x00 \|\| admin \|\| 0x00 \|\| be64(epoch)` |
+| `courier-group-inbox-req-v1` | group member | `groupID \|\| 0x00 \|\| member(32) \|\| be64(after) \|\| be64(limit) \|\| be64(ts)` |
+| `courier-key-announce-v1` | identity owner | `address(32) \|\| x25519_pub(32) \|\| be64(epoch)` |
+| `courier-inbox-req-v1` | recipient | `address(32) \|\| be64(after) \|\| be64(limit) \|\| be64(ts)` |
+| `courier-subscribe-req-v1` | recipient | `address(32) \|\| be64(cursor) \|\| be64(ts)` |
+| `courier-spam-report-v1` | reporter | `reporter(32) \|\| be64(envelope_id) \|\| be64(ts)` |
+| `courier-blob-upload-v1` | uploader | `from(32) \|\| to(32) \|\| blob_id(32) \|\| be64(size) \|\| be64(ts)` |
+| `courier-blob-req-v1` | recipient | `address(32) \|\| blob_id(32) \|\| be64(ts)` |
+| `courier-dashboard-register-v1` | identity owner | `username \|\| 0x00 \|\| address(32)` |
+| `courier-directory-register-v1` | handle owner | `handle \|\| 0x00 \|\| address(32) \|\| be64(epoch) \|\| 0x00 \|\| visibility \|\| 0x00 \|\| contact_policy \|\| 0x00 \|\| capabilities joined by 0x00` |
+| `courier-directory-transfer-v1` | current holder | `handle \|\| 0x00 \|\| new_address(32) \|\| be64(epoch)` |
+| `courier-directory-deregister-v1` | handle owner | `handle \|\| 0x00 \|\| address(32) \|\| be64(epoch)` |
+| `courier-directory-query-v1` | querier | `querier(32) \|\| 0x00 \|\| op \|\| 0x00 \|\| query \|\| 0x00 \|\| be64(ts)` |
+| `courier-introduction-req-v1` | requester | `requester(32) \|\| introducer(32) \|\| handle \|\| 0x00 \|\| be64(ts)` |
+| `courier-introduction-v1` | introducer | `introducer(32) \|\| subject(32) \|\| recipient(32) \|\| be64(ts)` |
+
+Safety numbers (not a signature) use the hash domain
+`courier-safety-v1` over both parties' Ed25519 keys, X25519 keys,
+and key epochs (§18).
 
 ## Appendix B. In-flight work requiring spec updates after merge
 
