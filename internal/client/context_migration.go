@@ -101,10 +101,7 @@ func durableReplace(path string, data []byte) error {
 	if err = f.Close(); err != nil {
 		return err
 	}
-	if err = os.Rename(temp, path); err != nil {
-		return err
-	}
-	return syncContextDir(filepath.Dir(path))
+	return commitContextFile(temp, path)
 }
 func syncContextDir(path string) error {
 	f, err := os.Open(path)
