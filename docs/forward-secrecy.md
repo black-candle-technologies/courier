@@ -79,12 +79,16 @@ them — no new relay endpoint, no new signed object.
      ordinary legacy sends don't hit the directory on every message (a
      newly-registered peer is discovered on the next send after that).
   2. **Handshake memory:** a previous successful handshake with the address
-     is recorded locally — no re-probing, ever.
+     is recorded locally, so routine capability discovery needs no new directory
+     probe. A missing session can still trigger a new handshake; an unknown
+     session ID can trigger rate-limited recovery.
   3. **Inbound proof:** receiving a valid `fs-init` proves the peer speaks
      FS; the client records it and answers — automatically, with no
      prompt.
 - **Fallback:** no positive knowledge → today's legacy seal, byte for byte.
-  Without an explicit require-FS policy, the client **never sends handshake probes to unknown peers**: an `fs-init`
+  Without positive capability knowledge or explicit authorization through
+  `contacts require-fs-on` or `contacts start-fs`, ordinary sends do not probe
+  unknown peers: an `fs-init`
   is a protocol DM, and a legacy client would display its JSON as a chat
   message. Probing strangers would spam them with garbage — the exact
   failure mode the v0.6.11 policy exists to prevent.

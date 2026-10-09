@@ -183,7 +183,7 @@ func (h *fsHarness) doHandshake(t *testing.T) {
 	h.asAlice(func() {
 		// Automatic initiation would also work (directory capability),
 		// but the test forces the init directly for determinism.
-		if err := h.alice.sendFSInit(h.bobCfg.Address); err != nil {
+		if err := h.alice.sendFSRecoveryInit(h.bobCfg.Address); err != nil {
 			t.Fatalf("alice fs init: %v", err)
 		}
 	})
@@ -537,7 +537,7 @@ func TestFSActive(t *testing.T) {
 func TestFSHandshakeNotInSentLog(t *testing.T) {
 	h := newFSHarness(t)
 	h.asAlice(func() {
-		if err := h.alice.sendFSInit(h.bobCfg.Address); err != nil {
+		if err := h.alice.sendFSRecoveryInit(h.bobCfg.Address); err != nil {
 			t.Fatalf("fs init: %v", err)
 		}
 	})
