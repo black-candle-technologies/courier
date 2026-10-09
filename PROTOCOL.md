@@ -1061,7 +1061,7 @@ it without euphemism:
   suppresses directory availability; a pinned peer suddenly reachable
   only via legacy is flagged `DOWNGRADE SUSPECTED` in
   `courier fs status` plus a rate-limited send-time warning.
-- Protocol DMs (group/state/handshake traffic) stay
+- Protocol DMs (group/handshake traffic) stay
   legacy-sealed by design: delivery reliability matters more for
   machine state, and the inbox pipeline decrypts FS before dispatch.
   FS applies only to human sends (`logSent=true`).
