@@ -141,10 +141,16 @@ func teamCounter(s string) (uint64, error) {
 	return v, nil
 }
 func teamB64(s string, n int) bool {
+	if len(s) != base64.RawURLEncoding.EncodedLen(n) {
+		return false
+	}
 	b, e := base64.RawURLEncoding.Strict().DecodeString(s)
 	return e == nil && len(b) == n && base64.RawURLEncoding.EncodeToString(b) == s
 }
 func teamAddress(s string) bool {
+	if len(s) != len(couriercrypto.AddressPrefix)+base64.RawURLEncoding.EncodedLen(32) {
+		return false
+	}
 	p, e := couriercrypto.ParseAddressSuite(s)
 	return e == nil && p.Suite == couriercrypto.SuiteV1 && couriercrypto.FormatAddress(p.PublicKey) == s
 }
@@ -199,8 +205,24 @@ func teamOrigin(s string) bool {
 // NewTeamRoot derives public identifiers from caller-supplied creation entropy.
 // No randomness or key generation is performed here.
 func NewTeamRoot(origin, owner, nonce string, l TeamLimits) (TeamRoot, error) {
+	if e := l.Validate(); e != nil {
+		return TeamRoot{}, e
+	}
+	if len(origin) > l.MaxStringBytes || len(owner) > l.MaxStringBytes || len(nonce) > l.MaxStringBytes {
+		return TeamRoot{}, ErrTeamLimit
+	}
 	if !teamOrigin(origin) || !teamAddress(owner) || !teamB64(nonce, 32) {
 		return TeamRoot{}, ErrTeamWire
+	}
+	// Count the three-field commitment before its first serialization too.
+	budget := teamSizeBudget{remaining: l.MaxObjectBytes, limits: l}
+	if e := budget.add(7); e != nil {
+		return TeamRoot{}, e
+	} // braces, commas, colons
+	for _, s := range []string{"relay_origin", origin, "genesis_owner", owner, "genesis_nonce", nonce} {
+		if e := budget.string(s); e != nil {
+			return TeamRoot{}, e
+		}
 	}
 	b, e := json.Marshal(map[string]string{"relay_origin": origin, "genesis_owner": owner, "genesis_nonce": nonce})
 	if e != nil {
@@ -223,6 +245,9 @@ func (r TeamRoot) validate(l TeamLimits) error {
 	return nil
 }
 func teamTime(s string) (time.Time, error) {
+	if len(s) != len("2006-01-02T15:04:05Z") {
+		return time.Time{}, ErrTeamWire
+	}
 	t, e := time.Parse("2006-01-02T15:04:05Z", s)
 	if e != nil || t.Year() < 1 || t.Format("2006-01-02T15:04:05Z") != s {
 		return time.Time{}, ErrTeamWire
@@ -451,6 +476,9 @@ func CanonicalTeamPayload(v TeamPayload, l TeamLimits) ([]byte, error) {
 	default:
 		return nil, ErrTeamWire
 	}
+	if _, e := teamEncodedSize(v, l, l.MaxObjectBytes); e != nil {
+		return nil, e
+	}
 	if e := v.validate(l, false); e != nil {
 		return nil, e
 	}
@@ -505,6 +533,9 @@ func MakeTeamSignature(v TeamPayload, role, address string, sign func([]byte) ([
 	sig, e := sign(b)
 	if e != nil {
 		return TeamSignature{}, e
+	}
+	if len(sig) != 64 {
+		return TeamSignature{}, ErrTeamSignature
 	}
 	s := TeamSignature{role, address, base64.RawURLEncoding.EncodeToString(sig)}
 	if e = teamSignatureShape([]TeamSignature{s}); e != nil {

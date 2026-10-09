@@ -1,7 +1,6 @@
 package envelope
 
 import (
-	"encoding/json"
 	"math"
 	"strconv"
 	"time"
@@ -32,6 +31,19 @@ type TeamConsent struct {
 // admission time. It does not consume an invite, establish current ownership or
 // read cancellation state; those are mandatory atomic publication checks in C.
 func VerifyTeamConsent(i TeamInvitation, a TeamAcceptance, root TeamRoot, owner, epoch string, at time.Time, l TeamLimits) error {
+	if e := l.Validate(); e != nil {
+		return e
+	}
+	if l.MaxChainObjects < 2 {
+		return ErrTeamLimit
+	}
+	total := 0
+	if e := teamBudget(i, l, &total); e != nil {
+		return e
+	}
+	if e := teamBudget(a, l, &total); e != nil {
+		return e
+	}
 	if e := i.validate(l, true); e != nil {
 		return e
 	}
@@ -111,14 +123,14 @@ func VerifyTeamOwnerProof(root TeamRoot, certs []TeamOwnerTransition, l TeamLimi
 
 func sameTeamHash(a, b *string) bool { return a == nil && b == nil || a != nil && b != nil && *a == *b }
 func teamBudget(v any, l TeamLimits, total *int) error {
-	b, e := json.Marshal(v)
-	if e != nil {
-		return ErrTeamWire
-	}
-	if len(b) > l.MaxObjectBytes || len(b) > l.MaxChainBytes-*total {
+	if *total < 0 || *total > l.MaxChainBytes {
 		return ErrTeamLimit
 	}
-	*total += len(b)
+	n, e := teamEncodedSize(v, l, l.MaxChainBytes-*total)
+	if e != nil {
+		return e
+	}
+	*total += n
 	return nil
 }
 

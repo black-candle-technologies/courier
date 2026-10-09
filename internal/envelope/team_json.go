@@ -195,6 +195,9 @@ func parseTeam(raw []byte, dst any, l TeamLimits) error {
 	}
 	// Exact round trip detects missing required fields, null scalar fields and
 	// encoding/json's case-insensitive field matching. No wire field is optional.
+	if _, err := teamEncodedSize(dst, l, l.MaxObjectBytes); err != nil {
+		return err
+	}
 	encoded, err := json.Marshal(dst)
 	if err != nil {
 		return ErrTeamWire
