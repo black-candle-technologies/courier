@@ -23,9 +23,9 @@ func isLegacyStatePayload(plain []byte) bool {
 // Maintain the retired archive in place. Repeating this at every config load
 // preserves future TTLs; a one-time export would strand entries that expire later.
 // Raw fields preserve unknown metadata and all non-expired user content.
-func maintainLegacyState() error {
-	return withConfigLock(func() error {
-		p, err := configPath()
+func (s Context) maintainLegacyState() error {
+	return s.withConfigLock(func() error {
+		p, err := s.configPath()
 		if err != nil {
 			return err
 		}
@@ -187,3 +187,5 @@ func maintainLegacyState() error {
 		return os.Rename(name, p)
 	})
 }
+
+func maintainLegacyState() error { return LegacyContext().maintainLegacyState() }

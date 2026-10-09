@@ -96,16 +96,14 @@ type groupState struct {
 }
 
 // groupsFilePath is ~/.courier/groups.json.
-func groupsFilePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".courier", "groups.json"), nil
+func (s Context) groupsFilePath() (string, error) {
+	return s.path("groups.json")
 }
 
-func loadGroupsLocked() (map[string]*groupState, error) {
-	p, err := groupsFilePath()
+func groupsFilePath() (string, error) { return LegacyContext().groupsFilePath() }
+
+func (s Context) loadGroupsLocked() (map[string]*groupState, error) {
+	p, err := s.groupsFilePath()
 	if err != nil {
 		return nil, err
 	}
@@ -123,8 +121,10 @@ func loadGroupsLocked() (map[string]*groupState, error) {
 	return gs, nil
 }
 
-func saveGroupsLocked(gs map[string]*groupState) error {
-	p, err := groupsFilePath()
+func loadGroupsLocked() (map[string]*groupState, error) { return LegacyContext().loadGroupsLocked() }
+
+func (s Context) saveGroupsLocked(gs map[string]*groupState) error {
+	p, err := s.groupsFilePath()
 	if err != nil {
 		return err
 	}
@@ -153,33 +153,41 @@ func saveGroupsLocked(gs map[string]*groupState) error {
 	return os.Rename(tmpName, p)
 }
 
+func saveGroupsLocked(gs map[string]*groupState) error { return LegacyContext().saveGroupsLocked(gs) }
+
 // updateGroups performs an atomic read-modify-write of groups.json under
 // the cross-process config lock (same discipline as Config.Update).
-func updateGroups(fn func(map[string]*groupState) error) error {
-	return withConfigLock(func() error {
-		gs, err := loadGroupsLocked()
+func (s Context) updateGroups(fn func(map[string]*groupState) error) error {
+	return s.withConfigLock(func() error {
+		gs, err := s.loadGroupsLocked()
 		if err != nil {
 			return err
 		}
 		if err := fn(gs); err != nil {
 			return err
 		}
-		return saveGroupsLocked(gs)
+		return s.saveGroupsLocked(gs)
 	})
 }
 
+func updateGroups(fn func(map[string]*groupState) error) error {
+	return LegacyContext().updateGroups(fn)
+}
+
 // loadGroups returns a copy of the local group records.
-func loadGroups() (map[string]*groupState, error) {
+func (s Context) loadGroups() (map[string]*groupState, error) {
 	var gs map[string]*groupState
-	if err := withConfigLock(func() error {
+	if err := s.withConfigLock(func() error {
 		var err error
-		gs, err = loadGroupsLocked()
+		gs, err = s.loadGroupsLocked()
 		return err
 	}); err != nil {
 		return nil, err
 	}
 	return gs, nil
 }
+
+func loadGroups() (map[string]*groupState, error) { return LegacyContext().loadGroups() }
 
 // ---- helpers ----
 
@@ -257,7 +265,7 @@ func (c *Client) postGroupControl(g *groupState, action, target string) (int64, 
 	if err := json.Unmarshal(data, &out); err != nil {
 		return 0, fmt.Errorf("bad relay response: %w", err)
 	}
-	err = updateGroups(func(gs map[string]*groupState) error {
+	err = c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
 		cur := gs[g.ID]
 		if cur == nil {
 			return fmt.Errorf("group %s disappeared", g.ID)
@@ -369,7 +377,7 @@ func (c *Client) GroupCreate(name string, members []string) (*groupState, error)
 		Keys:         map[string]groupSenderKey{me: sk},
 		ControlEpoch: 1,
 	}
-	if err := updateGroups(func(gs map[string]*groupState) error {
+	if err := c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
 		gs[groupID] = g
 		return nil
 	}); err != nil {
@@ -394,7 +402,7 @@ func (c *Client) GroupAdd(groupID, addr string) error {
 	if _, err := crypto.ParseAddress(target); err != nil {
 		return err
 	}
-	gs, err := loadGroups()
+	gs, err := c.cfg.local().loadGroups()
 	if err != nil {
 		return err
 	}
@@ -446,7 +454,7 @@ func (c *Client) GroupRemove(groupID, addr string) error {
 	if err != nil {
 		return err
 	}
-	gs, err := loadGroups()
+	gs, err := c.cfg.local().loadGroups()
 	if err != nil {
 		return err
 	}
@@ -473,7 +481,7 @@ func (c *Client) GroupRemove(groupID, addr string) error {
 	// the new key to the remaining members. Every other remaining
 	// member rotates their own key when they observe the remove control
 	// in GroupInbox.
-	return updateGroups(func(gs map[string]*groupState) error {
+	return c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
 		cur := gs[groupID]
 		if cur == nil {
 			return fmt.Errorf("group %s disappeared", groupID)
@@ -488,7 +496,7 @@ func (c *Client) GroupTransferAdmin(groupID, addr string) error {
 	if err != nil {
 		return err
 	}
-	gs, err := loadGroups()
+	gs, err := c.cfg.local().loadGroups()
 	if err != nil {
 		return err
 	}
@@ -512,7 +520,7 @@ func (c *Client) GroupTransferAdmin(groupID, addr string) error {
 // GroupSend seals body under my current sender key and posts it to the
 // group. Returns the relay envelope id.
 func (c *Client) GroupSend(groupID, body string) (int64, error) {
-	gs, err := loadGroups()
+	gs, err := c.cfg.local().loadGroups()
 	if err != nil {
 		return 0, err
 	}
@@ -579,7 +587,7 @@ func (c *Client) GroupSend(groupID, body string) (int64, error) {
 		return 0, fmt.Errorf("bad relay response: %w", err)
 	}
 	// Best-effort local record, like Send.
-	_ = appendSentLog(SentEntry{CourierID: out.ID, To: groupID, Body: body, SentAt: sentAt})
+	_ = c.cfg.local().appendSentLog(SentEntry{CourierID: out.ID, To: groupID, Body: body, SentAt: sentAt})
 	return out.ID, nil
 }
 
@@ -617,7 +625,7 @@ type groupInboxResponse struct {
 // removal its forward secrecy even when the admin's own client is the
 // only one guaranteed online at removal time.
 func (c *Client) GroupInbox(groupID string) ([]Message, error) {
-	gs, err := loadGroups()
+	gs, err := c.cfg.local().loadGroups()
 	if err != nil {
 		return nil, err
 	}
@@ -657,7 +665,7 @@ func (c *Client) GroupInbox(groupID string) ([]Message, error) {
 		// proves I am no longer a member. Record it locally so the
 		// group shows as removed even though the control feed is
 		// unreadable.
-		_ = updateGroups(func(gs map[string]*groupState) error {
+		_ = c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
 			if cur := gs[groupID]; cur != nil {
 				cur.Removed = true
 			}
@@ -756,7 +764,7 @@ func (c *Client) GroupInbox(groupID string) ([]Message, error) {
 	}
 	if removed {
 		g.Removed = true
-		if err := updateGroups(func(gs map[string]*groupState) error {
+		if err := c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
 			gs[groupID] = g
 			return nil
 		}); err != nil {
@@ -852,7 +860,7 @@ func (c *Client) GroupInbox(groupID string) ([]Message, error) {
 	}
 	c.recordSeen(seenConsumerInbox, newHashes)
 	g.InboxCursor = lastID
-	if err := updateGroups(func(gs map[string]*groupState) error {
+	if err := c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
 		gs[groupID] = g
 		return nil
 	}); err != nil {
@@ -863,7 +871,7 @@ func (c *Client) GroupInbox(groupID string) ([]Message, error) {
 
 // GroupList returns the local group records, oldest first.
 func (c *Client) GroupList() ([]*groupState, error) {
-	gs, err := loadGroups()
+	gs, err := c.cfg.local().loadGroups()
 	if err != nil {
 		return nil, err
 	}
@@ -887,7 +895,7 @@ func (c *Client) handleGroupDM(from string, p groupDMPayload) {
 		if err != nil || len(raw) != 32 || p.Epoch <= 0 {
 			return
 		}
-		_ = updateGroups(func(gs map[string]*groupState) error {
+		_ = c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
 			g := gs[p.Group]
 			if g == nil || g.Removed {
 				// Unknown group (the invite may not have arrived yet)
@@ -925,7 +933,7 @@ func (c *Client) handleGroupDM(from string, p groupDMPayload) {
 			return
 		}
 		joined := false
-		_ = updateGroups(func(gs map[string]*groupState) error {
+		_ = c.cfg.local().updateGroups(func(gs map[string]*groupState) error {
 			if _, ok := gs[p.Group]; ok {
 				return nil // idempotent: already joined
 			}
@@ -953,7 +961,7 @@ func (c *Client) handleGroupDM(from string, p groupDMPayload) {
 		}
 		// Distribute my sender key to the other members. Best effort:
 		// a missed DM is repaired on the next removal rekey.
-		gs, err := loadGroups()
+		gs, err := c.cfg.local().loadGroups()
 		if err != nil {
 			return
 		}

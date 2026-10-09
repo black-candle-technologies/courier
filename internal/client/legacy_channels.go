@@ -26,8 +26,8 @@ func isLegacyChannelPayload(plain []byte) bool {
 
 // Warn without opening or modifying sensitive legacy history. Retirement is an
 // explicit operator action because the file also holds non-expiring user data.
-func warnLegacyChannels() error {
-	p, err := configPath()
+func (s Context) warnLegacyChannels() error {
+	p, err := s.configPath()
 	if err != nil {
 		return err
 	}
@@ -40,3 +40,5 @@ func warnLegacyChannels() error {
 	fmt.Fprintln(os.Stderr, "warning: retired channels.json still contains channel history and secrets; see docs/legacy-channel-retirement.md for explicit export and cleanup. Courier does not migrate or delete it automatically.")
 	return nil
 }
+
+func warnLegacyChannels() error { return LegacyContext().warnLegacyChannels() }

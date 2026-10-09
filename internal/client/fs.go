@@ -330,13 +330,11 @@ type fsFile struct {
 	RequireFS map[string]bool `json:"require_fs,omitempty"`
 }
 
-func fsFilePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".courier", "fs.json"), nil
+func (s Context) fsFilePath() (string, error) {
+	return s.path("fs.json")
 }
+
+func fsFilePath() (string, error) { return LegacyContext().fsFilePath() }
 
 func (ff *fsFile) session(peer string) *fsSession {
 	if ff.Sessions == nil {
@@ -359,8 +357,8 @@ func newFSFile() *fsFile {
 	}
 }
 
-func loadFSLocked() (*fsFile, error) {
-	p, err := fsFilePath()
+func (s Context) loadFSLocked() (*fsFile, error) {
+	p, err := s.fsFilePath()
 	if err != nil {
 		return nil, err
 	}
@@ -403,8 +401,10 @@ func loadFSLocked() (*fsFile, error) {
 	return ff, nil
 }
 
-func saveFSLocked(ff *fsFile) error {
-	p, err := fsFilePath()
+func loadFSLocked() (*fsFile, error) { return LegacyContext().loadFSLocked() }
+
+func (s Context) saveFSLocked(ff *fsFile) error {
+	p, err := s.fsFilePath()
 	if err != nil {
 		return err
 	}
@@ -433,26 +433,30 @@ func saveFSLocked(ff *fsFile) error {
 	return os.Rename(tmpName, p)
 }
 
+func saveFSLocked(ff *fsFile) error { return LegacyContext().saveFSLocked(ff) }
+
 // updateFS performs an atomic read-modify-write of fs.json under the
 // cross-process config lock (same discipline as updateState).
-func updateFS(fn func(*fsFile) error) error {
-	return withConfigLock(func() error {
-		ff, err := loadFSLocked()
+func (s Context) updateFS(fn func(*fsFile) error) error {
+	return s.withConfigLock(func() error {
+		ff, err := s.loadFSLocked()
 		if err != nil {
 			return err
 		}
 		if err := fn(ff); err != nil {
 			return err
 		}
-		return saveFSLocked(ff)
+		return s.saveFSLocked(ff)
 	})
 }
 
-func loadFS() (*fsFile, error) {
+func updateFS(fn func(*fsFile) error) error { return LegacyContext().updateFS(fn) }
+
+func (s Context) loadFS() (*fsFile, error) {
 	var ff *fsFile
-	if err := withConfigLock(func() error {
+	if err := s.withConfigLock(func() error {
 		var err error
-		ff, err = loadFSLocked()
+		ff, err = s.loadFSLocked()
 		return err
 	}); err != nil {
 		return nil, err
@@ -460,11 +464,13 @@ func loadFS() (*fsFile, error) {
 	return ff, nil
 }
 
+func loadFS() (*fsFile, error) { return LegacyContext().loadFS() }
+
 // removeFSState deletes ~/.courier/fs.json (best-effort). Used by
 // `backup restore`: a restored identity is a new device and must not
 // inherit the old device's sessions (issue #50 §6b).
-func removeFSState() error {
-	p, err := fsFilePath()
+func (s Context) removeFSState() error {
+	p, err := s.fsFilePath()
 	if err != nil {
 		return err
 	}
@@ -473,6 +479,8 @@ func removeFSState() error {
 	}
 	return nil
 }
+
+func removeFSState() error { return LegacyContext().removeFSState() }
 
 // ---- helpers ----
 
@@ -699,7 +707,7 @@ func (c *Client) fsPrepareSend(address string) (*fsSendOutput, error) {
 	}
 	var out *fsSendOutput
 	var required bool
-	err := updateFS(func(ff *fsFile) error {
+	err := c.cfg.local().updateFS(func(ff *fsFile) error {
 		sess := ff.session(address)
 		if sess != nil && sess.Established {
 			o, err := fsAdvanceSendLocked(sess)
@@ -726,7 +734,7 @@ func (c *Client) fsPrepareSend(address string) (*fsSendOutput, error) {
 	c.fsAssessDowngrade(address)
 	if c.fsShouldInit(address) {
 		var due bool
-		_ = updateFS(func(ff *fsFile) error {
+		_ = c.cfg.local().updateFS(func(ff *fsFile) error {
 			if fsInitDue(ff, address, fsInitCooldownSeconds) {
 				if ff.LastInitAt == nil {
 					ff.LastInitAt = map[string]int64{}
@@ -764,7 +772,7 @@ func (c *Client) fsPrepareSend(address string) (*fsSendOutput, error) {
 // round-trip is not a downgrade.
 func (c *Client) fsAssessDowngrade(address string) {
 	now := time.Now().Unix()
-	ff, err := loadFS()
+	ff, err := c.cfg.local().loadFS()
 	if err != nil {
 		return
 	}
@@ -783,7 +791,7 @@ func (c *Client) fsAssessDowngrade(address string) {
 			// Fresh negative result: don't hit the directory again.
 		} else if c.fsDirectoryCapable(address) {
 			positive = true
-			_ = updateFS(func(ff *fsFile) error {
+			_ = c.cfg.local().updateFS(func(ff *fsFile) error {
 				if ff.CapCache == nil {
 					ff.CapCache = map[string]fsCapEntry{}
 				}
@@ -792,7 +800,7 @@ func (c *Client) fsAssessDowngrade(address string) {
 				return nil
 			})
 		} else {
-			_ = updateFS(func(ff *fsFile) error {
+			_ = c.cfg.local().updateFS(func(ff *fsFile) error {
 				if ff.NegCapCache == nil {
 					ff.NegCapCache = map[string]int64{}
 				}
@@ -806,7 +814,7 @@ func (c *Client) fsAssessDowngrade(address string) {
 			return
 		}
 		var warnDue bool
-		_ = updateFS(func(ff *fsFile) error {
+		_ = c.cfg.local().updateFS(func(ff *fsFile) error {
 			if ff.Downgrade == nil {
 				ff.Downgrade = map[string]int64{}
 			}
@@ -831,7 +839,7 @@ func (c *Client) fsAssessDowngrade(address string) {
 		return
 	}
 	// Positive evidence again: clear any downgrade marker.
-	_ = updateFS(func(ff *fsFile) error {
+	_ = c.cfg.local().updateFS(func(ff *fsFile) error {
 		delete(ff.Downgrade, address)
 		return nil
 	})
@@ -841,7 +849,7 @@ func (c *Client) fsAssessDowngrade(address string) {
 // is believed FS-capable and no live handshake is in flight (a pending
 // init older than fsInitRefreshSeconds is refreshed).
 func (c *Client) fsShouldInit(address string) bool {
-	ff, err := loadFS()
+	ff, err := c.cfg.local().loadFS()
 	if err != nil {
 		return false
 	}
@@ -874,7 +882,7 @@ func (c *Client) fsShouldInit(address string) bool {
 	// Directory reverse lookup (network, outside the config lock).
 	// Positive results are cached for a day; negatives briefly.
 	if c.fsDirectoryCapable(address) {
-		_ = updateFS(func(ff *fsFile) error {
+		_ = c.cfg.local().updateFS(func(ff *fsFile) error {
 			if ff.CapCache == nil {
 				ff.CapCache = map[string]fsCapEntry{}
 			}
@@ -884,7 +892,7 @@ func (c *Client) fsShouldInit(address string) bool {
 		})
 		return true
 	}
-	_ = updateFS(func(ff *fsFile) error {
+	_ = c.cfg.local().updateFS(func(ff *fsFile) error {
 		if ff.NegCapCache == nil {
 			ff.NegCapCache = map[string]int64{}
 		}
@@ -956,7 +964,7 @@ func (c *Client) sendFSInit(address string) error {
 		return fmt.Errorf("fs encode init: %w", err)
 	}
 	now := time.Now().Unix()
-	err = updateFS(func(ff *fsFile) error {
+	err = c.cfg.local().updateFS(func(ff *fsFile) error {
 		ff.Sessions[address] = &fsSession{
 			Peer: address, SID: p.SID, Initiator: true, Established: false,
 			InitID: p.InitID, RK0: p.RK0, EphPriv: b64fs.EncodeToString(ephPriv[:]),
@@ -1015,7 +1023,7 @@ func (c *Client) handleFSInit(from string, p fsPayload) {
 		return
 	}
 	var accept []byte
-	err = updateFS(func(ff *fsFile) error {
+	err = c.cfg.local().updateFS(func(ff *fsFile) error {
 		for _, id := range ff.ProcessedInits {
 			if id == p.InitID {
 				return errFSProcessed
@@ -1161,7 +1169,7 @@ func (c *Client) handleFSAccept(from string, p fsPayload) {
 	if rPub, err = fsDecode32(p.RPub); err != nil {
 		return
 	}
-	_ = updateFS(func(ff *fsFile) error {
+	_ = c.cfg.local().updateFS(func(ff *fsFile) error {
 		sess := ff.session(from)
 		if sess == nil || sess.Established || sess.InitID != p.InitID || sess.SID != p.SID {
 			return errFSIgnored
@@ -1488,7 +1496,7 @@ func fsDecryptCurrentChain(sess *fsSession, p fsPayload, rpk [32]byte, msgKey *[
 func (c *Client) fsDecryptMessage(from string, p fsPayload) (plain []byte, wrapKey *[32]byte, err error) {
 	var wk [32]byte
 	var healInit bool
-	err = updateFS(func(ff *fsFile) error {
+	err = c.cfg.local().updateFS(func(ff *fsFile) error {
 		sess := ff.session(from)
 		if sess == nil || !sess.Established || sess.SID != p.SID {
 			// The peer has a session we don't (we wiped, restored, or
@@ -1597,7 +1605,7 @@ func (c *Client) FSActive(peer string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	ff, err := loadFS()
+	ff, err := c.cfg.local().loadFS()
 	if err != nil {
 		return false, err
 	}
@@ -1616,7 +1624,7 @@ func (c *Client) FSRequire(peer string, require bool) error {
 	if err != nil {
 		return err
 	}
-	return updateFS(func(ff *fsFile) error {
+	return c.cfg.local().updateFS(func(ff *fsFile) error {
 		if ff.RequireFS == nil {
 			ff.RequireFS = map[string]bool{}
 		}
@@ -1636,7 +1644,7 @@ func (c *Client) FSRequired(peer string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	ff, err := loadFS()
+	ff, err := c.cfg.local().loadFS()
 	if err != nil {
 		return false, err
 	}
@@ -1654,7 +1662,7 @@ func (c *Client) FSForget(peer string) error {
 	if err != nil {
 		return err
 	}
-	return updateFS(func(ff *fsFile) error {
+	return c.cfg.local().updateFS(func(ff *fsFile) error {
 		delete(ff.Sessions, address)
 		// Contact removal is an explicit user action, not a downgrade:
 		// clear markers, including the suite-negotiation pin (issue
@@ -1678,7 +1686,7 @@ func (c *Client) FSDowngradeSuspected(peer string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	ff, err := loadFS()
+	ff, err := c.cfg.local().loadFS()
 	if err != nil {
 		return false, err
 	}

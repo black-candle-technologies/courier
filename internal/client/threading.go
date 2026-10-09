@@ -147,19 +147,17 @@ type replyCacheEntry struct {
 // dropped, mirroring maxSentLog.
 const maxReplyCache = 1000
 
-func replyCachePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".courier", "thread_cache.jsonl"), nil
+func (s Context) replyCachePath() (string, error) {
+	return s.path("thread_cache.jsonl")
 }
+
+func replyCachePath() (string, error) { return LegacyContext().replyCachePath() }
 
 // readReplyCache returns cached entries, oldest first. A missing or
 // corrupt file yields no entries, never an error: the cache is a
 // best-effort accelerator.
-func readReplyCache() []replyCacheEntry {
-	p, err := replyCachePath()
+func (s Context) readReplyCache() []replyCacheEntry {
+	p, err := s.replyCachePath()
 	if err != nil {
 		return nil
 	}
@@ -184,10 +182,12 @@ func readReplyCache() []replyCacheEntry {
 	return out
 }
 
+func readReplyCache() []replyCacheEntry { return LegacyContext().readReplyCache() }
+
 // writeReplyCache merges new entries into the cache (deduplicated by
 // courier id, newest wins) and prunes to maxReplyCache. Best effort: a
 // cache failure must never fail message delivery.
-func writeReplyCache(entries []replyCacheEntry) {
+func (s Context) writeReplyCacheLocked(entries []replyCacheEntry) {
 	if len(entries) == 0 {
 		return
 	}
@@ -197,7 +197,7 @@ func writeReplyCache(entries []replyCacheEntry) {
 		_, ok := merged[id]
 		return ok
 	}
-	for _, e := range readReplyCache() {
+	for _, e := range s.readReplyCache() {
 		if !seen(e.CourierID) {
 			order = append(order, e.CourierID)
 		}
@@ -221,7 +221,7 @@ func writeReplyCache(entries []replyCacheEntry) {
 		buf.Write(line)
 		buf.WriteByte('\n')
 	}
-	p, err := replyCachePath()
+	p, err := s.replyCachePath()
 	if err != nil {
 		return
 	}
@@ -231,26 +231,36 @@ func writeReplyCache(entries []replyCacheEntry) {
 	_ = os.WriteFile(p, buf.Bytes(), 0o600)
 }
 
+func writeReplyCache(entries []replyCacheEntry) { LegacyContext().writeReplyCache(entries) }
+
 // LookupReplyParent resolves the best-effort parent snippet for a reply
 // target: the local sent log first (my own outbound messages), then the
 // reply cache (inbound messages seen on this machine). ok=false when
 // the parent is unknown locally — the reply is still sent, referencing
 // the id; the recipient may resolve it from their own state.
-func LookupReplyParent(replyTo int64) (quote string, ok bool) {
+func (s Context) LookupReplyParent(replyTo int64) (quote string, ok bool) {
 	if replyTo <= 0 {
 		return "", false
 	}
-	if sent, err := readSentLog(); err == nil {
+	if sent, err := s.readSentLog(); err == nil {
 		for i := len(sent) - 1; i >= 0; i-- {
 			if sent[i].CourierID == replyTo && sent[i].Body != "" {
 				return truncateQuote(sent[i].Body), true
 			}
 		}
 	}
-	for _, e := range readReplyCache() {
+	for _, e := range s.readReplyCache() {
 		if e.CourierID == replyTo && e.Snippet != "" {
 			return e.Snippet, true
 		}
 	}
 	return "", false
+}
+
+func LookupReplyParent(replyTo int64) (quote string, ok bool) {
+	return LegacyContext().LookupReplyParent(replyTo)
+}
+
+func (s Context) writeReplyCache(entries []replyCacheEntry) {
+	_ = s.withConfigLock(func() error { s.writeReplyCacheLocked(entries); return nil })
 }

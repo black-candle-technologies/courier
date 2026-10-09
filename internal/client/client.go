@@ -67,6 +67,8 @@ type EncKey struct {
 // Config is the local agent identity, stored at ~/.courier/config.json.
 // The seed and encryption private keys never leave this file (mode 0600).
 type Config struct {
+	localContext *Context
+
 	Version          int               `json:"version"`
 	RelayURL         string            `json:"relay"`
 	Seed             string            `json:"seed"`                        // base64url 32-byte identity seed
@@ -166,23 +168,23 @@ type HandleCacheEntry struct {
 	At     int64  `json:"at"`
 }
 
-func configPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".courier", "config.json"), nil
+func (s Context) configPath() (string, error) {
+	return s.path("config.json")
 }
 
+func configPath() (string, error) { return LegacyContext().configPath() }
+
 // ConfigExists reports whether an identity file exists (any version).
-func ConfigExists() bool {
-	p, err := configPath()
+func (s Context) ConfigExists() bool {
+	p, err := s.configPath()
 	if err != nil {
 		return false
 	}
 	_, err = os.Stat(p)
 	return err == nil
 }
+
+func ConfigExists() bool { return LegacyContext().ConfigExists() }
 
 // configMu serializes in-process config access across goroutines.
 // withConfigLock holds it for the whole read-modify-write cycle, and the
@@ -192,8 +194,8 @@ var configMu sync.Mutex
 
 // loadConfigRaw reads and parses the config file: version check and
 // defaults, but no migrations and no writes.
-func loadConfigRaw() (*Config, error) {
-	p, err := configPath()
+func (s Context) loadConfigRaw() (*Config, error) {
+	p, err := s.configPath()
 	if err != nil {
 		return nil, err
 	}
@@ -211,8 +213,14 @@ func loadConfigRaw() (*Config, error) {
 	if c.RelayURL == "" {
 		c.RelayURL = DefaultRelay
 	}
+	if err := s.validateConfig(&c); err != nil {
+		return nil, err
+	}
+	c.localContext = &s
 	return &c, nil
 }
+
+func loadConfigRaw() (*Config, error) { return LegacyContext().loadConfigRaw() }
 
 // seenConsumer identifies one of the independent consumers that read
 // the inbox. Each tracks its own replay-suppression set (issue #45):
@@ -286,14 +294,14 @@ func migrateEncKeys(c *Config) error {
 }
 
 // LoadConfig reads the local identity.
-func LoadConfig() (*Config, error) {
-	if err := warnLegacyChannels(); err != nil {
+func (s Context) LoadConfig() (*Config, error) {
+	if err := s.warnLegacyChannels(); err != nil {
 		return nil, err
 	}
-	if err := maintainLegacyState(); err != nil {
+	if err := s.maintainLegacyState(); err != nil {
 		return nil, err
 	}
-	c, err := loadConfigRaw()
+	c, err := s.loadConfigRaw()
 	if err != nil {
 		return nil, err
 	}
@@ -315,10 +323,15 @@ func LoadConfig() (*Config, error) {
 	return c, nil
 }
 
+func LoadConfig() (*Config, error) { return LegacyContext().LoadConfig() }
+
 // saveAtomic writes the config via temp file + rename in the same
 // directory, so a crash can never leave a partially written config.
 func (c *Config) saveAtomic() error {
-	p, err := configPath()
+	if err := c.local().validateConfig(c); err != nil {
+		return err
+	}
+	p, err := c.local().configPath()
 	if err != nil {
 		return err
 	}
@@ -363,7 +376,8 @@ func (c *Config) saveAtomic() error {
 // otherwise fields another process changed meanwhile (e.g. rotated
 // encryption keys) are silently clobbered.
 func (c *Config) Save() error {
-	return withConfigLock(func() error { return c.saveAtomic() })
+	c.bindLegacyContext()
+	return c.local().withConfigLock(func() error { return c.saveAtomic() })
 }
 
 // Update performs an atomic read-modify-write: it takes the cross-process
@@ -373,8 +387,9 @@ func (c *Config) Save() error {
 // mutating a stale in-memory Config and calling Save would clobber fields
 // another process wrote meanwhile (v0.6.11 F5).
 func (c *Config) Update(fn func(*Config) error) error {
-	return withConfigLock(func() error {
-		fresh, err := loadConfigRaw()
+	c.bindLegacyContext()
+	return c.local().withConfigLock(func() error {
+		fresh, err := c.local().loadConfigRaw()
 		if err != nil {
 			return err
 		}
@@ -662,23 +677,21 @@ func (c *Client) RotateKey() (published bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	epoch := time.Now().Unix()
-	// Monotonic epoch even within the same second as a previous rotation.
-	if len(c.cfg.EncKeys) > 0 && epoch <= c.cfg.EncKeys[0].Epoch {
-		epoch = c.cfg.EncKeys[0].Epoch + 1
-	}
-	c.cfg.EncKeys = append([]EncKey{{
-		Pub:       base64.RawURLEncoding.EncodeToString(pub[:]),
-		Priv:      base64.RawURLEncoding.EncodeToString(priv[:]),
-		Epoch:     epoch,
-		CreatedAt: time.Now().Unix(),
-	}}, c.cfg.EncKeys...)
-	if len(c.cfg.EncKeys) > maxRetainedKeys {
-		c.cfg.EncKeys = c.cfg.EncKeys[:maxRetainedKeys]
-	}
-	if err := c.cfg.Save(); err != nil {
+	err = c.cfg.Update(func(fresh *Config) error {
+		epoch := time.Now().Unix()
+		if len(fresh.EncKeys) > 0 && epoch <= fresh.EncKeys[0].Epoch {
+			epoch = fresh.EncKeys[0].Epoch + 1
+		}
+		fresh.EncKeys = append([]EncKey{{Pub: base64.RawURLEncoding.EncodeToString(pub[:]), Priv: base64.RawURLEncoding.EncodeToString(priv[:]), Epoch: epoch, CreatedAt: time.Now().Unix()}}, fresh.EncKeys...)
+		if len(fresh.EncKeys) > maxRetainedKeys {
+			fresh.EncKeys = fresh.EncKeys[:maxRetainedKeys]
+		}
+		return nil
+	})
+	if err != nil {
 		return false, err
 	}
+
 	if err := c.PublishKey(); err != nil {
 		return false, fmt.Errorf("key rotated locally but NOT published: %w (run `courier publish-key` to announce it)", err)
 	}
@@ -876,6 +889,7 @@ type Client struct {
 
 // New returns a Client for cfg.
 func New(cfg *Config) *Client {
+	cfg.bindLegacyContext()
 	return &Client{cfg: cfg}
 }
 
@@ -904,6 +918,9 @@ func (c *Client) FSConsumeWarning(address string) string {
 // httpClient builds the transport, enforcing certificate pinning for
 // https relays. Plain http relays (custom/local) skip TLS.
 func (c *Client) httpClient() (*http.Client, error) {
+	if err := c.cfg.local().validateConfig(c.cfg); err != nil {
+		return nil, err
+	}
 	if !strings.HasPrefix(c.cfg.RelayURL, "https://") {
 		return &http.Client{Timeout: 30 * time.Second}, nil
 	}
@@ -1053,7 +1070,7 @@ func (c *Client) SendReplyWithAttachments(toOrName, body string, attachPaths []s
 	}
 	var quote string
 	if replyTo > 0 {
-		quote, _ = LookupReplyParent(replyTo)
+		quote, _ = c.cfg.local().LookupReplyParent(replyTo)
 	}
 	return c.send(toOrName, body, attachPaths, replyTo, quote, true, 0, vhl.Tier0, nil)
 }
@@ -1093,7 +1110,7 @@ func (c *Client) SendFull(toOrName, body string, attachPaths []string, replyTo i
 	}
 	var quote string
 	if replyTo > 0 {
-		quote, _ = LookupReplyParent(replyTo)
+		quote, _ = c.cfg.local().LookupReplyParent(replyTo)
 	}
 	return c.send(toOrName, body, attachPaths, replyTo, quote, true, ttl, vhl.Tier0, nil)
 }
@@ -1128,7 +1145,7 @@ func (c *Client) sendProtocolDM(toOrName, body string) (int64, error) {
 }
 
 func (c *Client) send(toOrName, body string, attachPaths []string, replyTo int64, quote string, logSent bool, ttl time.Duration, tier vhl.Tier, att *vhl.Attestation) (int64, error) {
-	if err := maintainLegacyState(); err != nil {
+	if err := c.cfg.local().maintainLegacyState(); err != nil {
 		return 0, err
 	}
 	// issue #142: resolve the recipient first. The outgoing
@@ -1299,7 +1316,7 @@ func (c *Client) sendSealed(address string, plain []byte, sentLogBody string, re
 	// conversation. A logging failure must never fail the send itself.
 	// Protocol DMs skip the log: they are machine traffic, not chat.
 	if logSent {
-		_ = appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: sentLogBody, SentAt: sentAt, ReplyTo: replyTo, Quote: quote, ExpiresAt: expiresAt})
+		_ = c.cfg.local().appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: sentLogBody, SentAt: sentAt, ReplyTo: replyTo, Quote: quote, ExpiresAt: expiresAt})
 	}
 	return out.ID, nil
 }
@@ -1419,20 +1436,18 @@ type SentEntry struct {
 // maxSentLog is the cap on the local sent log; older entries are dropped.
 const maxSentLog = 1000
 
-func sentLogPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".courier", "sent.jsonl"), nil
+func (s Context) sentLogPath() (string, error) {
+	return s.path("sent.jsonl")
 }
+
+func sentLogPath() (string, error) { return LegacyContext().sentLogPath() }
 
 // readSentLog returns all logged sent entries, oldest first. Expired
 // disappearing-message entries (issue #53) are pruned: they are
 // filtered from the result and the log file is rewritten without them
 // (best-effort; a rewrite failure still returns the filtered entries).
-func readSentLog() ([]SentEntry, error) {
-	p, err := sentLogPath()
+func (s Context) readSentLogLocked() ([]SentEntry, error) {
+	p, err := s.sentLogPath()
 	if err != nil {
 		return nil, err
 	}
@@ -1462,15 +1477,17 @@ func readSentLog() ([]SentEntry, error) {
 		out = append(out, e)
 	}
 	if pruned {
-		_ = rewriteSentLog(out)
+		_ = s.rewriteSentLogLocked(out)
 	}
 	return out, nil
 }
 
+func readSentLog() ([]SentEntry, error) { return LegacyContext().readSentLog() }
+
 // rewriteSentLog replaces the sent log with entries, preserving the
 // maxSentLog cap. Used to drop expired disappearing-message entries.
-func rewriteSentLog(entries []SentEntry) error {
-	p, err := sentLogPath()
+func (s Context) rewriteSentLogLocked(entries []SentEntry) error {
+	p, err := s.sentLogPath()
 	if err != nil {
 		return err
 	}
@@ -1507,31 +1524,26 @@ func rewriteSentLog(entries []SentEntry) error {
 	return os.Rename(tmpName, p)
 }
 
+func rewriteSentLog(entries []SentEntry) error { return LegacyContext().rewriteSentLog(entries) }
+
 // appendSentLog records a sent message, pruning the log to maxSentLog.
-func appendSentLog(e SentEntry) error {
-	p, err := sentLogPath()
+func (s Context) appendSentLogLocked(e SentEntry) error {
+	p, err := s.sentLogPath()
 	if err != nil {
 		return err
 	}
-	entries, err := readSentLog()
+	entries, err := s.readSentLogLocked()
 	if err != nil {
 		return err
 	}
 	entries = append(entries, e)
-	if len(entries) > maxSentLog {
-		entries = entries[len(entries)-maxSentLog:]
-	}
-	var buf bytes.Buffer
-	for _, en := range entries {
-		line, _ := json.Marshal(en)
-		buf.Write(line)
-		buf.WriteByte('\n')
-	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(p, buf.Bytes(), 0o600)
+	return s.rewriteSentLogLocked(entries)
 }
+
+func appendSentLog(e SentEntry) error { return LegacyContext().appendSentLog(e) }
 
 // Message is one decrypted, signature-verified inbox message.
 type Message struct {
@@ -1838,7 +1850,7 @@ func (c *Client) Inbox(after int64, limit int) ([]Message, int64, int, int, erro
 // depends on them staying silent. The three are reported separately so
 // routine delivery mechanics never look like an attack.
 func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsumer) ([]Message, int64, int, int, []string, error) {
-	if err := maintainLegacyState(); err != nil {
+	if err := c.cfg.local().maintainLegacyState(); err != nil {
 		return nil, after, 0, 0, nil, err
 	}
 	// v0.6.11 (F10): the inbox request is signed by the recipient, so
@@ -2065,7 +2077,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 			// already taken in a different envelope downgrades the
 			// verdict to a replay hold.
 			if out.Verdict == vhl.VerdictAttested && tier == vhl.Tier2 && att != nil {
-				replayed, cerr := vhlConsumeAttestation(att.ID, att.Approver, att.ApprovalNonce, m.ID)
+				replayed, cerr := c.cfg.local().vhlConsumeAttestation(att.ID, att.Approver, att.ApprovalNonce, m.ID)
 				switch {
 				case cerr != nil:
 					// Fail closed: without a committed replay mark,
@@ -2155,7 +2167,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 				local[m.ID] = truncateQuote(m.Body)
 			}
 		}
-		if sent, err := readSentLog(); err == nil {
+		if sent, err := c.cfg.local().readSentLog(); err == nil {
 			for _, e := range sent {
 				if e.Body != "" {
 					if _, ok := local[e.CourierID]; !ok {
@@ -2164,7 +2176,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 				}
 			}
 		}
-		for _, e := range readReplyCache() {
+		for _, e := range c.cfg.local().readReplyCache() {
 			if e.Snippet != "" {
 				if _, ok := local[e.CourierID]; !ok {
 					local[e.CourierID] = e.Snippet
@@ -2180,13 +2192,13 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		}
 	}
 	// Best-effort reply cache write; delivery never depends on it.
-	writeReplyCache(cacheEntries)
+	c.cfg.local().writeReplyCache(cacheEntries)
 	// issue #142: persist attestation ids consumed during this
 	// fetch (replay guard) and any revocations applied. Best
 	// effort: delivery already happened; a failure here only risks
 	// re-evaluating an already-seen attestation, which the
 	// envelope-aware replay check tolerates.
-	_ = vhlMergeSeen(vfr)
+	_ = c.cfg.local().vhlMergeSeen(vfr)
 	if markSeen {
 		c.recordSeen(consumer, newHashes)
 	}
@@ -2721,7 +2733,7 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 	// readSentLog already pruned expired disappearing-message entries;
 	// skip any that expired since (best-effort prune above) rather than
 	// pushing a message that is already gone.
-	if sent, err := readSentLog(); err == nil {
+	if sent, err := c.cfg.local().readSentLog(); err == nil {
 		now := time.Now().Unix()
 		for _, e := range sent {
 			if e.CourierID <= c.cfg.DashboardSentCursor {
@@ -2920,4 +2932,15 @@ func (c *Client) pushBatch(hc *http.Client, batch []pushItem) (stored int, inbox
 	}
 	_ = json.Unmarshal(raw, &out)
 	return out.Stored, inboxMax, sentMax, nil
+}
+
+func (s Context) readSentLog() (entries []SentEntry, err error) {
+	err = s.withConfigLock(func() error { var e error; entries, e = s.readSentLogLocked(); return e })
+	return
+}
+func (s Context) rewriteSentLog(entries []SentEntry) error {
+	return s.withConfigLock(func() error { return s.rewriteSentLogLocked(entries) })
+}
+func (s Context) appendSentLog(e SentEntry) error {
+	return s.withConfigLock(func() error { return s.appendSentLogLocked(e) })
 }

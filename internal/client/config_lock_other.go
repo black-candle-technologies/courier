@@ -17,8 +17,10 @@ package client
 //
 // Courier's supported server and agent deployments are unix, and a
 // Windows binary is published; both have real locks.
-func withConfigLock(fn func() error) error {
+func (s Context) withConfigLock(fn func() error) error {
 	configMu.Lock()
 	defer configMu.Unlock()
 	return fn()
 }
+
+func withConfigLock(fn func() error) error { return LegacyContext().withConfigLock(fn) }

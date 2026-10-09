@@ -2,6 +2,7 @@ package client
 
 import (
 	"fmt"
+	"github.com/black-candle-technologies/courier/internal/crypto"
 	"os"
 	"path/filepath"
 )
@@ -10,8 +11,10 @@ import (
 // process-wide selector. LegacyContext preserves the existing on-disk layout;
 // constructing a context never creates files or moves data.
 type Context struct {
-	root string
-	err  error
+	root      string
+	principal string
+	binding   RelayBinding
+	err       error
 }
 
 // LegacyContext snapshots the default directory. Changing HOME later cannot
@@ -46,4 +49,44 @@ func (s Context) path(name string) (string, error) {
 		return "", fmt.Errorf("invalid context file name")
 	}
 	return filepath.Join(root, name), nil
+}
+
+func (c *Config) local() Context {
+	if c.localContext != nil {
+		return *c.localContext
+	}
+	return LegacyContext()
+}
+
+func (c *Config) bindLegacyContext() {
+	if c.localContext == nil {
+		s := LegacyContext()
+		c.localContext = &s
+	}
+}
+
+// Context returns the context captured by this configuration.
+func (c *Config) Context() Context { return c.local() }
+
+// Principal and Binding return immutable value snapshots of the selected scope.
+// Legacy adapters have no named binding until explicitly migrated.
+func (s Context) Principal() string     { return s.principal }
+func (s Context) Binding() RelayBinding { return s.binding }
+
+func (s Context) validateConfig(c *Config) error {
+	if s.principal == "" {
+		return nil
+	}
+	origin, err := NormalizeRelayOrigin(c.RelayURL)
+	if err != nil || origin != s.binding.Endpoint || c.RelayFingerprint != s.binding.Pin || c.Address != s.principal {
+		return ErrContextMismatch
+	}
+	id, err := c.Identity()
+	if err != nil {
+		return err
+	}
+	if crypto.FormatAddress(id.EdPub[:]) != s.principal {
+		return ErrContextMismatch
+	}
+	return nil
 }

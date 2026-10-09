@@ -203,7 +203,7 @@ func (c *Client) VHLSetRP(rpID string, origins []string, rootFiles []string) err
 		roots = append(roots, base64.RawURLEncoding.EncodeToString(der))
 	}
 	rp := vhl.WebAuthnRP{ID: rpID, Origins: origins, AttestationRoots: roots}
-	return updateVHL(func(ff *vhlFile) error {
+	return c.cfg.local().updateVHL(func(ff *vhlFile) error {
 		ff.RP = rp
 		return nil
 	})
@@ -235,7 +235,7 @@ func loadCertDER(path string) ([]byte, error) {
 
 // VHLShowRP returns the local WebAuthn relying-party config.
 func (c *Client) VHLShowRP() (vhl.WebAuthnRP, error) {
-	ff, err := loadVHL()
+	ff, err := c.cfg.local().loadVHL()
 	if err != nil {
 		return vhl.WebAuthnRP{}, err
 	}
@@ -245,7 +245,7 @@ func (c *Client) VHLShowRP() (vhl.WebAuthnRP, error) {
 // vhlRPConfig loads the local VHL RP config, failing closed with
 // operator guidance when the relying party is not configured.
 func (c *Client) vhlRPConfig() (vhl.WebAuthnRP, error) {
-	ff, err := loadVHL()
+	ff, err := c.cfg.local().loadVHL()
 	if err != nil {
 		return vhl.WebAuthnRP{}, err
 	}
@@ -305,7 +305,7 @@ func (c *Client) VHLEnrollWebAuthn(deviceLabel string, printf func(string, ...an
 	// they logged into the dashboard, opened the ceremony page, and
 	// touched their security key with user verification. That is the
 	// Tier 2 human approval for this enrollment.
-	if err := updateVHL(func(ff *vhlFile) error {
+	if err := c.cfg.local().updateVHL(func(ff *vhlFile) error {
 		return ff.Registry.Enroll(c.cfg.Address, name, cred)
 	}); err != nil {
 		return nil, err
@@ -413,7 +413,7 @@ func (c *Client) VHLSessionMintCeremony(scope string, ttl time.Duration, printf 
 	}
 	// Collect the enrolled WebAuthn credential ids for the ceremony's
 	// allowCredentials list.
-	ff, err := loadVHL()
+	ff, err := c.cfg.local().loadVHL()
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +539,7 @@ func (c *Client) VHLApproveFIDO2Ceremony(nonce []byte, actionHash []byte, reques
 	if err != nil {
 		return vhl.Proof{}, fmt.Errorf("approve context: %w", err)
 	}
-	ff, err := loadVHL()
+	ff, err := c.cfg.local().loadVHL()
 	if err != nil {
 		return vhl.Proof{}, err
 	}
@@ -596,7 +596,7 @@ func (c *Client) VHLEnrollApproverCeremony(approverAddress string, printf func(s
 	if err != nil {
 		return nil, fmt.Errorf("enroll-approver context: %w", err)
 	}
-	ff, err := loadVHL()
+	ff, err := c.cfg.local().loadVHL()
 	if err != nil {
 		return nil, err
 	}

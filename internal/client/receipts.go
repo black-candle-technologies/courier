@@ -150,13 +150,11 @@ const (
 // timestamp before it is rejected as absurd.
 const receiptClockSkew = 300
 
-func receiptsFilePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".courier", "receipts.json"), nil
+func (s Context) receiptsFilePath() (string, error) {
+	return s.path("receipts.json")
 }
+
+func receiptsFilePath() (string, error) { return LegacyContext().receiptsFilePath() }
 
 func receivedReceiptKey(peer string, msgID int64) string {
 	return fmt.Sprintf("%s|%d", peer, msgID)
@@ -166,8 +164,8 @@ func sentReceiptKey(peer string, msgID int64) string {
 	return fmt.Sprintf("%s|%d", peer, msgID)
 }
 
-func loadReceiptsLocked() (*receiptStore, error) {
-	p, err := receiptsFilePath()
+func (s Context) loadReceiptsLocked() (*receiptStore, error) {
+	p, err := s.receiptsFilePath()
 	if err != nil {
 		return nil, err
 	}
@@ -194,8 +192,10 @@ func loadReceiptsLocked() (*receiptStore, error) {
 	return &rs, nil
 }
 
-func saveReceiptsLocked(rs *receiptStore) error {
-	p, err := receiptsFilePath()
+func loadReceiptsLocked() (*receiptStore, error) { return LegacyContext().loadReceiptsLocked() }
+
+func (s Context) saveReceiptsLocked(rs *receiptStore) error {
+	p, err := s.receiptsFilePath()
 	if err != nil {
 		return err
 	}
@@ -227,12 +227,14 @@ func saveReceiptsLocked(rs *receiptStore) error {
 	return os.Rename(tmpName, p)
 }
 
+func saveReceiptsLocked(rs *receiptStore) error { return LegacyContext().saveReceiptsLocked(rs) }
+
 // updateReceipts performs an atomic read-modify-write of receipts.json
 // under the cross-process config lock (same discipline as groups.json
 // and Config.Update), pruning both tables to their bounds afterwards.
-func updateReceipts(fn func(*receiptStore) error) error {
-	return withConfigLock(func() error {
-		rs, err := loadReceiptsLocked()
+func (s Context) updateReceipts(fn func(*receiptStore) error) error {
+	return s.withConfigLock(func() error {
+		rs, err := s.loadReceiptsLocked()
 		if err != nil {
 			return err
 		}
@@ -240,22 +242,26 @@ func updateReceipts(fn func(*receiptStore) error) error {
 			return err
 		}
 		pruneReceiptStore(rs)
-		return saveReceiptsLocked(rs)
+		return s.saveReceiptsLocked(rs)
 	})
 }
 
+func updateReceipts(fn func(*receiptStore) error) error { return LegacyContext().updateReceipts(fn) }
+
 // loadReceipts returns a copy of the receipt store.
-func loadReceipts() (*receiptStore, error) {
+func (s Context) loadReceipts() (*receiptStore, error) {
 	var rs *receiptStore
-	if err := withConfigLock(func() error {
+	if err := s.withConfigLock(func() error {
 		var err error
-		rs, err = loadReceiptsLocked()
+		rs, err = s.loadReceiptsLocked()
 		return err
 	}); err != nil {
 		return nil, err
 	}
 	return rs, nil
 }
+
+func loadReceipts() (*receiptStore, error) { return LegacyContext().loadReceipts() }
 
 func receiptLastTouch(r *receiptRecord) int64 {
 	return r.DeliveryAt
@@ -304,7 +310,7 @@ func pruneReceiptStore(rs *receiptStore) {
 func (c *Client) sendDeliveryReceipt(peer string, msgID int64) {
 	key := sentReceiptKey(peer, msgID)
 	var already bool
-	if err := updateReceipts(func(rs *receiptStore) error {
+	if err := c.cfg.local().updateReceipts(func(rs *receiptStore) error {
 		if _, ok := rs.Sent[key]; ok {
 			already = true
 			return nil
@@ -339,7 +345,7 @@ func (c *Client) handleReceiptDM(from string, p receiptDMPayload) {
 	if _, err := crypto.ParseAddress(from); err != nil {
 		return
 	}
-	sent, err := readSentLog()
+	sent, err := c.cfg.local().readSentLog()
 	if err != nil {
 		return
 	}
@@ -358,7 +364,7 @@ func (c *Client) handleReceiptDM(from string, p receiptDMPayload) {
 		return // absurd timestamp: drop
 	}
 	key := receivedReceiptKey(from, p.MsgID)
-	_ = updateReceipts(func(rs *receiptStore) error {
+	_ = c.cfg.local().updateReceipts(func(rs *receiptStore) error {
 		// First receipt wins: replays are idempotent. "read" receipts
 		// from older clients are recognized above but never recorded
 		// (#146): read receipts were cut, and silently dropping the
@@ -415,11 +421,11 @@ func (c *Client) ReceiptsStatus(filter string) ([]ReceiptInfo, error) {
 		}
 		filterAddr = addr
 	}
-	sent, err := readSentLog()
+	sent, err := c.cfg.local().readSentLog()
 	if err != nil {
 		return nil, err
 	}
-	rs, err := loadReceipts()
+	rs, err := c.cfg.local().loadReceipts()
 	if err != nil {
 		return nil, err
 	}

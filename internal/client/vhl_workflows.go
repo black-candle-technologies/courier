@@ -39,7 +39,7 @@ func (c *Client) VHLMintChallenge(action []byte) (*vhl.Challenge, string, error)
 	// Open, append, and reseal inside one lock-protected critical
 	// section: two concurrent mints must not lose one another's
 	// challenge (issue #142 review).
-	if err := updateVHL(func(ff *vhlFile) error {
+	if err := c.cfg.local().updateVHL(func(ff *vhlFile) error {
 		chs, err := openChallengesLocked(ff.SealedChall, key)
 		if err != nil {
 			return err
@@ -71,7 +71,7 @@ func (c *Client) VHLVerifyChallenge(challengeID, code string) error {
 	// verifications of the same challenge cannot both succeed
 	// (issue #142 review). Only the seal key derivation happens
 	// outside the lock — never network I/O.
-	if err := updateVHL(func(ff *vhlFile) error {
+	if err := c.cfg.local().updateVHL(func(ff *vhlFile) error {
 		chs, err := openChallengesLocked(ff.SealedChall, key)
 		if err != nil {
 			return err
@@ -139,7 +139,7 @@ func (c *Client) VHLRequestApproval(humanAddr string, tier vhl.Tier, body string
 			Request: req, From: c.cfg.Address,
 			ReceivedAt: time.Now().Unix(), EnvelopeID: 0,
 		}
-		if err := updateVHL(func(ff *vhlFile) error {
+		if err := c.cfg.local().updateVHL(func(ff *vhlFile) error {
 			for len(ff.Requests) >= maxVHLPending {
 				oldest, ot := "", int64(0)
 				first := true
@@ -170,7 +170,7 @@ func (c *Client) VHLRequestApproval(humanAddr string, tier vhl.Tier, body string
 // VHLPendingRequests lists approval requests awaiting the human,
 // oldest first. Expired requests are skipped.
 func (c *Client) VHLPendingRequests() ([]*vhlRequestRecord, error) {
-	ff, err := loadVHL()
+	ff, err := c.cfg.local().loadVHL()
 	if err != nil {
 		return nil, err
 	}
@@ -252,7 +252,7 @@ func (c *Client) VHLApproveMint(requestID string, displayedHash [32]byte, displa
 	// lock-protected critical section: the display-to-sign gap
 	// closes here, and signing inside the config lock is fine —
 	// never network I/O (issue #142 review).
-	if err := updateVHL(func(ff *vhlFile) error {
+	if err := c.cfg.local().updateVHL(func(ff *vhlFile) error {
 		rec := ff.Requests[requestID]
 		if rec == nil || rec.Request == nil {
 			return fmt.Errorf("no pending approval request %q", requestID)
@@ -335,7 +335,7 @@ func (c *Client) VHLApproveMint(requestID string, displayedHash [32]byte, displa
 // VHLAttestations lists received attestations not yet attached to an
 // outgoing message, newest first.
 func (c *Client) VHLAttestations() ([]*vhl.Attestation, error) {
-	ff, err := loadVHL()
+	ff, err := c.cfg.local().loadVHL()
 	if err != nil {
 		return nil, err
 	}
@@ -413,7 +413,7 @@ func (c *Client) VHLEnrollApprover(address, name string, art *vhl.EnrollmentArti
 	if err != nil {
 		return err
 	}
-	return updateVHL(func(ff *vhlFile) error {
+	return c.cfg.local().updateVHL(func(ff *vhlFile) error {
 		return ff.Registry.EnrollWithArtifact(address, name, vhl.Credential{
 			ID:         credID,
 			Kind:       "ed25519",
@@ -427,7 +427,7 @@ func (c *Client) VHLEnrollApprover(address, name string, art *vhl.EnrollmentArti
 // VHLUnenrollApprover revokes an approver, by address or by the local
 // display name.
 func (c *Client) VHLUnenrollApprover(addrOrName string) error {
-	return updateVHL(func(ff *vhlFile) error {
+	return c.cfg.local().updateVHL(func(ff *vhlFile) error {
 		identity := addrOrName
 		if ff.Registry.Approvers[identity] == nil {
 			for id, a := range ff.Registry.Approvers {
@@ -443,7 +443,7 @@ func (c *Client) VHLUnenrollApprover(addrOrName string) error {
 
 // VHLApprovers lists enrolled approvers, oldest first.
 func (c *Client) VHLApprovers() ([]ApproverInfo, error) {
-	ff, err := loadVHL()
+	ff, err := c.cfg.local().loadVHL()
 	if err != nil {
 		return nil, err
 	}
@@ -507,7 +507,7 @@ func (c *Client) VHLFinishSessionMint(pending *vhl.PendingSessionMint, credentia
 	// a concurrent mint slips past the ceremony-downgrade guard
 	// (issue #142 review). Only local crypto and the seal key
 	// derivation run here — never network I/O.
-	if err := updateVHL(func(ff *vhlFile) error {
+	if err := c.cfg.local().updateVHL(func(ff *vhlFile) error {
 		if ff.RP.ID == "" || len(ff.RP.Origins) == 0 {
 			return fmt.Errorf("session mint refused: no WebAuthn relying party configured — run `courier vhl rp set` first, then enroll a credential with `courier vhl enroll-webauthn`")
 		}
@@ -582,7 +582,7 @@ func (c *Client) VHLRevokeSessionToken(idOrPrefix string, broadcast bool) error 
 	// revoke's store restore the just-revoked token), because each
 	// side overwrote the other's keystore write (issue #142
 	// review).
-	if err := updateVHL(func(ff *vhlFile) error {
+	if err := c.cfg.local().updateVHL(func(ff *vhlFile) error {
 		toks, err := openTokensLocked(ff.SealedTokens, key)
 		if err != nil {
 			return err
@@ -655,7 +655,7 @@ func (c *Client) SendFullTiered(toOrName, body string, replyTo int64, ttl time.D
 	}
 	var quote string
 	if replyTo > 0 {
-		quote, _ = LookupReplyParent(replyTo)
+		quote, _ = c.cfg.local().LookupReplyParent(replyTo)
 	}
 	return c.send(toOrName, body, nil, replyTo, quote, true, ttl, tier, att)
 }

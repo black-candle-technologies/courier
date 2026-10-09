@@ -33,13 +33,11 @@ import (
 // On other platforms the lock degrades to an in-process mutex only
 // (config_lock_other.go) — see that file's platform table.
 
-func configLockPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".courier", "config.lock"), nil
+func (s Context) configLockPath() (string, error) {
+	return s.path("config.lock")
 }
+
+func configLockPath() (string, error) { return LegacyContext().configLockPath() }
 
 // lockFileEx takes an exclusive LockFileEx over byte range [0,1) of f.
 // When blocking is false, LOCKFILE_FAIL_IMMEDIATELY is set so the call
@@ -66,8 +64,8 @@ func unlockFileEx(f *os.File) error {
 // lock file and take a blocking exclusive lock on it. The returned func
 // releases the lock; the OS also releases it automatically on process
 // death.
-func acquireConfigLock() (release func(), err error) {
-	p, err := configLockPath()
+func (s Context) acquireConfigLock() (release func(), err error) {
+	p, err := s.configLockPath()
 	if err != nil {
 		return nil, err
 	}
@@ -88,17 +86,21 @@ func acquireConfigLock() (release func(), err error) {
 	}, nil
 }
 
+func acquireConfigLock() (release func(), err error) { return LegacyContext().acquireConfigLock() }
+
 // withConfigLock runs fn while holding the in-process config mutex and an
 // exclusive LockFileEx on the config lock file. The mutex serializes
 // goroutines sharing a Config; the LockFileEx serializes Courier
 // processes on this machine — the same contract as the unix path.
-func withConfigLock(fn func() error) error {
+func (s Context) withConfigLock(fn func() error) error {
 	configMu.Lock()
 	defer configMu.Unlock()
-	release, err := acquireConfigLock()
+	release, err := s.acquireConfigLock()
 	if err != nil {
 		return err
 	}
 	defer release()
 	return fn()
 }
+
+func withConfigLock(fn func() error) error { return LegacyContext().withConfigLock(fn) }

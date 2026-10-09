@@ -31,9 +31,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -480,10 +478,9 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
 
 // DefaultWakePIDFile is ~/.courier/wake.pid: the default pidfile the
 // wake daemon locks while running.
-func DefaultWakePIDFile() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".courier", "wake.pid")
+func (s Context) DefaultWakePIDFile() string {
+	p, _ := s.path("wake.pid")
+	return p
 }
+
+func DefaultWakePIDFile() string { return LegacyContext().DefaultWakePIDFile() }

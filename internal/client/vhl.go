@@ -64,13 +64,11 @@ type vhlFile struct {
 // bounds lifetimes, so this is just hygiene.
 const maxVHLPending = 100
 
-func vhlFilePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".courier", "vhl.json"), nil
+func (s Context) vhlFilePath() (string, error) {
+	return s.path("vhl.json")
 }
+
+func vhlFilePath() (string, error) { return LegacyContext().vhlFilePath() }
 
 func newVHLFile() *vhlFile {
 	return &vhlFile{
@@ -83,8 +81,8 @@ func newVHLFile() *vhlFile {
 	}
 }
 
-func loadVHLLocked() (*vhlFile, error) {
-	p, err := vhlFilePath()
+func (s Context) loadVHLLocked() (*vhlFile, error) {
+	p, err := s.vhlFilePath()
 	if err != nil {
 		return nil, err
 	}
@@ -120,8 +118,10 @@ func loadVHLLocked() (*vhlFile, error) {
 	return ff, nil
 }
 
-func saveVHLLocked(ff *vhlFile) error {
-	p, err := vhlFilePath()
+func loadVHLLocked() (*vhlFile, error) { return LegacyContext().loadVHLLocked() }
+
+func (s Context) saveVHLLocked(ff *vhlFile) error {
+	p, err := s.vhlFilePath()
 	if err != nil {
 		return err
 	}
@@ -157,26 +157,30 @@ func saveVHLLocked(ff *vhlFile) error {
 	return os.Rename(tmpName, p)
 }
 
+func saveVHLLocked(ff *vhlFile) error { return LegacyContext().saveVHLLocked(ff) }
+
 // updateVHL performs an atomic read-modify-write of vhl.json under
 // the cross-process config lock (same discipline as updateFS).
-func updateVHL(fn func(*vhlFile) error) error {
-	return withConfigLock(func() error {
-		ff, err := loadVHLLocked()
+func (s Context) updateVHL(fn func(*vhlFile) error) error {
+	return s.withConfigLock(func() error {
+		ff, err := s.loadVHLLocked()
 		if err != nil {
 			return err
 		}
 		if err := fn(ff); err != nil {
 			return err
 		}
-		return saveVHLLocked(ff)
+		return s.saveVHLLocked(ff)
 	})
 }
 
-func loadVHL() (*vhlFile, error) {
+func updateVHL(fn func(*vhlFile) error) error { return LegacyContext().updateVHL(fn) }
+
+func (s Context) loadVHL() (*vhlFile, error) {
 	var ff *vhlFile
-	if err := withConfigLock(func() error {
+	if err := s.withConfigLock(func() error {
 		var err error
-		ff, err = loadVHLLocked()
+		ff, err = s.loadVHLLocked()
 		return err
 	}); err != nil {
 		return nil, err
@@ -184,12 +188,14 @@ func loadVHL() (*vhlFile, error) {
 	return ff, nil
 }
 
+func loadVHL() (*vhlFile, error) { return LegacyContext().loadVHL() }
+
 // removeVHLState deletes ~/.courier/vhl.json (best-effort). Used by
 // `backup restore`: a restored identity is a new device and must not
 // inherit the old device's enrollments, session tokens, or replay
 // sets.
-func removeVHLState() error {
-	p, err := vhlFilePath()
+func (s Context) removeVHLState() error {
+	p, err := s.vhlFilePath()
 	if err != nil {
 		return err
 	}
@@ -198,6 +204,8 @@ func removeVHLState() error {
 	}
 	return nil
 }
+
+func removeVHLState() error { return LegacyContext().removeVHLState() }
 
 // vhlBootIDOnce generates this process's VHL boot id. Session tokens
 // are bound to the boot id of the process that minted them; a restart
@@ -392,7 +400,7 @@ func (c *Client) vhlLoadTokens() ([]*vhl.SessionToken, error) {
 	if err != nil {
 		return nil, err
 	}
-	ff, err := loadVHL()
+	ff, err := c.cfg.local().loadVHL()
 	if err != nil {
 		return nil, err
 	}
@@ -424,7 +432,7 @@ func (c *Client) vhlLiveToken(recipient string) (*vhl.SessionToken, error) {
 
 // vhlVerifier builds the receiver-side verifier from local state.
 func (c *Client) vhlVerifier() (*vhl.Verifier, error) {
-	ff, err := loadVHL()
+	ff, err := c.cfg.local().loadVHL()
 	if err != nil {
 		return nil, err
 	}
@@ -453,11 +461,11 @@ func (c *Client) vhlVerifier() (*vhl.Verifier, error) {
 // revocations made through updateVHL during the fetch; the counters
 // are the only registry field evaluation mutates (NoteSignCount),
 // and they only ever move forward.
-func vhlMergeSeen(vfr *vhl.Verifier) error {
+func (s Context) vhlMergeSeen(vfr *vhl.Verifier) error {
 	if vfr == nil {
 		return nil
 	}
-	return updateVHL(func(ff *vhlFile) error {
+	return s.updateVHL(func(ff *vhlFile) error {
 		for id, env := range vfr.Seen.IDs {
 			ff.Seen.Mark(id, env)
 		}
@@ -491,6 +499,8 @@ func vhlMergeSeen(vfr *vhl.Verifier) error {
 	})
 }
 
+func vhlMergeSeen(vfr *vhl.Verifier) error { return LegacyContext().vhlMergeSeen(vfr) }
+
 // handleVHLFrame consumes an in-band VHL protocol frame. Frames are
 // E2E DMs, so `from` is the authenticated sender. vfr is the caller's
 // fetch-local verifier, if it has one: revocations applied to the
@@ -501,7 +511,7 @@ func vhlMergeSeen(vfr *vhl.Verifier) error {
 func (c *Client) handleVHLFrame(from string, fr *vhl.Frame, envelopeID int64, vfr *vhl.Verifier) {
 	now := time.Now().Unix()
 	var applied *vhl.Revocation
-	err := updateVHL(func(ff *vhlFile) error {
+	err := c.cfg.local().updateVHL(func(ff *vhlFile) error {
 		switch fr.Type {
 		case vhl.FrameApprovalRequest:
 			r := fr.ApprovalRequest
@@ -630,7 +640,7 @@ func vhlClampTier(t int) int {
 // messages below this tier are held for human review. 0 (the
 // default) means no requirement.
 func (c *Client) VHLGetRequiredTier() (int, error) {
-	ff, err := loadVHL()
+	ff, err := c.cfg.local().loadVHL()
 	if err != nil {
 		return 0, err
 	}
@@ -644,7 +654,7 @@ func (c *Client) VHLSetRequiredTier(tier int) error {
 	if tier < 0 || tier > int(vhl.Tier2) {
 		return fmt.Errorf("require-tier must be 0, 1, or 2")
 	}
-	return updateVHL(func(ff *vhlFile) error {
+	return c.cfg.local().updateVHL(func(ff *vhlFile) error {
 		ff.RequiredTier = tier
 		return nil
 	})
@@ -669,9 +679,9 @@ func (c *Client) VHLSetRequiredTier(tier int) error {
 // atomically with the ID closes the concurrent-verifier rewrap
 // replay (PROTOCOL.md §30.3–§30.4). PIN/challenge proofs carry no
 // nonce (nonceB64 == "") and keep the ID-only check.
-func vhlConsumeAttestation(attID, approver, nonceB64 string, envelopeID int64) (bool, error) {
+func (s Context) vhlConsumeAttestation(attID, approver, nonceB64 string, envelopeID int64) (bool, error) {
 	alreadySeen := false
-	err := updateVHL(func(ff *vhlFile) error {
+	err := s.updateVHL(func(ff *vhlFile) error {
 		if ff.Seen.Seen(attID, envelopeID) {
 			alreadySeen = true
 			return nil
@@ -688,6 +698,10 @@ func vhlConsumeAttestation(attID, approver, nonceB64 string, envelopeID int64) (
 		return nil
 	})
 	return alreadySeen, err
+}
+
+func vhlConsumeAttestation(attID, approver, nonceB64 string, envelopeID int64) (bool, error) {
+	return LegacyContext().vhlConsumeAttestation(attID, approver, nonceB64, envelopeID)
 }
 
 // VHLStatus is the receiver-side VHL evaluation surfaced on a
