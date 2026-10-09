@@ -2306,7 +2306,11 @@ func (c *Client) AcceptRequest(id int64, asName string) ([]Message, error) {
 		if name == "" {
 			// #146: the display name defaults to the known directory
 			// handle; the generated name is the fallback.
-			if h := c.PeerHandle(sender); h != "" && contactNameRe.MatchString(h) {
+			h, err := c.lookupPeerHandle(sender)
+			if err != nil {
+				return nil, fmt.Errorf("resolve sender handle: retry or supply --as: %w", err)
+			}
+			if h != "" && contactNameRe.MatchString(h) {
 				name = h
 			} else {
 				name = c.requestContactName(sender)

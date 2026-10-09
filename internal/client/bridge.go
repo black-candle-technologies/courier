@@ -44,6 +44,9 @@ func encodeBridgedBody(wrappedBody string, meta *bridge.BridgeMeta) ([]byte, err
 // standard sealed box. It is recorded in the local sent log like any
 // DM so the dashboard threads it.
 func (c *Client) SendBridged(address, wrappedBody string, meta *bridge.BridgeMeta) (int64, error) {
+	if err := maintainLegacyState(); err != nil {
+		return 0, err
+	}
 	if _, err := crypto.ParseAddress(address); err != nil {
 		return 0, fmt.Errorf("bad recipient address: %w", err)
 	}

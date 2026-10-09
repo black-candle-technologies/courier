@@ -168,6 +168,7 @@ func usage() {
   courier contacts unverify <name>       clear a contact's verification
   courier contacts delivery-receipts-on <name>    opt into delivery receipts for a contact
   courier contacts delivery-receipts-off <name>   opt out of delivery receipts (default)
+  courier contacts start-fs <name>           explicitly probe a private FS-capable peer
   courier contacts require-fs-on <name>      require forward secrecy: sends fail
                                          rather than fall back to legacy (default off)
   courier contacts require-fs-off <name>    clear the require-forward-secrecy policy
@@ -448,6 +449,7 @@ func (scope command) cmdSend(args []string) error {
 		return err
 	}
 	cl := client.New(cfg)
+	resolvedHandle := ""
 	// Contact discovery (issue #39): @handle and handle:<name> resolve
 	// via the directory. The resolved address is always shown; sending
 	// to a handle for the first time, or to a contacts-policy handle,
@@ -455,6 +457,7 @@ func (scope command) cmdSend(args []string) error {
 	if addr, profile, isHandle, herr := cl.ResolveHandleTarget(address); herr != nil {
 		return fmt.Errorf("handle resolution failed: %w", herr)
 	} else if isHandle {
+		resolvedHandle = profile.Handle
 		fmt.Fprintf(os.Stderr, "resolved @%s -> %s\n", profile.Handle, addr)
 		firstContact := cfg.IsFirstContact(addr)
 		contactsOnly := profile.ContactPolicy == "contacts"
@@ -524,6 +527,9 @@ func (scope command) cmdSend(args []string) error {
 	display := address
 	if resolved, rerr := cfg.ResolveRecipient(address); rerr == nil {
 		display = cl.ContactDisplayName(resolved)
+		if existingContactAlias(cfg, resolved) == "" && resolvedHandle != "" {
+			display = fmt.Sprintf("@%s (%s)", resolvedHandle, resolved)
+		}
 	}
 	fmt.Printf("sent to %s (id %d)", display, id)
 	if replyTo > 0 {
@@ -1111,7 +1117,7 @@ func writeSvcJSON(w http.ResponseWriter, code int, v any) {
 
 func (scope command) cmdContacts(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|require-fs-on|require-fs-off|remove>")
+		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|start-fs|require-fs-on|require-fs-off|remove>")
 	}
 	cfg, err := scope.context.LoadConfig()
 	if err != nil {
@@ -1330,6 +1336,14 @@ func (scope command) cmdContacts(args []string) error {
 		} else {
 			fmt.Printf("delivery receipts off for %q.\n", args[1])
 		}
+	case "start-fs":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: courier contacts start-fs <name>")
+		}
+		if err := cl.FSStart(args[1]); err != nil {
+			return err
+		}
+		fmt.Println("FS bootstrap requested; poll both inboxes to complete the handshake. Send policy is unchanged.")
 	case "require-fs-on", "require-fs-off":
 		// #146 (per #327): the per-contact fail-closed policy.
 		// Opting a contact in means sends to them refuse legacy
@@ -1374,7 +1388,7 @@ func (scope command) cmdContacts(args []string) error {
 		}
 		fmt.Printf("contact %q removed.\n", args[1])
 	default:
-		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|require-fs-on|require-fs-off|remove)", args[0])
+		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|start-fs|require-fs-on|require-fs-off|remove)", args[0])
 	}
 	return nil
 }
@@ -1949,3 +1963,6 @@ func existingContactAlias(cfg *client.Config, address string) string {
 	}
 	return result
 }
+
+// Legacy command adapter retained for existing command-level fixtures.
+func cmdSend(args []string) error { return (command{context: client.LegacyContext()}).cmdSend(args) }

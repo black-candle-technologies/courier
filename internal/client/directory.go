@@ -449,15 +449,20 @@ func (c *Client) DirectoryReverse(address string) ([]DirectoryProfile, error) {
 // dashboard, with a 24h local cache so the per-minute push does not
 // query the relay for every thread.
 func (c *Client) PeerHandle(address string) string {
+	handle, _ := c.lookupPeerHandle(address)
+	return handle
+}
+
+func (c *Client) lookupPeerHandle(address string) (string, error) {
 	if c.cfg.HandleCache != nil {
 		if e, ok := c.cfg.HandleCache[address]; ok &&
 			time.Now().Unix()-e.At < 24*3600 {
-			return e.Handle
+			return e.Handle, nil
 		}
 	}
 	profiles, err := c.DirectoryReverse(address)
 	if err != nil {
-		return ""
+		return "", err
 	} // Transient/network/verification failures are not negative knowledge.
 	handle := ""
 	if err == nil && len(profiles) > 0 {
@@ -482,7 +487,7 @@ func (c *Client) PeerHandle(address string) string {
 		}
 		return nil
 	})
-	return handle
+	return handle, nil
 }
 
 // ResolveHandleTarget accepts "@handle" or "handle:<name>" and resolves
