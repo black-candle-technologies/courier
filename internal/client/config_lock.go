@@ -87,6 +87,9 @@ func (s Context) withConfigLock(fn func() error) error {
 		return err
 	}
 	defer release()
+	if err := s.refuseMigrated(); err != nil {
+		return err
+	}
 	return fn()
 }
 

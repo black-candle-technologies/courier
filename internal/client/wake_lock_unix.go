@@ -13,8 +13,9 @@ import (
 
 // acquireWakeLock locks path for the daemon's lifetime (flock,
 // non-blocking): a second `courier wake` refuses to start while the
-// first holds it. The PID is written for operators; release removes
-// the file and drops the lock. An empty path disables the lock.
+// first holds it. The PID is written for operators. Retain the inode after
+// release so a concurrent opener cannot lock an unlinked inode. A stale PID
+// is not evidence of a live daemon; the OS lock is authoritative.
 func acquireWakeLock(path string) (release func(), err error) {
 	noop := func() {}
 	if path == "" {
@@ -38,6 +39,5 @@ func acquireWakeLock(path string) (release func(), err error) {
 	return func() {
 		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
 		f.Close()
-		_ = os.Remove(path)
 	}, nil
 }

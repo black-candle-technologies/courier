@@ -184,7 +184,10 @@ func (s Context) ConfigExists() bool {
 	return err == nil
 }
 
-func ConfigExists() bool { return LegacyContext().ConfigExists() }
+func ConfigExists() bool {
+	ctx, err := LegacyContext().ActiveContext()
+	return err == nil && ctx.ConfigExists()
+}
 
 // configMu serializes in-process config access across goroutines.
 // withConfigLock holds it for the whole read-modify-write cycle, and the
@@ -195,6 +198,9 @@ var configMu sync.Mutex
 // loadConfigRaw reads and parses the config file: version check and
 // defaults, but no migrations and no writes.
 func (s Context) loadConfigRaw() (*Config, error) {
+	if err := s.refuseMigrated(); err != nil {
+		return nil, err
+	}
 	p, err := s.configPath()
 	if err != nil {
 		return nil, err
@@ -323,7 +329,13 @@ func (s Context) LoadConfig() (*Config, error) {
 	return c, nil
 }
 
-func LoadConfig() (*Config, error) { return LegacyContext().LoadConfig() }
+func LoadConfig() (*Config, error) {
+	ctx, err := LegacyContext().ActiveContext()
+	if err != nil {
+		return nil, err
+	}
+	return ctx.LoadConfig()
+}
 
 // saveAtomic writes the config via temp file + rename in the same
 // directory, so a crash can never leave a partially written config.
@@ -677,7 +689,17 @@ func (c *Client) RotateKey() (published bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	err = c.cfg.Update(func(fresh *Config) error {
+	fresh, err := c.cfg.local().IdentityStore().update(func(fresh *Config) error {
+		if fresh.Address != c.cfg.Address || fresh.Seed != c.cfg.Seed {
+			return ErrContextMismatch
+		}
+		// Legacy callers may supply an unsaved endpoint override. Preserve that
+		// established API while loading key history under the identity-wide lock.
+		if c.cfg.local().principal == "" {
+			fresh.RelayURL = c.cfg.RelayURL
+			fresh.RelayFingerprint = c.cfg.RelayFingerprint
+		}
+
 		epoch := time.Now().Unix()
 		if len(fresh.EncKeys) > 0 && epoch <= fresh.EncKeys[0].Epoch {
 			epoch = fresh.EncKeys[0].Epoch + 1
@@ -692,6 +714,7 @@ func (c *Client) RotateKey() (published bool, err error) {
 		return false, err
 	}
 
+	*c.cfg = *fresh
 	if err := c.PublishKey(); err != nil {
 		return false, fmt.Errorf("key rotated locally but NOT published: %w (run `courier publish-key` to announce it)", err)
 	}
@@ -890,6 +913,14 @@ type Client struct {
 // New returns a Client for cfg.
 func New(cfg *Config) *Client {
 	cfg.bindLegacyContext()
+	if cfg.local().principal != "" {
+		raw, _ := json.Marshal(cfg)
+		var snapshot Config
+		_ = json.Unmarshal(raw, &snapshot)
+		ctx := cfg.local()
+		snapshot.localContext = &ctx
+		cfg = &snapshot
+	}
 	return &Client{cfg: cfg}
 }
 
