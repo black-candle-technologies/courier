@@ -70,3 +70,53 @@ func TestFSRequiredDowngradeRemainsVisible(t *testing.T) {
 		}
 	})
 }
+
+func TestFSPrivateBootstrapWithoutRequiredPolicy(t *testing.T) {
+	h := newFSHarness(t)
+	bob := h.bobCfg.Address
+	h.asAlice(func() {
+		if err := h.aliceCfg.AddContact("bob", bob); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.alice.FSStart(bob); err == nil {
+			t.Fatal("raw non-contact selector accepted")
+		}
+		if err := h.alice.FSStart("bob"); err != nil {
+			t.Fatal(err)
+		}
+		required, err := h.alice.FSRequired("bob")
+		if err != nil || required {
+			t.Fatal("bootstrap changed required policy", required, err)
+		}
+	})
+	if msgs := h.bobInbox(t); len(msgs) != 0 {
+		t.Fatal(msgs)
+	}
+	if msgs := h.aliceInbox(t); len(msgs) != 0 {
+		t.Fatal(msgs)
+	}
+	h.asAlice(func() {
+		before, err := loadFS()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sid := before.session(bob).SID
+		if err := h.alice.FSStart("bob"); err != nil {
+			t.Fatal(err)
+		}
+		after, err := loadFS()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.session(bob).SID != sid {
+			t.Fatal("active session replaced")
+		}
+		if _, err := h.alice.Send("bob", "private FS"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	msgs := h.bobInbox(t)
+	if len(msgs) != 1 || msgs[0].Body != "private FS" {
+		t.Fatal(msgs)
+	}
+}

@@ -916,6 +916,10 @@ func (c *Client) fsDirectoryCapable(address string) bool {
 // sendFSInit starts (or refreshes) an FS handshake with address: a
 // protocol DM sealed with the legacy seal, never in the sent log.
 func (c *Client) sendFSInit(address string) error {
+	return c.sendFSInitGuarded(address, false)
+}
+
+func (c *Client) sendFSInitGuarded(address string, preserveActive bool) error {
 	if address == c.cfg.Address {
 		return errors.New("fs: cannot handshake with self")
 	}
@@ -956,7 +960,12 @@ func (c *Client) sendFSInit(address string) error {
 		return fmt.Errorf("fs encode init: %w", err)
 	}
 	now := time.Now().Unix()
+	skipped := false
 	err = updateFS(func(ff *fsFile) error {
+		if sess := ff.session(address); preserveActive && sess != nil && sess.Established {
+			skipped = true
+			return nil
+		}
 		ff.Sessions[address] = &fsSession{
 			Peer: address, SID: p.SID, Initiator: true, Established: false,
 			InitID: p.InitID, RK0: p.RK0, EphPriv: b64fs.EncodeToString(ephPriv[:]),
@@ -973,6 +982,9 @@ func (c *Client) sendFSInit(address string) error {
 	crypto.Zero(rPriv[:])
 	if err != nil {
 		return err
+	}
+	if skipped {
+		return nil
 	}
 	_, err = c.sendSealed(address, raw, "", 0, "", false, 0)
 	return err
@@ -1684,4 +1696,22 @@ func (c *Client) FSDowngradeSuspected(peer string) (bool, error) {
 	}
 	_, ok := ff.Downgrade[address]
 	return ok, nil
+}
+
+// FSStart explicitly authorizes a handshake probe to a saved private/no-handle
+// contact without changing the fail-open/fail-closed policy. Active sessions are
+// left intact. A pending or failed probe can be retried by the operator.
+func (c *Client) FSStart(name string) error {
+	address, err := c.cfg.LookupContact(name)
+	if err != nil {
+		return err
+	}
+	ff, err := loadFS()
+	if err != nil {
+		return err
+	}
+	if sess := ff.session(address); sess != nil && sess.Established {
+		return nil
+	}
+	return c.sendFSInitGuarded(address, true)
 }
