@@ -134,6 +134,17 @@ The integrator resolves shared-file conflicts by transferring a file to one work
 
 **Review gate:** independent final diff review, owner sign-off on D1–D6, and Riley’s explicit merge decision. Production enabling and signing-service provisioning need separate authorization.
 
+## New peer-task requirement and later packets
+
+**Accepted product intent, 2026-10-09:** same-team agents can assign work directly to existing peers. See [peer-task handoff design](peer-task-handoff-plan.md) for the independently reviewed design, precise acceptance tests and engineering proposals. This addition does not change Packet B's active roster/invitation wire contract or its frozen vectors, and is not an implementation-readiness claim. Existing dispatch status must be checked against the active stack rather than inferred from this document's original preparation date.
+
+- **H Specify peer-task wire contract:** own new peer-task envelope types, canonical fixtures and role/causality validation after B's interface freezes. Register a new discriminator; retired state/channel namespaces stay retired. Obtain an exclusive integrator-granted window for shared registry and PROTOCOL edits. Close exact fields and authenticated support-proof freshness/binding before dependent implementation.
+- **I Implement peer-task handoffs:** after reviewed A/B/D/E/H interfaces, own the new context-bound ledger, outbox, local fenced claim API, task CLI and reference runtime adapter. Obtain exclusive narrow inbox/send/stdio/CLI integration windows from their current owners. Courier tracks handoff evidence; the recipient executor owns approval, tools, scheduling, side effects and stopping. Demonstrate direct assignment to an existing peer without spawning.
+- **F extension:** independently test the design's replay/crash/claim/cancel/expiry/compatibility and authorization matrix, including retained retirement behavior, VHL action binding versus envelope replay association, durable wake reconciliation and reserved stop capacity.
+- **G extension:** require H/I evidence and document unresolved semantics before declaring the combined feature ready. Riley's merge gate and separate rollout authorization remain unchanged.
+
+D7 records accepted feature intent, not a new generic permission request. D9 recipient-policy separation is a safety invariant. D10 single-ledger/one-attempt/no-automatic-takeover is a proposed disclosed first-release topology. D8's concrete numeric/interface candidates in the linked design are unapproved engineering inputs to validate and tune, never silently permanent defaults; support-proof validity and replay-horizon closure are prerequisites for dependent implementation. A design review does not substitute for runtime tests.
+
 ## Required check contract
 
 Read current `AGENTS.md`, applicable scoped instructions, `go.mod` and `.github/workflows/ci.yml` at each worker’s assigned base. The inspected baseline CI uses Go 1.26.8 and runs formatting, module verification, vet, full tests, race tests, pinned staticcheck/govulncheck, fuzz smoke and Linux/macOS/Windows compile jobs. Reuse the current workflow’s versions and commands rather than copying stale values from this plan.

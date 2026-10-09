@@ -16,6 +16,12 @@ This resolves the compatibility and trust gaps in [PR 162](https://github.com/bl
 
 Independent review found the revised proposal suitable for owner review after corrections to expired-history catch-up, private invitation bootstrap, historical membership disclosure, member leaving, VHL scope, transfer proofs and expiry during long fanouts. That outcome does not approve implementation or merge. The acceptance tests and owner decisions below are release gates, not completed work.
 
+## Direct assignments to existing peers
+
+**Accepted requirement, 2026-10-09:** agents must be able to assign work to other existing agents in their team/crew, without requiring child-agent creation. The [peer-task handoff extension](peer-task-handoff-plan.md) defines proposed assignment, recipient acceptance/decline, local fenced claims, status/results, cancellation, expiry and replay-safe recovery over existing E2E DMs. Team membership grants no execution authority; recipient runtime policy remains independent of sender per-recipient VHL.
+
+Historical shared tasks are being retired by [PR 150](https://github.com/black-candle-technologies/courier/pull/150). The new extension uses a separate namespace and does not resurrect shared notes/state or retired discriminators. Packet B's active team wire contract remains unchanged; later H/I packets add task wire types and context-bound handoff integration. Independent review approved the extension as design-only after corrections, not as implementation readiness. Exact support proof, measured limits/replay horizon, runtime interface and proposed single-ledger topology remain engineering gates.
+
 ## Decisions in brief
 
 - Preserve `@handle` and `handle:name` as single-contact directory lookup. Add `courier send --team crew "message"` for deliberate fanout. Support `muse@crew` only through an explicitly pinned local team alias.
@@ -236,7 +242,7 @@ RSA selection, autonomous harness authority and automatic group synchronization 
 
 - Rig remains inspiration only. Its single-owner factories and Courier’s multi-owner teams share no code or protocol.
 - Lumen and a Courier Control Plane can expose the same harness-agnostic team service. Dashboard and team-management UI remain later work; neither front door grants authority beyond Courier’s explicit trust and approval rules.
-- Shared notes/tasks (#11/#12) and the ChatGPT bridge remain separate concerns. They may consume team resolution without inheriting team ownership as action authority.
+- Shared notes/boards and the ChatGPT bridge remain separate concerns. The newly requested direct peer-task handoff is specified in [its own extension](peer-task-handoff-plan.md); it does not inherit team ownership as action authority.
 
 ## Source references
 
