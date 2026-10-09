@@ -805,10 +805,10 @@ The inbox pipeline (`Client.inbox`, `internal/client/client.go`):
    4 retired, §5.3); undecryptable messages are skipped without
    stalling.
 8. Dispatch the plaintext in the order in §13: FS frames to the FS
-   layer (§15), retired state/channel payloads to silent consumption
-   (§27), active group / receipt / introduction protocol DMs to their
-   consumers, and chat to the inbox. Retired payloads never enter the
-   reply cache or dashboard output.
+   layer (§15), then active group / receipt / VHL / introduction handlers,
+   then retired state/channel payloads to silent consumption (§27), and
+   finally chat to the inbox. Retired payloads never enter the reply cache
+   or dashboard output.
 9. Mark delivered hashes seen (per consumer), flush the reply cache,
    persist the cursor.
 
