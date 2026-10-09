@@ -21,7 +21,7 @@ func Resolve(mode, endpoint string) (string, error) {
 		return "legacy-non-https", nil
 	case DirectTLS:
 		u, err := url.Parse(endpoint)
-		if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		if err != nil || !strings.HasPrefix(endpoint, "https://") || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 			return "", fmt.Errorf("direct-tls requires an HTTPS endpoint without credentials, query or fragment")
 		}
 		return DirectTLS, nil

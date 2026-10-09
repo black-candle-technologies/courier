@@ -11,6 +11,7 @@ func TestResolve(t *testing.T) {
 		{"", "http://localhost:1234", "legacy-non-https", false},
 		{DirectTLS, "https://example.invalid", DirectTLS, false},
 		{DirectTLS, "http://localhost", "", true},
+		{DirectTLS, "HTTPS://example.invalid", "", true},
 		{DirectTLS, "https://user:secret@example.invalid", "", true},
 		{DirectTLS, "https://example.invalid?token=secret", "", true},
 		{"cloud", "https://example.invalid", "", true},
