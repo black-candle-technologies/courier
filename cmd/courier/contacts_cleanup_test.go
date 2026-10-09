@@ -50,6 +50,9 @@ func TestContactCleanupRetryAfterReopen(t *testing.T) {
 			}
 			err = cmdContacts(args)
 			command := "courier contacts retry-fs-cleanup " + old.Address
+			if !removal {
+				command = "cannot inspect replacement FS policy"
+			}
 			if err == nil || !strings.Contains(err.Error(), command) {
 				t.Fatalf("missing durable retry input: %v", err)
 			}
@@ -57,7 +60,7 @@ func TestContactCleanupRetryAfterReopen(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := next.Address
+			want := old.Address
 			if removal {
 				want = ""
 			}
@@ -66,6 +69,15 @@ func TestContactCleanupRetryAfterReopen(t *testing.T) {
 			}
 			if err := os.WriteFile(path, good, 0600); err != nil {
 				t.Fatal(err)
+			}
+			if !removal {
+				if err := cmdContacts(args); err != nil {
+					t.Fatal(err)
+				}
+				reopened, err = client.LoadConfig()
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 			// A newly saved alias must protect the old policy even from this stale client.
 			stale := client.New(reopened)

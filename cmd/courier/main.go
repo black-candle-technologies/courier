@@ -457,6 +457,7 @@ func (scope command) cmdSend(args []string) error {
 	}
 	cl := client.New(cfg)
 	resolvedHandle := ""
+	var resolvedProfile *client.DirectoryProfile
 	// Contact discovery (issue #39): @handle and handle:<name> resolve
 	// via the directory. The resolved address is always shown; sending
 	// to a handle for the first time, or to a contacts-policy handle,
@@ -465,6 +466,7 @@ func (scope command) cmdSend(args []string) error {
 		return fmt.Errorf("handle resolution failed: %w", herr)
 	} else if isHandle {
 		resolvedHandle = profile.Handle
+		resolvedProfile = profile
 		fmt.Fprintf(os.Stderr, "resolved @%s -> %s\n", profile.Handle, addr)
 		firstContact := cfg.IsFirstContact(addr)
 		contactsOnly := profile.ContactPolicy == "contacts"
@@ -528,6 +530,11 @@ func (scope command) cmdSend(args []string) error {
 	}
 	if err != nil {
 		return err
+	}
+	if resolvedProfile != nil {
+		if cacheErr := cl.CacheDirectoryProfile(resolvedProfile); cacheErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: message delivered, but could not cache recipient handle: %v\n", cacheErr)
+		}
 	}
 	// #146: confirm who the message went to — handle by default,
 	// private alias when one is set.
@@ -1198,7 +1205,7 @@ func (scope command) cmdContacts(args []string) error {
 		if len(args) == 3 {
 			err = cfg.AddContactAlias(name, address)
 		} else {
-			err = cfg.AddContact(name, address)
+			name, err = cfg.AddDiscoveredContact(name, address)
 		}
 		if err != nil {
 			return err

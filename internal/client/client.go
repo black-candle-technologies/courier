@@ -68,7 +68,8 @@ type EncKey struct {
 // Config is the local agent identity, stored at ~/.courier/config.json.
 // The seed and encryption private keys never leave this file (mode 0600).
 type Config struct {
-	localContext *Context
+	localContext    *Context
+	unsavedIdentity bool // only NewIdentity may initialize through contact mutation
 
 	Version          int               `json:"version"`
 	RelayURL         string            `json:"relay"`
@@ -152,7 +153,9 @@ type Config struct {
 	// HandleRefreshAt is the last time refreshPeerHandles pushed a
 	// handles-only update; refreshed at most once per 24h so inactive
 	// threads get their labels without a message batch.
-	HandleRefreshAt int64 `json:"handle_refresh_at,omitempty"`
+	HandleRefreshAt      int64                         `json:"handle_refresh_at,omitempty"`
+	PendingPeerDiscovery map[string]PeerDiscoveryEntry `json:"pending_peer_discovery,omitempty"`
+	PublishedPeerTrust   map[string]string             `json:"published_peer_trust,omitempty"`
 	// Instant wake (issue #42). WakeCursor is the last envelope id the
 	// wake daemon observed. It is tracked separately from Cursor so
 	// observing a message never consumes it: a woken agent still sees
@@ -407,7 +410,13 @@ func (c *Config) Save() error {
 	c.bindLegacyContext()
 	scope := c.local()
 	configMu.Unlock()
-	return scope.withConfigLock(func() error { return c.saveAtomic() })
+	return scope.withConfigLock(func() error {
+		if err := c.saveAtomic(); err != nil {
+			return err
+		}
+		c.unsavedIdentity = false
+		return nil
+	})
 }
 
 // Update performs an atomic read-modify-write: it takes the cross-process
@@ -417,12 +426,28 @@ func (c *Config) Save() error {
 // mutating a stale in-memory Config and calling Save would clobber fields
 // another process wrote meanwhile (v0.6.11 F5).
 func (c *Config) Update(fn func(*Config) error) error {
+	return c.updateWithSave(fn, false, (*Config).saveAtomic)
+}
+
+// updateWithSave shares the fresh-config transaction; only contact initialization
+// on an unsaved NewIdentity may create a missing file.
+func (c *Config) updateWithSave(fn func(*Config) error, initialize bool, save func(*Config) error) error {
 	configMu.Lock()
 	c.bindLegacyContext()
 	scope := c.local()
 	configMu.Unlock()
 	return scope.withConfigLock(func() error {
-		fresh, err := c.local().loadConfigRaw()
+		fresh, err := scope.loadConfigRaw()
+		if errors.Is(err, os.ErrNotExist) && initialize && c.unsavedIdentity {
+			// Clone all maps/slices so a failed mutation cannot alter the receiver.
+			raw, cloneErr := json.Marshal(c)
+			if cloneErr != nil {
+				return cloneErr
+			}
+			fresh = new(Config)
+			err = json.Unmarshal(raw, fresh)
+			fresh.localContext = &scope
+		}
 		if err != nil {
 			return err
 		}
@@ -440,10 +465,11 @@ func (c *Config) Update(fn func(*Config) error) error {
 		if err := fn(fresh); err != nil {
 			return err
 		}
-		if err := fresh.saveAtomic(); err != nil {
+		if err := save(fresh); err != nil {
 			return err
 		}
 		c.refreshState(fresh)
+		c.unsavedIdentity = false
 		return nil
 	})
 }
@@ -471,10 +497,11 @@ func NewIdentity(relayURL string) (*Config, error) {
 		return nil, err
 	}
 	return &Config{
-		Version:  ConfigVersion,
-		RelayURL: relayURL,
-		Seed:     base64.RawURLEncoding.EncodeToString(id.Seed[:]),
-		Address:  crypto.FormatAddress(id.EdPub[:]),
+		unsavedIdentity: true,
+		Version:         ConfigVersion,
+		RelayURL:        relayURL,
+		Seed:            base64.RawURLEncoding.EncodeToString(id.Seed[:]),
+		Address:         crypto.FormatAddress(id.EdPub[:]),
 		EncKeys: []EncKey{{
 			Pub:       base64.RawURLEncoding.EncodeToString(xpub[:]),
 			Priv:      base64.RawURLEncoding.EncodeToString(xpriv[:]),
@@ -497,31 +524,49 @@ func (c *Config) Identity() (*crypto.Identity, error) {
 
 var contactNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
-// AddContact stores name -> address after validating both.
+// AddContact stores an explicitly requested name-to-address mapping.
 func (c *Config) AddContact(name, address string) error {
-	return c.addContact(name, address, false)
+	_, err := c.addContact(name, address, false, false)
+	return err
 }
 
-// AddContactAlias saves an explicitly chosen private display alias without
-// deleting other names or their verification metadata for the same address.
+// AddContactAlias also makes the private alias the preferred display name.
 func (c *Config) AddContactAlias(name, address string) error {
-	return c.addContact(name, address, true)
+	_, err := c.addContact(name, address, true, false)
+	return err
 }
 
-func (c *Config) addContact(name, address string, prefer bool) error {
+// AddDiscoveredContact never replaces a saved alias on directory evidence alone.
+// It returns the actual saved name, including one concurrently saved elsewhere.
+func (c *Config) AddDiscoveredContact(name, address string) (string, error) {
+	return c.addContact(name, address, false, true)
+}
+
+func (c *Config) addContact(name, address string, prefer, discovered bool) (string, error) {
 	if !contactNameRe.MatchString(name) {
-		return fmt.Errorf("bad contact name %q: use 1-32 chars, lowercase letters, digits, - and _, starting with a letter or digit", name)
+		return "", fmt.Errorf("bad contact name %q: use 1-32 chars, lowercase letters, digits, - and _, starting with a letter or digit", name)
 	}
 	if _, err := crypto.ParseAddress(address); err != nil {
-		return fmt.Errorf("bad address: %w", err)
+		return "", fmt.Errorf("bad address: %w", err)
 	}
 	var oldAddress string
 	var replaced bool
-	if err := c.Update(func(fresh *Config) error {
-		if fresh.Contacts == nil {
-			fresh.Contacts = map[string]string{}
+	savedName := name
+	if err := c.updateWithSave(func(fresh *Config) error {
+		if discovered {
+			if existing := fresh.ContactNameForAddress(address); existing != "" {
+				savedName = existing
+				return nil
+			}
+			if old, exists := fresh.Contacts[name]; exists && old != address {
+				return fmt.Errorf("contact %q already exists for a different address", name)
+			}
 		}
-		oldAddress, replaced = fresh.Contacts[name]
+		var err error
+		oldAddress, replaced, err = replaceContactLocked(fresh, name, address)
+		if err != nil {
+			return err
+		}
 		if fresh.PreferredContactNames[oldAddress] == name && oldAddress != address {
 			delete(fresh.PreferredContactNames, oldAddress)
 		}
@@ -531,22 +576,19 @@ func (c *Config) addContact(name, address string, prefer bool) error {
 			}
 			fresh.PreferredContactNames[address] = name
 		}
-		fresh.Contacts[name] = address
 		return nil
-	}); err != nil {
-		return err
+	}, true, (*Config).saveAtomic); err != nil {
+		return "", err
 	}
 	if replaced && oldAddress != address {
 		if _, err := New(c).FSCleanupOrphan(oldAddress); err != nil {
-			return fmt.Errorf("contact saved, but could not erase replaced contact's FS session; retry with courier contacts retry-fs-cleanup %s: %w", oldAddress, err)
+			return savedName, fmt.Errorf("contact saved, but could not erase replaced contact's FS session; retry with courier contacts retry-fs-cleanup %s: %w", oldAddress, err)
 		}
 	}
-	return nil
+	return savedName, nil
 }
 
-// RemoveContact atomically removes an alias and its verification. Receipt
-// consent survives while another alias references the principal. FS cleanup
-// rechecks the saved aliases under the captured context lock.
+// RemoveContact changes fresh aliases and live trust in one config transaction.
 func (c *Config) RemoveContact(name string) error {
 	var address string
 	var existed bool
@@ -556,17 +598,11 @@ func (c *Config) RemoveContact(name string) error {
 			delete(fresh.PreferredContactNames, address)
 		}
 		delete(fresh.Contacts, name)
-		stillReferenced := false
-		for _, other := range fresh.Contacts {
-			if other == address {
-				stillReferenced = true
-				break
-			}
-		}
-		if existed && !stillReferenced {
-			delete(fresh.ReceiptContacts, address)
-		}
 		delete(fresh.ContactVerifications, name)
+		if existed {
+			clearOrphanReceipt(fresh, address)
+			fresh.HandleRefreshAt = 0
+		}
 		return nil
 	}); err != nil {
 		return err
@@ -1427,6 +1463,7 @@ func (c *Client) sendSealed(address string, plain []byte, sentLogBody string, re
 	// Protocol DMs skip the log: they are machine traffic, not chat.
 	if logSent {
 		_ = c.cfg.local().appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: sentLogBody, SentAt: sentAt, ReplyTo: replyTo, Quote: quote, ExpiresAt: expiresAt})
+		_ = c.queuePeerDiscovery(address)
 	}
 	return out.ID, nil
 }
@@ -2215,13 +2252,6 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 					msg.Flags = flags
 				}
 			}
-			// issue #51: remember this delivery in the reply cache so a
-			// later reply to it can quote the parent without a relay
-			// round-trip. Best effort; delivery never depends on it.
-			cacheEntries = append(cacheEntries, replyCacheEntry{
-				CourierID: m.ID, From: m.From,
-				Snippet: truncateQuote(body), SentAt: m.SentAt,
-			})
 			// Hold rule: a message becomes a request (held for review,
 			// never delivered to the inbox or dashboard) when the
 			// recipient's contacts-only policy quarantines a first contact,
@@ -2236,6 +2266,15 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 				newHashes = append(newHashes, "")
 				return
 			}
+			_ = c.queuePeerDiscovery(m.From)
+			// issue #51: remember this delivery in the reply cache so a
+			// later reply to it can quote the parent without a relay
+			// round-trip. Best effort; delivery never depends on it.
+			cacheEntries = append(cacheEntries, replyCacheEntry{
+				CourierID: m.ID, From: m.From,
+				Snippet: truncateQuote(body), SentAt: m.SentAt, ExpiresAt: expiresAt,
+			})
+
 			out = append(out, msg)
 			outputHashes = append(outputHashes, h)
 			// issue #52: opt-in delivery receipt. Fires only for the inbox
@@ -2274,7 +2313,9 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// comes first: a parent and its reply can arrive together.
 		local := make(map[int64]string)
 		for _, m := range out {
-			if m.Body != "" {
+			// A held or now-expired parent must not escape through an accepted
+			// reply, including a dashboard batch that omits the parent itself.
+			if !m.Request && !stateExpired(time.Now().Unix(), m.ExpiresAt) && m.Body != "" {
 				local[m.ID] = truncateQuote(m.Body)
 			}
 		}
@@ -2932,57 +2973,49 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 // the dashboard applies its own label TTL. Explicit discovery and the
 // bounded follow-mode worker refresh the cache independently.
 func (c *Client) refreshPeerHandles(hc *http.Client) {
-	if time.Now().Unix()-c.cfg.HandleRefreshAt < 24*3600 {
+	// Build each push from disk: the delivery client's contact snapshot can
+	// predate a removal, rebind, or verification in another process.
+	cfg, err := c.cfg.local().LoadConfig()
+	if err != nil {
 		return
 	}
-	peers := make([]string, 0, len(c.cfg.HandleCache))
-	for peer := range c.cfg.HandleCache {
-		peers = append(peers, peer)
+	if cfg.Address != c.cfg.Address || cfg.Seed != c.cfg.Seed || cfg.RelayURL != c.cfg.RelayURL || (cfg.RelayFingerprint != c.cfg.RelayFingerprint && !sameCertificatePin(cfg.RelayFingerprint, c.cfg.RelayFingerprint)) || cfg.DashboardURL != c.cfg.DashboardURL || cfg.DashboardFingerprint != c.cfg.DashboardFingerprint || cfg.DashboardToken != c.cfg.DashboardToken {
+		return
 	}
-	// Also cover named contacts whose cached label changed since the
-	// last dashboard update.
-	for _, addr := range c.cfg.Contacts {
-		peers = append(peers, addr)
+	current := cachedDashboardTrust(cfg)
+	if time.Now().Unix()-cfg.HandleRefreshAt < 24*3600 && maps.Equal(current, cfg.PublishedPeerTrust) {
+		return
 	}
 	handles := map[string]string{}
-	seen := map[string]bool{}
-	for _, peer := range peers {
-		if seen[peer] {
-			continue
-		}
-		seen[peer] = true
-		if entry, ok := c.cfg.HandleCache[peer]; ok && time.Now().Unix()-entry.At < 24*3600 {
-			handles[peer] = entry.Handle // authoritative empty clears an old label
+	for peer, entry := range cfg.HandleCache {
+		if time.Now().Unix()-entry.At < 24*3600 {
+			handles[peer] = entry.Handle
 		}
 	}
-	// issue #48: push contact trust states alongside the handle labels.
-	// Only contacts carry verification; verified/stale peers get a
-	// badge in the dashboard, unverified peers get none.
-	verified := map[string]string{}
-	for name := range c.cfg.Contacts {
-		addr, err := c.cfg.LookupContact(name)
-		if err != nil {
-			continue
-		}
-		st, _ := c.CachedContactTrust(name)
-		switch st {
-		case TrustVerified:
-			if verified[addr] != "stale" {
-				verified[addr] = "verified_cached"
-			}
-		case TrustStale:
-			verified[addr] = "stale"
-		default:
-			if _, reported := verified[addr]; !reported {
-				verified[addr] = ""
-			}
+	verified := maps.Clone(current)
+	for peer := range cfg.PublishedPeerTrust {
+		if _, exists := current[peer]; !exists {
+			verified[peer] = ""
 		}
 	}
-	// Mark only successfully published evidence, and do not consume a
-	// concurrent worker's refresh request for a newer local snapshot.
 	markRefreshed := func() {
-		_ = c.cfg.Update(func(fresh *Config) error {
-			if maps.Equal(fresh.HandleCache, c.cfg.HandleCache) && maps.Equal(fresh.ContactVerifications, c.cfg.ContactVerifications) && maps.Equal(fresh.VerifiedKeyEpochs, c.cfg.VerifiedKeyEpochs) && maps.Equal(fresh.Contacts, c.cfg.Contacts) {
+		_ = cfg.Update(func(fresh *Config) error {
+			// Record exactly what this successful request published. If local
+			// evidence changed in flight, the next pass must correct that view.
+			if fresh.PublishedPeerTrust == nil {
+				fresh.PublishedPeerTrust = map[string]string{}
+			}
+			// Preserve pending clears or other push evidence created while this
+			// request was in flight but not represented in its payload.
+			for peer := range verified {
+				if status, exists := current[peer]; exists {
+					fresh.PublishedPeerTrust[peer] = status
+				} else {
+					delete(fresh.PublishedPeerTrust, peer)
+				}
+			}
+			fresh.HandleRefreshAt = 0
+			if maps.Equal(fresh.HandleCache, cfg.HandleCache) && maps.Equal(cachedDashboardTrust(fresh), current) && maps.Equal(fresh.PublishedPeerTrust, current) {
 				fresh.HandleRefreshAt = time.Now().Unix()
 			}
 			return nil
@@ -2992,14 +3025,13 @@ func (c *Client) refreshPeerHandles(hc *http.Client) {
 		markRefreshed()
 		return
 	}
-	body, _ := json.Marshal(map[string]any{
-		"messages": []any{},
-		"handles":  handles,
-		"verified": verified,
-	})
-	req, _ := http.NewRequest(http.MethodPost, c.cfg.DashboardURL+"/v1/dashboard/push", bytes.NewReader(body))
+	body, _ := json.Marshal(map[string]any{"messages": []any{}, "handles": handles, "verified": verified})
+	req, err := http.NewRequest(http.MethodPost, cfg.DashboardURL+"/v1/dashboard/push", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.cfg.DashboardToken)
+	req.Header.Set("Authorization", "Bearer "+cfg.DashboardToken)
 	resp, err := hc.Do(req)
 	if err != nil {
 		return
@@ -3116,6 +3148,8 @@ func (c *Config) refreshState(fresh *Config) {
 	c.DirectoryEpoch = fresh.DirectoryEpoch
 	c.Introductions = fresh.Introductions
 	c.HandleCache = fresh.HandleCache
+	c.PendingPeerDiscovery = fresh.PendingPeerDiscovery
+	c.PublishedPeerTrust = fresh.PublishedPeerTrust
 	c.HandleRefreshAt = fresh.HandleRefreshAt
 	c.WakeCursor = fresh.WakeCursor
 	c.BridgeGateways = fresh.BridgeGateways
