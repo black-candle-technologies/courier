@@ -67,6 +67,8 @@ type EncKey struct {
 // Config is the local agent identity, stored at ~/.courier/config.json.
 // The seed and encryption private keys never leave this file (mode 0600).
 type Config struct {
+	unsavedIdentity bool // only NewIdentity may initialize through contact mutation
+
 	Version          int               `json:"version"`
 	RelayURL         string            `json:"relay"`
 	Seed             string            `json:"seed"`                        // base64url 32-byte identity seed
@@ -363,7 +365,11 @@ func (c *Config) saveAtomic() error {
 // otherwise fields another process changed meanwhile (e.g. rotated
 // encryption keys) are silently clobbered.
 func (c *Config) Save() error {
-	return withConfigLock(func() error { return c.saveAtomic() })
+	err := withConfigLock(func() error { return c.saveAtomic() })
+	if err == nil {
+		c.unsavedIdentity = false
+	}
+	return err
 }
 
 // Update performs an atomic read-modify-write: it takes the cross-process
@@ -373,8 +379,23 @@ func (c *Config) Save() error {
 // mutating a stale in-memory Config and calling Save would clobber fields
 // another process wrote meanwhile (v0.6.11 F5).
 func (c *Config) Update(fn func(*Config) error) error {
+	return c.updateWithSave(fn, false, (*Config).saveAtomic)
+}
+
+// updateWithSave shares the fresh-config transaction; only contact initialization
+// on an unsaved NewIdentity may create a missing file.
+func (c *Config) updateWithSave(fn func(*Config) error, initialize bool, save func(*Config) error) error {
 	return withConfigLock(func() error {
 		fresh, err := loadConfigRaw()
+		if errors.Is(err, os.ErrNotExist) && initialize && c.unsavedIdentity {
+			// Clone all maps/slices so a failed mutation cannot alter the receiver.
+			raw, cloneErr := json.Marshal(c)
+			if cloneErr != nil {
+				return cloneErr
+			}
+			fresh = new(Config)
+			err = json.Unmarshal(raw, fresh)
+		}
 		if err != nil {
 			return err
 		}
@@ -389,7 +410,7 @@ func (c *Config) Update(fn func(*Config) error) error {
 		if err := fn(fresh); err != nil {
 			return err
 		}
-		if err := fresh.saveAtomic(); err != nil {
+		if err := save(fresh); err != nil {
 			return err
 		}
 		*c = *fresh
@@ -420,10 +441,11 @@ func NewIdentity(relayURL string) (*Config, error) {
 		return nil, err
 	}
 	return &Config{
-		Version:  ConfigVersion,
-		RelayURL: relayURL,
-		Seed:     base64.RawURLEncoding.EncodeToString(id.Seed[:]),
-		Address:  crypto.FormatAddress(id.EdPub[:]),
+		unsavedIdentity: true,
+		Version:         ConfigVersion,
+		RelayURL:        relayURL,
+		Seed:            base64.RawURLEncoding.EncodeToString(id.Seed[:]),
+		Address:         crypto.FormatAddress(id.EdPub[:]),
 		EncKeys: []EncKey{{
 			Pub:       base64.RawURLEncoding.EncodeToString(xpub[:]),
 			Priv:      base64.RawURLEncoding.EncodeToString(xpriv[:]),
@@ -454,19 +476,16 @@ func (c *Config) AddContact(name, address string) error {
 	if _, err := crypto.ParseAddress(address); err != nil {
 		return fmt.Errorf("bad address: %w", err)
 	}
-	if c.Contacts == nil {
-		c.Contacts = map[string]string{}
-	}
-	oldAddress, replaced := c.Contacts[name]
-	c.Contacts[name] = address
-	if err := c.Save(); err != nil {
-		if replaced {
-			c.Contacts[name] = oldAddress
-		} else {
-			delete(c.Contacts, name)
-		}
+	var oldAddress string
+	var replaced bool
+	if err := c.updateWithSave(func(fresh *Config) error {
+		var err error
+		oldAddress, replaced, err = replaceContactLocked(fresh, name, address)
+		return err
+	}, true, (*Config).saveAtomic); err != nil {
 		return err
 	}
+
 	// Persist the replacement before erasure; retry checks the freshest aliases.
 	if replaced && oldAddress != address {
 		if _, err := New(c).FSCleanupOrphan(oldAddress); err != nil {
@@ -476,29 +495,21 @@ func (c *Config) AddContact(name, address string) error {
 	return nil
 }
 
-// RemoveContact deletes a contact and its verification record (issue
-// #48: a removed contact's trust must not resurrect if re-added), plus
-// its receipt opt-in (issue #52: no lingering activity-leak consent).
-// It is not an error if absent.
+// RemoveContact removes live verification and revokes address-level consent
+// only when no alias remains. The fresh saved aliases guard post-save FS erasure.
 func (c *Config) RemoveContact(name string) error {
-	address, existed := c.Contacts[name]
-	verification, verified := c.ContactVerifications[name]
-	receipt, hadReceipt := c.ReceiptContacts[address]
-	if existed {
-		delete(c.ReceiptContacts, address)
-	}
-	delete(c.Contacts, name)
-	delete(c.ContactVerifications, name)
-	if err := c.Save(); err != nil {
+	var address string
+	var existed bool
+	if err := c.Update(func(fresh *Config) error {
+		address, existed = fresh.Contacts[name]
+		delete(fresh.Contacts, name)
+		delete(fresh.ContactVerifications, name)
 		if existed {
-			c.Contacts[name] = address
+			clearOrphanReceipt(fresh, address)
+			fresh.HandleRefreshAt = 0
 		}
-		if verified {
-			c.ContactVerifications[name] = verification
-		}
-		if hadReceipt {
-			c.ReceiptContacts[address] = receipt
-		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	if existed {

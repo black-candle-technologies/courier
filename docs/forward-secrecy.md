@@ -96,6 +96,12 @@ them — no new relay endpoint, no new signed object.
   authorizes automatic handshake probes, including private/no-handle peers.
   Sends fail closed until a session is established. `require-fs-off` restores
   the default opportunistic fallback. Private peers can explicitly bootstrap with `contacts start-fs`; repeating it restarts a pending handshake with a fresh init, while an active session is preserved.
+- Rebinding a saved name to a different identity preserves its required-FS
+  policy: the new address's requirement is persisted and synced before the
+  new mapping is published. Session keys, negotiation pins and verification
+  never transfer. An unreadable policy store blocks rebinding. A failed config
+  save may leave an extra restrictive policy, but cannot expose a fail-open
+  replacement. Receipt consent stays only with still-saved old aliases.
 - Removing or replacing a contact erases the old identity's FS session/policy only after the contact change is saved
   and only when no remaining alias references that address. Persistent downgrade
   suspicion is visible in `contacts show` and fail-closed send errors.
@@ -358,8 +364,8 @@ automatic:
 - `courier contacts remove <name>` erases the peer's FS session only after
   the last alias is successfully removed or replaced (replaces `fs forget`).
   A failed save preserves the old session; cleanup failure after a replacement
-  reports that the contact was saved but the old session could not be erased. Both
-  removal and replacement failures print `courier contacts retry-fs-cleanup
+  reports that the contact was saved but the old session could not be erased. Post-save
+  removal and replacement cleanup failures print `courier contacts retry-fs-cleanup
   <old-address>`. After fixing the reported local file error, that command
   works after reopening Courier and can be repeated safely. It refuses erasure
   if any saved alias now references the address. This is operator-driven repair,
