@@ -95,5 +95,3 @@ func (s Context) syncFSReplacementPolicy() error {
 	defer d.Close()
 	return d.Sync()
 }
-
-func syncFSReplacementPolicy() error { return LegacyContext().syncFSReplacementPolicy() }
