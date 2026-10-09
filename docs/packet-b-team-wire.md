@@ -55,7 +55,7 @@ Tests include strict schema/encoding rejection, JCS equivalence, domain separati
 - Independent review of schema/API, creation commitment, restricted canonicalizer, signatures, consent semantics and golden revision before C/D freeze dependencies.
 - Numeric limits and security-state retention policy, with production-representative benchmarks and a design for long-lived history.
 - Native platform/release evidence and downstream malicious-relay, atomic admission, persistence/crash and fanout tests. B's pure verifier tests do not establish those properties.
-- Current workflow triggers only PRs targeting `main` or `consolidation/**`; a draft targeting `packet-a/context-isolation` does not automatically receive aggregate CI. Local evidence must not be described as remote CI. Workflow changes belong to the integrator.
+- The root authorized the separate CI trigger change in `3b97a68`: both push and pull-request branch filters now cover `main`, `consolidation/**` and `packet-*/**`. All existing jobs, permissions and gates are preserved. Actual remote run outcomes must be tied to the exact candidate head; local checks are not substitutes for remote CI.
 - Root coordinates independent reviews and all merges; no deployment or release is authorized here.
 
 
@@ -78,3 +78,22 @@ Go 1.26.9, Darwin/arm64, Apple M5, `GOMAXPROCS=2`, `-benchtime=3x`, synthetic pu
 Commands: `go test -run '^$' -bench '^BenchmarkTeam(Chain|History)$' -benchmem -benchtime=3x ./internal/envelope` and `go test -run '^$' -bench '^BenchmarkTeamCombinedBudget' -benchmem -benchtime=3x ./internal/envelope`. The 8 MiB stress result motivates the 2 MiB initial proposal. Even that costs material allocation and limits long-lived histories: release needs a reviewed catch-up/retention design or explicit fail-closed product limits, not silent deletion of security history. Member count, snapshot/chain budgets, invite lifetime/rate and downstream operation/outbox retention still require release sign-off; B does not invent rate or outbox policies.
 
 Fixture SHA256: `23c9118bde7d7cefb4baafc46451e714aad548c42620fc95b10edf6608e1ed28`. Exported API and fixture acceptance must pin the eventual draft PR head, not a moving branch.
+
+
+## Repaired Packet A integration and review delta
+
+The parent supplied Packet A freeze `80bff09d5c9e1548db6f7be0e44920887c2e64d3`, tree `0770b0fecfaa024a9806e4623c56f03d8bad53bb`, containing predecessor `b1c9c7196c82af0a3cec7ad999fd2bcf0acdc797`. GitHub and local Git independently confirmed the freeze. Merge commit `79f7edcece0b81cd1e3848cf7c0952bb38049150`, tree `ce503821db60007c9e72dd4f9bc44fd76e1f0f9f`, has parents B `3b97a68` and A `80bff09`. It cleanly incorporates A's 13-file update without rewriting either history. No B protocol, API, tests, fixtures or CI implementation changed in that merge. Fresh local full/race tests, vet, staticcheck, module verification and independent Node vectors passed at the merge head.
+
+The coordinator reported independent acceptance of the pure B protocol/API at `3b97a68`, with no confirmed defects after full/race tests, seven Node vectors and 383 additional checks. That is protocol review evidence, not acceptance of numeric release policy or later base changes. The subsequent B-specific delta is documentation only: correcting CI coverage and recording the measured history constraint below. Final delta review and exact-head remote CI remain gates coordinated by the root.
+
+## Measured history limit and downstream proposal
+
+Independent review measured the proposed **2 MiB total validation budget** with **256 unchanged members and all original consent**: **33 snapshots fit; snapshot 34 fails closed at 2,117,514 serialized bytes**, exceeding 2,097,152 bytes. Its 32-snapshot fixture reported approximately **211 ms** and **93.6 MB allocated per verification**. Timing is environment-dependent and does not supersede the separate local measurements above. There is no guaranteed 33-day lifetime: renewal frequency, membership churn and other object sizes change when the bound is reached. Neither the 2 MiB budget nor a retention/history strategy has release approval.
+
+Downstream C/D proposal, subject to review:
+
+- Paginate and bound raw retrieval, then enforce the existing total object/serialized-byte limits for verification. Pagination alone does not make an over-budget full history admissible. Preflight projected history growth and expose remaining capacity before publication; errors must clearly pause activation/sending instead of dropping old records.
+- Until a longer-history protocol is reviewed, retain full history and security records and fail closed at the configured limit. A separately authorized new team requires a fresh root pin and fresh consent; it cannot silently inherit the old team's trust or erase its tombstone/checkpoint.
+- Explore an explicitly reviewed incremental-verification API rooted only in a **durably saved, previously fully verified local checkpoint**, with authenticated continuity and persistent anti-rollback, owner-transition, membership/consent replay, deletion and clock-floor state. This is a design proposal, not an available B capability. A compact ownership proof, relay assertion, arbitrary checkpoint or restored unverified cache must not substitute for full membership history or establish a fresh head. New-device/bootstrap and recovery need their own reviewed authenticated evidence design before any checkpoint-based history compaction can ship.
+
+Do not silently increase limits, prune consent/history/tombstones, accept partial chains, or convert a limit failure into trusted state. Current `VerifyTeamChain` still requires complete history within explicit budgets; this documentation introduces no alternate acceptance path.
