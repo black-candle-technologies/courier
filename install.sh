@@ -186,7 +186,9 @@ main() {
 		*":$(dirname "$DEST"):"*) ;;
 		*) echo "note: $(dirname "$DEST") is not on your PATH" ;;
 	esac
-	echo "next: courier init"
+	echo "Existing transport settings and certificate pins are unchanged."
+	echo "New setup: courier init --transport direct-tls --fingerprint <independently-verified-SHA256>"
+	echo "Cloud TLS interception is unsupported. Run courier update interactively to review existing transport settings."
 }
 
 # Sourcing this file (INSTALL_SH_TEST=1) loads the helpers without running
