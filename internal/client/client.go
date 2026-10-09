@@ -2095,13 +2095,6 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 					msg.Flags = flags
 				}
 			}
-			// issue #51: remember this delivery in the reply cache so a
-			// later reply to it can quote the parent without a relay
-			// round-trip. Best effort; delivery never depends on it.
-			cacheEntries = append(cacheEntries, replyCacheEntry{
-				CourierID: m.ID, From: m.From,
-				Snippet: truncateQuote(body), SentAt: m.SentAt,
-			})
 			// Hold rule: a message becomes a request (held for review,
 			// never delivered to the inbox or dashboard) when the
 			// recipient's contacts-only policy quarantines a first contact,
@@ -2116,6 +2109,13 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 				newHashes = append(newHashes, "")
 				return
 			}
+			// issue #51: remember this delivery in the reply cache so a
+			// later reply to it can quote the parent without a relay
+			// round-trip. Best effort; delivery never depends on it.
+			cacheEntries = append(cacheEntries, replyCacheEntry{
+				CourierID: m.ID, From: m.From,
+				Snippet: truncateQuote(body), SentAt: m.SentAt, ExpiresAt: expiresAt,
+			})
 			out = append(out, msg)
 			outputHashes = append(outputHashes, h)
 			// issue #52: opt-in delivery receipt. Fires only for the inbox
@@ -2154,7 +2154,9 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 		// comes first: a parent and its reply can arrive together.
 		local := make(map[int64]string)
 		for _, m := range out {
-			if m.Body != "" {
+			// A held or now-expired parent must not escape through an accepted
+			// reply, including a dashboard batch that omits the parent itself.
+			if !m.Request && !stateExpired(time.Now().Unix(), m.ExpiresAt) && m.Body != "" {
 				local[m.ID] = truncateQuote(m.Body)
 			}
 		}
