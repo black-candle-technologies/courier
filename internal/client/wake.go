@@ -32,7 +32,6 @@ import (
 	"math/rand"
 	"net/http"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
@@ -69,17 +68,12 @@ const subscribeTimeout = 90 * time.Second
 // longPollHTTPClient mirrors httpClient but with a timeout suited to
 // held subscriptions. Certificate pinning still applies end-to-end.
 func (c *Client) longPollHTTPClient() (*http.Client, error) {
-	if !strings.HasPrefix(c.cfg.RelayURL, "https://") {
-		return &http.Client{Timeout: subscribeTimeout}, nil
-	}
-	if c.cfg.RelayFingerprint == "" {
-		return nil, fmt.Errorf("no pinned certificate for relay %s; run `courier init --repin` to pin it (verify the fingerprint against the published value first)", c.cfg.RelayURL)
-	}
-	tr, err := pinnedTransport(c.cfg.RelayFingerprint)
+	hc, err := c.httpClient()
 	if err != nil {
 		return nil, err
 	}
-	return &http.Client{Timeout: subscribeTimeout, Transport: tr}, nil
+	hc.Timeout = subscribeTimeout
+	return hc, nil
 }
 
 // Subscribe holds one long-poll subscription round against
@@ -483,4 +477,17 @@ func (s Context) DefaultWakePIDFile() string {
 	return p
 }
 
-func DefaultWakePIDFile() string { return LegacyContext().DefaultWakePIDFile() }
+// DefaultWakePIDFile follows the same active manifest as LoadConfig.
+// Preserve the string API, but return an invalid OS path on resolution failure:
+// an empty path would silently disable the daemon lock.
+func DefaultWakePIDFile() string {
+	scope, err := LegacyContext().ActiveContext()
+	if err != nil {
+		return "\x00"
+	}
+	path := scope.DefaultWakePIDFile()
+	if path == "" {
+		return "\x00"
+	}
+	return path
+}

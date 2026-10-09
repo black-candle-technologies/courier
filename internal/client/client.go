@@ -1031,6 +1031,9 @@ func pinnedTransport(fingerprint string) (*http.Transport, error) {
 // dashboardHTTPClient returns a pinned client for the dashboard, or an
 // error directing the agent to run `courier dashboard setup`.
 func (c *Client) dashboardHTTPClient() (*http.Client, error) {
+	if err := c.cfg.local().validateConfig(c.cfg); err != nil {
+		return nil, err
+	}
 	if c.cfg.DashboardToken == "" {
 		return nil, fmt.Errorf("no dashboard account configured; run `courier dashboard setup` first")
 	}
@@ -2577,6 +2580,9 @@ func GenerateTempPassword() (string, error) {
 // otherwise it falls back to TOFU, printing the fingerprint for the
 // user to verify.
 func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassword string, err error) {
+	if err := c.cfg.local().validateConfig(c.cfg); err != nil {
+		return "", err
+	}
 	if !dashboardUsernameRe.MatchString(username) {
 		return "", fmt.Errorf("username must be 3-32 chars: lowercase letters, digits, - and _")
 	}
