@@ -312,7 +312,14 @@ func TestTier1SessionFlow(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		out := v.Evaluate(EvalInput{Tier: Tier1, Body: []byte(body), Attestation: a, Receiver: receiver, Now: now})
+		// Evaluate at the attestation's own issue time, not the
+		// frozen `now` captured above: NewTier1Attestation stamps
+		// a fresh clock read, which can land on the next second
+		// after `now` was captured. Evaluating the earlier `now`
+		// then makes the attestation look not-yet-issued and
+		// flakes this test with "expired" (policy.go rejects
+		// now < a.IssuedAt).
+		out := v.Evaluate(EvalInput{Tier: Tier1, Body: []byte(body), Attestation: a, Receiver: receiver, Now: a.IssuedAt})
 		if out.Verdict != VerdictAttested {
 			t.Fatalf("tier 1 message %q should attest, got %v (%s)", body, out.Verdict, out.Reason)
 		}
@@ -913,7 +920,13 @@ func TestTier1FailsClosedWithoutRP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := verifier.Evaluate(EvalInput{Tier: Tier1, Body: []byte("orders"), Attestation: a, Receiver: receiver, Now: now})
+	// Evaluate at the attestation's own issue time: NewTier1Attestation
+	// stamps a fresh clock read, which can land on the next second
+	// after `now` was captured above. The evaluator checks expiry
+	// before the token-mint assertion, so a stale `now` would make
+	// this test fail with "expired" instead of the "token-mint:"
+	// rejection it is checking for.
+	out := verifier.Evaluate(EvalInput{Tier: Tier1, Body: []byte("orders"), Attestation: a, Receiver: receiver, Now: a.IssuedAt})
 	if out.Verdict != VerdictInvalid || !strings.HasPrefix(out.Reason, "token-mint:") {
 		t.Fatalf("want token-mint rejection without RP, got %v (%s)", out.Verdict, out.Reason)
 	}
