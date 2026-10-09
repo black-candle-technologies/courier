@@ -231,3 +231,50 @@ func BenchmarkTeamHistory(b *testing.B) {
 		})
 	}
 }
+
+// Combined fixtures measure membership and history costs together. The 2 MiB
+// proposal and 8 MiB stress case are explicit inputs, not production defaults.
+func BenchmarkTeamCombinedBudget(b *testing.B) {
+	for _, snapshots := range []int{32, 160} {
+		b.Run(fmt.Sprint(snapshots), func(b *testing.B) {
+			l := teamTestLimits()
+			if snapshots == 32 {
+				l.MaxChainBytes = 2 << 20
+			}
+			r := teamTestRoster(b)
+			consents := make([]TeamConsent, 0, 256)
+			for n := 0; n < 256; n++ {
+				c := teamTestConsent(b, r.TeamRoot, 1, byte(n), "1", fmtTeamCount(n), byte(n))
+				h, e := TeamPayloadHash(c.Acceptance, l)
+				if e != nil {
+					b.Fatal(e)
+				}
+				consents = append(consents, c)
+				r.Members = append(r.Members, TeamMember{c.Acceptance.Handle, c.Acceptance.MemberAddress, h})
+			}
+			chain := make([]TeamRoster, 0, snapshots)
+			for n := 0; n < snapshots; n++ {
+				if n > 0 {
+					r = teamTestNext(b, r)
+				}
+				r.Signatures = []TeamSignature{teamTestSign(b, r, "owner", 1)}
+				chain = append(chain, r)
+			}
+			total := 0
+			for _, r := range chain {
+				total += len(teamTestBytes(b, r))
+			}
+			for _, c := range consents {
+				total += len(teamTestBytes(b, c.Invitation)) + len(teamTestBytes(b, c.Acceptance))
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, e := VerifyTeamChain(r.TeamRoot, chain, nil, consents, nil, teamTestNow(), l); e != nil {
+					b.Fatal(e)
+				}
+			}
+			b.ReportMetric(float64(total), "chain_bytes")
+		})
+	}
+}
