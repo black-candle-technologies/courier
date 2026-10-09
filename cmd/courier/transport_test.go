@@ -219,3 +219,39 @@ func TestUpgradeAcknowledgementDoesNotMigrateLegacyIdentity(t *testing.T) {
 		})
 	}
 }
+
+func TestInitAndRepinPersistVerifiedTrust(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+	sum := sha256.Sum256(srv.Certificate().Raw)
+	pin := hex.EncodeToString(sum[:])
+	scope := command{context: client.LegacyContext()}
+	if err := scope.cmdInit([]string{"--transport", "direct-tls", "--relay", srv.URL, "--fingerprint", pin}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := scope.context.LoadTransportConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RelayTransport != "direct-tls" || cfg.RelayFingerprint != pin || cfg.RelayURL != srv.URL {
+		t.Fatal("setup did not persist verified selection")
+	}
+	seed, address := cfg.Seed, cfg.Address
+	if err := cfg.Update(func(f *client.Config) error { f.RelayFingerprint = strings.Repeat("ab", 32); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := scope.cmdInit([]string{"--repin", "--fingerprint", pin}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = scope.context.LoadTransportConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RelayFingerprint != pin || cfg.Seed != seed || cfg.Address != address || cfg.RelayTransport != "direct-tls" {
+		t.Fatal("repin lost identity or policy")
+	}
+}

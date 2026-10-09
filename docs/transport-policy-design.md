@@ -160,7 +160,8 @@ The scaffold implements separate relay/dashboard policy fields, direct-TLS relay
 CLI validation, pre-I/O unavailable-mode rejection, explicit fresh setup, verified
 bootstrap/repin, a once-per-install interactive keep/cancel upgrade review, and
 noninteractive preservation. Transport review reads config without lazy migrations;
-recording acknowledgement uses the existing locked atomic update path. Invalid
+recording acknowledgement uses a locked raw-JSON transaction with no lazy key or
+replay migrations, preserving unknown fields and omitted defaults. Invalid
 manifests do not prevent executable updates. The installer and automatic updater
 provide nonblocking guidance rather than reading stdin.
 
@@ -181,3 +182,13 @@ reviewed version/format barrier and rollback policy before it can be enabled.
 The requirements above for cloud support, complete authenticated responses,
 metadata confidentiality and negotiation remain unimplemented and blocked. No
 actual dot-cloud compatibility or live identity test has been performed.
+
+Independent review follow-up: acknowledgement must not call generic Config.Update,
+which migrates old keys/replay state and can block updating damaged legacy
+identities. The dedicated raw transaction compares captured identity/trust, changes
+only transport_reviewed, and atomically persists mode 0600. Dashboard setup also
+captures persisted trust before networking and rejects final publication if a
+concurrent writer changed the relay/dashboard binding or dashboard account. Key
+rotation alone remains compatible. A remote registration may have completed when
+that local race is detected; the error does not authorize overwriting the newer
+local trust or retrying against another server automatically.

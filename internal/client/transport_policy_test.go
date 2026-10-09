@@ -3,6 +3,7 @@ package client
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -185,5 +186,81 @@ func TestPinnedTransportRetainsProxyPolicy(t *testing.T) {
 	// A proxy presence never disables certificate authentication.
 	if err := tr.TLSClientConfig.VerifyPeerCertificate([][]byte{[]byte("synthetic interception cert")}, nil); err == nil {
 		t.Fatal("accepted interception")
+	}
+}
+
+func TestDashboardSetupPreservesConcurrentTrust(t *testing.T) {
+	cfg, scope := reviewConfig(t, false)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/dashboard/register" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		fresh, err := scope.LoadTransportConfig()
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(500)
+			return
+		}
+		err = fresh.Update(func(f *Config) error {
+			f.DashboardURL = "https://replacement.invalid"
+			f.DashboardFingerprint = strings.Repeat("ab", 32)
+			f.DashboardToken = "replacement-synthetic-token"
+			return nil
+		})
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(500)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"username":"fixture","api_token":"stale-synthetic-token"}`))
+	}))
+	defer srv.Close()
+	cfg.DashboardURL = srv.URL
+	sum := sha256.Sum256(srv.Certificate().Raw)
+	if _, err := New(cfg).DashboardSetup("fixture", hex.EncodeToString(sum[:])); !errors.Is(err, ErrContextMismatch) {
+		t.Fatalf("want stale trust rejection: %v", err)
+	}
+	fresh, err := scope.LoadTransportConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.DashboardURL != "https://replacement.invalid" || fresh.DashboardFingerprint != strings.Repeat("ab", 32) || fresh.DashboardToken != "replacement-synthetic-token" {
+		t.Fatal("overwrote concurrently configured dashboard")
+	}
+}
+
+func TestDashboardSetupRejectsBootstrapAndRegistrationRedirects(t *testing.T) {
+	for _, redirectPath := range []string{"/v1/health", "/v1/dashboard/register"} {
+		t.Run(redirectPath, func(t *testing.T) {
+			cfg, _ := reviewConfig(t, false)
+			var calls atomic.Int32
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1) }))
+			defer target.Close()
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == redirectPath {
+					http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+			cfg.DashboardURL = srv.URL
+			sum := sha256.Sum256(srv.Certificate().Raw)
+			if _, err := New(cfg).DashboardSetup("fixture", hex.EncodeToString(sum[:])); err == nil {
+				t.Fatal("accepted redirect")
+			}
+			if calls.Load() != 0 {
+				t.Fatal("redirect transmitted dashboard setup")
+			}
+			persisted, err := cfg.Context().LoadTransportConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.DashboardToken != "" || persisted.DashboardFingerprint != "" {
+				t.Fatal("failed setup persisted trust")
+			}
+		})
 	}
 }

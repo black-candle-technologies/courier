@@ -2676,8 +2676,7 @@ func GenerateTempPassword() (string, error) {
 // the setup requires the dashboard certificate to match the already
 // pinned relay fingerprint whenever the dashboard shares the relay's
 // host (the documented deployment shares the relay's certificate);
-// otherwise it falls back to TOFU, printing the fingerprint for the
-// user to verify.
+// otherwise setup fails before discovery until independent expected trust is supplied.
 func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassword string, err error) {
 	if err := c.cfg.local().validateConfig(c.cfg); err != nil {
 		return "", err
@@ -2700,6 +2699,18 @@ func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassw
 	}
 	if _, err := pinnedTransport(want); err != nil {
 		return "", err
+	}
+	// Capture persisted trust before networking; the caller may intentionally
+	// override DashboardURL for this setup, but cannot overwrite concurrent setup.
+	before, err := c.cfg.local().loadConfigRaw()
+	if err != nil {
+		return "", err
+	}
+	if before.Address != c.cfg.Address || before.Seed != c.cfg.Seed || before.DashboardToken != "" || before.DashboardTransport != c.cfg.DashboardTransport {
+		return "", ErrContextMismatch
+	}
+	if expectedFingerprint == "" && (before.RelayURL != c.cfg.RelayURL || !sameCertificatePin(before.RelayFingerprint, c.cfg.RelayFingerprint) || before.RelayTransport != c.cfg.RelayTransport) {
+		return "", ErrContextMismatch
 	}
 	tempPassword, err = GenerateTempPassword()
 	if err != nil {
@@ -2768,6 +2779,9 @@ func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassw
 	}
 	dashboardURL := c.cfg.DashboardURL
 	if err := c.cfg.Update(func(fresh *Config) error {
+		if fresh.RelayURL != before.RelayURL || fresh.RelayFingerprint != before.RelayFingerprint || fresh.RelayTransport != before.RelayTransport || fresh.DashboardURL != before.DashboardURL || fresh.DashboardFingerprint != before.DashboardFingerprint || fresh.DashboardTransport != before.DashboardTransport || fresh.DashboardToken != before.DashboardToken || fresh.DashboardUser != before.DashboardUser {
+			return ErrContextMismatch
+		}
 		fresh.DashboardURL = dashboardURL
 		fresh.DashboardUser = out.Username
 		fresh.DashboardToken = out.APIToken
@@ -2780,7 +2794,7 @@ func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassw
 }
 
 // expectedDashboardFingerprint returns the dashboard certificate
-// fingerprint the setup must see, or "" to fall back to TOFU. An
+// fingerprint the setup must see, or "" when independent trust is missing. An
 // explicitly provided fingerprint always wins; otherwise the pinned relay
 // fingerprint applies when the dashboard shares the relay's host (the
 // documented deployment shares the relay's certificate).
