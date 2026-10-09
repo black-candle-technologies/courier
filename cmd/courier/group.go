@@ -55,11 +55,11 @@ usage:
       show a group's name, admin, and full roster.`
 }
 
-func cmdGroup(args []string) error {
+func (scope command) cmdGroup(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("%s", groupUsage())
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -182,6 +182,8 @@ func cmdGroup(args []string) error {
 	}
 	return nil
 }
+
+func cmdGroup(args []string) error { return (command{context: client.LegacyContext()}).cmdGroup(args) }
 
 // cmdGroupInbox syncs direct messages first (group invitations and
 // sender-key updates arrive as DMs), then reads the group's messages.

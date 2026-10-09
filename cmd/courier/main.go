@@ -41,67 +41,75 @@ import (
 // build time via ldflags -X; see docs/versions.md.
 
 func main() {
+	scope, args, selectErr := selectCommand(os.Args[1:])
+	if selectErr != nil {
+		fmt.Fprintln(os.Stderr, selectErr)
+		os.Exit(1)
+	}
+	os.Args = append([]string{os.Args[0]}, args...)
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
 	}
 	// v0.5.0+: opportunistic update check (at most once per 12h). Notices
 	// go to stderr so stdout stays machine-readable (stdio/serve).
-	if os.Args[1] != "update" && client.ConfigExists() {
-		if cfg, err := client.LoadConfig(); err == nil {
+	if os.Args[1] != "update" && os.Args[1] != "context" && scope.context.ConfigExists() {
+		if cfg, err := scope.context.LoadConfig(); err == nil {
 			client.New(cfg).MaybeUpdateCheck(version.Client)
 		}
 	}
 	var err error
 	switch os.Args[1] {
+	case "context":
+		err = scope.cmdContext(os.Args[2:])
 	case "init":
-		err = cmdInit(os.Args[2:])
+		err = scope.cmdInit(os.Args[2:])
 	case "address", "key":
-		err = cmdAddress()
+		err = scope.cmdAddress()
 	case "send":
-		err = cmdSend(os.Args[2:])
+		err = scope.cmdSend(os.Args[2:])
 	case "inbox":
-		err = cmdInbox(os.Args[2:])
+		err = scope.cmdInbox(os.Args[2:])
 	case "attachments":
-		err = cmdAttachments(os.Args[2:])
+		err = scope.cmdAttachments(os.Args[2:])
 	case "wake":
-		err = cmdWake(os.Args[2:])
+		err = scope.cmdWake(os.Args[2:])
 	case "stdio":
-		err = cmdStdio()
+		err = scope.cmdStdio()
 	case "serve":
-		err = cmdServe(os.Args[2:])
+		err = scope.cmdServe(os.Args[2:])
 	case "contacts":
-		err = cmdContacts(os.Args[2:])
+		err = scope.cmdContacts(os.Args[2:])
 	case "receipts":
-		err = cmdReceipts(os.Args[2:])
+		err = scope.cmdReceipts(os.Args[2:])
 	case "block":
-		err = cmdBlock(os.Args[2:])
+		err = scope.cmdBlock(os.Args[2:])
 	case "unblock":
-		err = cmdUnblock(os.Args[2:])
+		err = scope.cmdUnblock(os.Args[2:])
 	case "report-spam":
-		err = cmdReportSpam(os.Args[2:])
+		err = scope.cmdReportSpam(os.Args[2:])
 	case "request":
-		err = cmdRequest(os.Args[2:])
+		err = scope.cmdRequest(os.Args[2:])
 	case "directory":
-		err = cmdDirectory(os.Args[2:])
+		err = scope.cmdDirectory(os.Args[2:])
 	case "group":
-		err = cmdGroup(os.Args[2:])
+		err = scope.cmdGroup(os.Args[2:])
 	case "rotate":
-		err = cmdRotate(os.Args[2:])
+		err = scope.cmdRotate(os.Args[2:])
 	case "vhl":
-		err = cmdVHL(os.Args[2:])
+		err = scope.cmdVHL(os.Args[2:])
 	case "publish-key":
-		err = cmdPublishKey()
+		err = scope.cmdPublishKey()
 	case "backup":
-		err = cmdBackup(os.Args[2:])
+		err = scope.cmdBackup(os.Args[2:])
 	case "update":
-		err = cmdUpdate()
+		err = scope.cmdUpdate()
 	case "dashboard":
-		err = cmdDashboard(os.Args[2:])
+		err = scope.cmdDashboard(os.Args[2:])
 	case "bridge":
-		err = cmdBridge(os.Args[2:])
+		err = scope.cmdBridge(os.Args[2:])
 	case "config":
-		err = cmdConfig(os.Args[2:])
+		err = scope.cmdConfig(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println("courier", version.Client)
 	default:
@@ -252,7 +260,10 @@ Your address is your public key: share it so others can message you.
 Your private key never leaves ~/.courier/config.json.`)
 }
 
-func cmdInit(args []string) error {
+func (scope command) cmdInit(args []string) error {
+	if scope.context.Principal() != "" {
+		return fmt.Errorf("named identity creation and pin migration require separate explicit provisioning; init is legacy-only")
+	}
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	relay := fs.String("relay", "", "relay URL (default "+client.DefaultRelay+")")
 	force := fs.Bool("force", false, "overwrite existing identity")
@@ -262,7 +273,7 @@ func cmdInit(args []string) error {
 	}
 
 	if *repin {
-		cfg, err := client.LoadConfig()
+		cfg, err := scope.context.LoadConfig()
 		if err != nil {
 			return err
 		}
@@ -280,8 +291,8 @@ func cmdInit(args []string) error {
 		return nil
 	}
 
-	if client.ConfigExists() && !*force {
-		cfg, err := client.LoadConfig()
+	if scope.context.ConfigExists() && !*force {
+		cfg, err := scope.context.LoadConfig()
 		if err != nil {
 			// v0.1.0 identity (or corrupt config): tell the user how to migrate.
 			fmt.Println(err)
@@ -335,6 +346,8 @@ func cmdInit(args []string) error {
 	return nil
 }
 
+func cmdInit(args []string) error { return (command{context: client.LegacyContext()}).cmdInit(args) }
+
 // autoWakeDirective informs the installing agent that wake-on-message is an
 // opt-in feature: the agent must ask its user before enabling anything.
 func autoWakeDirective() string {
@@ -363,8 +376,8 @@ func dashboardSetupDirective() string {
   4. Keep messages flowing with:  courier dashboard push --follow`
 }
 
-func cmdAddress() error {
-	cfg, err := client.LoadConfig()
+func (scope command) cmdAddress() error {
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -372,7 +385,9 @@ func cmdAddress() error {
 	return nil
 }
 
-func cmdSend(args []string) error {
+func cmdAddress() error { return (command{context: client.LegacyContext()}).cmdAddress() }
+
+func (scope command) cmdSend(args []string) error {
 	fs := flag.NewFlagSet("send", flag.ContinueOnError)
 	file := fs.String("file", "", "read message body from file")
 	var attach stringSliceFlag
@@ -401,7 +416,7 @@ func cmdSend(args []string) error {
 			return fmt.Errorf("invalid --reply-to %q: want a positive message id", replyToVal)
 		}
 		replyTo = n
-		if _, ok := client.LookupReplyParent(replyTo); !ok {
+		if _, ok := scope.context.LookupReplyParent(replyTo); !ok {
 			fmt.Fprintf(os.Stderr, "warning: parent message #%d not found locally; sending reply reference anyway\n", replyTo)
 		}
 	}
@@ -432,7 +447,7 @@ func cmdSend(args []string) error {
 	if strings.TrimSpace(body) == "" {
 		return fmt.Errorf("refusing to send an empty message")
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -533,6 +548,8 @@ func cmdSend(args []string) error {
 	}
 	return nil
 }
+
+func cmdSend(args []string) error { return (command{context: client.LegacyContext()}).cmdSend(args) }
 
 // eqValue returns the value of a --name=value argument. An empty value
 // is rejected the same way a missing trailing value is: silently
@@ -794,7 +811,7 @@ func saveAttachment(dir string, filename string, data []byte) (string, error) {
 	}
 }
 
-func cmdInbox(args []string) error {
+func (scope command) cmdInbox(args []string) error {
 	fs := flag.NewFlagSet("inbox", flag.ContinueOnError)
 	all := fs.Bool("all", false, "show all messages, not just new ones")
 	limit := fs.Int("limit", 50, "max messages per fetch")
@@ -806,7 +823,7 @@ func cmdInbox(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -911,6 +928,8 @@ func cmdInbox(args []string) error {
 	return nil
 }
 
+func cmdInbox(args []string) error { return (command{context: client.LegacyContext()}).cmdInbox(args) }
+
 // ---- stdio bridge: JSON lines on stdin/stdout for agent integration ----
 
 type stdioReq struct {
@@ -965,8 +984,8 @@ func toStdioMessage(m client.Message) stdioMessage {
 	}
 }
 
-func cmdStdio() error {
-	cfg, err := client.LoadConfig()
+func (scope command) cmdStdio() error {
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1031,19 +1050,21 @@ func cmdStdio() error {
 	return sc.Err()
 }
 
+func cmdStdio() error { return (command{context: client.LegacyContext()}).cmdStdio() }
+
 func bytesTrimSpace(b []byte) []byte {
 	return []byte(strings.TrimSpace(string(b)))
 }
 
 // ---- serve: each client runs their own local server ----
 
-func cmdServe(args []string) error {
+func (scope command) cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	listen := fs.String("listen", "127.0.0.1:8471", "local listen address")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1090,6 +1111,8 @@ func cmdServe(args []string) error {
 	return http.ListenAndServe(*listen, mux)
 }
 
+func cmdServe(args []string) error { return (command{context: client.LegacyContext()}).cmdServe(args) }
+
 func writeSvcJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -1098,11 +1121,11 @@ func writeSvcJSON(w http.ResponseWriter, code int, v any) {
 
 // ---- v0.5.0: contacts ----
 
-func cmdContacts(args []string) error {
+func (scope command) cmdContacts(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|require-fs-on|require-fs-off|remove>")
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1368,13 +1391,17 @@ func cmdContacts(args []string) error {
 	return nil
 }
 
+func cmdContacts(args []string) error {
+	return (command{context: client.LegacyContext()}).cmdContacts(args)
+}
+
 // ---- delivery receipts CLI (issue #52) ----
 
 // cmdReceipts shows delivery status for sent messages, newest first:
 // ✓ delivered, or "no receipt yet". Receipts only arrive from peers
 // who opted in on their side — absence of a receipt is not a signal
 // that the message is undelivered.
-func cmdReceipts(args []string) error {
+func (scope command) cmdReceipts(args []string) error {
 	fs := flag.NewFlagSet("receipts", flag.ContinueOnError)
 	limit := fs.Int("limit", 20, "max sent messages to show")
 	if err := fs.Parse(args); err != nil {
@@ -1388,7 +1415,7 @@ func cmdReceipts(args []string) error {
 	if len(rest) == 1 {
 		filter = rest[0]
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1426,14 +1453,18 @@ func cmdReceipts(args []string) error {
 	return nil
 }
 
+func cmdReceipts(args []string) error {
+	return (command{context: client.LegacyContext()}).cmdReceipts(args)
+}
+
 // ---- spam / abuse filtering CLI ----
 
 // cmdBlock blocks a sender, or lists the blocklist with `block list`.
 // Blocking is per-recipient and local: blocked messages are dropped at
 // inbox time, and nothing about the recipient's relationships leaves
 // the machine.
-func cmdBlock(args []string) error {
-	cfg, err := client.LoadConfig()
+func (scope command) cmdBlock(args []string) error {
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1463,12 +1494,14 @@ func cmdBlock(args []string) error {
 	return nil
 }
 
+func cmdBlock(args []string) error { return (command{context: client.LegacyContext()}).cmdBlock(args) }
+
 // cmdUnblock removes a sender from the blocklist.
-func cmdUnblock(args []string) error {
+func (scope command) cmdUnblock(args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: courier unblock <address|contact>")
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1486,10 +1519,14 @@ func cmdUnblock(args []string) error {
 	return nil
 }
 
+func cmdUnblock(args []string) error {
+	return (command{context: client.LegacyContext()}).cmdUnblock(args)
+}
+
 // cmdReportSpam files a signed spam report with the relay. Reports are
 // idempotent per (sender, reporter): only distinct reporters count
 // toward the relay's throttle threshold.
-func cmdReportSpam(args []string) error {
+func (scope command) cmdReportSpam(args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: courier report-spam <message-id>")
 	}
@@ -1497,7 +1534,7 @@ func cmdReportSpam(args []string) error {
 	if err != nil || id <= 0 {
 		return fmt.Errorf("bad message id %q", args[0])
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1508,16 +1545,20 @@ func cmdReportSpam(args []string) error {
 	return nil
 }
 
+func cmdReportSpam(args []string) error {
+	return (command{context: client.LegacyContext()}).cmdReportSpam(args)
+}
+
 // ---- message requests ----
 
 // cmdRequest manages held message requests: list (review), accept
 // (release + optionally add the sender to contacts), dismiss (suppress
 // future requests from the sender), undismiss (reverse a dismissal).
-func cmdRequest(args []string) error {
+func (scope command) cmdRequest(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: courier request <list|accept|dismiss|undismiss>")
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1599,14 +1640,18 @@ func cmdRequest(args []string) error {
 	}
 }
 
+func cmdRequest(args []string) error {
+	return (command{context: client.LegacyContext()}).cmdRequest(args)
+}
+
 // ---- v0.5.0: key rotation ----
 
-func cmdRotate(args []string) error {
+func (scope command) cmdRotate(args []string) error {
 	fs := flag.NewFlagSet("rotate", flag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1623,8 +1668,12 @@ func cmdRotate(args []string) error {
 	return nil
 }
 
-func cmdPublishKey() error {
-	cfg, err := client.LoadConfig()
+func cmdRotate(args []string) error {
+	return (command{context: client.LegacyContext()}).cmdRotate(args)
+}
+
+func (scope command) cmdPublishKey() error {
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1635,9 +1684,11 @@ func cmdPublishKey() error {
 	return nil
 }
 
+func cmdPublishKey() error { return (command{context: client.LegacyContext()}).cmdPublishKey() }
+
 // ---- v0.5.0: self-update ----
 
-func cmdUpdate() error {
+func (scope command) cmdUpdate() error {
 	fmt.Println("checking for updates...")
 	rel, err := update.Latest()
 	if err != nil {
@@ -1647,7 +1698,7 @@ func cmdUpdate() error {
 		fmt.Printf("already up to date (courier %s).\n", version.Client)
 		// v0.6.0+: agents that updated via an older binary never saw
 		// the dashboard setup directive, so surface it here too.
-		if cfg, err := client.LoadConfig(); err == nil && cfg.DashboardToken == "" {
+		if cfg, err := scope.context.LoadConfig(); err == nil && cfg.DashboardToken == "" {
 			fmt.Println()
 			fmt.Println(dashboardSetupDirective())
 		}
@@ -1660,7 +1711,7 @@ func cmdUpdate() error {
 	fmt.Printf("updated to %s.\n", rel.Tag)
 	// v0.6.0+: agents arriving via the updater never ran the new `init`
 	// flow, so point them at dashboard setup too.
-	if cfg, err := client.LoadConfig(); err == nil && cfg.DashboardToken == "" {
+	if cfg, err := scope.context.LoadConfig(); err == nil && cfg.DashboardToken == "" {
 		fmt.Println()
 		fmt.Println(dashboardSetupDirective())
 	}
@@ -1671,10 +1722,12 @@ func cmdUpdate() error {
 	return nil
 }
 
+func cmdUpdate() error { return (command{context: client.LegacyContext()}).cmdUpdate() }
+
 // ---- v0.5.0: config ----
 
-func cmdConfig(args []string) error {
-	cfg, err := client.LoadConfig()
+func (scope command) cmdConfig(args []string) error {
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1759,19 +1812,23 @@ func cmdConfig(args []string) error {
 	return nil
 }
 
+func cmdConfig(args []string) error {
+	return (command{context: client.LegacyContext()}).cmdConfig(args)
+}
+
 // ---- v0.6.0: dashboard ----
 
-func cmdDashboard(args []string) error {
+func (scope command) cmdDashboard(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: courier dashboard <setup|push|status|set-admin> [args]")
 	}
 	switch args[0] {
 	case "setup":
-		return cmdDashboardSetup(args[1:])
+		return scope.cmdDashboardSetup(args[1:])
 	case "push":
-		return cmdDashboardPush(args[1:])
+		return scope.cmdDashboardPush(args[1:])
 	case "status":
-		return cmdDashboardStatus()
+		return scope.cmdDashboardStatus()
 	case "set-admin":
 		return cmdDashboardSetAdmin(args[1:])
 	default:
@@ -1779,10 +1836,14 @@ func cmdDashboard(args []string) error {
 	}
 }
 
+func cmdDashboard(args []string) error {
+	return (command{context: client.LegacyContext()}).cmdDashboard(args)
+}
+
 // cmdDashboardSetup registers the dashboard user. The agent obtains a
 // username from its user, then runs this; it prints a temporary password
 // exactly once for the agent to hand to the user.
-func cmdDashboardSetup(args []string) error {
+func (scope command) cmdDashboardSetup(args []string) error {
 	fs := flag.NewFlagSet("dashboard setup", flag.ContinueOnError)
 	username := fs.String("username", "", "dashboard login username (3-32 chars: a-z, 0-9, -, _)")
 	dashURL := fs.String("dashboard-url", "", "dashboard URL (default "+client.DefaultDashboardURL+")")
@@ -1802,7 +1863,7 @@ func cmdDashboardSetup(args []string) error {
 		}
 		name = line
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1826,16 +1887,20 @@ func cmdDashboardSetup(args []string) error {
 	return nil
 }
 
+func cmdDashboardSetup(args []string) error {
+	return (command{context: client.LegacyContext()}).cmdDashboardSetup(args)
+}
+
 // cmdDashboardPush forwards newly decrypted inbox messages to the
 // dashboard. With --follow it runs as a poller.
-func cmdDashboardPush(args []string) error {
+func (scope command) cmdDashboardPush(args []string) error {
 	fs := flag.NewFlagSet("dashboard push", flag.ContinueOnError)
 	follow := fs.Bool("follow", false, "keep polling for new messages")
 	interval := fs.Duration("interval", 30*time.Second, "poll interval with --follow")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := client.LoadConfig()
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1864,8 +1929,12 @@ func cmdDashboardPush(args []string) error {
 	return nil
 }
 
-func cmdDashboardStatus() error {
-	cfg, err := client.LoadConfig()
+func cmdDashboardPush(args []string) error {
+	return (command{context: client.LegacyContext()}).cmdDashboardPush(args)
+}
+
+func (scope command) cmdDashboardStatus() error {
+	cfg, err := scope.context.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -1879,6 +1948,10 @@ func cmdDashboardStatus() error {
 	fmt.Printf("cursor:   %d (last pushed courier message id)\n", cfg.DashboardCursor)
 	fmt.Printf("sent:     %d (last pushed sent message id)\n", cfg.DashboardSentCursor)
 	return nil
+}
+
+func cmdDashboardStatus() error {
+	return (command{context: client.LegacyContext()}).cmdDashboardStatus()
 }
 
 // cmdDashboardSetAdmin grants or revokes dashboard admin rights (issue
