@@ -144,3 +144,34 @@ func TestNamedMetadataAcknowledgementUsesCapturedContext(t *testing.T) {
 		t.Fatal("ACK reached wrong context")
 	}
 }
+
+func TestNamedLegacyBootstrapAuthorizationIsolation(t *testing.T) {
+	a, sa := reviewConfig(t, true)
+	_, sb := reviewConfig(t, true)
+	peer, err := NewIdentity("https://fixture.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sa.updateFS(func(f *fsFile) error {
+		f.LegacyEnabledPeers = map[string]bool{peer.Address: true}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !New(a).fsShouldInit(peer.Address) {
+		t.Fatal("captured context lost authorization")
+	}
+	other, err := sb.loadFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.LegacyEnabledPeers[peer.Address] {
+		t.Fatal("bootstrap authorization crossed contexts")
+	}
+	if err := sa.updateFS(func(f *fsFile) error { forgetFSAddress(f, peer.Address); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if New(a).fsShouldInit(peer.Address) {
+		t.Fatal("forget retained bootstrap authorization")
+	}
+}

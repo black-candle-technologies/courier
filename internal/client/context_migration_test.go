@@ -53,6 +53,19 @@ func TestMigrationCrashRecovery(t *testing.T) {
 					}
 				}
 			}
+			// Exercise the actual legacy FS authorization representation at every
+			// crash boundary; migration must copy bytes before lazy conversion.
+			legacyFS, err := json.Marshal(map[string]any{
+				"sessions":   map[string]any{},
+				"peer_modes": map[string]string{cfg.Address: "on", "invalid": "on"},
+				"require_fs": map[string]bool{cfg.Address: true},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = os.WriteFile(filepath.Join(source.root, "fs.json"), legacyFS, 0600); err != nil {
+				t.Fatal(err)
+			}
 			original := map[string][]byte{}
 			for _, name := range contextFiles {
 				original[name], err = os.ReadFile(filepath.Join(source.root, name))
@@ -96,6 +109,22 @@ func TestMigrationCrashRecovery(t *testing.T) {
 						t.Fatalf("file changed %s: %v", name, err)
 					}
 				}
+			}
+			if err = target.updateFS(func(f *fsFile) error {
+				if len(f.LegacyEnabledPeers) != 1 || !f.LegacyEnabledPeers[cfg.Address] || !f.RequireFS[cfg.Address] || len(f.FSPins) != 0 {
+					t.Fatal("legacy authorization changed meaning during context migration")
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			persisted, err := target.loadFS()
+			if err != nil || !persisted.LegacyEnabledPeers[cfg.Address] {
+				t.Fatalf("authorization not durable: %v", err)
+			}
+			retained, err := os.ReadFile(filepath.Join(source.root, "fs.json"))
+			if err != nil || string(retained) != string(legacyFS) {
+				t.Fatalf("retained legacy source changed: %v", err)
 			}
 			if err = cfg.Save(); !errors.Is(err, ErrLegacyMigrated) {
 				t.Fatalf("stale writer accepted: %v", err)

@@ -293,6 +293,10 @@ type fsCapEntry struct {
 
 // fsFile is ~/.courier/fs.json.
 type fsFile struct {
+	// LegacyEnabledPeers preserves explicit pre-automatic bootstrap authorization.
+	// Unlike FSPins, these entries are operator assertions, not handshake proof.
+	LegacyEnabledPeers map[string]bool `json:"legacy_enabled_peers,omitempty"`
+
 	Sessions       map[string]*fsSession `json:"sessions"`
 	CapCache       map[string]fsCapEntry `json:"cap_cache,omitempty"`
 	NegCapCache    map[string]int64      `json:"neg_cap_cache,omitempty"`
@@ -395,6 +399,27 @@ func (s Context) loadFSLocked() (*fsFile, error) {
 	}
 	if ff.DowngradeWarnedAt == nil {
 		ff.DowngradeWarnedAt = map[string]int64{}
+	}
+	if ff.RequireFS == nil {
+		ff.RequireFS = map[string]bool{}
+	}
+	var legacy struct {
+		PeerModes map[string]string `json:"peer_modes"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return nil, fmt.Errorf("fs.json legacy peer modes: %w", err)
+	}
+	for address, mode := range legacy.PeerModes {
+		if mode != "on" {
+			continue
+		}
+		if _, err := crypto.ParseAddress(address); err != nil {
+			continue
+		}
+		if ff.LegacyEnabledPeers == nil {
+			ff.LegacyEnabledPeers = map[string]bool{}
+		}
+		ff.LegacyEnabledPeers[address] = true
 	}
 	return ff, nil
 }
@@ -866,7 +891,7 @@ func (c *Client) fsShouldInit(address string) bool {
 		}
 	}
 	// Requiring FS explicitly authorizes a probe, even for private peers.
-	if ff.RequireFS[address] {
+	if ff.RequireFS[address] || ff.LegacyEnabledPeers[address] {
 		return true
 	}
 	// Issue #110: a pinned peer has proven FS support before. The pin
@@ -1742,6 +1767,7 @@ func (c *Client) fsCleanupOrphanWithSave(address string, save func(*Config) erro
 
 func forgetFSAddress(ff *fsFile, address string) {
 	delete(ff.LastInitAt, address)
+	delete(ff.LegacyEnabledPeers, address)
 	delete(ff.Sessions, address)
 	// Contact removal is an explicit user action, not a downgrade:
 	// clear markers, including the suite-negotiation pin (issue
