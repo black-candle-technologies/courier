@@ -447,3 +447,14 @@ chat.
 - **Relay / dashboard: no changes.** No new endpoints, no migration, no
   redeploy. The wire is unchanged; negotiation reuses the directory's
   existing capability tokens.
+
+### Legacy enabled-peer migration
+
+An old `peer_modes` entry set to `on` was an explicit operator assertion that
+an address supports FS. Valid addresses retain durable bootstrap authorization
+in `legacy_enabled_peers`, including private peers with no directory handle.
+This is not promoted to a cryptographic capability pin. `off`, unknown modes,
+and malformed addresses do not create positive authorization. Existing
+`require_fs` policies remain unchanged. The next successful state write drops
+`peer_modes` while retaining migrated authorization; repeated loads are
+idempotent. Forgetting a peer clears this authorization with its session.
