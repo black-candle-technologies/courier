@@ -213,6 +213,20 @@ func (s Context) loadConfigRaw() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("no courier identity: run `courier init` first (%w)", err)
 	}
+	c, err := decodeConfig(raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.validateConfig(c); err != nil {
+		return nil, err
+	}
+	c.localContext = &s
+	return c, nil
+}
+
+// decodeConfig applies the same compatibility checks and defaults to normal
+// loading and migration validation without changing the original file bytes.
+func decodeConfig(raw []byte) (*Config, error) {
 	var c Config
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("bad config: %w", err)
@@ -223,10 +237,6 @@ func (s Context) loadConfigRaw() (*Config, error) {
 	if c.RelayURL == "" {
 		c.RelayURL = DefaultRelay
 	}
-	if err := s.validateConfig(&c); err != nil {
-		return nil, err
-	}
-	c.localContext = &s
 	return &c, nil
 }
 

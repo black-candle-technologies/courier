@@ -176,3 +176,92 @@ func TestMigrationRefusesUnsafeInputs(t *testing.T) {
 		t.Fatal("wrote outside staging", err)
 	}
 }
+
+func TestMigrationUsesLegacyRelayDefaults(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("migration gated")
+	}
+	for _, tc := range []struct {
+		name, relay, binding       string
+		omit, unsupported, wantErr bool
+	}{
+		{name: "omitted", binding: DefaultRelay, omit: true},
+		{name: "empty", binding: DefaultRelay},
+		{name: "explicit", relay: "https://explicit.invalid", binding: "https://explicit.invalid"},
+		{name: "explicit-not-defaulted", relay: "https://explicit.invalid", binding: DefaultRelay, wantErr: true},
+		{name: "malformed-not-defaulted", relay: ":bad", binding: DefaultRelay, wantErr: true},
+		{name: "unsupported-scheme", relay: "http://fixture.invalid", binding: DefaultRelay, wantErr: true},
+		{name: "unsupported-version", binding: DefaultRelay, unsupported: true, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := Context{root: t.TempDir()}
+			cfg, err := NewIdentity(DefaultRelay)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.RelayFingerprint = strings.Repeat("a", 64)
+			raw, err := json.Marshal(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var doc map[string]any
+			if err = json.Unmarshal(raw, &doc); err != nil {
+				t.Fatal(err)
+			}
+			if tc.omit {
+				delete(doc, "relay")
+			} else {
+				doc["relay"] = tc.relay
+			}
+			if tc.unsupported {
+				doc["version"] = 999
+			}
+			raw, err = json.Marshal(doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(source.root, "config.json")
+			if err = os.WriteFile(path, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			h := Hosts{Enabled: true, Bindings: map[string]RelayBinding{"r": {ID: "r", Endpoint: tc.binding, Pin: cfg.RelayFingerprint}}, Identities: map[string]NamedIdentity{"i": {Principal: cfg.Address, BindingID: "r"}}, Hosts: map[string]Host{"h": {BindingID: "r", Identity: "i"}}}
+			target, err := h.Resolve(source.root, "h", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.wantErr {
+				loaded, err := source.loadConfigRaw()
+				if err != nil || loaded.RelayURL != tc.binding {
+					t.Fatalf("normal load control: %v %+v", err, loaded)
+				}
+			}
+			err = source.MigrateLegacy(target, MigrationOptions{ConfirmLegacyWritersStopped: true})
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("invalid config/binding migrated")
+				}
+				for _, name := range []string{"context-migration.json", "active-context.json"} {
+					if _, err := os.Stat(filepath.Join(source.root, name)); !os.IsNotExist(err) {
+						t.Fatalf("invalid input created %s: %v", name, err)
+					}
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				loaded, err := target.LoadConfig()
+				if err != nil || loaded.RelayURL != tc.binding {
+					t.Fatalf("migrated config: %v %+v", err, loaded)
+				}
+				copied, err := os.ReadFile(filepath.Join(target.root, "config.json"))
+				if err != nil || string(copied) != string(raw) {
+					t.Fatal("migration changed source bytes", err)
+				}
+			}
+			retained, err := os.ReadFile(path)
+			if err != nil || string(retained) != string(raw) {
+				t.Fatal("legacy source changed", err)
+			}
+		})
+	}
+}
