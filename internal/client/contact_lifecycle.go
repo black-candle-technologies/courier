@@ -2,9 +2,6 @@ package client
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
-	"runtime"
 )
 
 // replaceContactLocked is called only inside the fresh config transaction.
@@ -65,33 +62,12 @@ func clearOrphanReceipt(fresh *Config, address string) {
 	fresh.HandleRefreshAt = 0
 }
 
-// The FS file and its rename must reach storage before config can publish the
-// alias. Windows does not support directory Sync through os.File; file Sync
-// still completes before config publication there.
+// Republish even an already-present required policy: a prior publication may
+// have failed after rename. Use the platform's durable publication primitive.
 func syncFSReplacementPolicy() error {
-	p, err := fsFilePath()
+	ff, err := loadFSLocked()
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(p, os.O_RDWR, 0)
-	if err != nil {
-		return err
-	}
-	err = f.Sync()
-	closeErr := f.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	d, err := os.Open(filepath.Dir(p))
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
+	return saveFSLocked(ff)
 }
