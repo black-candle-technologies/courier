@@ -176,3 +176,23 @@ func TestLegacyStateEmptyArchiveCompatibility(t *testing.T) {
 		}
 	}
 }
+
+func TestBridgedSendMaintainsLegacyStateAfterStartup(t *testing.T) {
+	cfg := testConfig(t)
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	cl := New(cfg)
+	p, _ := configPath()
+	p = filepath.Join(filepath.Dir(p), "state.json")
+	// A gateway has already loaded its client when the archive expires.
+	raw := `{"conversations":{"peer":{"events":[{"k":"note-add","note_id":"dead","title":"expired-secret","expires_at":1}]}}}`
+	if err := os.WriteFile(p, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = cl.SendBridged("invalid-address", "body", nil)
+	b, err := os.ReadFile(p)
+	if err != nil || strings.Contains(string(b), "expired-secret") {
+		t.Fatalf("gateway retained expired state: %s %v", b, err)
+	}
+}
