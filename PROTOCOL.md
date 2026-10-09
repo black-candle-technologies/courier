@@ -804,9 +804,11 @@ The inbox pipeline (`Client.inbox`, `internal/client/client.go`):
 7. Trial-decrypt across retained X25519 private keys (current + up to
    4 retired, §5.3); undecryptable messages are skipped without
    stalling.
-8. Dispatch the plaintext: FS frames to the FS layer (§15), group /
-   state / receipt / introduction protocol DMs to their
-   consumers, chat to the inbox.
+8. Dispatch the plaintext in the order in §13: FS frames to the FS
+   layer (§15), retired state/channel payloads to silent consumption
+   (§27), active group / receipt / introduction protocol DMs to their
+   consumers, and chat to the inbox. Retired payloads never enter the
+   reply cache or dashboard output.
 9. Mark delivered hashes seen (per consumer), flush the reply cache,
    persist the cursor.
 
@@ -1990,7 +1992,8 @@ Carried over from prior disclosures; each is tracked:
   versioned payload (`v1`, `v2`, ...) or a new magic
   (`cg`/`cc`/`cs`/`cr`/`cf`); senders emit the minimal form their
   content needs (§13); receivers render anything unrecognized as raw
-  text. The established degradation is "harmless": the message is
+  text, except the permanently reserved retired protocol discriminators
+  below, which must be consumed silently. The established degradation is "harmless": the message is
   delivered, nothing crashes, the body text is preserved. Pre-feature
   clients never lose messages — they may lose features (TTL ignored,
   replies shown as JSON, protocol DMs shown as text).
@@ -2012,6 +2015,18 @@ Carried over from prior disclosures; each is tracked:
 `rekey`, and `leave` payloads. Updated clients consume them without chat output,
 cache insertion, dashboard publication, or channel mutation. Explicit fetch
 refuses these protocol frames. See [legacy archive retirement](docs/legacy-channel-retirement.md).
+
+### Retired state discriminator
+
+The JSON discriminator `{"cs":1,"t":"state",...}` remains permanently
+reserved, regardless of the `v` value (including unknown or missing versions).
+Updated clients silently consume matching payloads without applying state
+mutations, rendering chat, inserting reply-cache entries, or publishing them
+to the dashboard. Explicit message fetch rejects these retired protocol frames
+rather than returning their plaintext. This tombstone takes precedence over
+the general raw-text fallback and does not depend on a valid mutation body.
+Existing local archives follow the retention rules in
+[disappearing messages](docs/disappearing-messages.md#retired-shared-state-archive).
 
 ## 28. Verified Human in the Loop (issue #142)
 
