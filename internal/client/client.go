@@ -150,7 +150,9 @@ type Config struct {
 	// HandleRefreshAt is the last time refreshPeerHandles pushed a
 	// handles-only update; refreshed at most once per 24h so inactive
 	// threads get their labels without a message batch.
-	HandleRefreshAt int64 `json:"handle_refresh_at,omitempty"`
+	HandleRefreshAt      int64                         `json:"handle_refresh_at,omitempty"`
+	PendingPeerDiscovery map[string]PeerDiscoveryEntry `json:"pending_peer_discovery,omitempty"`
+	PublishedPeerTrust   map[string]string             `json:"published_peer_trust,omitempty"`
 	// Instant wake (issue #42). WakeCursor is the last envelope id the
 	// wake daemon observed. It is tracked separately from Cursor so
 	// observing a message never consumes it: a woken agent still sees
@@ -1374,6 +1376,7 @@ func (c *Client) sendSealed(address string, plain []byte, sentLogBody string, re
 	// Protocol DMs skip the log: they are machine traffic, not chat.
 	if logSent {
 		_ = appendSentLog(SentEntry{CourierID: out.ID, To: address, Body: sentLogBody, SentAt: sentAt, ReplyTo: replyTo, Quote: quote, ExpiresAt: expiresAt})
+		_ = c.queuePeerDiscovery(address)
 	}
 	return out.ID, nil
 }
@@ -2190,6 +2193,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 				newHashes = append(newHashes, "")
 				return
 			}
+			_ = c.queuePeerDiscovery(m.From)
 			out = append(out, msg)
 			outputHashes = append(outputHashes, h)
 			// issue #52: opt-in delivery receipt. Fires only for the inbox
@@ -2880,57 +2884,46 @@ func (c *Client) DashboardPush() (pushed int, err error) {
 // the dashboard applies its own label TTL. Explicit discovery and the
 // bounded follow-mode worker refresh the cache independently.
 func (c *Client) refreshPeerHandles(hc *http.Client) {
-	if time.Now().Unix()-c.cfg.HandleRefreshAt < 24*3600 {
+	// Build each push from disk: the delivery client's contact snapshot can
+	// predate a removal, rebind, or verification in another process.
+	cfg, err := LoadConfig()
+	if err != nil {
 		return
 	}
-	peers := make([]string, 0, len(c.cfg.HandleCache))
-	for peer := range c.cfg.HandleCache {
-		peers = append(peers, peer)
-	}
-	// Also cover named contacts whose cached label changed since the
-	// last dashboard update.
-	for _, addr := range c.cfg.Contacts {
-		peers = append(peers, addr)
+	current := cachedDashboardTrust(cfg)
+	if time.Now().Unix()-cfg.HandleRefreshAt < 24*3600 && maps.Equal(current, cfg.PublishedPeerTrust) {
+		return
 	}
 	handles := map[string]string{}
-	seen := map[string]bool{}
-	for _, peer := range peers {
-		if seen[peer] {
-			continue
-		}
-		seen[peer] = true
-		if entry, ok := c.cfg.HandleCache[peer]; ok && time.Now().Unix()-entry.At < 24*3600 {
-			handles[peer] = entry.Handle // authoritative empty clears an old label
+	for peer, entry := range cfg.HandleCache {
+		if time.Now().Unix()-entry.At < 24*3600 {
+			handles[peer] = entry.Handle
 		}
 	}
-	// issue #48: push contact trust states alongside the handle labels.
-	// Only contacts carry verification; verified/stale peers get a
-	// badge in the dashboard, unverified peers get none.
-	verified := map[string]string{}
-	for name := range c.cfg.Contacts {
-		addr, err := c.cfg.LookupContact(name)
-		if err != nil {
-			continue
-		}
-		st, _ := c.CachedContactTrust(name)
-		switch st {
-		case TrustVerified:
-			if verified[addr] != "stale" {
-				verified[addr] = "verified_cached"
-			}
-		case TrustStale:
-			verified[addr] = "stale"
-		default:
-			if _, reported := verified[addr]; !reported {
-				verified[addr] = ""
-			}
+	verified := maps.Clone(current)
+	for peer := range cfg.PublishedPeerTrust {
+		if _, exists := current[peer]; !exists {
+			verified[peer] = ""
 		}
 	}
-	// Mark only successfully published evidence, and do not consume a
-	// concurrent worker's refresh request for a newer local snapshot.
 	markRefreshed := func() {
-		_ = c.cfg.Update(func(fresh *Config) error {
-			if maps.Equal(fresh.HandleCache, c.cfg.HandleCache) && maps.Equal(fresh.ContactVerifications, c.cfg.ContactVerifications) && maps.Equal(fresh.VerifiedKeyEpochs, c.cfg.VerifiedKeyEpochs) && maps.Equal(fresh.Contacts, c.cfg.Contacts) {
+		_ = cfg.Update(func(fresh *Config) error {
+			// Record exactly what this successful request published. If local
+			// evidence changed in flight, the next pass must correct that view.
+			if fresh.PublishedPeerTrust == nil {
+				fresh.PublishedPeerTrust = map[string]string{}
+			}
+			// Preserve pending clears or other push evidence created while this
+			// request was in flight but not represented in its payload.
+			for peer := range verified {
+				if status, exists := current[peer]; exists {
+					fresh.PublishedPeerTrust[peer] = status
+				} else {
+					delete(fresh.PublishedPeerTrust, peer)
+				}
+			}
+			fresh.HandleRefreshAt = 0
+			if maps.Equal(fresh.HandleCache, cfg.HandleCache) && maps.Equal(cachedDashboardTrust(fresh), current) && maps.Equal(fresh.PublishedPeerTrust, current) {
 				fresh.HandleRefreshAt = time.Now().Unix()
 			}
 			return nil
@@ -2940,14 +2933,13 @@ func (c *Client) refreshPeerHandles(hc *http.Client) {
 		markRefreshed()
 		return
 	}
-	body, _ := json.Marshal(map[string]any{
-		"messages": []any{},
-		"handles":  handles,
-		"verified": verified,
-	})
-	req, _ := http.NewRequest(http.MethodPost, c.cfg.DashboardURL+"/v1/dashboard/push", bytes.NewReader(body))
+	body, _ := json.Marshal(map[string]any{"messages": []any{}, "handles": handles, "verified": verified})
+	req, err := http.NewRequest(http.MethodPost, cfg.DashboardURL+"/v1/dashboard/push", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.cfg.DashboardToken)
+	req.Header.Set("Authorization", "Bearer "+cfg.DashboardToken)
 	resp, err := hc.Do(req)
 	if err != nil {
 		return
