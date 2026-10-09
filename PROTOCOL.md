@@ -6,10 +6,10 @@ the system work. It is written for implementers of interoperable
 clients and relays, and for reviewers who need a precise statement of
 what the protocol guarantees and what it does not.
 
-**Scope.** This spec describes the protocol as implemented at
-`origin/main` of `black-candle-technologies/courier`, including the
-merged bridge phase 1 (issue #61). In-flight work on feature branches
-(see Appendix B) is not part of the spec yet.
+**Scope.** This spec describes the implementation in this checkout of
+`black-candle-technologies/courier`. Changes under review are documented
+alongside their implementation; this does not imply deployment or merge.
+Appendix B describes how future changes must update the specification.
 
 **Reading order.** §1–§4 give the model. §5–§8 define the cryptographic
 core. §9 is the relay API reference. §10–§14 cover messaging machinery
@@ -18,7 +18,7 @@ ride inside ordinary envelopes. §23 covers the bridge boundary, §24 the
 dashboard, §25–§26 the security properties stated honestly, §27
 versioning; §28 specifies Verified Human in the Loop. Appendix A is
 the canonical signature-domain registry;
-Appendix B lists pending changes.
+Appendix B covers future protocol changes.
 
 ## 1. Overview
 
@@ -841,7 +841,7 @@ The envelope ciphertext decrypts to one of (dispatch order in
    review policies.
 3. **Retired protocols**: state `{"cs":1,"t":"state",...}` (any
    version) and recognized channel `{"cc":2,...}` frames are consumed
-   silently before chat decoding (§27).
+   silently before chat decoding (§27); these discriminators remain reserved.
 4. **Versioned chat payloads**:
    - **Raw text** — plain messages. Old clients render everything as
      text; this is the compatible baseline.
@@ -1927,7 +1927,7 @@ claim otherwise in product copy (issue #113).
 | Attacker | Protocol answer |
 |---|---|
 | Passive network observer | Defeated by TLS + pinning (§4) for metadata; by E2E encryption for content. |
-| Active network attacker (MITM) | Certificate pinning defeats impersonation of the relay. **But:** an attacker who controls delivery can suppress FS handshake traffic, silently downgrading conversations to legacy encryption (§15.5, issue #110). No downgrade alarm exists in v1. |
+| Active network attacker (MITM) | Certificate pinning defeats impersonation of the relay. **But:** an attacker who controls delivery can suppress FS handshake traffic, silently downgrading conversations to legacy encryption (§15.5, issue #110). Remembered FS capability enables a downgrade warning; it cannot prevent suppression under the default fail-open policy. |
 | Malicious or compromised relay | Cannot read message contents (E2E). **Can:** read all metadata (§26.1); suppress, delay, or replay envelopes (replays are deduped by recipients, §10; suppression is detectable only by the correspondents noticing missing mail); serve forked directory/group views to different clients (clients verify signatures, so forgery fails, but equivocation is not detected); retain ciphertext indefinitely (operator policy, not protocol). Directory and group clients verify control/registration signatures and abort on epoch gaps rather than applying forked history — detect, don't heal. |
 | Thief of a recipient's device (after the fact) | FS sessions: messages from before the last DH ratchet step are unreadable (§15). Legacy DMs: readable if the long-term X25519 key is recovered, unless rotated away — and pre-rotation ciphertext sealed to retired keys remains readable while the retired keys are retained (up to 4). Seed compromise additionally re-derives epoch-0 keys on pre-v0.6.11 identities (§5.1). |
 | Thief of the bridge gateway | Reads all bridged plaintext (§23.1). The bridge identity is a high-value key: compromise procedure is rotate identity, re-pin, revoke/re-issue tokens (`docs/bridge.md` runbook). |
@@ -2425,44 +2425,16 @@ Safety numbers (not a signature) use the hash domain
 `courier-safety-v1` over both parties' Ed25519 keys, X25519 keys,
 and key epochs (§18).
 
-## Appendix B. In-flight work requiring spec updates after merge
+## Appendix B. Future protocol changes
 
-This spec describes `origin/main` (+ merged bridge phase 1). The
-following open efforts will change protocol behavior and MUST be
-folded into this document when they merge:
-
-- **Bridge phase 2** (`feature/bridge-phase2`): dashboard
-  "not end-to-end encrypted" badge on bridged messages
-  (`bridge.HasBanner`-keyed rendering); relay-side advisory bridge
-  flag (coordinated in advance; no protocol break expected);
-  client-side untrusted-input enforcement; dashboard admin audit
-  view. Affects §23.3, §23.5, §24.
-- **Issue #97** (bridge input validation hardening), **#98**
-  (bridge follow-ups): tighten the gateway ingest path; may add
-  ingest limits or error codes — affects §23.2, §23.4.
-- **Issue #100** (blob upload rate limiting / per-uploader quota):
-  will add relay-side blob abuse controls — affects §9.7, §11,
-  §26.4.
-- **Issue #106** (CI on main): process change; the spec's "no CI
-  gates main" disclosure (§26.4) flips when branch protection lands.
-- **Issue #108** (version consistency + LICENSE): the
-  `/v1/health` `version` field and version table (§9.10, §26.4)
-  become true.
-- **Issue #110** (FS downgrade resistance): any enforcement mode or
-  downgrade alarm changes §15.5.
-- **Issue #111** (dashboard CSRF tokens): changes §24.4.
-- **Group/threading/receipts/FS feature branches** visible on
-  `origin` (`feature/fs-50`, `feature/receipts-52`,
-  `feature/threading-51`, `feature/ttl-53`, `feature/bridge-oauth`,
-  `feature/bridge-phase1-61`, `backup-multi-device-47`,
-  `contact-discovery-design`, `contact-verification-48`,
-  `fix-v091-silent-replays`, `fix/81`–`fix/86`): if any merge with
-  wire-visible changes, the corresponding section needs a
-  conformance pass.
+Every wire-visible change must update its normative section, the
+plaintext dispatch order (§13), compatibility rules, relevant canonical
+signature domains (Appendix A), and conformance tests as applicable.
+Documentation of a reviewed branch does not establish what is deployed.
+Verify the release and its implementation before relying on a capability.
 
 ---
 
-*Implementation references are to
-`github.com/black-candle-technologies/courier` at `origin/main`.
-Where this document and the code disagree, the code governs — and
-the discrepancy is a bug in this document.*
+*Implementation references are to this checkout of
+`github.com/black-candle-technologies/courier`. Where this document and
+the code disagree, the discrepancy is a bug in this document.*
