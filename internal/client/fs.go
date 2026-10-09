@@ -1590,6 +1590,8 @@ func (c *Client) fsDecryptMessage(from string, p fsPayload) (plain []byte, wrapK
 		_ = c.sendFSInit(from)
 	}
 	if err != nil {
+		crypto.Zero(wk[:])
+		crypto.Zero(plain)
 		return nil, nil, err
 	}
 	return plain, &wk, nil
