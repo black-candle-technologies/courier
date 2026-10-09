@@ -832,11 +832,12 @@ The envelope ciphertext decrypts to one of (dispatch order in
 `internal/client/client.go` `inbox`):
 
 1. **FS frame** (`{"cf": 3, ...}`) → §15.
-2. **Protocol DMs** by magic: group `{"cg": 1, ...}` (§16.5),
+2. **Retired protocols**: state `{"cs":1,"t":"state",...}` (any version) and recognized channel `{"cc":2,...}` frames are consumed silently before chat decoding (§27).
+3. **Protocol DMs** by magic: group `{"cg": 1, ...}` (§16.5),
    receipts `{"cr": 3, ...}` (§19). Recognized types are consumed
    silently; unknown `cg`/`cr` values fall through as ordinary
    chat — never silently swallowed.
-3. **Versioned chat payloads**:
+4. **Versioned chat payloads**:
    - **Raw text** — plain messages. Old clients render everything as
      text; this is the compatible baseline.
    - **v1** (`{"v": 1, "body": ..., "attachments": [...],
@@ -846,7 +847,7 @@ The envelope ciphertext decrypts to one of (dispatch order in
    - **v2** (`{"v": 2, "body": ..., "reply_to"?, "quote"?,
      "attachments"?, "expires_at"?, "bridge"?}`) — reply threading
      (§20), plus attachments/expiry, plus bridge attribution (§23).
-4. Anything else renders as raw text (harmless degradation, §27).
+5. Anything else renders as raw text (harmless degradation, §27).
 
 `encodeMessageBody` (`internal/client/threading.go`) picks the
 minimal form: raw text for plain messages, v1 when attachments or a
@@ -1895,7 +1896,7 @@ claim otherwise in product copy (issue #113).
 | Thief of a recipient's device (after the fact) | FS sessions: messages from before the last DH ratchet step are unreadable (§15). Legacy DMs: readable if the long-term X25519 key is recovered, unless rotated away — and pre-rotation ciphertext sealed to retired keys remains readable while the retired keys are retained (up to 4). Seed compromise additionally re-derives epoch-0 keys on pre-v0.6.11 identities (§5.1). |
 | Thief of the bridge gateway | Reads all bridged plaintext (§23.1). The bridge identity is a high-value key: compromise procedure is rotate identity, re-pin, revoke/re-issue tokens (`docs/bridge.md` runbook). |
 | Spammer / Sybil | Rate limits (§11.1), reporter throttling (§11.2), key-announcement hurdle for handles (§17.1). **No strong identity cost**: identities are free Ed25519 keys. Proof-of-work or allowlists are future work. |
-| Malicious contact (in-group) | Group: a member holds everyone's sender keys for the current epoch and can decrypt current-epoch traffic; removal + rekey bounds this (§16.5). A malicious sender can misquote in replies — recipients prefer their own local copy of the parent (§19.2). |
+| Malicious contact (in-group) | Group: a member holds everyone's sender keys for the current epoch and can decrypt current-epoch traffic; removal + rekey bounds this (§16.5). A malicious sender can misquote in replies — recipients prefer their own local copy of the parent (§20.2). |
 | Malicious bridge caller | OAuth + allowlist (§23.2), per-token rate limits, first-send confirmation (§23.4), audit log. The caller still reaches the gateway in plaintext — the bridge is not E2E (§23.1). |
 
 **Not threats in scope:** endpoint compromise *during* a live session
@@ -1968,6 +1969,13 @@ Carried over from prior disclosures; each is tracked:
   is forward-compatibility.)
 - All directory endpoints are additive; pre-v0.8.0 clients never call
   them.
+
+### Retired channel discriminator
+
+`cc:2` remains reserved for legacy `join-request`, `join-accept`, `msg`,
+`rekey`, and `leave` payloads. Updated clients consume them without chat output,
+cache insertion, dashboard publication, or channel mutation. Explicit fetch
+refuses these protocol frames. See [legacy archive retirement](docs/legacy-channel-retirement.md).
 
 ## Appendix A. Canonical signature-domain registry
 
@@ -2422,10 +2430,3 @@ folded into this document when they merge:
 `github.com/black-candle-technologies/courier` at `origin/main`.
 Where this document and the code disagree, the code governs — and
 the discrepancy is a bug in this document.*
-
-### Retired channel discriminator
-
-`cc:2` remains reserved for legacy `join-request`, `join-accept`, `msg`,
-`rekey`, and `leave` payloads. Updated clients consume them without chat output,
-cache insertion, dashboard publication, or channel mutation. Explicit fetch
-refuses these protocol frames. See [legacy archive retirement](docs/legacy-channel-retirement.md).
