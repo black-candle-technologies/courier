@@ -422,7 +422,7 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		if _, err := crypto.ParseAddress(peer); err != nil {
 			continue
 		}
-		if status != "verified" && status != "stale" {
+		if status != "" && status != "verified" && status != "verified_cached" && status != "stale" {
 			continue
 		}
 		if err := s.store.SavePeerVerified(user.ID, peer, status); err != nil {
@@ -1412,7 +1412,7 @@ const appTmpl = pageHead + `
 {{identicon .Peer}}
 <div class="thread-main">
 <div class="thread-top">
-{{if .Handle}}<span class="sender" title="{{.Peer}}">@{{.Handle}}</span>{{else}}<span class="sender" title="{{.Peer}}">{{senderShort .Peer}}</span>{{end}}{{if eq .Verified "verified"}}<span class="vbadge" title="Identity verified out of band">✓</span>{{else if eq .Verified "stale"}}<span class="vbadge stale" title="Their encryption key changed — re-verify out of band">⚠</span>{{end}}{{if .LastBridged}}<span class="nbadge small" title="Latest message arrived via the ChatGPT web bridge — not end-to-end encrypted">⚠</span>{{end}}
+{{if .Handle}}<span class="sender" title="{{.Peer}}">@{{.Handle}}</span>{{else}}<span class="sender" title="{{.Peer}}">{{senderShort .Peer}}</span>{{end}}{{if eq .Verified "verified"}}<span class="vbadge" title="Identity verified out of band">✓</span>{{else if eq .Verified "verified_cached"}}<span class="vbadge" title="Stored out-of-band verification; current keys have not been revalidated">✓ cached</span>{{else if eq .Verified "stale"}}<span class="vbadge stale" title="Their encryption key changed — re-verify out of band">⚠</span>{{end}}{{if .LastBridged}}<span class="nbadge small" title="Latest message arrived via the ChatGPT web bridge — not end-to-end encrypted">⚠</span>{{end}}
 <span class="when" data-ts="{{.LastTS}}">{{ago .LastTS}}</span>
 </div>
 <p class="preview">{{.Preview}}</p>
@@ -1483,7 +1483,7 @@ window.addEventListener('appinstalled',function(){btn.hidden=true;deferred=null;
 const threadTmpl = pageHead + `
 <header class="appbar"><div class="appbar-inner">
 <a class="back" href="/app" aria-label="Back to threads">‹</a>
-<h1 class="thread-title" title="{{.Peer}}">{{if .PeerHandle}}@{{.PeerHandle}}{{else}}{{senderShort .Peer}}{{end}}{{if eq .PeerVerified "verified"}}<span class="vbadge" title="Identity verified out of band">✓</span>{{else if eq .PeerVerified "stale"}}<span class="vbadge stale" title="Their encryption key changed — re-verify out of band">⚠</span>{{end}}</h1>
+<h1 class="thread-title" title="{{.Peer}}">{{if .PeerHandle}}@{{.PeerHandle}}{{else}}{{senderShort .Peer}}{{end}}{{if eq .PeerVerified "verified"}}<span class="vbadge" title="Identity verified out of band">✓</span>{{else if eq .PeerVerified "verified_cached"}}<span class="vbadge" title="Stored out-of-band verification; current keys have not been revalidated">✓ cached</span>{{else if eq .PeerVerified "stale"}}<span class="vbadge stale" title="Their encryption key changed — re-verify out of band">⚠</span>{{end}}</h1>
 <span class="user" title="{{.User}}">{{.User}}</span>
 </div></header>
 <div class="wrap thread-wrap">

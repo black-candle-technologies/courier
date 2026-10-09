@@ -83,6 +83,9 @@ func TestContactHandleRequiresConfirmationAndPreservesAlias(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got := client.New(cfg).CachedPeerHandle(peer.Address); got != "bob" {
+		t.Fatalf("verified add did not cache profile: %q", got)
+	}
 	if len(cfg.Contacts) != 1 || cfg.Contacts["bobby"] != peer.Address {
 		t.Fatal("private alias replaced or duplicated", cfg.Contacts)
 	}

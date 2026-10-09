@@ -1829,12 +1829,22 @@ advances its local cursor only after a successful push. `handles` and
 `verified` are the agent-reported peer labels (§17.6, §18). Each
 push also sweeps already-expired `expires_at` rows (§21).
 
-Dashboard batches and periodic label updates use only unexpired local
-handle-cache entries. They never query the directory during rendering;
-unknown or expired labels are omitted while messages retain full peer
-addresses. Explicit contact discovery or request acceptance can refresh
-verified handle evidence independently. A transient lookup failure never
-creates an authoritative empty handle entry.
+Dashboard batches and periodic label updates never query the directory
+while rendering. They use unexpired local handle evidence; unknown peers
+retain full addresses. In `dashboard push --follow`, a separate worker
+renews expired contact/cached-peer handles with a five-second total
+budget and at most eight peers per pass. A failed lookup gets a
+five-minute in-memory retry delay and never creates an authoritative
+empty cache entry. Verified empty responses clear old labels. Explicit
+confirmed `contacts add @handle` also caches the verified binding while
+preserving private aliases. One-shot pushes use the existing cache.
+
+Trust badges are likewise local snapshots: `verified_cached` means stored
+out-of-band verification, **not fresh key-directory validation**; `stale`
+means the address or locally observed key epoch changed. Empty status
+clears an unverified contact's old badge. Live contact validation remains
+an explicit separate operation. Successful label pushes acknowledge only
+the snapshot they sent, so concurrent refresh results are not lost.
 
 ### 24.4 Security properties
 

@@ -16,6 +16,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -1153,6 +1154,9 @@ func (scope command) cmdContacts(args []string) error {
 				if !known && !force {
 					return fmt.Errorf("re-run with --force to confirm the contact identity")
 				}
+				if err := cl.CacheDirectoryProfile(profile); err != nil {
+					return err
+				}
 			} else {
 				address = args[1]
 				if _, err := crypto.ParseAddress(address); err != nil {
@@ -1870,6 +1874,14 @@ func (scope command) cmdDashboardPush(args []string) error {
 	}
 	c := client.New(cfg)
 	pushOnce := func() error {
+		fresh, err := scope.context.LoadConfig()
+		if err != nil {
+			return err
+		}
+		if fresh.Address != cfg.Address || fresh.Seed != cfg.Seed || fresh.RelayURL != cfg.RelayURL || fresh.RelayFingerprint != cfg.RelayFingerprint {
+			return client.ErrContextMismatch
+		}
+		c = client.New(fresh)
 		n, err := c.DashboardPush()
 		if err != nil {
 			return err
@@ -1883,6 +1895,11 @@ func (scope command) cmdDashboardPush(args []string) error {
 	if !*follow {
 		return nil
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	metadataClient := c
+	go func() { defer close(done); metadataClient.RunDashboardMetadataRefresh(ctx) }()
+	defer func() { cancel(); <-done }()
 	t := time.NewTicker(*interval)
 	defer t.Stop()
 	for range t.C {
