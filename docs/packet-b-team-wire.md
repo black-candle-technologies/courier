@@ -6,7 +6,7 @@ No runtime feature is enabled. No real keys, teams, rosters or messages were cre
 
 Riley approved D1/D2/D4/D5 and the CLI portion of D6 through the parent conversation on 2026-10-09 at 01:41 UTC: private invitation-only teams; owner-signed roster lifetimes at most 24 hours and no expired sends; no automatic lost-owner recovery; historical roster disclosure to current/future members; owner-dependent removal with local blocking; explicit text-only `send --team`. This records the chosen tradeoff of bounded stale-membership exposure, disclosure needed for full-history verification, and no implicit recovery authority. D3 (one security binding per principal) was separately approved. Approval covers implementation, not provisioning, actual disclosure, sending or deployment. Numeric budgets remain proposals requiring measured review.
 
-Initial base: PR163 `packet-a/context-isolation`, commit `db0f83c68277cb45990193c2dd0e213e44655907`, tree `ad8f9a35d9a493d87ed95447a2293f16f229ac7d`. Planning reference: PR162 `26f89b23aeb1b077340cdd63296737d41e04b133`, `docs/team-addressing-plan.md` and `docs/team-addressing-implementation-plan.md`. No AGENTS.md exists in the assigned tree or workspace ancestors. Packet A configuration fixes are a publication/acceptance dependency; B does not import client or edit its context/config/path code.
+Initial base: PR163 `packet-a/context-isolation`, commit `db0f83c68277cb45990193c2dd0e213e44655907`, tree `ad8f9a35d9a493d87ed95447a2293f16f229ac7d`. Planning reference: PR162 `26f89b23aeb1b077340cdd63296737d41e04b133`, `docs/team-addressing-plan.md` and `docs/team-addressing-implementation-plan.md`. No AGENTS.md exists in the assigned tree or workspace ancestors. Packet A configuration fixes are incorporated at the refreshed base below; B does not import client or edit its context/config/path code.
 
 ## Wire and canonicalization
 
@@ -41,7 +41,7 @@ The user subsequently requested same-team peer task assignment. That protocol re
 
 ## Proposed resource budgets and fixtures
 
-`TeamLimits` is an explicit validated input to every parser/verifier; zero values fail. No release defaults are installed. Test/benchmark proposals are 256 members, 256 array entries, 512 bytes/string, 256 KiB/object, 1,024 total chain objects (each invitation and acceptance counts separately), 8 MiB total serialized chain data and 24-hour invitation lifetime. Roster lifetime is the approved hard 24-hour protocol bound; invitation lifetime is a caller budget capped at that bound for this candidate.
+`TeamLimits` is an explicit validated input to every parser/verifier; zero values fail. No release defaults are installed. Test/benchmark proposals are 256 members, 256 array entries, 512 bytes/string, 256 KiB/object, 1,024 total chain objects (each invitation and acceptance counts separately), 8 MiB total serialized chain data for stress tests and 24-hour invitation lifetime. The measured initial release proposal is tighter: 2 MiB total chain data, retaining the other numeric caps; it is not a default and still needs owner/reviewer approval. Roster lifetime is the approved hard 24-hour protocol bound; invitation lifetime is a caller budget capped at that bound for this candidate.
 
 These budgets bound one validation attempt, not total team lifetime. Longer histories must fail visibly until a separately reviewed bounded catch-up/checkpoint design is available. Do not prune signed history, consumed consent or tombstones to make validation pass. Durable security metadata retention and any outbox retention are unresolved release policy; Packet B neither owns outbox storage nor claims an unmeasured retention maximum is safe. Benchmark evidence is recorded below before recommending release values.
 
@@ -51,9 +51,30 @@ Tests include strict schema/encoding rejection, JCS equivalence, domain separati
 
 ## Remaining gates
 
-- Verified incorporation of the next Packet A fixes without rewriting published work.
+- Independent acceptance of refreshed Packet A and any further predecessor fixes. Incorporation at the verified base below is complete; independent predecessor review is not claimed.
 - Independent review of schema/API, creation commitment, restricted canonicalizer, signatures, consent semantics and golden revision before C/D freeze dependencies.
 - Numeric limits and security-state retention policy, with production-representative benchmarks and a design for long-lived history.
 - Native platform/release evidence and downstream malicious-relay, atomic admission, persistence/crash and fanout tests. B's pure verifier tests do not establish those properties.
 - Current workflow triggers only PRs targeting `main` or `consolidation/**`; a draft targeting `packet-a/context-isolation` does not automatically receive aggregate CI. Local evidence must not be described as remote CI. Workflow changes belong to the integrator.
 - Root coordinates independent reviews and all merges; no deployment or release is authorized here.
+
+
+## Refreshed base and measurements
+
+GitHub PR metadata and Git commit API independently confirmed PR163 head `490c736bf8511042a55f60824a8de539d8af1ec5`, tree `8ec775ba321e2a2668859d9b30ff00bfe99a31eb`, branch `packet-a/context-isolation`. It contains the caller-config/locked-update fixes and the latest PR154 integration. B was replayed into a fresh `packet-b/team-wire-v1` worktree directly from that tip. The original unpublished `packet-b/team-wire` branch remains intact; no merge or force push was performed. The resulting diff contains only new envelope files/fixtures and this document.
+
+Go 1.26.9, Darwin/arm64, Apple M5, `GOMAXPROCS=2`, `-benchtime=3x`, synthetic public fixtures. These are small local measurements (some with other bounded validation jobs running), not throughput guarantees or peak resident memory. `B/op` measures total allocations per verification.
+
+| Fixture | Serialized bytes | Time/op | Allocated bytes/op |
+| --- | ---: | ---: | ---: |
+| 1 member, genesis plus consent | 1,169 roster bytes | 0.83 ms | 195,040 |
+| 64 members, genesis plus consent | 11,942 roster bytes | 70.9 ms | 8,323,133 |
+| 256 members, genesis plus consent | 44,774 roster bytes | 171.9 ms | 33,318,362 |
+| 128 empty snapshots | 136,783 | 35.8 ms | 7,185,088 |
+| 1,024 empty snapshots | 1,095,528 | 360.3 ms | 57,419,704 |
+| 256 members, 32 snapshots, all consent (2 MiB proposal) | 2,027,826 | 525.7 ms | 93,167,866 |
+| 256 members, 160 snapshots, all consent (8 MiB stress budget) | 7,767,919 | 2,152.7 ms | 340,084,602 |
+
+Commands: `go test -run '^$' -bench '^BenchmarkTeam(Chain|History)$' -benchmem -benchtime=3x ./internal/envelope` and `go test -run '^$' -bench '^BenchmarkTeamCombinedBudget' -benchmem -benchtime=3x ./internal/envelope`. The 8 MiB stress result motivates the 2 MiB initial proposal. Even that costs material allocation and limits long-lived histories: release needs a reviewed catch-up/retention design or explicit fail-closed product limits, not silent deletion of security history. Member count, snapshot/chain budgets, invite lifetime/rate and downstream operation/outbox retention still require release sign-off; B does not invent rate or outbox policies.
+
+Fixture SHA256: `23c9118bde7d7cefb4baafc46451e714aad548c42620fc95b10edf6608e1ed28`. Exported API and fixture acceptance must pin the eventual draft PR head, not a moving branch.
