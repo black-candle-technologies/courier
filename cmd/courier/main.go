@@ -165,6 +165,7 @@ func usage() {
   courier contacts require-fs-on <name>      require forward secrecy: sends fail
                                          rather than fall back to legacy (default off)
   courier contacts require-fs-off <name>    clear the require-forward-secrecy policy
+  courier contacts retry-fs-cleanup <address>  retry erasure for a former contact
   courier contacts remove <name>         delete a contact
   courier receipts [contact] [--limit N] show delivery status of sent messages
   courier group create --name <name> [addr...]
@@ -1107,7 +1108,7 @@ func writeSvcJSON(w http.ResponseWriter, code int, v any) {
 
 func cmdContacts(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|start-fs|require-fs-on|require-fs-off|remove>")
+		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|start-fs|require-fs-on|require-fs-off|retry-fs-cleanup|remove>")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
@@ -1364,32 +1365,32 @@ func cmdContacts(args []string) error {
 		} else {
 			fmt.Printf("forward secrecy no longer required for %q (fail-open default).\n", args[1])
 		}
+	case "retry-fs-cleanup":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: courier contacts retry-fs-cleanup <address>")
+		}
+		cleaned, err := cl.FSCleanupOrphan(args[1])
+		if err != nil {
+			return err
+		}
+		if !cleaned {
+			return fmt.Errorf("FS state retained: a saved contact still references that address")
+		}
+		fmt.Println("former contact FS state erased.")
 	case "remove", "rm", "delete":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: courier contacts remove <name>")
 		}
-		address, err := cfg.LookupContact(args[1])
-		if err != nil {
+		if _, err := cfg.LookupContact(args[1]); err != nil {
 			return err
 		}
 		if err := cfg.RemoveContact(args[1]); err != nil {
 			return err
 		}
-		stillReferenced := false
-		for _, addr := range cfg.Contacts {
-			if addr == address {
-				stillReferenced = true
-				break
-			}
-		}
-		if !stillReferenced {
-			if ferr := cl.FSForget(address); ferr != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not erase FS session: %v\n", ferr)
-			}
-		}
+
 		fmt.Printf("contact %q removed.\n", args[1])
 	default:
-		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|start-fs|require-fs-on|require-fs-off|remove)", args[0])
+		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|start-fs|require-fs-on|require-fs-off|retry-fs-cleanup|remove)", args[0])
 	}
 	return nil
 }
