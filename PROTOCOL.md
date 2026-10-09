@@ -805,10 +805,10 @@ The inbox pipeline (`Client.inbox`, `internal/client/client.go`):
    4 retired, §5.3); undecryptable messages are skipped without
    stalling.
 8. Dispatch the plaintext in the order in §13: FS frames to the FS
-   layer (§15), retired state/channel payloads to silent consumption
-   (§27), active group / receipt / introduction protocol DMs to their
-   consumers, and chat to the inbox. Retired payloads never enter the
-   reply cache or dashboard output.
+   layer (§15), then active group / receipt / VHL / introduction handlers,
+   then retired state/channel payloads to silent consumption (§27), and
+   finally chat to the inbox. Retired payloads never enter the reply cache
+   or dashboard output.
 9. Mark delivered hashes seen (per consumer), flush the reply cache,
    persist the cursor.
 
@@ -1123,7 +1123,11 @@ sent over FS, only their relay-side metadata (blob id, size, timing).
 Replacing a contact name with a different address also erases the old peer's
 FS state after saving, provided no other alias references that peer. A failed
 contact save preserves the old state; a subsequent cleanup failure reports
-that the contact was saved but erasure failed.
+that the contact was saved but erasure failed. Removal and replacement cleanup
+failures print `courier contacts retry-fs-cleanup <old-address>`. This explicit,
+idempotent retry works after reopening; the saved alias check and FS erasure
+share the config lock. A newly saved alias prevents erasure. There is no automatic
+cleanup queue or crash-durable pending intent.
 
 ### 15.8 CLI
 
@@ -1427,6 +1431,13 @@ reversible (`UntombstoneHandle`). Tombstoned **private** handles stay
 
 ### 17.6 Client behavior
 
+- `courier contacts add <address|@handle>` uses the verified directory handle
+  as the default name. `courier contacts add <name> <address>` records that
+  explicit private alias as the preferred local display name, regardless of
+  alphabetical ordering. Other saved aliases and their verification records
+  remain intact. Re-adding a handle does not override the preference; removing
+  or repointing the preferred alias clears it, with deterministic fallback to
+  the remaining saved names. Rendering does not query the directory.
 - `courier directory register <handle> [--public|--unlisted|--private]
   [--cap chat,...] [--contacts-only]` — register (default private).
 - `courier directory update ...` / `unregister` /

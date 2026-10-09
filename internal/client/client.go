@@ -80,10 +80,13 @@ type Config struct {
 	// issue #48 (phase 1): out-of-band contact verifications, keyed by
 	// contact name. A record pins the address + key epoch the safety
 	// number was computed over; if either changes, trust goes stale.
-	ContactVerifications map[string]ContactVerification `json:"contact_verifications,omitempty"`
-	EncKeys              []EncKey                       `json:"enc_keys,omitempty"`          // current first; lazily migrated
-	AutoUpdate           *bool                          `json:"auto_update,omitempty"`       // nil = unset: auto-install newer releases (v0.6.12+ default); false opts out
-	UpdateCheckedAt      int64                          `json:"update_checked_at,omitempty"` // unix seconds of last update check
+	// PreferredContactNames records explicitly chosen private display aliases,
+	// keyed by address. Other aliases and their verification records remain intact.
+	PreferredContactNames map[string]string              `json:"preferred_contact_names,omitempty"`
+	ContactVerifications  map[string]ContactVerification `json:"contact_verifications,omitempty"`
+	EncKeys               []EncKey                       `json:"enc_keys,omitempty"`          // current first; lazily migrated
+	AutoUpdate            *bool                          `json:"auto_update,omitempty"`       // nil = unset: auto-install newer releases (v0.6.12+ default); false opts out
+	UpdateCheckedAt       int64                          `json:"update_checked_at,omitempty"` // unix seconds of last update check
 	// v0.6.0: web dashboard account. Token is the push API token (the
 	// dashboard stores only its hash). DashboardCursor is the last
 	// courier message id pushed.
@@ -486,6 +489,16 @@ var contactNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
 // AddContact stores name -> address after validating both.
 func (c *Config) AddContact(name, address string) error {
+	return c.addContact(name, address, false)
+}
+
+// AddContactAlias saves an explicitly chosen private display alias without
+// deleting other names or their verification metadata for the same address.
+func (c *Config) AddContactAlias(name, address string) error {
+	return c.addContact(name, address, true)
+}
+
+func (c *Config) addContact(name, address string, prefer bool) error {
 	if !contactNameRe.MatchString(name) {
 		return fmt.Errorf("bad contact name %q: use 1-32 chars, lowercase letters, digits, - and _, starting with a letter or digit", name)
 	}
@@ -499,39 +512,53 @@ func (c *Config) AddContact(name, address string) error {
 			fresh.Contacts = map[string]string{}
 		}
 		oldAddress, replaced = fresh.Contacts[name]
+		if fresh.PreferredContactNames[oldAddress] == name && oldAddress != address {
+			delete(fresh.PreferredContactNames, oldAddress)
+		}
+		if prefer {
+			if fresh.PreferredContactNames == nil {
+				fresh.PreferredContactNames = map[string]string{}
+			}
+			fresh.PreferredContactNames[address] = name
+		}
 		fresh.Contacts[name] = address
 		return nil
 	}); err != nil {
 		return err
 	}
-	// Persist before erasing the replaced principal's FS session. Aliases
-	// still referring to that principal retain its session and policy.
 	if replaced && oldAddress != address {
-		for _, other := range c.Contacts {
-			if other == oldAddress {
-				return nil
-			}
-		}
-		if err := New(c).FSForget(oldAddress); err != nil {
-			return fmt.Errorf("contact saved, but could not erase replaced contact's FS session: %w", err)
+		if _, err := New(c).FSCleanupOrphan(oldAddress); err != nil {
+			return fmt.Errorf("contact saved, but could not erase replaced contact's FS session; retry with courier contacts retry-fs-cleanup %s: %w", oldAddress, err)
 		}
 	}
 	return nil
 }
 
-// RemoveContact deletes a contact and its verification record (issue
-// #48: a removed contact's trust must not resurrect if re-added), plus
-// its receipt opt-in (issue #52: no lingering activity-leak consent).
-// It is not an error if absent.
+// RemoveContact removes the alias and its consent records atomically, then
+// cleans up FS only if the latest saved config has no alias for that principal.
 func (c *Config) RemoveContact(name string) error {
-	return c.Update(func(fresh *Config) error {
-		if addr, ok := fresh.Contacts[name]; ok {
-			delete(fresh.ReceiptContacts, addr)
+	var address string
+	var existed bool
+	if err := c.Update(func(fresh *Config) error {
+		address, existed = fresh.Contacts[name]
+		if existed {
+			delete(fresh.ReceiptContacts, address)
+			if fresh.PreferredContactNames[address] == name {
+				delete(fresh.PreferredContactNames, address)
+			}
 		}
 		delete(fresh.Contacts, name)
 		delete(fresh.ContactVerifications, name)
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	if existed {
+		if _, err := New(c).FSCleanupOrphan(address); err != nil {
+			return fmt.Errorf("contact removed, but could not erase its FS session; retry with courier contacts retry-fs-cleanup %s: %w", address, err)
+		}
+	}
+	return nil
 }
 
 // LookupContact returns the address for a contact name.
@@ -1031,6 +1058,9 @@ func pinnedTransport(fingerprint string) (*http.Transport, error) {
 // dashboardHTTPClient returns a pinned client for the dashboard, or an
 // error directing the agent to run `courier dashboard setup`.
 func (c *Client) dashboardHTTPClient() (*http.Client, error) {
+	if err := c.cfg.local().validateConfig(c.cfg); err != nil {
+		return nil, err
+	}
 	if c.cfg.DashboardToken == "" {
 		return nil, fmt.Errorf("no dashboard account configured; run `courier dashboard setup` first")
 	}
@@ -2577,6 +2607,9 @@ func GenerateTempPassword() (string, error) {
 // otherwise it falls back to TOFU, printing the fingerprint for the
 // user to verify.
 func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassword string, err error) {
+	if err := c.cfg.local().validateConfig(c.cfg); err != nil {
+		return "", err
+	}
 	if !dashboardUsernameRe.MatchString(username) {
 		return "", fmt.Errorf("username must be 3-32 chars: lowercase letters, digits, - and _")
 	}
@@ -3042,6 +3075,7 @@ func (c *Config) refreshState(fresh *Config) {
 	c.Cursor = fresh.Cursor
 	c.RelayFingerprint = fresh.RelayFingerprint
 	c.Contacts = fresh.Contacts
+	c.PreferredContactNames = fresh.PreferredContactNames
 	c.ContactVerifications = fresh.ContactVerifications
 	c.EncKeys = fresh.EncKeys
 	c.AutoUpdate = fresh.AutoUpdate

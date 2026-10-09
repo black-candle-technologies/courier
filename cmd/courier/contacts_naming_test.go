@@ -100,6 +100,62 @@ func TestContactHandleRequiresConfirmationAndPreservesAlias(t *testing.T) {
 	if err != nil || cfg.Contacts["bob"] != peer.Address {
 		t.Fatal("confirmed add failed", err)
 	}
+	// An explicit alias must shadow the auto-derived name regardless of sort
+	// order, without deleting existing aliases or their trust records.
+	if err := cfg.AddContact("aaron", peer.Address); err != nil {
+		t.Fatal(err)
+	}
+	other, err := client.NewIdentity(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.AddContact("unrelated", other.Address); err != nil {
+		t.Fatal(err)
+	}
+	record := client.ContactVerification{Address: peer.Address, VerifiedAt: 123, KeyEpoch: 7, SafetyNumber: "retained"}
+	cfg.ContactVerifications = map[string]client.ContactVerification{"bob": record, "aaron": record}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdContacts([]string{"add", "zach", peer.Address}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = client.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.New(cfg).ContactDisplayName(peer.Address); got != "zach" {
+		t.Fatalf("explicit alias lost to handle: %s", got)
+	}
+	if got := existingContactAlias(cfg, peer.Address); got != "zach" {
+		t.Fatalf("CLI alias disagrees: %s", got)
+	}
+	if len(cfg.Contacts) != 4 || cfg.Contacts["bob"] != peer.Address || cfg.Contacts["aaron"] != peer.Address || cfg.Contacts["unrelated"] != other.Address {
+		t.Fatal("existing aliases changed", cfg.Contacts)
+	}
+	if cfg.ContactVerifications["bob"] != record || cfg.ContactVerifications["aaron"] != record {
+		t.Fatal("trust metadata changed")
+	}
+	if err := cmdContacts([]string{"add", "@bob"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = client.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.New(cfg).ContactDisplayName(peer.Address); got != "zach" {
+		t.Fatalf("handle re-add replaced explicit preference: %s", got)
+	}
+	if err := cmdContacts([]string{"remove", "zach"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = client.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PreferredContactNames[peer.Address] != "" || client.New(cfg).ContactDisplayName(peer.Address) != "aaron" {
+		t.Fatal("removed preference did not fall back safely")
+	}
 }
 
 func TestContactAddressDistinguishesDirectoryFailure(t *testing.T) {

@@ -1670,21 +1670,58 @@ func (c *Client) FSForget(peer string) error {
 		return err
 	}
 	return c.cfg.local().updateFS(func(ff *fsFile) error {
-		delete(ff.Sessions, address)
-		// Contact removal is an explicit user action, not a downgrade:
-		// clear markers, including the suite-negotiation pin (issue
-		// #138) so a later fresh handshake can renegotiate from
-		// scratch. The capability pin (issue #110) is a historical
-		// fact and is kept.
-		delete(ff.Downgrade, address)
-		delete(ff.DowngradeWarnedAt, address)
-		delete(ff.FSNegotiated, address)
-		// The require-fs policy is per-contact: removing the contact
-		// drops it, so a re-added contact starts on the fail-open
-		// default.
-		delete(ff.RequireFS, address)
+		forgetFSAddress(ff, address)
 		return nil
 	})
+}
+
+// FSCleanupOrphan retries contact cleanup by its raw former address. It checks
+// the current saved aliases under the same lock as erasure, so a reopened or
+// stale client cannot erase a peer that another process has saved again.
+// The bool is false when an alias still references the address.
+func (c *Client) FSCleanupOrphan(address string) (bool, error) {
+	if _, err := crypto.ParseAddress(address); err != nil {
+		return false, fmt.Errorf("cleanup requires a full contact address: %w", err)
+	}
+	cleaned := false
+	err := c.cfg.local().withConfigLock(func() error {
+		fresh, err := c.cfg.local().loadConfigRaw()
+		if err != nil {
+			return err
+		}
+		for _, saved := range fresh.Contacts {
+			if saved == address {
+				return nil
+			}
+		}
+		ff, err := c.cfg.local().loadFSLocked()
+		if err != nil {
+			return err
+		}
+		forgetFSAddress(ff, address)
+		if err := c.cfg.local().saveFSLocked(ff); err != nil {
+			return err
+		}
+		cleaned = true
+		return nil
+	})
+	return cleaned, err
+}
+
+func forgetFSAddress(ff *fsFile, address string) {
+	delete(ff.Sessions, address)
+	// Contact removal is an explicit user action, not a downgrade:
+	// clear markers, including the suite-negotiation pin (issue
+	// #138) so a later fresh handshake can renegotiate from
+	// scratch. The capability pin (issue #110) is a historical
+	// fact and is kept.
+	delete(ff.Downgrade, address)
+	delete(ff.DowngradeWarnedAt, address)
+	delete(ff.FSNegotiated, address)
+	// The require-fs policy is per-contact: removing the contact
+	// drops it, so a re-added contact starts on the fail-open
+	// default.
+	delete(ff.RequireFS, address)
 }
 
 // FSDowngradeSuspected exposes persistent downgrade memory to local inspection.
