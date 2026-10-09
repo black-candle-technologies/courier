@@ -2,6 +2,7 @@ package client
 
 import (
 	"errors"
+	"github.com/black-candle-technologies/courier/internal/crypto"
 	"os"
 	"path/filepath"
 	"strings"
@@ -180,5 +181,85 @@ func TestContextRequiredFSAndVHLDoNotCross(t *testing.T) {
 	}
 	if tier, err := cb.VHLGetRequiredTier(); err != nil || tier != 0 {
 		t.Fatal("VHL policy leaked", err)
+	}
+}
+
+func TestLegacyUpdateRefusesReplacedPrincipal(t *testing.T) {
+	s := Context{root: t.TempDir()}
+	old, err := NewIdentity("https://fixture.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.localContext = &s
+	if err = old.Save(); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := NewIdentity("https://fixture.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement.localContext = &s
+	if err = replacement.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err = old.Update(func(f *Config) error { f.Cursor = 100; return nil }); !errors.Is(err, ErrContextMismatch) {
+		t.Fatal("running client switched principal", err)
+	}
+	fresh, err := s.LoadConfig()
+	if err != nil || fresh.Address != replacement.Address || fresh.Cursor != 0 {
+		t.Fatal("replacement changed", err)
+	}
+}
+
+func TestNamedContextBackupResetAndSyncBinding(t *testing.T) {
+	legacy := Context{root: t.TempDir()}
+	cfg, err := NewIdentity("https://fixture.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.RelayFingerprint = strings.Repeat("a", 64)
+	cfg.localContext = &legacy
+	if err = cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	scoped := migrationTarget(t, legacy)
+	cfg.localContext = &scoped
+	if err = cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	c := New(cfg)
+	if err = c.FSRequire(cfg.Address, true); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.VHLSetRequiredTier(1); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := cfg.backupPayload(crypto.BackupKindSync, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.RelayURL = "https://other.invalid"
+	if _, err = cfg.MergeSyncKeys(payload); !errors.Is(err, ErrContextMismatch) {
+		t.Fatal("cross-relay sync accepted", err)
+	}
+	raw, err := cfg.CreateBackup([]byte("fixture-only-passphrase"), crypto.BackupKindBackup, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := scoped.RestoreBackup([]byte("fixture-only-passphrase"), raw, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Context() != scoped || restored.Cursor != 0 || len(restored.Contacts) != 0 {
+		t.Fatal("restore scope or fresh state incorrect")
+	}
+	for _, name := range []string{"fs.json", "vhl.json"} {
+		if _, err = os.Stat(filepath.Join(scoped.root, name)); !os.IsNotExist(err) {
+			t.Fatal("restore retained state", name, err)
+		}
+	}
+	original, err := legacy.loadConfigRaw()
+	if err != nil || original.Address != cfg.Address {
+		t.Fatal("restore changed another context", err)
 	}
 }

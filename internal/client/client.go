@@ -409,6 +409,9 @@ func (c *Config) Update(fn func(*Config) error) error {
 		if err != nil {
 			return err
 		}
+		if fresh.Address != c.Address || fresh.Seed != c.Seed {
+			return ErrContextMismatch
+		}
 		if len(fresh.EncKeys) == 0 {
 			if err := migrateEncKeys(fresh); err != nil {
 				return err
