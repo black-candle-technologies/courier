@@ -4,8 +4,11 @@ import (
 	"github.com/black-candle-technologies/courier/internal/client"
 	"github.com/black-candle-technologies/courier/internal/relay"
 	"github.com/black-candle-technologies/courier/internal/store"
+	"io"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -38,6 +41,25 @@ func TestContactHandleRequiresConfirmationAndPreservesAlias(t *testing.T) {
 	}
 	if err := cfg.Save(); err != nil {
 		t.Fatal(err)
+	}
+	out, err := os.CreateTemp(t.TempDir(), "send-output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldOut := os.Stdout
+	os.Stdout = out
+	sendErr := cmdSend([]string{"@bob", "hello", "--force"})
+	os.Stdout = oldOut
+	if sendErr != nil {
+		t.Fatal(sendErr)
+	}
+	if _, err := out.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(out)
+	out.Close()
+	if err != nil || !strings.Contains(string(output), "sent to @bob ("+peer.Address+")") {
+		t.Fatalf("lost verified handle: %s %v", output, err)
 	}
 	if err := cmdContacts([]string{"add", "@bob"}); err == nil {
 		t.Fatal("unconfirmed handle became trusted contact")

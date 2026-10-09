@@ -1,6 +1,7 @@
 package client
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"slices"
 	"testing"
@@ -324,5 +325,40 @@ func TestAcceptRequestPrefersHandle(t *testing.T) {
 	}
 	if got := senderAddr(cfg, senderAddrStr); got != "sam" {
 		t.Fatalf("want contact named after handle %q, got %q", "sam", got)
+	}
+}
+
+func TestRequestAcceptRetriesTransientHandleFailure(t *testing.T) {
+	sender, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := crypto.FormatAddress(sender.EdPub[:])
+	cfg, cl := spamTestRecipient(t)
+	var pushed [][]byte
+	base := spamInboxServer(t, []map[string]any{spamFixture(t, 91, sender, cfg, "hello")}, &pushed)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/directory/reverse" {
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+			return
+		}
+		base.Config.Handler.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	pointAtServer(t, cfg, srv)
+	if err := cfg.Update(func(fresh *Config) error { fresh.DMPolicy = DMPolicyContacts; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cl.AcceptRequest(91, ""); err == nil {
+		t.Fatal("transient lookup silently created fallback")
+	}
+	if senderAddr(cfg, address) != "" {
+		t.Fatal("failed lookup persisted an alias")
+	}
+	if msgs, err := cl.AcceptRequest(91, "explicit"); err != nil || len(msgs) != 1 {
+		t.Fatalf("explicit alias cannot recover: %v %v", msgs, err)
+	}
+	if cfg.Contacts["explicit"] != address {
+		t.Fatal("explicit alias missing")
 	}
 }

@@ -437,6 +437,7 @@ func cmdSend(args []string) error {
 		return err
 	}
 	cl := client.New(cfg)
+	resolvedHandle := ""
 	// Contact discovery (issue #39): @handle and handle:<name> resolve
 	// via the directory. The resolved address is always shown; sending
 	// to a handle for the first time, or to a contacts-policy handle,
@@ -444,6 +445,7 @@ func cmdSend(args []string) error {
 	if addr, profile, isHandle, herr := cl.ResolveHandleTarget(address); herr != nil {
 		return fmt.Errorf("handle resolution failed: %w", herr)
 	} else if isHandle {
+		resolvedHandle = profile.Handle
 		fmt.Fprintf(os.Stderr, "resolved @%s -> %s\n", profile.Handle, addr)
 		firstContact := cfg.IsFirstContact(addr)
 		contactsOnly := profile.ContactPolicy == "contacts"
@@ -513,6 +515,9 @@ func cmdSend(args []string) error {
 	display := address
 	if resolved, rerr := cfg.ResolveRecipient(address); rerr == nil {
 		display = cl.ContactDisplayName(resolved)
+		if existingContactAlias(cfg, resolved) == "" && resolvedHandle != "" {
+			display = fmt.Sprintf("@%s (%s)", resolvedHandle, resolved)
+		}
 	}
 	fmt.Printf("sent to %s (id %d)", display, id)
 	if replyTo > 0 {
