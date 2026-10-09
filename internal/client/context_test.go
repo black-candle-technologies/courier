@@ -61,7 +61,9 @@ func TestContextStoresRemainBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A changed process default must not redirect either Update or sidecars.
-	t.Setenv("HOME", t.TempDir())
+	otherHome := t.TempDir()
+	t.Setenv("HOME", otherHome)
+	t.Setenv("USERPROFILE", otherHome)
 	if err := cfg.Update(func(f *Config) error { f.Cursor++; return nil }); err != nil {
 		t.Fatal(err)
 	}
