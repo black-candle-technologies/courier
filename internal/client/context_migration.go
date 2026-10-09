@@ -205,11 +205,11 @@ func (s Context) migrateLegacy(target Context, opts MigrationOptions, stop func(
 	if err != nil {
 		return err
 	}
-	var cfg Config
-	if err = json.Unmarshal(raw, &cfg); err != nil {
+	cfg, err := decodeConfig(raw)
+	if err != nil {
 		return err
 	}
-	if err = target.validateConfig(&cfg); err != nil {
+	if err = target.validateConfig(cfg); err != nil {
 		return err
 	}
 	j := migrationJournal{Manifest: target.manifest(), Files: map[string]string{}}
