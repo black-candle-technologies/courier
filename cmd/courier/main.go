@@ -54,7 +54,7 @@ func main() {
 	}
 	// v0.5.0+: opportunistic update check (at most once per 12h). Notices
 	// go to stderr so stdout stays machine-readable (stdio/serve).
-	if os.Args[1] != "update" && os.Args[1] != "context" && scope.context.ConfigExists() {
+	if commandNeedsIdentity(args) && os.Args[1] != "context" && scope.context.ConfigExists() {
 		if cfg, err := scope.context.LoadConfig(); err == nil {
 			client.New(cfg).MaybeUpdateCheck(version.Client)
 		}
@@ -1168,13 +1168,13 @@ func (scope command) cmdContacts(args []string) error {
 				if _, err := crypto.ParseAddress(address); err != nil {
 					return fmt.Errorf("bad address %q: usage: courier contacts add <address|@handle> [--force] | courier contacts add <name> <address>", address)
 				}
-				if existing := existingContactAlias(cfg, address); existing != "" {
-					fmt.Printf("contact already saved as %q.\n", existing)
-					return nil
-				}
 				handle, err := cl.LookupPeerHandle(address)
 				if err != nil {
 					return fmt.Errorf("directory handle lookup failed; retry or supply an explicit name: %w", err)
+				}
+				if existing := existingContactAlias(cfg, address); existing != "" {
+					fmt.Printf("contact already saved as %q.\n", existing)
+					return nil
 				}
 				if handle == "" {
 					return fmt.Errorf("no directory handle known for that address — add it with an explicit name: courier contacts add <name> <address>")
@@ -1215,11 +1215,11 @@ func (scope command) cmdContacts(args []string) error {
 		}
 		sort.Strings(names)
 		for _, n := range names {
-			st, _ := cl.ContactTrust(n)
+			st, _ := cl.CachedContactTrust(n)
 			var badge string
 			switch st {
 			case client.TrustVerified:
-				badge = "✓ verified"
+				badge = "✓ verified (cached; keys not revalidated)"
 			case client.TrustStale:
 				badge = "⚠ stale"
 			default:
@@ -1694,7 +1694,7 @@ func (scope command) cmdUpdate() error {
 		fmt.Printf("already up to date (courier %s).\n", version.Client)
 		// v0.6.0+: agents that updated via an older binary never saw
 		// the dashboard setup directive, so surface it here too.
-		if cfg, err := scope.context.LoadConfig(); err == nil && cfg.DashboardToken == "" {
+		if cfg, err := client.LoadConfig(); err == nil && cfg.DashboardToken == "" {
 			fmt.Println()
 			fmt.Println(dashboardSetupDirective())
 		}
@@ -1707,7 +1707,7 @@ func (scope command) cmdUpdate() error {
 	fmt.Printf("updated to %s.\n", rel.Tag)
 	// v0.6.0+: agents arriving via the updater never ran the new `init`
 	// flow, so point them at dashboard setup too.
-	if cfg, err := scope.context.LoadConfig(); err == nil && cfg.DashboardToken == "" {
+	if cfg, err := client.LoadConfig(); err == nil && cfg.DashboardToken == "" {
 		fmt.Println()
 		fmt.Println(dashboardSetupDirective())
 	}

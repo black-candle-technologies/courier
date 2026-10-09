@@ -534,20 +534,28 @@ func (c *Config) addContact(name, address string, prefer bool) error {
 	return nil
 }
 
-// RemoveContact removes the alias and its consent records atomically, then
-// cleans up FS only if the latest saved config has no alias for that principal.
+// RemoveContact atomically removes an alias and its verification. Receipt
+// consent survives while another alias references the principal. FS cleanup
+// rechecks the saved aliases under the captured context lock.
 func (c *Config) RemoveContact(name string) error {
 	var address string
 	var existed bool
 	if err := c.Update(func(fresh *Config) error {
 		address, existed = fresh.Contacts[name]
-		if existed {
-			delete(fresh.ReceiptContacts, address)
-			if fresh.PreferredContactNames[address] == name {
-				delete(fresh.PreferredContactNames, address)
-			}
+		if existed && fresh.PreferredContactNames[address] == name {
+			delete(fresh.PreferredContactNames, address)
 		}
 		delete(fresh.Contacts, name)
+		stillReferenced := false
+		for _, other := range fresh.Contacts {
+			if other == address {
+				stillReferenced = true
+				break
+			}
+		}
+		if existed && !stillReferenced {
+			delete(fresh.ReceiptContacts, address)
+		}
 		delete(fresh.ContactVerifications, name)
 		return nil
 	}); err != nil {
@@ -2269,7 +2277,7 @@ func (c *Client) inbox(after int64, limit int, markSeen bool, consumer seenConsu
 				}
 			}
 		}
-		for _, e := range readReplyCache() {
+		for _, e := range c.cfg.local().readReplyCache() {
 			if e.Snippet != "" {
 				if _, ok := local[e.CourierID]; !ok {
 					local[e.CourierID] = e.Snippet

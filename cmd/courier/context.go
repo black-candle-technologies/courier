@@ -35,6 +35,12 @@ func selectCommand(args []string) (command, []string, error) {
 		}
 		args = args[2:]
 	}
+	if !commandNeedsIdentity(args) {
+		if host != "" || identity != "" {
+			return command{}, nil, fmt.Errorf("identity selectors do not apply to this context-free command")
+		}
+		return command{}, args, nil
+	}
 	if host == "" && identity == "" {
 		ctx, err := legacy.ActiveContext()
 		scope.context = ctx
@@ -81,4 +87,22 @@ func (scope command) cmdContext(args []string) error {
 		return fmt.Errorf("unexpected migration arguments")
 	}
 	return client.LegacyContext().MigrateLegacy(scope.context, client.MigrationOptions{ConfirmLegacyWritersStopped: *stopped})
+}
+
+// Context-free administration has its own explicit database authority. Do not
+// resolve identity manifests or run opportunistic identity/network work for it.
+func commandNeedsIdentity(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "version", "--version", "-v", "update":
+		return false
+	case "bridge":
+		return len(args) < 2 || (args[1] != "token" && args[1] != "audit")
+	case "dashboard":
+		return len(args) < 2 || args[1] != "set-admin"
+	default:
+		return true
+	}
 }

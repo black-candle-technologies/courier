@@ -53,3 +53,72 @@ func TestCommandContextSelection(t *testing.T) {
 		t.Fatal("default changed", err)
 	}
 }
+
+func TestBadManifestCommandSelection(t *testing.T) {
+	for _, manifest := range []string{"malformed", "unsupported", "unreadable"} {
+		t.Run(manifest, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			root := filepath.Join(home, ".courier")
+			if err := os.MkdirAll(root, 0700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(root, "active-context.json")
+			if manifest == "unreadable" {
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				raw := []byte("invalid")
+				if manifest == "unsupported" {
+					raw = []byte(`{"version":999}`)
+				}
+				if err := os.WriteFile(path, raw, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, args := range [][]string{{"version"}, {"--version"}, {"-v"}, {"update"}, {"bridge", "token", "revoke"}, {"bridge", "audit"}, {"dashboard", "set-admin"}} {
+				if _, _, err := selectCommand(args); err != nil {
+					t.Errorf("context-free %v blocked: %v", args, err)
+				}
+			}
+			for _, args := range [][]string{{"address"}, {"inbox"}, {"bridge", "trust"}, {"dashboard", "push"}, {"backup", "restore"}} {
+				if _, _, err := selectCommand(args); err == nil {
+					t.Errorf("identity command %v did not fail closed", args)
+				}
+			}
+			if _, _, err := selectCommand([]string{"--host", "work", "bridge", "token", "revoke"}); err == nil {
+				t.Fatal("identity selector silently scoped context-free admin command")
+			}
+		})
+	}
+}
+
+func TestBadManifestBridgeRevocationDispatch(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	root := filepath.Join(home, ".courier")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "active-context.json"), []byte("invalid"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	db, cleanup := testBridgeEnv(t)
+	defer cleanup()
+	if err := cmdBridgeTokenIssue(db, []string{"--name", "fixture", "--allow", testAddr}); err != nil {
+		t.Fatal(err)
+	}
+	scope, args, err := selectCommand([]string{"bridge", "token", "revoke", "--name", "fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scope.cmdBridge(args[1:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdBridgeTokenRevoke(db, []string{"--name", "fixture"}); err == nil {
+		t.Fatal("dispatch did not revoke fixture token")
+	}
+}

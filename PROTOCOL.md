@@ -69,7 +69,7 @@ sender's Ed25519 identity key under a domain-separated canonical form
   shown to the user. Legacy clients render their JSON as chat text
   (harmless degradation, §27).
 - **Consumer.** One of the client's independent inbox readers. The
-  implementation has three: the interactive inbox poller, the dashboard
+  implementation has two: the interactive inbox poller and the dashboard
   pusher. Each keeps its own seen set and
   cursor (§10.2).
 - **Bridge identity.** The Courier identity held by the ChatGPT-web
@@ -1437,7 +1437,11 @@ reversible (`UntombstoneHandle`). Tombstoned **private** handles stay
   alphabetical ordering. Other saved aliases and their verification records
   remain intact. Re-adding a handle does not override the preference; removing
   or repointing the preferred alias clears it, with deterministic fallback to
-  the remaining saved names. Rendering does not query the directory.
+  the remaining saved names. Rendering does not query the directory. `contacts
+  list` also uses stored verification and locally observed key epochs only;
+  its verified badge explicitly says cached and that current keys were not
+  revalidated. Locally observed address/key changes appear as stale. Explicit
+  verification commands retain their live key checks.
 - `courier directory register <handle> [--public|--unlisted|--private]
   [--cap chat,...] [--contacts-only]` — register (default private).
 - `courier directory update ...` / `unregister` /
@@ -1628,11 +1632,12 @@ backups, forwarded plaintext) is out of scope. See §26.2.
 
 ### 21.1 Backward compatibility
 
-Pre-#53 clients ignore unknown JSON fields: state `note-add` /
-`task-add` payloads still parse (the note/task simply never expires
-for them), and old chat clients display a TTL message's versioned
-JSON as raw text rather than losing the message. Old dashboard rows
-default to `expires_at = 0`.
+Chat clients predating the TTL payload can display its versioned JSON as
+raw text rather than losing the message; clients that ignore `expires_at`
+do not enforce expiry. Old dashboard rows default to `expires_at = 0`.
+These compatibility rules concern chat and dashboard storage. Historical
+shared-state TTL behavior is not an active contract: current clients silently
+consume the reserved state discriminator at any version, as specified in §27.
 
 ## 22. Instant wake (client side)
 
