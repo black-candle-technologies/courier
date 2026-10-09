@@ -91,12 +91,15 @@ them — no new relay endpoint, no new signed object.
 - **Required FS:** `courier contacts require-fs-on <name>` explicitly
   authorizes automatic handshake probes, including private/no-handle peers.
   Sends fail closed until a session is established. `require-fs-off` restores
-  the default opportunistic fallback. There is no manual session CLI.
+  the default opportunistic fallback. Private peers can explicitly bootstrap with `contacts start-fs`; repeating it restarts a pending handshake with a fresh init, while an active session is preserved.
 - Removing a contact erases its FS session/policy only after removal is saved
   and only when no remaining alias references that address. Persistent downgrade
   suspicion is visible in `contacts show` and fail-closed send errors.
 
-Private peers can bootstrap with an explicit require-FS policy on either side;
+Private peers can bootstrap with `courier contacts start-fs <name>` on either
+side without changing send policy. Both peers must poll their inboxes to finish.
+The operator must know the peer supports FS: older clients display handshake JSON.
+An explicit require-FS policy also authorizes probes;
 without that authorization or prior capability knowledge, no probe is sent.
 
 ## 4. Session protocol
@@ -344,6 +347,8 @@ automatic:
 - `courier contacts show <name>` reports `forward secrecy:
   active/inactive`, the required policy, and persistent downgrade suspicion
   for the peer (replaces `fs status`).
+- `courier contacts start-fs <name>` probes a saved private/no-handle peer
+  without requiring fail-closed sending; established sessions are left intact.
 - `courier contacts require-fs-on|require-fs-off <name>` enables or clears
   fail-closed sending; enabling authorizes private-peer handshake probes.
 - `courier contacts remove <name>` erases the peer's FS session only after

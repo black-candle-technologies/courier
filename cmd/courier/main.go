@@ -160,6 +160,7 @@ func usage() {
   courier contacts unverify <name>       clear a contact's verification
   courier contacts delivery-receipts-on <name>    opt into delivery receipts for a contact
   courier contacts delivery-receipts-off <name>   opt out of delivery receipts (default)
+  courier contacts start-fs <name>           explicitly probe a private FS-capable peer
   courier contacts require-fs-on <name>      require forward secrecy: sends fail
                                          rather than fall back to legacy (default off)
   courier contacts require-fs-off <name>    clear the require-forward-secrecy policy
@@ -1105,7 +1106,7 @@ func writeSvcJSON(w http.ResponseWriter, code int, v any) {
 
 func cmdContacts(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|require-fs-on|require-fs-off|remove>")
+		return fmt.Errorf("usage: courier contacts <add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|start-fs|require-fs-on|require-fs-off|remove>")
 	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
@@ -1324,6 +1325,14 @@ func cmdContacts(args []string) error {
 		} else {
 			fmt.Printf("delivery receipts off for %q.\n", args[1])
 		}
+	case "start-fs":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: courier contacts start-fs <name>")
+		}
+		if err := cl.FSStart(args[1]); err != nil {
+			return err
+		}
+		fmt.Println("FS bootstrap requested; poll both inboxes to complete the handshake. Send policy is unchanged.")
 	case "require-fs-on", "require-fs-off":
 		// #146 (per #327): the per-contact fail-closed policy.
 		// Opting a contact in means sends to them refuse legacy
@@ -1368,7 +1377,7 @@ func cmdContacts(args []string) error {
 		}
 		fmt.Printf("contact %q removed.\n", args[1])
 	default:
-		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|require-fs-on|require-fs-off|remove)", args[0])
+		return fmt.Errorf("unknown contacts subcommand %q (add|list|show|verify|unverify|delivery-receipts-on|delivery-receipts-off|start-fs|require-fs-on|require-fs-off|remove)", args[0])
 	}
 	return nil
 }
