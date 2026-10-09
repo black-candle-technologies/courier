@@ -1741,6 +1741,7 @@ func (c *Client) fsCleanupOrphanWithSave(address string, save func(*Config) erro
 }
 
 func forgetFSAddress(ff *fsFile, address string) {
+	delete(ff.LastInitAt, address)
 	delete(ff.Sessions, address)
 	// Contact removal is an explicit user action, not a downgrade:
 	// clear markers, including the suite-negotiation pin (issue
