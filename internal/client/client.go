@@ -39,10 +39,10 @@ import (
 )
 
 // DefaultRelay is the central relay (HTTPS, pinned certificate).
-const DefaultRelay = "https://courier.blackcandletech.com:8470"
+const DefaultRelay = "https://courier.blackcandletech.com"
 
 // DefaultDashboardURL is the web dashboard (HTTPS, pinned certificate).
-const DefaultDashboardURL = "https://courier.blackcandletech.com:8471"
+const DefaultDashboardURL = "https://courier.blackcandletech.com"
 
 // ConfigVersion is the current identity format version (v0.2.0+).
 // v0.5.0 keeps version 2: new fields (contacts, encryption keys,
