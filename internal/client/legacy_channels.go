@@ -43,6 +43,6 @@ func (s Context) warnLegacyChannels() error {
 	if _, loaded := legacyChannelWarnings.LoadOrStore(p, struct{}{}); loaded {
 		return nil
 	}
-	fmt.Fprintln(os.Stderr, "warning: retired channels.json still contains channel history and secrets; see docs/legacy-channel-retirement.md for explicit export and cleanup. Courier does not migrate or delete it automatically.")
+	fmt.Fprintln(os.Stderr, "warning: retired channels.json still contains channel history and secrets; see https://github.com/black-candle-technologies/courier/blob/main/docs/legacy-channel-retirement.md for explicit export and cleanup. Courier does not migrate or delete it automatically.")
 	return nil
 }

@@ -492,13 +492,31 @@ func (c *Config) AddContact(name, address string) error {
 	if _, err := crypto.ParseAddress(address); err != nil {
 		return fmt.Errorf("bad address: %w", err)
 	}
-	return c.Update(func(fresh *Config) error {
+	var oldAddress string
+	var replaced bool
+	if err := c.Update(func(fresh *Config) error {
 		if fresh.Contacts == nil {
 			fresh.Contacts = map[string]string{}
 		}
+		oldAddress, replaced = fresh.Contacts[name]
 		fresh.Contacts[name] = address
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	// Persist before erasing the replaced principal's FS session. Aliases
+	// still referring to that principal retain its session and policy.
+	if replaced && oldAddress != address {
+		for _, other := range c.Contacts {
+			if other == oldAddress {
+				return nil
+			}
+		}
+		if err := New(c).FSForget(oldAddress); err != nil {
+			return fmt.Errorf("contact saved, but could not erase replaced contact's FS session: %w", err)
+		}
+	}
+	return nil
 }
 
 // RemoveContact deletes a contact and its verification record (issue
@@ -2313,7 +2331,7 @@ func (c *Client) AcceptRequest(id int64, asName string) ([]Message, error) {
 		if name == "" {
 			// #146: the display name defaults to the known directory
 			// handle; the generated name is the fallback.
-			h, err := c.lookupPeerHandle(sender)
+			h, err := c.LookupPeerHandle(sender)
 			if err != nil {
 				return nil, fmt.Errorf("resolve sender handle: retry or supply --as: %w", err)
 			}

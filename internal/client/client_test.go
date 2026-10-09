@@ -88,7 +88,7 @@ func TestHTTPTransportSkipsPinning(t *testing.T) {
 
 func testConfig(t *testing.T) *Config {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	cfg, err := NewIdentity("")
 	if err != nil {
 		t.Fatal(err)
@@ -1045,4 +1045,11 @@ func TestDashboardPushFailedBatchKeepsAckedCursors(t *testing.T) {
 	if cfg.DashboardCursor != 200 {
 		t.Fatalf("DashboardCursor = %d, want 200", cfg.DashboardCursor)
 	}
+}
+
+// setTestHome isolates filesystem state on both Unix and Windows.
+func setTestHome(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 }

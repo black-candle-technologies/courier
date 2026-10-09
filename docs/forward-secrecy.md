@@ -92,7 +92,7 @@ them — no new relay endpoint, no new signed object.
   authorizes automatic handshake probes, including private/no-handle peers.
   Sends fail closed until a session is established. `require-fs-off` restores
   the default opportunistic fallback. Private peers can explicitly bootstrap with `contacts start-fs`; repeating it restarts a pending handshake with a fresh init, while an active session is preserved.
-- Removing a contact erases its FS session/policy only after removal is saved
+- Removing or replacing a contact erases the old identity's FS session/policy only after the contact change is saved
   and only when no remaining alias references that address. Persistent downgrade
   suspicion is visible in `contacts show` and fail-closed send errors.
 
@@ -352,7 +352,9 @@ automatic:
 - `courier contacts require-fs-on|require-fs-off <name>` enables or clears
   fail-closed sending; enabling authorizes private-peer handshake probes.
 - `courier contacts remove <name>` erases the peer's FS session only after
-  the last alias is successfully removed (replaces `fs forget`).
+  the last alias is successfully removed or replaced (replaces `fs forget`).
+  A failed save preserves the old session; cleanup failure after a replacement
+  reports that the contact was saved but the old session could not be erased.
 
 Handshake traffic never touches `~/.courier/sent.jsonl` (logSent=false,
 the existing `sendProtocolDM` pattern) — the dashboard shows only human

@@ -31,6 +31,14 @@ type fsHarness struct {
 func newFSHarness(t *testing.T) *fsHarness {
 	t.Helper()
 	origHome, _ := os.LookupEnv("HOME")
+	origProfile, hadProfile := os.LookupEnv("USERPROFILE")
+	t.Cleanup(func() {
+		if hadProfile {
+			os.Setenv("USERPROFILE", origProfile)
+		} else {
+			os.Unsetenv("USERPROFILE")
+		}
+	})
 	t.Cleanup(func() { os.Setenv("HOME", origHome) })
 	st, err := store.Open(filepath.Join(t.TempDir(), "relay.db"))
 	if err != nil {
@@ -42,7 +50,7 @@ func newFSHarness(t *testing.T) *fsHarness {
 
 	aliceHome := t.TempDir()
 	bobHome := t.TempDir()
-	os.Setenv("HOME", aliceHome)
+	setTestHome(t, aliceHome)
 	aliceCfg, err := NewIdentity(srv.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -50,7 +58,7 @@ func newFSHarness(t *testing.T) *fsHarness {
 	if err := aliceCfg.Save(); err != nil {
 		t.Fatal(err)
 	}
-	os.Setenv("HOME", bobHome)
+	setTestHome(t, bobHome)
 	bobCfg, err := NewIdentity(srv.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -62,15 +70,20 @@ func newFSHarness(t *testing.T) *fsHarness {
 	// recipients actually hold (NewIdentity generates random keys;
 	// without this the relay 404s and senders fall back to the
 	// address-derived key nobody holds).
-	os.Setenv("HOME", aliceHome)
+	setTestHome(t, aliceHome)
 	if err := New(aliceCfg).PublishKey(); err != nil {
 		t.Fatal(err)
 	}
-	os.Setenv("HOME", bobHome)
+	setTestHome(t, bobHome)
 	if err := New(bobCfg).PublishKey(); err != nil {
 		t.Fatal(err)
 	}
 	os.Setenv("HOME", origHome)
+	if hadProfile {
+		os.Setenv("USERPROFILE", origProfile)
+	} else {
+		os.Unsetenv("USERPROFILE")
+	}
 	return &fsHarness{
 		t: t, srv: srv,
 		alice: New(aliceCfg), bob: New(bobCfg),
@@ -84,16 +97,32 @@ func newFSHarness(t *testing.T) *fsHarness {
 func (h *fsHarness) asAlice(fn func()) {
 	h.t.Helper()
 	prev, _ := os.LookupEnv("HOME")
-	os.Setenv("HOME", h.aliceHome)
-	defer os.Setenv("HOME", prev)
+	prevProfile, hadProfile := os.LookupEnv("USERPROFILE")
+	setTestHome(h.t, h.aliceHome)
+	defer func() {
+		os.Setenv("HOME", prev)
+		if hadProfile {
+			os.Setenv("USERPROFILE", prevProfile)
+		} else {
+			os.Unsetenv("USERPROFILE")
+		}
+	}()
 	fn()
 }
 
 func (h *fsHarness) asBob(fn func()) {
 	h.t.Helper()
 	prev, _ := os.LookupEnv("HOME")
-	os.Setenv("HOME", h.bobHome)
-	defer os.Setenv("HOME", prev)
+	prevProfile, hadProfile := os.LookupEnv("USERPROFILE")
+	setTestHome(h.t, h.bobHome)
+	defer func() {
+		os.Setenv("HOME", prev)
+		if hadProfile {
+			os.Setenv("USERPROFILE", prevProfile)
+		} else {
+			os.Unsetenv("USERPROFILE")
+		}
+	}()
 	fn()
 }
 

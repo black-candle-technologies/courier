@@ -5,6 +5,7 @@ import (
 	"github.com/black-candle-technologies/courier/internal/relay"
 	"github.com/black-candle-technologies/courier/internal/store"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -20,7 +21,7 @@ func TestContactHandleRequiresConfirmationAndPreservesAlias(t *testing.T) {
 	defer st.Close()
 	srv := httptest.NewServer(relay.New(st).Routes())
 	defer srv.Close()
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	peer, err := client.NewIdentity(srv.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -34,7 +35,7 @@ func TestContactHandleRequiresConfirmationAndPreservesAlias(t *testing.T) {
 	if err := client.New(peer).DirectoryRegister("bob", "public", nil, "open"); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	cfg, err := client.NewIdentity(srv.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -98,5 +99,55 @@ func TestContactHandleRequiresConfirmationAndPreservesAlias(t *testing.T) {
 	cfg, err = client.LoadConfig()
 	if err != nil || cfg.Contacts["bob"] != peer.Address {
 		t.Fatal("confirmed add failed", err)
+	}
+}
+
+func TestContactAddressDistinguishesDirectoryFailure(t *testing.T) {
+	for _, failed := range []bool{true, false} {
+		t.Run(map[bool]string{true: "failure", false: "no-public-handle"}[failed], func(t *testing.T) {
+			setTestHome(t, t.TempDir())
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if failed {
+					http.Error(w, "temporary outage", http.StatusServiceUnavailable)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, `{"results":[]}`)
+			}))
+			defer srv.Close()
+			cfg, err := client.NewIdentity(srv.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			peer, err := client.NewIdentity(srv.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cfg.Save(); err != nil {
+				t.Fatal(err)
+			}
+			err = cmdContacts([]string{"add", peer.Address})
+			if err == nil {
+				t.Fatal("missing handle unexpectedly created a contact")
+			}
+			if failed {
+				if !strings.Contains(err.Error(), "lookup failed; retry") || strings.Contains(err.Error(), "no directory handle known") {
+					t.Fatal(err)
+				}
+			} else if !strings.Contains(err.Error(), "no directory handle known") {
+				t.Fatal(err)
+			}
+			saved, err := client.LoadConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(saved.Contacts) != 0 {
+				t.Fatal("lookup failure or absence created contact")
+			}
+			_, cached := saved.HandleCache[peer.Address]
+			if cached == failed {
+				t.Fatal("lookup failure cached as authoritative absence, or verified absence not cached")
+			}
+		})
 	}
 }

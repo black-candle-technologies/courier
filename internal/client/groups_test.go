@@ -207,7 +207,7 @@ func newGroupTestEnv(t *testing.T) *groupTestEnv {
 
 	aHome := t.TempDir()
 	bHome := t.TempDir()
-	t.Setenv("HOME", aHome)
+	setTestHome(t, aHome)
 	aCfg, err := NewIdentity(srv.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +215,7 @@ func newGroupTestEnv(t *testing.T) *groupTestEnv {
 	if err := aCfg.Save(); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("HOME", bHome)
+	setTestHome(t, bHome)
 	bCfg, err := NewIdentity(srv.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -242,8 +242,8 @@ func newGroupTestEnv(t *testing.T) *groupTestEnv {
 	return env
 }
 
-func (e *groupTestEnv) asAlice() { e.t.Setenv("HOME", e.aHome) }
-func (e *groupTestEnv) asBob()   { e.t.Setenv("HOME", e.bHome) }
+func (e *groupTestEnv) asAlice() { setTestHome(e.t, e.aHome) }
+func (e *groupTestEnv) asBob()   { setTestHome(e.t, e.bHome) }
 
 // syncPersonal runs a personal inbox sync like `courier inbox` does,
 // returning chat messages.
@@ -265,7 +265,7 @@ func (e *groupTestEnv) syncPersonal(c *Client, cfg *Config, cursor *int64) []Mes
 
 func (e *groupTestEnv) groupState(home, groupID string) *groupState {
 	e.t.Helper()
-	e.t.Setenv("HOME", home)
+	setTestHome(e.t, home)
 	gs, err := loadGroups()
 	if err != nil {
 		e.t.Fatal(err)

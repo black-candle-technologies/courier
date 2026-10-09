@@ -1661,7 +1661,8 @@ func (c *Client) FSRequired(peer string) (bool, error) {
 // skipped keys, and handshake state are deleted, and the downgrade and
 // suite-negotiation markers are cleared so a later handshake starts
 // from scratch. It is invoked automatically on `courier contacts
-// remove` (#146); there is no CLI surface for it. Erasure is
+// remove` or when replacing the final alias for an identity (#146);
+// there is no CLI surface for it. Erasure is
 // best-effort local deletion — see docs/forward-secrecy.md §6.
 func (c *Client) FSForget(peer string) error {
 	address, err := c.cfg.ResolveRecipient(peer)
