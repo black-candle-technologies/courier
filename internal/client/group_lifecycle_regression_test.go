@@ -41,7 +41,7 @@ func TestGroupLifecycleRemovalDelivery(t *testing.T) {
 					t.Error("key distribution preceded durable rotation")
 				}
 			}
-			http.Error(w, "injected delivery failure", 503)
+			http.Error(w, "injected delivery failure", http.StatusServiceUnavailable)
 			return
 		}
 		routes.ServeHTTP(w, r)
