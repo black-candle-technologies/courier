@@ -1,6 +1,9 @@
 package client
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"os"
@@ -78,7 +81,7 @@ func (s Context) validateConfig(c *Config) error {
 		return nil
 	}
 	origin, err := NormalizeRelayOrigin(c.RelayURL)
-	if err != nil || origin != s.binding.Endpoint || c.RelayFingerprint != s.binding.Pin || c.Address != s.principal {
+	if err != nil || origin != s.binding.Endpoint || !sameCertificatePin(c.RelayFingerprint, s.binding.Pin) || c.Address != s.principal {
 		return ErrContextMismatch
 	}
 	id, err := c.Identity()
@@ -89,4 +92,15 @@ func (s Context) validateConfig(c *Config) error {
 		return ErrContextMismatch
 	}
 	return nil
+}
+
+// Pins identify bytes, not their hex spelling. Reject malformed or non-SHA256
+// values even when both strings happen to be equal.
+func sameCertificatePin(a, b string) bool {
+	left, err := hex.DecodeString(a)
+	if err != nil || len(left) != sha256.Size {
+		return false
+	}
+	right, err := hex.DecodeString(b)
+	return err == nil && len(right) == sha256.Size && bytes.Equal(left, right)
 }
