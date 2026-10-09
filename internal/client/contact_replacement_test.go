@@ -26,6 +26,9 @@ func TestContactReplacementErasesOnlyOrphanedFS(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if err := cfg.Save(); err != nil {
+				t.Fatal(err)
+			}
 			if err := cfg.AddContact("peer", old.Address); err != nil {
 				t.Fatal(err)
 			}
@@ -81,6 +84,9 @@ func TestContactReplacementSaveFailurePreservesFS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
 	if err := cfg.AddContact("peer", old.Address); err != nil {
 		t.Fatal(err)
 	}
@@ -134,10 +140,13 @@ func TestContactReplacementReportsCleanupFailureAfterSave(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
 	if err := cfg.AddContact("peer", old.Address); err != nil {
 		t.Fatal(err)
 	}
-	p, err := fsFilePath()
+	p, err := cfg.Context().fsFilePath()
 	if err != nil {
 		t.Fatal(err)
 	}
