@@ -413,9 +413,18 @@ func (s Context) saveFSLocked(ff *fsFile) error {
 		return err
 	}
 	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
 	if _, err := tmp.Write(append(data, '\n')); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -426,7 +435,10 @@ func (s Context) saveFSLocked(ff *fsFile) error {
 		os.Remove(tmpName)
 		return err
 	}
-	return os.Rename(tmpName, p)
+	if err := renamePublishedFile(tmpName, p); err != nil {
+		return err
+	}
+	return syncPublishedDirectory(p)
 }
 
 // updateFS performs an atomic read-modify-write of fs.json under the
@@ -1691,6 +1703,10 @@ func (c *Client) FSForget(peer string) error {
 // stale client cannot erase a peer that another process has saved again.
 // The bool is false when an alias still references the address.
 func (c *Client) FSCleanupOrphan(address string) (bool, error) {
+	return c.fsCleanupOrphanWithSave(address, (*Config).saveAtomic)
+}
+
+func (c *Client) fsCleanupOrphanWithSave(address string, save func(*Config) error) (bool, error) {
 	if _, err := crypto.ParseAddress(address); err != nil {
 		return false, fmt.Errorf("cleanup requires a full contact address: %w", err)
 	}
@@ -1704,6 +1720,11 @@ func (c *Client) FSCleanupOrphan(address string) (bool, error) {
 			if saved == address {
 				return nil
 			}
+		}
+		// A previous rename may be visible despite a failed directory sync.
+		// Republish the fresh mapping durably even on explicit cleanup retries.
+		if err := save(fresh); err != nil {
+			return err
 		}
 		ff, err := c.cfg.local().loadFSLocked()
 		if err != nil {
@@ -1720,6 +1741,7 @@ func (c *Client) FSCleanupOrphan(address string) (bool, error) {
 }
 
 func forgetFSAddress(ff *fsFile, address string) {
+	delete(ff.LastInitAt, address)
 	delete(ff.Sessions, address)
 	// Contact removal is an explicit user action, not a downgrade:
 	// clear markers, including the suite-negotiation pin (issue

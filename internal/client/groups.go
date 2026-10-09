@@ -119,6 +119,10 @@ func (s Context) loadGroupsLocked() (map[string]*groupState, error) {
 }
 
 func (s Context) saveGroupsLocked(gs map[string]*groupState) error {
+	return s.saveGroupsWithPublication(gs, renamePublishedFile, syncPublishedDirectory)
+}
+
+func (s Context) saveGroupsWithPublication(gs map[string]*groupState, rename func(string, string) error, syncDir func(string) error) error {
 	p, err := s.groupsFilePath()
 	if err != nil {
 		return err
@@ -132,9 +136,18 @@ func (s Context) saveGroupsLocked(gs map[string]*groupState) error {
 		return err
 	}
 	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
 	if _, err := tmp.Write(append(data, '\n')); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -145,7 +158,10 @@ func (s Context) saveGroupsLocked(gs map[string]*groupState) error {
 		os.Remove(tmpName)
 		return err
 	}
-	return os.Rename(tmpName, p)
+	if err := rename(tmpName, p); err != nil {
+		return err
+	}
+	return syncDir(p)
 }
 
 // updateGroups performs an atomic read-modify-write of groups.json under
@@ -321,7 +337,19 @@ func (c *Client) rotateMyKey(g *groupState) error {
 // retryGroupKey distributes an immutable, already committed snapshot outside
 // the config lock. Clear only that generation; newer rotations remain pending.
 func (c *Client) retryGroupKey(groupID string) error {
-	gs, err := c.cfg.local().loadGroups()
+	return c.retryGroupKeyWithSave(groupID, c.cfg.local().saveGroupsLocked)
+}
+
+func (c *Client) retryGroupKeyWithSave(groupID string, save func(map[string]*groupState) error) error {
+	var gs map[string]*groupState
+	err := c.cfg.local().withConfigLock(func() error {
+		var err error
+		gs, err = c.cfg.local().loadGroupsLocked()
+		if err != nil {
+			return err
+		}
+		return save(gs)
+	})
 	if err != nil {
 		return err
 	}
@@ -539,6 +567,9 @@ func (c *Client) GroupSend(groupID, body string) (int64, error) {
 	}
 	if !inRoster(g.Roster, c.cfg.Address) {
 		return 0, fmt.Errorf("you are not in the group roster")
+	}
+	if g.KeyPending {
+		return 0, fmt.Errorf("group key distribution pending; retry the group operation or receive group updates before sending")
 	}
 	id, err := c.cfg.Identity()
 	if err != nil {

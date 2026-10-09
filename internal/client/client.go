@@ -355,6 +355,10 @@ func LoadConfig() (*Config, error) {
 // saveAtomic writes the config via temp file + rename in the same
 // directory, so a crash can never leave a partially written config.
 func (c *Config) saveAtomic() error {
+	return c.saveWithPublication(renamePublishedFile, syncPublishedDirectory)
+}
+
+func (c *Config) saveWithPublication(rename func(string, string) error, syncDir func(string) error) error {
 	if err := c.local().validateConfig(c); err != nil {
 		return err
 	}
@@ -394,7 +398,10 @@ func (c *Config) saveAtomic() error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, p)
+	if err := rename(tmpName, p); err != nil {
+		return err
+	}
+	return syncDir(p)
 }
 
 // Save writes the config with mode 0600: atomically (temp file + rename)
