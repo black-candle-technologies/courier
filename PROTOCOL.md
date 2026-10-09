@@ -2046,6 +2046,13 @@ Carried over from prior disclosures; each is tracked:
 - All directory endpoints are additive; pre-v0.8.0 clients never call
   them.
 
+### Retired channel discriminator
+
+`cc:2` remains reserved for legacy `join-request`, `join-accept`, `msg`,
+`rekey`, and `leave` payloads. Updated clients consume them without chat output,
+cache insertion, dashboard publication, or channel mutation. Explicit fetch
+refuses these protocol frames. See [legacy archive retirement](docs/legacy-channel-retirement.md).
+
 ## Appendix A. Canonical signature-domain registry
 
 All domains are defined in `internal/envelope/envelope.go`. `0x00`
@@ -2075,7 +2082,7 @@ Safety numbers (not a signature) use the hash domain
 `courier-safety-v1` over both parties' Ed25519 keys, X25519 keys,
 and key epochs (§18).
 
-## 30. Verified Human in the Loop (issue #142)
+## 29. Verified Human in the Loop (issue #142)
 
 VHL lets a **receiver** verify that a message an agent sent was
 actually reviewed and approved by a human — countering malicious or
@@ -2085,7 +2092,7 @@ guarantee: the sender claims a tier, the receiver verifies the claim
 against its own locally-enrolled trust root, and anything unverified
 is held for human review — never acted on, never silently discarded.
 
-### 30.1 Tiers
+### 29.1 Tiers
 
 - **Tier 0** — unattested chat and status. The legacy wire is
   untouched: a message with no VHL fields is Tier 0.
@@ -2096,7 +2103,7 @@ is held for human review — never acted on, never silently discarded.
   approval** bound to the exact action bytes; drawn signatures do not
   count as presence.
 
-### 30.2 Wire format
+### 29.2 Wire format
 
 The tier tag and the inline attestation live **inside the
 E2E-encrypted DM plaintext** (v1/v2 payloads gain `vhl_tier` and
@@ -2109,7 +2116,7 @@ A Tier 0 message that improperly carries an attestation is
 **invalid**, not harmless Tier 0 — an unattested tier tag with a
 smuggled artifact is a downgrade/evasiveness signal.
 
-### 30.3 Attestations
+### 29.3 Attestations
 
 An attestation is a signed, versioned artifact binding the action
 hash, tier, approver identity, timestamp, presence proof, and the
@@ -2186,11 +2193,11 @@ single-process on those hosts. Minting is ceremony-bound: the CLI's
 `session mint` creates a relay-hosted WebAuthn ceremony over the
 mint challenge and the mint completes only against the verified
 assertion the human's authenticator produced in the browser (see
-§30.8). There is no path that mints a token without a fresh
+§29.8). There is no path that mints a token without a fresh
 WebAuthn ceremony. The same-or-stronger re-mint rule still
 applies: a live token is never renewable with a weaker ceremony.
 
-### 30.4 Receiver verification
+### 29.4 Receiver verification
 
 The receiver's verifier (`internal/vhl/policy.go`) checks, in order:
 tier tag validity → receiver minimum-tier requirement (a claim
@@ -2240,7 +2247,7 @@ review). `courier inbox` renders a typed badge — `✔ human-verified
 (tier N) by <address>` or `⚠ UNVERIFIED … HELD for human review` —
 never body text, so an unverified claim can never look reviewed.
 
-### 30.5 Native frames
+### 29.5 Native frames
 
 Three frame types travel as E2E-encrypted protocol DMs (consumed by
 the VHL layer, never surfaced as chat):
@@ -2255,11 +2262,11 @@ the VHL layer, never surfaced as chat):
   (anyone cannot revoke anyone's tokens). Broadcast reaches the
   sender's contacts.
 
-### 30.6 Client behavior
+### 29.6 Client behavior
 
 - `courier vhl approver add <address> [--name N]` — enroll a human
   approver through a relay-hosted WebAuthn assertion ceremony
-  (§30.8): the agent creates an `enroll-approver` ceremony binding
+  (§29.8): the agent creates an `enroll-approver` ceremony binding
   the approver and agent addresses, the human approves the pairing
   with their enrolled security key in the browser, and the agent
   validates the resulting artifact (challenge recomputation,
@@ -2270,7 +2277,7 @@ the VHL layer, never surfaced as chat):
   human-approved event. `approver list` lists enrolled approvers;
   `approver remove <address|name>` revokes an approver.
 - `courier vhl enroll-webauthn [--device LABEL]` — enroll a
-  WebAuthn credential via the relay-hosted ceremony (§30.8): the
+  WebAuthn credential via the relay-hosted ceremony (§29.8): the
   agent creates the ceremony, the human completes it with their
   security key in the browser, and the agent verifies the
   attestation itself before enrolling locally and publishing the
@@ -2291,7 +2298,7 @@ the VHL layer, never surfaced as chat):
   fails closed. `courier vhl rp show` prints the current config.
 - `courier vhl session mint [--scope ADDRESS] [--ttl DURATION]`
   — mint a session token through the relay-hosted mint ceremony
-  (§30.8): the agent begins the mint locally, creates the
+  (§29.8): the agent begins the mint locally, creates the
   ceremony bound to the mint challenge, waits for the human to
   approve it with their security key in the browser, and finishes
   the mint against the verified assertion. The returned token is
@@ -2304,7 +2311,7 @@ the VHL layer, never surfaced as chat):
   <request-id> [--presence pin|challenge|fido2|fido2_uv]` shows the
   human the exact bytes and the recomputed action hash before the
   ceremony. `fido2`/`fido2_uv` run the relay-hosted `approve`
-  ceremony (§30.8): the human reviews the exact action context in
+  ceremony (§29.8): the human reviews the exact action context in
   the browser and answers the nonce-bound approval challenge with
   their security key. Approval is atomic: the displayed hash and
   sender are bound to the minted attestation inside one locked
@@ -2313,7 +2320,7 @@ the VHL layer, never surfaced as chat):
   transport failure after minting requires a new request rather
   than a retry.
 - `courier vhl policy [--require-tier 0|1|2]` — show or set the
-  receiver-side minimum tier (see §30.3).
+  receiver-side minimum tier (see §29.3).
 - `courier send --tier 1|2 [--attestation <id>]` — tiered send.
   Tier 1 without a live session token fails closed; Tier 2 without
   a human approval attestation for the exact bytes fails closed;
@@ -2325,7 +2332,7 @@ the VHL layer, never surfaced as chat):
   from a 32-symbol alphabet; 256 mod 32 == 0 so the modulo
   sampling is unbiased).
 
-### 30.7 Security properties stated honestly
+### 29.7 Security properties stated honestly
 
 - The PIN ceremony is only as strong as the terminal it runs on:
   typing `APPROVE <id>` proves a human is at *that* keyboard, not
@@ -2376,7 +2383,7 @@ the VHL layer, never surfaced as chat):
   address's other credentials — but the directory is discovery
   only and never overrides the local registry.
 
-### 30.8 Relay-hosted WebAuthn ceremony transport
+### 29.8 Relay-hosted WebAuthn ceremony transport
 
 The agent cannot touch a YubiKey, so enrollment, session minting,
 Tier 2 approvals, and approver enrollment run as relay-hosted
@@ -2499,10 +2506,3 @@ folded into this document when they merge:
 `github.com/black-candle-technologies/courier` at `origin/main`.
 Where this document and the code disagree, the code governs — and
 the discrepancy is a bug in this document.*
-
-### Retired channel discriminator
-
-`cc:2` remains reserved for legacy `join-request`, `join-accept`, `msg`,
-`rekey`, and `leave` payloads. Updated clients consume them without chat output,
-cache insertion, dashboard publication, or channel mutation. Explicit fetch
-refuses these protocol frames. See [legacy archive retirement](docs/legacy-channel-retirement.md).

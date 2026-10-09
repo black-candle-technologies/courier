@@ -67,6 +67,9 @@ func TestLegacyChannelArchiveWarnsWithoutMutation(t *testing.T) {
 	}
 	os.Stderr = w
 	_, loadErr := LoadConfig()
+	if loadErr == nil {
+		_, loadErr = LoadConfig()
+	}
 	w.Close()
 	os.Stderr = old
 	out, _ := io.ReadAll(r)
@@ -74,7 +77,7 @@ func TestLegacyChannelArchiveWarnsWithoutMutation(t *testing.T) {
 	if loadErr != nil {
 		t.Fatal(loadErr)
 	}
-	if !strings.Contains(string(out), "legacy-channel-retirement.md") || strings.Contains(string(out), "do-not-print") {
+	if strings.Count(string(out), "legacy-channel-retirement.md") != 1 || strings.Contains(string(out), "do-not-print") {
 		t.Fatal("unsafe or missing warning", string(out))
 	}
 	b, _ := os.ReadFile(p)
