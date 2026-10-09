@@ -78,10 +78,13 @@ type Config struct {
 	// issue #48 (phase 1): out-of-band contact verifications, keyed by
 	// contact name. A record pins the address + key epoch the safety
 	// number was computed over; if either changes, trust goes stale.
-	ContactVerifications map[string]ContactVerification `json:"contact_verifications,omitempty"`
-	EncKeys              []EncKey                       `json:"enc_keys,omitempty"`          // current first; lazily migrated
-	AutoUpdate           *bool                          `json:"auto_update,omitempty"`       // nil = unset: auto-install newer releases (v0.6.12+ default); false opts out
-	UpdateCheckedAt      int64                          `json:"update_checked_at,omitempty"` // unix seconds of last update check
+	// PreferredContactNames records explicitly chosen private display aliases,
+	// keyed by address. Other aliases and their verification records remain intact.
+	PreferredContactNames map[string]string              `json:"preferred_contact_names,omitempty"`
+	ContactVerifications  map[string]ContactVerification `json:"contact_verifications,omitempty"`
+	EncKeys               []EncKey                       `json:"enc_keys,omitempty"`          // current first; lazily migrated
+	AutoUpdate            *bool                          `json:"auto_update,omitempty"`       // nil = unset: auto-install newer releases (v0.6.12+ default); false opts out
+	UpdateCheckedAt       int64                          `json:"update_checked_at,omitempty"` // unix seconds of last update check
 	// v0.6.0: web dashboard account. Token is the push API token (the
 	// dashboard stores only its hash). DashboardCursor is the last
 	// courier message id pushed.
@@ -449,6 +452,16 @@ var contactNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
 // AddContact stores name -> address after validating both.
 func (c *Config) AddContact(name, address string) error {
+	return c.addContact(name, address, false)
+}
+
+// AddContactAlias saves an explicitly chosen private display alias without
+// deleting other names or their verification metadata for the same address.
+func (c *Config) AddContactAlias(name, address string) error {
+	return c.addContact(name, address, true)
+}
+
+func (c *Config) addContact(name, address string, prefer bool) error {
 	if !contactNameRe.MatchString(name) {
 		return fmt.Errorf("bad contact name %q: use 1-32 chars, lowercase letters, digits, - and _, starting with a letter or digit", name)
 	}
@@ -459,8 +472,19 @@ func (c *Config) AddContact(name, address string) error {
 		c.Contacts = map[string]string{}
 	}
 	oldAddress, replaced := c.Contacts[name]
+	oldPreferences := maps.Clone(c.PreferredContactNames)
+	if c.PreferredContactNames[oldAddress] == name && oldAddress != address {
+		delete(c.PreferredContactNames, oldAddress)
+	}
+	if prefer {
+		if c.PreferredContactNames == nil {
+			c.PreferredContactNames = map[string]string{}
+		}
+		c.PreferredContactNames[address] = name
+	}
 	c.Contacts[name] = address
 	if err := c.Save(); err != nil {
+		c.PreferredContactNames = oldPreferences
 		if replaced {
 			c.Contacts[name] = oldAddress
 		} else {
@@ -488,6 +512,9 @@ func (c *Config) AddContact(name, address string) error {
 // its receipt opt-in (issue #52: no lingering activity-leak consent).
 // It is not an error if absent.
 func (c *Config) RemoveContact(name string) error {
+	if address, ok := c.Contacts[name]; ok && c.PreferredContactNames[address] == name {
+		delete(c.PreferredContactNames, address)
+	}
 	if addr, ok := c.Contacts[name]; ok {
 		delete(c.ReceiptContacts, addr)
 	}

@@ -1178,7 +1178,12 @@ func cmdContacts(args []string) error {
 		default:
 			return fmt.Errorf("usage: courier contacts add <address|@handle> [--force] | courier contacts add <name> <address>")
 		}
-		if err := cfg.AddContact(name, address); err != nil {
+		if len(args) == 3 {
+			err = cfg.AddContactAlias(name, address)
+		} else {
+			err = cfg.AddContact(name, address)
+		}
+		if err != nil {
 			return err
 		}
 		fmt.Printf("contact %q saved.\n", name)
@@ -1956,11 +1961,5 @@ func cmdDashboardSetAdmin(args []string) error {
 }
 
 func existingContactAlias(cfg *client.Config, address string) string {
-	result := ""
-	for name, addr := range cfg.Contacts {
-		if addr == address && (result == "" || name < result) {
-			result = name
-		}
-	}
-	return result
+	return cfg.ContactNameForAddress(address)
 }

@@ -750,10 +750,8 @@ func (c *Client) recordIntroduction(from string, envelopeID int64, p introductio
 // contactNameFor returns the contact name for an address, or a
 // truncated address when unknown.
 func (c *Client) contactNameFor(address string) string {
-	for name, addr := range c.cfg.Contacts {
-		if addr == address {
-			return name
-		}
+	if name := c.cfg.ContactNameForAddress(address); name != "" {
+		return name
 	}
 	return shortAddr(address)
 }
@@ -772,7 +770,7 @@ func (c *Client) contactNameFor(address string) string {
 //
 // Exported for CLI display.
 func (c *Client) ContactDisplayName(address string) string {
-	if name := c.cfg.contactNameForAddress(address); name != "" {
+	if name := c.cfg.ContactNameForAddress(address); name != "" {
 		return name
 	}
 	if h := c.CachedPeerHandle(address); h != "" {

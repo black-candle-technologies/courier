@@ -1427,6 +1427,13 @@ reversible (`UntombstoneHandle`). Tombstoned **private** handles stay
 
 ### 17.6 Client behavior
 
+- `courier contacts add <address|@handle>` uses the verified directory handle
+  as the default name. `courier contacts add <name> <address>` records that
+  explicit private alias as the preferred local display name, regardless of
+  alphabetical ordering. Other saved aliases and their verification records
+  remain intact. Re-adding a handle does not override the preference; removing
+  or repointing the preferred alias clears it, with deterministic fallback to
+  the remaining saved names. Rendering does not query the directory.
 - `courier directory register <handle> [--public|--unlisted|--private]
   [--cap chat,...] [--contacts-only]` — register (default private).
 - `courier directory update ...` / `unregister` /

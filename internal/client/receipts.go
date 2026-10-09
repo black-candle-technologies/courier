@@ -109,9 +109,12 @@ func (c *Config) SetReceiptsOptIn(address string, on bool) error {
 	})
 }
 
-// contactNameForAddress returns the contact name for an address, or ""
+// ContactNameForAddress returns the contact name for an address, or ""
 // when the address is not a named contact.
-func (c *Config) contactNameForAddress(address string) string {
+func (c *Config) ContactNameForAddress(address string) string {
+	if preferred := c.PreferredContactNames[address]; preferred != "" && c.Contacts[preferred] == address {
+		return preferred
+	}
 	result := ""
 	for name, addr := range c.Contacts {
 		if addr == address && (result == "" || name < result) {
@@ -432,7 +435,7 @@ func (c *Client) ReceiptsStatus(filter string) ([]ReceiptInfo, error) {
 		info := ReceiptInfo{
 			CourierID:   e.CourierID,
 			To:          e.To,
-			ContactName: c.cfg.contactNameForAddress(e.To),
+			ContactName: c.cfg.ContactNameForAddress(e.To),
 			Body:        e.Body,
 			SentAt:      e.SentAt,
 		}
