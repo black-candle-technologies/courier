@@ -832,11 +832,15 @@ The envelope ciphertext decrypts to one of (dispatch order in
 `internal/client/client.go` `inbox`):
 
 1. **FS frame** (`{"cf": 3, ...}`) → §15.
-2. **Retired protocols**: state `{"cs":1,"t":"state",...}` (any version) and recognized channel `{"cc":2,...}` frames are consumed silently before chat decoding (§27).
-3. **Protocol DMs** by magic: group `{"cg": 1, ...}` (§16.5),
+2. **Protocol DMs** by magic: group `{"cg": 1, ...}` (§16.5),
    receipts `{"cr": 3, ...}` (§19). Recognized types are consumed
    silently; unknown `cg`/`cr` values fall through as ordinary
-   chat — never silently swallowed.
+   chat — never silently swallowed. VHL frames (§28) and verified
+   introductions (§25) are handled next under their validation and
+   review policies.
+3. **Retired protocols**: state `{"cs":1,"t":"state",...}` (any
+   version) and recognized channel `{"cc":2,...}` frames are consumed
+   silently before chat decoding (§27).
 4. **Versioned chat payloads**:
    - **Raw text** — plain messages. Old clients render everything as
      text; this is the compatible baseline.
