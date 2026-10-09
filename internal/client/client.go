@@ -2843,11 +2843,15 @@ func (c *Client) refreshPeerHandles(hc *http.Client) {
 		st, _ := c.CachedContactTrust(name)
 		switch st {
 		case TrustVerified:
-			verified[addr] = "verified_cached"
+			if verified[addr] != "stale" {
+				verified[addr] = "verified_cached"
+			}
 		case TrustStale:
 			verified[addr] = "stale"
 		default:
-			verified[addr] = ""
+			if _, reported := verified[addr]; !reported {
+				verified[addr] = ""
+			}
 		}
 	}
 	// Mark only successfully published evidence, and do not consume a

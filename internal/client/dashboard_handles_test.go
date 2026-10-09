@@ -40,7 +40,7 @@ func TestDashboardHandleRenderingNeverQueriesDirectory(t *testing.T) {
 	defer srv.Close()
 	cfg.RelayURL, cfg.DashboardURL = srv.URL, srv.URL
 	cfg.HandleCache = map[string]HandleCacheEntry{cfg.Address: {Handle: "known", At: time.Now().Unix()}}
-	cfg.Contacts = map[string]string{"unknown": unknownAddress, "known": cfg.Address}
+	cfg.Contacts = map[string]string{"unknown": unknownAddress, "known": cfg.Address, "unverified-alias": cfg.Address}
 	cfg.ContactVerifications = map[string]ContactVerification{"known": {Address: cfg.Address, KeyEpoch: 1}}
 	cfg.VerifiedKeyEpochs = map[string]int64{cfg.Address: 1}
 	if err := cfg.Save(); err != nil {
