@@ -341,6 +341,9 @@ func (c *Config) saveAtomic() error {
 	if err := c.local().validateConfig(c); err != nil {
 		return err
 	}
+	if err := c.local().checkBinding(true); err != nil {
+		return err
+	}
 	p, err := c.local().configPath()
 	if err != nil {
 		return err

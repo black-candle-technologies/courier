@@ -80,6 +80,16 @@ func acquireConfigLock() (release func(), err error) { return LegacyContext().ac
 func (s Context) withConfigLock(fn func() error) error {
 	configMu.Lock()
 	defer configMu.Unlock()
+	if s.principal != "" {
+		releaseRoot, err := s.installation().acquireConfigLock()
+		if err != nil {
+			return err
+		}
+		defer releaseRoot()
+		if err := s.checkBinding(false); err != nil {
+			return err
+		}
+	}
 	release, err := s.acquireConfigLock()
 	if err != nil {
 		return err

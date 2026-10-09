@@ -174,6 +174,9 @@ func (s Context) migrateLegacy(target Context, opts MigrationOptions, stop func(
 		return err
 	}
 	defer release()
+	if err = target.checkBinding(false); err != nil {
+		return err
+	}
 	// Supported binaries refuse mixed legacy writes once the commit point exists.
 	active, err := s.ActiveContext()
 	if err != nil {
@@ -294,6 +297,12 @@ func (s Context) migrateLegacy(target Context, opts MigrationOptions, stop func(
 		return err
 	}
 	if _, err = target.loadConfigRaw(); err != nil {
+		return err
+	}
+	if err = target.checkBinding(true); err != nil {
+		return err
+	}
+	if err = checkpoint("binding"); err != nil {
 		return err
 	}
 	raw, _ = json.Marshal(j.Manifest)

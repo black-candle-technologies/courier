@@ -263,3 +263,37 @@ func TestNamedContextBackupResetAndSyncBinding(t *testing.T) {
 		t.Fatal("restore changed another context", err)
 	}
 }
+
+func TestPrincipalBindingSurvivesAliasRemoval(t *testing.T) {
+	root := t.TempDir()
+	cfg, err := NewIdentity("https://first.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin := strings.Repeat("a", 64)
+	cfg.RelayFingerprint = pin
+	registry := func(binding, endpoint string) Hosts {
+		return Hosts{Enabled: true, Bindings: map[string]RelayBinding{binding: {ID: binding, Endpoint: endpoint, Pin: pin}}, Identities: map[string]NamedIdentity{"identity": {cfg.Address, binding}}, Hosts: map[string]Host{"host": {binding, "identity"}}}
+	}
+	first, err := registry("first", cfg.RelayURL).Resolve(root, "host", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.localContext = &first
+	if err = cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	// Entirely replace aliases; the durable principal binding must still win.
+	second, err := registry("second", "https://second.invalid").Resolve(root, "host", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.localContext = &second
+	cfg.RelayURL = "https://second.invalid"
+	if err = cfg.Save(); !errors.Is(err, ErrContextMismatch) {
+		t.Fatal("alias removal reset D3", err)
+	}
+	if second.ConfigExists() {
+		t.Fatal("rejected binding wrote a config")
+	}
+}

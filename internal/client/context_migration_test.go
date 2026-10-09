@@ -33,7 +33,7 @@ func TestMigrationCrashRecovery(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("migration remains gated on Windows")
 	}
-	for _, point := range append([]string{"journal", "staged", "verified", "committed"}, migrationCopyPoints()...) {
+	for _, point := range append([]string{"journal", "staged", "verified", "binding", "committed"}, migrationCopyPoints()...) {
 		t.Run(point, func(t *testing.T) {
 			source := Context{root: t.TempDir()}
 			cfg, err := NewIdentity("https://fixture.invalid")

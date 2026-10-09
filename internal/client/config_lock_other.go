@@ -20,6 +20,9 @@ import "fmt"
 // Courier's supported server and agent deployments are unix, and a
 // Windows binary is published; both have real locks.
 func (s Context) withConfigLock(fn func() error) error {
+	if s.principal != "" {
+		return fmt.Errorf("named contexts require cross-process locks")
+	}
 	configMu.Lock()
 	defer configMu.Unlock()
 	if err := s.refuseMigrated(); err != nil {
