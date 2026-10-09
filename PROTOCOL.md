@@ -939,7 +939,7 @@ Automatic initiation uses:
    register/update). Positive results are cached 24h; negative
    results 10 minutes.
 2. **Handshake memory:** a previous successful handshake with the
-   address — no re-probing, ever.
+   address pins its capability even when the directory is unavailable.
 3. **Inbound proof:** receiving a valid `fs-init` proves the peer
    speaks FS; the client records it and answers — automatically, with
    no prompt.
@@ -1038,7 +1038,20 @@ drop the message as undecryptable — self-healing without user action.
 Standard Signal-shaped, per conversation (`crypto.FSRootStep`,
 `crypto.FSChainStep`):
 
-- **Symmetric step** (every message)
+- **Symmetric step** (every message): derive the message key and next
+  chain key through the negotiated suite, then erase the used message
+  key and replace the previous chain key.
+- **DH step**: a new peer ratchet public key advances the receive root
+  and chain; a fresh local ratchet keypair then advances the send root
+  and chain. The old root, chain keys, and local ratchet private key
+  are erased after replacement.
+- **Rotation**: the initiator rotates on its first post-accept send.
+  Established senders also rotate after 100 messages or seven days
+  since rotation; a receive-side DH step prepares a fresh send key.
+- **Gaps**: `n` and `pn` support out-of-order delivery, with at most
+  100 skipped message keys. Used keys and keys from older chains are
+  erased; excessive gaps or delays can therefore be undecryptable.
+
 ### 15.5 Fail-open negotiation (stated plainly)
 
 **FS is opportunistic by default; require-fs enforces fail-closed sends.** This is the standard
