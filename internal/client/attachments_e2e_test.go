@@ -64,7 +64,7 @@ func newAttachTestEnv(t *testing.T) *attachTestEnv {
 		{env.snoopHome, &env.snoopCfg},
 	}
 	for _, id := range identities {
-		t.Setenv("HOME", id.home)
+		setTestHome(t, id.home)
 		cfg, err := NewIdentity(srv.URL)
 		if err != nil {
 			t.Fatal(err)
@@ -80,9 +80,9 @@ func newAttachTestEnv(t *testing.T) *attachTestEnv {
 	return env
 }
 
-func (e *attachTestEnv) asSender()    { e.t.Setenv("HOME", e.senderHome) }
-func (e *attachTestEnv) asRecipient() { e.t.Setenv("HOME", e.recipHome) }
-func (e *attachTestEnv) asSnoop()     { e.t.Setenv("HOME", e.snoopHome) }
+func (e *attachTestEnv) asSender()    { setTestHome(e.t, e.senderHome) }
+func (e *attachTestEnv) asRecipient() { setTestHome(e.t, e.recipHome) }
+func (e *attachTestEnv) asSnoop()     { setTestHome(e.t, e.snoopHome) }
 
 // TestAttachmentEndToEnd exercises the whole attachment flow against a
 // live relay: sender encrypts, uploads blobs, and sends; the recipient

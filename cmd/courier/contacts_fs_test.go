@@ -9,7 +9,7 @@ import (
 )
 
 func TestContactRemovalPreservesSharedFSPolicy(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	cfg, err := client.NewIdentity("")
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +54,7 @@ func TestContactRemovalPreservesSharedFSPolicy(t *testing.T) {
 }
 
 func TestContactRemoveRejectsRawNonContactAddress(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	cfg, err := client.NewIdentity("")
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +84,7 @@ func TestContactRemovalSaveFailurePreservesFS(t *testing.T) {
 		t.Skip("requires Unix permissions as non-root")
 	}
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	cfg, err := client.NewIdentity("")
 	if err != nil {
 		t.Fatal(err)
@@ -115,4 +115,11 @@ func TestContactRemovalSaveFailurePreservesFS(t *testing.T) {
 	if err != nil || !required {
 		t.Fatal("failed persistence erased policy", required, err)
 	}
+}
+
+// setTestHome isolates filesystem state on both Unix and Windows.
+func setTestHome(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 }

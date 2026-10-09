@@ -37,7 +37,7 @@ func TestSendWithTTLValidation(t *testing.T) {
 }
 
 func TestReadSentLogPrunesExpired(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	now := time.Now().Unix()
 	p, err := sentLogPath()
 	if err != nil {

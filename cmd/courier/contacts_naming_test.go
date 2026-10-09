@@ -20,7 +20,7 @@ func TestContactHandleRequiresConfirmationAndPreservesAlias(t *testing.T) {
 	defer st.Close()
 	srv := httptest.NewServer(relay.New(st).Routes())
 	defer srv.Close()
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	peer, err := client.NewIdentity(srv.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -34,7 +34,7 @@ func TestContactHandleRequiresConfirmationAndPreservesAlias(t *testing.T) {
 	if err := client.New(peer).DirectoryRegister("bob", "public", nil, "open"); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	cfg, err := client.NewIdentity(srv.URL)
 	if err != nil {
 		t.Fatal(err)
