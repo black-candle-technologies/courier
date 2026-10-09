@@ -424,6 +424,9 @@ func TestDashboardSetupRejectsPinMismatch(t *testing.T) {
 	u, _ := url.Parse(ts.URL)
 	cfg.RelayURL = "https://" + u.Hostname() + ":8470"
 	cfg.RelayFingerprint = strings.Repeat("00", 32)
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err := New(cfg).DashboardSetup("someuser", "")
 	if err == nil || !strings.Contains(err.Error(), "mismatch") {

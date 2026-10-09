@@ -62,3 +62,9 @@ func (c *Config) AcknowledgeTransport() error {
 		return nil
 	})
 }
+
+// sameSetupTrust excludes rotating message keys and cursors, but includes every
+// persisted input that can redirect setup or replace an existing dashboard account.
+func sameSetupTrust(a, b *Config) bool {
+	return a.RelayURL == b.RelayURL && a.RelayFingerprint == b.RelayFingerprint && a.RelayTransport == b.RelayTransport && a.DashboardURL == b.DashboardURL && a.DashboardFingerprint == b.DashboardFingerprint && a.DashboardTransport == b.DashboardTransport && a.DashboardToken == b.DashboardToken && a.DashboardUser == b.DashboardUser
+}

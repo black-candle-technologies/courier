@@ -1,9 +1,11 @@
 package client
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -148,8 +150,7 @@ func TestDashboardBootstrapRequiresIndependentTrust(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1) }))
 	defer srv.Close()
 	cfg, _ := NewIdentity("https://different.example.invalid")
-	cfg.DashboardURL = srv.URL
-	if _, err := New(cfg).DashboardSetup("synthetic", ""); err == nil {
+	if _, err := New(cfg).DashboardSetupAt("synthetic", "", srv.URL); err == nil {
 		t.Fatal("trusted candidate without expected pin")
 	}
 	if calls.Load() != 0 {
@@ -217,9 +218,8 @@ func TestDashboardSetupPreservesConcurrentTrust(t *testing.T) {
 		_, _ = w.Write([]byte(`{"username":"fixture","api_token":"stale-synthetic-token"}`))
 	}))
 	defer srv.Close()
-	cfg.DashboardURL = srv.URL
 	sum := sha256.Sum256(srv.Certificate().Raw)
-	if _, err := New(cfg).DashboardSetup("fixture", hex.EncodeToString(sum[:])); !errors.Is(err, ErrContextMismatch) {
+	if _, err := New(cfg).DashboardSetupAt("fixture", hex.EncodeToString(sum[:]), srv.URL); !errors.Is(err, ErrContextMismatch) {
 		t.Fatalf("want stale trust rejection: %v", err)
 	}
 	fresh, err := scope.LoadTransportConfig()
@@ -246,9 +246,8 @@ func TestDashboardSetupRejectsBootstrapAndRegistrationRedirects(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			}))
 			defer srv.Close()
-			cfg.DashboardURL = srv.URL
 			sum := sha256.Sum256(srv.Certificate().Raw)
-			if _, err := New(cfg).DashboardSetup("fixture", hex.EncodeToString(sum[:])); err == nil {
+			if _, err := New(cfg).DashboardSetupAt("fixture", hex.EncodeToString(sum[:]), srv.URL); err == nil {
 				t.Fatal("accepted redirect")
 			}
 			if calls.Load() != 0 {
@@ -262,5 +261,58 @@ func TestDashboardSetupRejectsBootstrapAndRegistrationRedirects(t *testing.T) {
 				t.Fatal("failed setup persisted trust")
 			}
 		})
+	}
+}
+
+func TestDashboardSetupRejectsStaleBindingBeforeIO(t *testing.T) {
+	for _, field := range []string{"url", "fingerprint"} {
+		for _, override := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/override=%v", field, override), func(t *testing.T) {
+				cfg, scope := reviewConfig(t, false)
+				var calls atomic.Int32
+				srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					w.WriteHeader(http.StatusCreated)
+					_, _ = w.Write([]byte(`{"username":"fixture","api_token":"synthetic"}`))
+				}))
+				defer srv.Close()
+				if err := cfg.Update(func(f *Config) error { f.DashboardURL = srv.URL; return nil }); err != nil {
+					t.Fatal(err)
+				}
+				newer, err := scope.LoadTransportConfig()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := newer.Update(func(f *Config) error {
+					if field == "url" {
+						f.DashboardURL = "https://replacement.invalid"
+					} else {
+						f.DashboardFingerprint = strings.Repeat("ab", 32)
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				path, _ := scope.configPath()
+				before, _ := os.ReadFile(path)
+				sum := sha256.Sum256(srv.Certificate().Raw)
+				pin := hex.EncodeToString(sum[:])
+				if override {
+					_, err = New(cfg).DashboardSetupAt("fixture", pin, srv.URL)
+				} else {
+					_, err = New(cfg).DashboardSetup("fixture", pin)
+				}
+				if !errors.Is(err, ErrContextMismatch) {
+					t.Fatalf("want stale binding error: %v", err)
+				}
+				if calls.Load() != 0 {
+					t.Fatal("stale setup performed network I/O")
+				}
+				after, _ := os.ReadFile(path)
+				if !bytes.Equal(before, after) {
+					t.Fatal("stale setup changed persisted trust")
+				}
+			})
+		}
 	}
 }

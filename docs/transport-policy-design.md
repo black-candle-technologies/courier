@@ -192,3 +192,9 @@ concurrent writer changed the relay/dashboard binding or dashboard account. Key
 rotation alone remains compatible. A remote registration may have completed when
 that local race is detected; the error does not authorize overwriting the newer
 local trust or retrying against another server automatically.
+
+Codex follow-up: DashboardSetupAt takes an explicit endpoint override instead of
+mutating the captured Config. Preflight compares the captured and persisted relay/
+dashboard trust before any discovery or registration; stale URL/pin changes with
+an empty token fail before I/O even when an explicit override is requested. Final
+publication still checks that persisted trust did not change during the request.

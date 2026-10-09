@@ -1906,10 +1906,7 @@ func (scope command) cmdDashboardSetup(args []string) error {
 	if err != nil {
 		return err
 	}
-	if *dashURL != "" {
-		cfg.DashboardURL = *dashURL
-	}
-	temp, err := client.New(cfg).DashboardSetup(name, *fingerprint)
+	temp, err := client.New(cfg).DashboardSetupAt(name, *fingerprint, *dashURL)
 	if err != nil {
 		return err
 	}

@@ -2677,7 +2677,13 @@ func GenerateTempPassword() (string, error) {
 // pinned relay fingerprint whenever the dashboard shares the relay's
 // host (the documented deployment shares the relay's certificate);
 // otherwise setup fails before discovery until independent expected trust is supplied.
-func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassword string, err error) {
+func (c *Client) DashboardSetup(username, expectedFingerprint string) (string, error) {
+	return c.DashboardSetupAt(username, expectedFingerprint, "")
+}
+
+// DashboardSetupAt accepts an explicit setup endpoint without modifying the
+// captured config. A URL override never authorizes overwriting stale local trust.
+func (c *Client) DashboardSetupAt(username, expectedFingerprint, dashboardURL string) (tempPassword string, err error) {
 	if err := c.cfg.local().validateConfig(c.cfg); err != nil {
 		return "", err
 	}
@@ -2687,29 +2693,29 @@ func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassw
 	if c.cfg.DashboardToken != "" {
 		return "", fmt.Errorf("dashboard already configured for user %q; reset by clearing dashboard_* in the config", c.cfg.DashboardUser)
 	}
-	if c.cfg.DashboardURL == "" {
-		c.cfg.DashboardURL = DefaultDashboardURL
+	if dashboardURL == "" {
+		dashboardURL = c.cfg.DashboardURL
 	}
-	if _, err := transport.Resolve(transport.DirectTLS, c.cfg.DashboardURL); err != nil {
+	if dashboardURL == "" {
+		dashboardURL = DefaultDashboardURL
+	}
+	if _, err := transport.Resolve(transport.DirectTLS, dashboardURL); err != nil {
 		return "", err
 	}
-	want := c.expectedDashboardFingerprint(expectedFingerprint)
+	want := c.expectedDashboardFingerprintFor(dashboardURL, expectedFingerprint)
 	if want == "" {
 		return "", fmt.Errorf("dashboard setup requires --fingerprint from an independently trusted source")
 	}
 	if _, err := pinnedTransport(want); err != nil {
 		return "", err
 	}
-	// Capture persisted trust before networking; the caller may intentionally
-	// override DashboardURL for this setup, but cannot overwrite concurrent setup.
+	// Compare captured and persisted trust before any discovery/registration.
+	// Intentional URL changes are separate arguments, never mutations of c.cfg.
 	before, err := c.cfg.local().loadConfigRaw()
 	if err != nil {
 		return "", err
 	}
-	if before.Address != c.cfg.Address || before.Seed != c.cfg.Seed || before.DashboardToken != "" || before.DashboardTransport != c.cfg.DashboardTransport {
-		return "", ErrContextMismatch
-	}
-	if expectedFingerprint == "" && (before.RelayURL != c.cfg.RelayURL || !sameCertificatePin(before.RelayFingerprint, c.cfg.RelayFingerprint) || before.RelayTransport != c.cfg.RelayTransport) {
+	if before.Address != c.cfg.Address || before.Seed != c.cfg.Seed || !sameSetupTrust(before, c.cfg) {
 		return "", ErrContextMismatch
 	}
 	tempPassword, err = GenerateTempPassword()
@@ -2734,7 +2740,7 @@ func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassw
 	// relay's certificate), the fetched fingerprint must equal the
 	// already-pinned relay fingerprint. Without either trust anchor setup
 	// is rejected before discovery or account registration.
-	fp, err := FetchRelayFingerprint(c.cfg.DashboardURL)
+	fp, err := FetchRelayFingerprint(dashboardURL)
 	if err != nil {
 		return "", fmt.Errorf("dashboard unreachable: %w", err)
 	}
@@ -2754,7 +2760,7 @@ func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassw
 		"sig":      base64.RawURLEncoding.EncodeToString(sig),
 	})
 	resp, err := (&http.Client{Timeout: 30 * time.Second, Transport: hc, CheckRedirect: transport.NoRedirect}).Post(
-		c.cfg.DashboardURL+"/v1/dashboard/register", "application/json", bytes.NewReader(body))
+		dashboardURL+"/v1/dashboard/register", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("register: %w", err)
 	}
@@ -2777,9 +2783,8 @@ func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassw
 	if err := json.Unmarshal(raw, &out); err != nil || out.APIToken == "" {
 		return "", fmt.Errorf("register: bad response")
 	}
-	dashboardURL := c.cfg.DashboardURL
 	if err := c.cfg.Update(func(fresh *Config) error {
-		if fresh.RelayURL != before.RelayURL || fresh.RelayFingerprint != before.RelayFingerprint || fresh.RelayTransport != before.RelayTransport || fresh.DashboardURL != before.DashboardURL || fresh.DashboardFingerprint != before.DashboardFingerprint || fresh.DashboardTransport != before.DashboardTransport || fresh.DashboardToken != before.DashboardToken || fresh.DashboardUser != before.DashboardUser {
+		if !sameSetupTrust(fresh, before) {
 			return ErrContextMismatch
 		}
 		fresh.DashboardURL = dashboardURL
@@ -2799,10 +2804,14 @@ func (c *Client) DashboardSetup(username, expectedFingerprint string) (tempPassw
 // fingerprint applies when the dashboard shares the relay's host (the
 // documented deployment shares the relay's certificate).
 func (c *Client) expectedDashboardFingerprint(expected string) string {
+	return c.expectedDashboardFingerprintFor(c.cfg.DashboardURL, expected)
+}
+
+func (c *Client) expectedDashboardFingerprintFor(dashboardURL, expected string) string {
 	if expected != "" {
 		return expected
 	}
-	if c.cfg.RelayFingerprint != "" && sameURLHost(c.cfg.DashboardURL, c.cfg.RelayURL) {
+	if c.cfg.RelayFingerprint != "" && sameURLHost(dashboardURL, c.cfg.RelayURL) {
 		return c.cfg.RelayFingerprint
 	}
 	return ""
