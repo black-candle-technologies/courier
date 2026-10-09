@@ -574,6 +574,9 @@ func (c *Client) GroupSend(groupID, body string) (int64, error) {
 	if !inRoster(g.Roster, c.cfg.Address) {
 		return 0, fmt.Errorf("you are not in the group roster")
 	}
+	if g.KeyPending {
+		return 0, fmt.Errorf("group key distribution pending; retry the group operation or receive group updates before sending")
+	}
 	id, err := c.cfg.Identity()
 	if err != nil {
 		return 0, err

@@ -94,6 +94,9 @@ func TestGroupLifecycleRemovalDelivery(t *testing.T) {
 	if rotated.MyKey == old || rotated.MyEpoch != 2 || inRoster(rotated.Roster, clients[2].cfg.Address) {
 		t.Fatal("removal/key rotation not durable")
 	}
+	if _, err = clients[0].GroupSend(g.ID, "must not send while key pending"); err == nil {
+		t.Fatal("pending key allowed application send")
+	}
 	fail.Store(false)
 	if err = clients[0].GroupRemove(g.ID, clients[2].cfg.Address); err != nil {
 		t.Fatalf("retry: %v", err)
