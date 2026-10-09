@@ -120,6 +120,9 @@ else
 fi
 
 # --- fetch: curl/wget fallback paths --------------------------------------
+# Keep PATH overrides inside subshells: POSIX shells may retain assignments
+# made before function calls, which otherwise breaks later fixtures and cleanup.
+TEST_PATH="$PATH"
 # Stub downloaders that honor each tool's real argument shape, so the test
 # proves fetch() drives them correctly without touching the network.
 mkdir -p "$FIX/stubbin" "$FIX/empty"
@@ -138,7 +141,7 @@ printf 'stubbed-via-curl' > "$dest"
 EOF
 chmod +x "$FIX/stubbin/curl"
 
-if PATH="$FIX/stubbin:$PATH" fetch "https://example.com/courier" "$FIX/dl-curl" \
+if (PATH="$FIX/stubbin:$PATH" fetch "https://example.com/courier" "$FIX/dl-curl") \
 	&& [ "$(cat "$FIX/dl-curl")" = "stubbed-via-curl" ]; then
 	ok "fetch uses curl with -o DEST when curl is present"
 else
@@ -161,7 +164,7 @@ printf 'stubbed-via-wget' > "$dest"
 EOF
 chmod +x "$FIX/stubbin-wget/wget"
 
-if PATH="$FIX/stubbin-wget:$FIX/empty" fetch "https://example.com/courier" "$FIX/dl-wget" \
+if (PATH="$FIX/stubbin-wget:$FIX/empty" fetch "https://example.com/courier" "$FIX/dl-wget") \
 	&& [ "$(cat "$FIX/dl-wget")" = "stubbed-via-wget" ]; then
 	ok "fetch falls back to wget -qO DEST when curl is absent"
 else
@@ -169,7 +172,7 @@ else
 fi
 
 # Neither downloader present: clear error, nonzero exit.
-if PATH="$FIX/empty" fetch "https://example.com/courier" "$FIX/dl-none" 2>/dev/null; then
+if (PATH="$FIX/empty" fetch "https://example.com/courier" "$FIX/dl-none" 2>/dev/null); then
 	bad "fetch fails clearly when neither curl nor wget exists"
 else
 	ok "fetch fails clearly when neither curl nor wget exists"
@@ -180,10 +183,16 @@ cat > "$FIX/stubbin/curl" <<'EOF'
 #!/bin/sh
 exit 1
 EOF
-if PATH="$FIX/stubbin:$PATH" fetch "https://example.com/courier" "$FIX/dl-fail" 2>/dev/null; then
+if (PATH="$FIX/stubbin:$PATH" fetch "https://example.com/courier" "$FIX/dl-fail" 2>/dev/null); then
 	bad "fetch propagates a downloader failure"
 else
 	ok "fetch propagates a downloader failure"
+fi
+
+if [ "$PATH" = "$TEST_PATH" ]; then
+	ok "fetch fixtures preserve PATH for cleanup"
+else
+	bad "fetch fixtures preserve PATH for cleanup"
 fi
 
 # --- summary --------------------------------------------------------------
