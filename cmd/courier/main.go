@@ -3,7 +3,7 @@
 //
 // Usage:
 //
-//	courier init [--relay URL] [--force]   create your identity
+//	courier init --transport direct-tls --fingerprint SHA256 [--relay URL] [--force]   create your identity
 //	courier address                      print your address (public key)
 //	courier send <address> <message|-> [--file path] [--attach file]... [--reply-to id] [--ttl 10m]
 //	courier inbox [--all] [--limit N] [--follow] [--attachments-dir dir]
@@ -32,6 +32,7 @@ import (
 	"github.com/black-candle-technologies/courier/internal/client"
 	"github.com/black-candle-technologies/courier/internal/crypto"
 	"github.com/black-candle-technologies/courier/internal/store"
+	"github.com/black-candle-technologies/courier/internal/transport"
 	"github.com/black-candle-technologies/courier/internal/update"
 	"github.com/black-candle-technologies/courier/internal/version"
 	"github.com/black-candle-technologies/courier/internal/vhl"
@@ -54,7 +55,7 @@ func main() {
 	}
 	// v0.5.0+: opportunistic update check (at most once per 12h). Notices
 	// go to stderr so stdout stays machine-readable (stdio/serve).
-	if commandNeedsIdentity(args) && os.Args[1] != "context" && scope.context.ConfigExists() {
+	if commandNeedsIdentity(args) && os.Args[1] != "context" && os.Args[1] != "init" && scope.context.ConfigExists() {
 		if cfg, err := scope.context.LoadConfig(); err == nil {
 			client.New(cfg).MaybeUpdateCheck(version.Client)
 		}
@@ -127,8 +128,8 @@ func main() {
 func usage() {
 	fmt.Println(`courier — encrypted agent-to-agent messaging
 
-  courier init [--relay URL] [--force]   create your identity (keypair)
-  courier init --repin                   re-pin the relay certificate
+  courier init --transport direct-tls --fingerprint SHA256 [--relay URL] [--force]   create your identity (keypair)
+  courier init --repin --fingerprint SHA256   explicitly replace the relay pin
   courier address                        print your address (public key)
   courier send <address|contact|@handle> <msg>
                                          send a message ("-" reads stdin); --force confirms
@@ -270,22 +271,28 @@ func (scope command) cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	relay := fs.String("relay", "", "relay URL (default "+client.DefaultRelay+")")
 	force := fs.Bool("force", false, "overwrite existing identity")
-	repin := fs.Bool("repin", false, "re-pin the relay certificate fingerprint (keeps identity)")
+	repin := fs.Bool("repin", false, "re-pin using an independently verified --fingerprint (keeps identity)")
+	mode := fs.String("transport", "", "transport mode: direct-tls (cloud unavailable)")
+	expected := fs.String("fingerprint", "", "independently verified relay certificate SHA256 (required for setup/repin)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
+	if *mode != "" && *mode != transport.DirectTLS {
+		_, err := transport.Resolve(*mode, "")
+		return err
+	}
 	if *repin {
-		cfg, err := scope.context.LoadConfig()
+		cfg, err := scope.context.LoadTransportConfig()
 		if err != nil {
 			return err
 		}
-		fp, err := client.FetchRelayFingerprint(cfg.RelayURL)
+		fp, err := verifiedRelayFingerprint(cfg.RelayURL, *expected)
 		if err != nil {
 			return err
 		}
 		if err := cfg.Update(func(fresh *client.Config) error {
-			if fresh.RelayURL != cfg.RelayURL {
+			if fresh.RelayURL != cfg.RelayURL || fresh.RelayFingerprint != cfg.RelayFingerprint || fresh.RelayTransport != cfg.RelayTransport {
 				return client.ErrContextMismatch
 			}
 			fresh.RelayFingerprint = fp
@@ -313,16 +320,24 @@ func (scope command) cmdInit(args []string) error {
 		fmt.Println("(use --repin to re-pin the relay certificate)")
 		return nil
 	}
-	cfg, err := client.NewIdentity(*relay)
+	endpoint := *relay
+	if endpoint == "" {
+		endpoint = client.DefaultRelay
+	}
+	selected, err := setupTransport(*mode, endpoint, isatty.IsTerminal(os.Stdin.Fd()), os.Stdin, os.Stderr)
 	if err != nil {
 		return err
 	}
-	// Pin the relay's TLS certificate (TOFU). For the default relay the
-	// fingerprint is published in INSTALL.md — compare before trusting.
-	fp, err := client.FetchRelayFingerprint(cfg.RelayURL)
+	fp, err := verifiedRelayFingerprint(endpoint, *expected)
 	if err != nil {
 		return err
 	}
+	cfg, err := client.NewIdentity(endpoint)
+	if err != nil {
+		return err
+	}
+	cfg.RelayTransport = selected
+	cfg.TransportReviewed = true
 	cfg.RelayFingerprint = fp
 	if err := cfg.Save(); err != nil {
 		return err
@@ -1692,6 +1707,9 @@ func (scope command) cmdPublishKey() error {
 // ---- v0.5.0: self-update ----
 
 func (scope command) cmdUpdate() error {
+	if err := reviewUpgradeTransport(); err != nil {
+		return err
+	}
 	fmt.Println("checking for updates...")
 	rel, err := update.Latest()
 	if err != nil {
@@ -1701,7 +1719,7 @@ func (scope command) cmdUpdate() error {
 		fmt.Printf("already up to date (courier %s).\n", version.Client)
 		// v0.6.0+: agents that updated via an older binary never saw
 		// the dashboard setup directive, so surface it here too.
-		if cfg, err := client.LoadConfig(); err == nil && cfg.DashboardToken == "" {
+		if cfg, err := upgradeTransportConfig(); err == nil && cfg.DashboardToken == "" {
 			fmt.Println()
 			fmt.Println(dashboardSetupDirective())
 		}
@@ -1714,7 +1732,7 @@ func (scope command) cmdUpdate() error {
 	fmt.Printf("updated to %s.\n", rel.Tag)
 	// v0.6.0+: agents arriving via the updater never ran the new `init`
 	// flow, so point them at dashboard setup too.
-	if cfg, err := client.LoadConfig(); err == nil && cfg.DashboardToken == "" {
+	if cfg, err := upgradeTransportConfig(); err == nil && cfg.DashboardToken == "" {
 		fmt.Println()
 		fmt.Println(dashboardSetupDirective())
 	}
@@ -1733,6 +1751,8 @@ func (scope command) cmdConfig(args []string) error {
 		return err
 	}
 	if len(args) == 0 {
+		relayMode, _ := transport.Resolve(cfg.RelayTransport, cfg.RelayURL)
+		fmt.Printf("relay_transport=%s\n", relayMode)
 		fmt.Printf("auto_update=%v\n", cfg.AutoUpdateEnabled())
 		fmt.Printf("relay=%s\n", cfg.RelayURL)
 		fmt.Printf("address=%s\n", cfg.Address)
@@ -1745,6 +1765,19 @@ func (scope command) cmdConfig(args []string) error {
 			return fmt.Errorf("usage: courier config get <key>")
 		}
 		switch args[1] {
+		case "relay_transport", "dashboard_transport":
+			mode, endpoint := cfg.RelayTransport, cfg.RelayURL
+			if args[1] == "dashboard_transport" {
+				mode, endpoint = cfg.DashboardTransport, cfg.DashboardURL
+				if endpoint == "" {
+					endpoint = client.DefaultDashboardURL
+				}
+			}
+			effective, err := transport.Resolve(mode, endpoint)
+			if err != nil {
+				return err
+			}
+			fmt.Println(effective)
 		case "auto_update":
 			fmt.Println(cfg.AutoUpdateEnabled())
 		case "relay":
@@ -1761,6 +1794,21 @@ func (scope command) cmdConfig(args []string) error {
 			return fmt.Errorf("usage: courier config set <key> <value>")
 		}
 		switch args[1] {
+		case "relay_transport", "dashboard_transport":
+			if args[2] != transport.DirectTLS {
+				return fmt.Errorf("only direct-tls is available; cloud transport is unavailable")
+			}
+			if err := cfg.Update(func(fresh *client.Config) error {
+				if args[1] == "relay_transport" {
+					fresh.RelayTransport = args[2]
+				} else {
+					fresh.DashboardTransport = args[2]
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			fmt.Printf("%s=direct-tls; endpoint, pin and identity unchanged\n", args[1])
 		case "auto_update":
 			v, err := strconv.ParseBool(args[2])
 			if err != nil {
@@ -1803,7 +1851,7 @@ func (scope command) cmdConfig(args []string) error {
 				fmt.Println("messages from anyone will be delivered normally.")
 			}
 		default:
-			return fmt.Errorf("unknown config key %q (settable: auto_update, relay, dm_policy)", args[1])
+			return fmt.Errorf("unknown config key %q (settable: auto_update, relay, relay_transport, dashboard_transport, dm_policy)", args[1])
 		}
 	default:
 		return fmt.Errorf("usage: courier config [get <key>|set <key> <value>]")
@@ -1858,10 +1906,7 @@ func (scope command) cmdDashboardSetup(args []string) error {
 	if err != nil {
 		return err
 	}
-	if *dashURL != "" {
-		cfg.DashboardURL = *dashURL
-	}
-	temp, err := client.New(cfg).DashboardSetup(name, *fingerprint)
+	temp, err := client.New(cfg).DashboardSetupAt(name, *fingerprint, *dashURL)
 	if err != nil {
 		return err
 	}

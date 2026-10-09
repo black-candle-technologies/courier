@@ -27,9 +27,11 @@ import (
 	"github.com/black-candle-technologies/courier/internal/relay"
 	"github.com/black-candle-technologies/courier/internal/store"
 	"github.com/black-candle-technologies/courier/internal/tlscert"
+	"github.com/black-candle-technologies/courier/internal/transport"
 )
 
 func main() {
+	mode := flag.String("transport", transport.DirectTLS, "transport mode (direct-tls only; cloud unavailable)")
 	addr := flag.String("addr", ":8470", "listen address")
 	dbPath := flag.String("db", "courier-relay.db", "sqlite database path")
 	retainDays := flag.Int("retain-days", 30, "delete envelopes older than this many days")
@@ -69,6 +71,9 @@ func main() {
 	takedownReason := flag.String("takedown-reason", "", "public reason for the takedown (required with -takedown)")
 	untakedown := flag.String("untakedown", "", "lift a directory handle tombstone (admin mode: applies and exits)")
 	flag.Parse()
+	if *mode != transport.DirectTLS {
+		log.Fatal("unsupported relay transport: only direct-tls is available; cloud requires platform support and security review")
+	}
 
 	// Parse the operator-registered bridge identities (issue #98)
 	// before building the relay config.

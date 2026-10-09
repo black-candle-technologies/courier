@@ -77,6 +77,9 @@ func (s Context) Principal() string     { return s.principal }
 func (s Context) Binding() RelayBinding { return s.binding }
 
 func (s Context) validateConfig(c *Config) error {
+	if err := c.validateTransport(); err != nil {
+		return err
+	}
 	if s.principal == "" {
 		return nil
 	}
