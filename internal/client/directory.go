@@ -46,6 +46,13 @@ type DirectoryProfile struct {
 // against. A profile that verifies neither way is rejected outright —
 // the client never resolves a handle to an unverified address.
 func verifyDirectoryProfile(p *DirectoryProfile) error {
+	if p == nil {
+		return fmt.Errorf("missing directory profile")
+	}
+	handle, err := envelope.NormalizeHandle(p.Handle)
+	if err != nil || handle != p.Handle {
+		return fmt.Errorf("directory profile has noncanonical handle")
+	}
 	addrEd, err := crypto.ParseAddress(p.Address)
 	if err != nil {
 		return fmt.Errorf("bad profile address: %w", err)
@@ -392,6 +399,9 @@ func (c *Client) DirectoryLookup(handle string) (*DirectoryProfile, error) {
 	if err := verifyDirectoryProfile(&p); err != nil {
 		return nil, err
 	}
+	if p.Handle != handle {
+		return nil, fmt.Errorf("directory lookup returned a different handle")
+	}
 	return &p, nil
 }
 
@@ -485,7 +495,9 @@ func (c *Client) LookupPeerHandle(address string) (string, error) {
 	if err == nil && len(profiles) > 0 {
 		handle = profiles[0].Handle
 	}
-	_ = c.cachePeerHandle(address, handle)
+	if err := c.cachePeerHandle(address, handle); err != nil {
+		return "", err
+	}
 	return handle, nil
 }
 

@@ -293,6 +293,10 @@ type fsCapEntry struct {
 
 // fsFile is ~/.courier/fs.json.
 type fsFile struct {
+	// LegacyEnabledPeers preserves explicit pre-automatic bootstrap authorization.
+	// Unlike FSPins, these entries are operator assertions, not handshake proof.
+	LegacyEnabledPeers map[string]bool `json:"legacy_enabled_peers,omitempty"`
+
 	Sessions       map[string]*fsSession `json:"sessions"`
 	CapCache       map[string]fsCapEntry `json:"cap_cache,omitempty"`
 	NegCapCache    map[string]int64      `json:"neg_cap_cache,omitempty"`
@@ -396,6 +400,27 @@ func (s Context) loadFSLocked() (*fsFile, error) {
 	if ff.DowngradeWarnedAt == nil {
 		ff.DowngradeWarnedAt = map[string]int64{}
 	}
+	if ff.RequireFS == nil {
+		ff.RequireFS = map[string]bool{}
+	}
+	var legacy struct {
+		PeerModes map[string]string `json:"peer_modes"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return nil, fmt.Errorf("fs.json legacy peer modes: %w", err)
+	}
+	for address, mode := range legacy.PeerModes {
+		if mode != "on" {
+			continue
+		}
+		if _, err := crypto.ParseAddress(address); err != nil {
+			continue
+		}
+		if ff.LegacyEnabledPeers == nil {
+			ff.LegacyEnabledPeers = map[string]bool{}
+		}
+		ff.LegacyEnabledPeers[address] = true
+	}
 	return ff, nil
 }
 
@@ -413,9 +438,18 @@ func (s Context) saveFSLocked(ff *fsFile) error {
 		return err
 	}
 	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
 	if _, err := tmp.Write(append(data, '\n')); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -426,7 +460,10 @@ func (s Context) saveFSLocked(ff *fsFile) error {
 		os.Remove(tmpName)
 		return err
 	}
-	return os.Rename(tmpName, p)
+	if err := renamePublishedFile(tmpName, p); err != nil {
+		return err
+	}
+	return syncPublishedDirectory(p)
 }
 
 // updateFS performs an atomic read-modify-write of fs.json under the
@@ -739,7 +776,7 @@ func (c *Client) fsPrepareSend(address string) (*fsSendOutput, error) {
 		if due {
 			// Best-effort: a failed init just means this message (and
 			// later ones, until the next due init) go legacy.
-			_ = c.sendFSInit(address)
+			_ = c.sendFSInitGuarded(address, true)
 		}
 	}
 	if required {
@@ -854,7 +891,7 @@ func (c *Client) fsShouldInit(address string) bool {
 		}
 	}
 	// Requiring FS explicitly authorizes a probe, even for private peers.
-	if ff.RequireFS[address] {
+	if ff.RequireFS[address] || ff.LegacyEnabledPeers[address] {
 		return true
 	}
 	// Issue #110: a pinned peer has proven FS support before. The pin
@@ -913,9 +950,14 @@ func (c *Client) fsDirectoryCapable(address string) bool {
 
 // ---- handshake ----
 
-// sendFSInit starts (or refreshes) an FS handshake with address: a
-// protocol DM sealed with the legacy seal, never in the sent log.
+// sendFSInit initiates opportunistically without replacing an active session.
 func (c *Client) sendFSInit(address string) error {
+	return c.sendFSInitGuarded(address, true)
+}
+
+// sendFSRecoveryInit deliberately replaces a stale session after an unknown-SID
+// frame. Ordinary opportunistic initiation must never use this recovery path.
+func (c *Client) sendFSRecoveryInit(address string) error {
 	return c.sendFSInitGuarded(address, false)
 }
 
@@ -966,8 +1008,9 @@ func (c *Client) sendFSInitGuarded(address string, preserveActive bool) error {
 			skipped = true
 			return nil
 		}
-		// Explicit start-fs bypasses fsPrepareSend's attempt clock. Persist its
-		// fresh probe with the pending session so immediate sends recognize it.
+		// Guarded initiation includes explicit start-fs, which bypasses
+		// fsPrepareSend's attempt clock. Persist the probe with its pending
+		// session so immediate sends recognize it.
 		if preserveActive {
 			ff.LastInitAt[address] = now
 		}
@@ -1595,7 +1638,7 @@ func (c *Client) fsDecryptMessage(from string, p fsPayload) (plain []byte, wrapK
 		return nil
 	})
 	if healInit {
-		_ = c.sendFSInit(from)
+		_ = c.sendFSRecoveryInit(from)
 	}
 	if err != nil {
 		crypto.Zero(wk[:])
@@ -1685,6 +1728,10 @@ func (c *Client) FSForget(peer string) error {
 // stale client cannot erase a peer that another process has saved again.
 // The bool is false when an alias still references the address.
 func (c *Client) FSCleanupOrphan(address string) (bool, error) {
+	return c.fsCleanupOrphanWithSave(address, (*Config).saveAtomic)
+}
+
+func (c *Client) fsCleanupOrphanWithSave(address string, save func(*Config) error) (bool, error) {
 	if _, err := crypto.ParseAddress(address); err != nil {
 		return false, fmt.Errorf("cleanup requires a full contact address: %w", err)
 	}
@@ -1698,6 +1745,11 @@ func (c *Client) FSCleanupOrphan(address string) (bool, error) {
 			if saved == address {
 				return nil
 			}
+		}
+		// A previous rename may be visible despite a failed directory sync.
+		// Republish the fresh mapping durably even on explicit cleanup retries.
+		if err := save(fresh); err != nil {
+			return err
 		}
 		ff, err := c.cfg.local().loadFSLocked()
 		if err != nil {
@@ -1714,6 +1766,8 @@ func (c *Client) FSCleanupOrphan(address string) (bool, error) {
 }
 
 func forgetFSAddress(ff *fsFile, address string) {
+	delete(ff.LastInitAt, address)
+	delete(ff.LegacyEnabledPeers, address)
 	delete(ff.Sessions, address)
 	// Contact removal is an explicit user action, not a downgrade:
 	// clear markers, including the suite-negotiation pin (issue
