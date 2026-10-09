@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +22,7 @@ func TestGroupLifecycleRemovalDelivery(t *testing.T) {
 	}
 	defer st.Close()
 	routes := relay.New(st).Routes()
+	var appSends atomic.Int64
 	var fail atomic.Bool
 	var activeGroup atomic.Value
 	var dashboard bytes.Buffer
@@ -30,6 +32,17 @@ func TestGroupLifecycleRemovalDelivery(t *testing.T) {
 			dashboard.Write(b)
 			w.Write([]byte(`{}`))
 			return
+		}
+		if r.Method == "POST" && r.URL.Path == "/v1/send" {
+			raw, _ := io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+			var req struct {
+				Kind string `json:"kind"`
+			}
+			_ = json.Unmarshal(raw, &req)
+			if req.Kind == "group" {
+				appSends.Add(1)
+			}
 		}
 		if fail.Load() && r.Method == "POST" && r.URL.Path == "/v1/send" {
 			gs, err := loadGroups()
@@ -94,8 +107,12 @@ func TestGroupLifecycleRemovalDelivery(t *testing.T) {
 	if rotated.MyKey == old || rotated.MyEpoch != 2 || inRoster(rotated.Roster, clients[2].cfg.Address) {
 		t.Fatal("removal/key rotation not durable")
 	}
+	beforeSends := appSends.Load()
 	if _, err = clients[0].GroupSend(g.ID, "must not send while key pending"); err == nil {
 		t.Fatal("pending key allowed application send")
+	}
+	if appSends.Load() != beforeSends {
+		t.Fatal("pending distribution emitted application ciphertext")
 	}
 	fail.Store(false)
 	if err = clients[0].GroupRemove(g.ID, clients[2].cfg.Address); err != nil {
