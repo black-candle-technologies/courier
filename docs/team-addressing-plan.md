@@ -14,7 +14,7 @@ This resolves the compatibility and trust gaps in [PR 162](https://github.com/bl
 
 ## Independent design review
 
-Independent review found the revised proposal suitable for owner review after corrections to expired-history catch-up, private invitation bootstrap, historical membership disclosure, member leaving, VHL scope, transfer proofs and expiry during long fanouts. That outcome does not approve implementation or merge. The acceptance tests and owner decisions below are release gates, not completed work.
+Independent review found the revised proposal suitable for owner review after corrections to expired-history catch-up, private invitation bootstrap, historical membership disclosure, member leaving, VHL scope, transfer proofs and expiry during long fanouts. That outcome does not approve implementation or merge. The acceptance tests, remaining owner decisions and downstream integration below remain release gates; the approved choices are recorded separately below.
 
 ## Direct assignments to existing peers
 
@@ -176,9 +176,9 @@ Hash the canonical payload, excluding signatures, with SHA256. The signature cov
 
 Version monotonicity detects replay of something older than a client has seen. It cannot prove that a malicious relay has shown the newest roster, particularly on a new device. State this limitation explicitly.
 
-Proposed initial defaults: owner-signed snapshots valid for no more than 24 hours, no expired-roster sends, and a fresh relay fetch before every new team send or retry operation. A relay that withholds an unexpired removal can still cause a sender to target the removed member until expiration. Removal is therefore not instantaneous revocation against a malicious relay. A compromised owner can sign harmful fresh rosters; signatures do not eliminate that risk.
+The approved first-release freshness policy permits owner-signed snapshots valid for no more than 24 hours and forbids expired-roster sends. Downstream integration must also provide a fresh relay fetch before every new team send or retry operation. A relay that withholds an unexpired removal can still cause a sender to target the removed member until expiration. Removal is therefore not instantaneous revocation against a malicious relay. A compromised owner can sign harmful fresh rosters; signatures do not eliminate that risk.
 
-The 24-hour bound trades availability for stale-membership exposure and needs product sign-off. Renewals require the owner or an explicitly provisioned signing service; installing a team must not silently authorize recurring roster signing. If stronger revocation is required, design an online owner freshness attestation or a transparency/witness service as a separate protocol. A nonce echoed by the relay alone does not solve malicious-relay withholding.
+Riley approved the 24-hour bound and its availability versus stale-membership tradeoff on 2026-10-09, as recorded in the pinned Packet B decision record below. Renewals require the owner or an explicitly provisioned signing service; installing a team must not silently authorize recurring roster signing. If stronger revocation is required, design an online owner freshness attestation or a transparency/witness service as a separate protocol. A nonce echoed by the relay alone does not solve malicious-relay withholding.
 
 ## Invitations and privacy
 
@@ -229,7 +229,7 @@ Legacy installs retain their principal and current relay pin; do not re-init, re
 
 - **Parser:** `@crew` always remains one directory lookup, even if a team called crew exists; failed lookup never broadcasts. Verify `handle:crew`, raw addresses, ordinary contacts, manually edited or legacy-invalid contacts containing `@`, malformed selectors and flags in documented positions.
 - **Context isolation:** colliding relay message IDs do not hide messages; inbox/push/state replay sets remain independent; groups, FS, VHL and dashboard state never cross principals; alias renames do not reset trust; changed endpoints/pins fail closed; daemon and command concurrency cannot select different identities mid-operation.
-- **Roster integrity:** altered member, owner, origin, expiry, visibility or suite fails; duplicate keys/handles/addresses and canonicalization variants fail; lower versions, gaps, equal-version forks, integer overflow and missing owner transitions fail; identical snapshots are idempotent.
+- **Roster integrity:** altered member, owner, origin, expiry, visibility or suite fails; duplicate keys/handles/addresses, invalid field encodings and unsorted members fail; equivalent valid JSON whitespace or escaping produces identical canonical bytes; lower versions, gaps, equal-version forks, integer overflow and missing owner transitions fail; identical snapshots are idempotent.
 - **Trust and recovery:** self-signed replacement owners cannot bootstrap trust; a new device must import a verified checkpoint; a reset cache cannot silently inherit trust; tombstone/slug recreation never rebinds an alias; old/new owner dual signatures and lost-key recovery paths are tested.
 - **Freshness:** an unexpired frozen head demonstrates the documented stale-member window; expiration and clock rollback stop sends; missing chain pages and private-read revocation fail visibly; a relay nonce is not accepted as owner freshness.
 - **Consent and privacy:** wrong invite nonce/team/handle/member/owner/visibility, replay, cancellation, expiry and transfer all block admission; pending invitees cannot fetch private rosters; removal updates ACLs atomically; unapproved visibility expansion fails.
@@ -239,14 +239,16 @@ Legacy installs retain their principal and current relay pin; do not re-init, re
 
 Require protocol golden vectors, adversarial relay fixtures, cross-process race tests and migration crash injection in addition to happy-path CLI tests. This proposal is not a claim that those tests have run or passed.
 
-## Decisions that still need an owner
+## Approved choices and remaining decisions
 
-1. **Freshness budget:** accept the proposed maximum 24-hour stale-membership exposure and renewal burden, or fund an online owner/witness design for stronger revocation. This is the main security versus availability choice.
-2. **Private-only first release:** recommended. Public discovery and nonmember directory readers need a deliberate metadata-disclosure and consent policy.
-3. **Key reuse across relays:** approve the recommended one-relay-per-principal restriction for the first release, or require a separate cross-relay replay, trust and rotation design before allowing reuse. Do not accidentally permit it through arbitrary config paths.
-4. **Owner recovery:** ship without automatic recovery, as recommended, or design a separately reviewed recovery key or threshold-owner model. The relay must not become an implicit recovery authority.
-5. **Membership privacy and leaving:** approve disclosure of historical full rosters to current and future members, and owner-dependent removal in v1, or require compact membership proofs and independently verifiable withdrawals before release. These limits must be visible in invitations.
-6. **Fanout scale and ergonomics:** choose measured roster/operation limits and approve the exact CLI spelling. The invariant is explicit fanout and preserved existing address semantics; the spelling can change without weakening it.
+The original recommendations below were subsequently approved for implementation by Riley. The pinned [Packet B decision record](https://github.com/black-candle-technologies/courier/blob/a9af611aa478eb103a66300b133e98c098665abe/docs/packet-b-team-wire.md#decisions-and-dependency) records D1/D2/D4/D5 and the CLI portion of D6 at 2026-10-09 01:41 UTC, with D3 separately approved. These approvals do not authorize provisioning, actual disclosure, sending, deployment or merge; numeric budgets and downstream integration/release gates remain pending.
+
+1. **D1 freshness — approved:** owner-signed roster lifetimes of at most 24 hours and no expired sends, accepting bounded stale-membership exposure and the renewal burden. Stronger revocation requires a separately reviewed online owner/witness design.
+2. **D2 private-only first release — approved:** private invitation-only teams. Public discovery and nonmember directory readers require a separate metadata-disclosure and consent policy.
+3. **D3 key reuse across relays — approved:** one relay security binding per principal for the first release. Cross-relay reuse requires a separate replay, trust and rotation design; arbitrary config paths must not bypass this restriction.
+4. **D4 owner recovery — approved:** no automatic lost-owner recovery. A recovery key or threshold-owner model requires separate review; the relay cannot become an implicit recovery authority.
+5. **D5 membership privacy and leaving — approved:** historical full-roster disclosure to current and future members, with owner-dependent removal and local blocking in v1. These limits must be visible in invitations.
+6. **D6 CLI — approved; numeric policy pending:** explicit text-only `send --team`, preserving existing address semantics. Measured roster/operation limits, retention and other numeric budgets still require owner/reviewer approval, along with downstream integration and release checks.
 
 RSA selection, autonomous harness authority and automatic group synchronization are separate proposals, not unresolved prerequisites for team addressing.
 
