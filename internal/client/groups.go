@@ -125,6 +125,10 @@ func loadGroupsLocked() (map[string]*groupState, error) {
 }
 
 func saveGroupsLocked(gs map[string]*groupState) error {
+	return saveGroupsWithPublication(gs, renamePublishedFile, syncPublishedDirectory)
+}
+
+func saveGroupsWithPublication(gs map[string]*groupState, rename func(string, string) error, syncDir func(string) error) error {
 	p, err := groupsFilePath()
 	if err != nil {
 		return err
@@ -138,9 +142,18 @@ func saveGroupsLocked(gs map[string]*groupState) error {
 		return err
 	}
 	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
 	if _, err := tmp.Write(append(data, '\n')); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -151,7 +164,10 @@ func saveGroupsLocked(gs map[string]*groupState) error {
 		os.Remove(tmpName)
 		return err
 	}
-	return os.Rename(tmpName, p)
+	if err := rename(tmpName, p); err != nil {
+		return err
+	}
+	return syncDir(p)
 }
 
 // updateGroups performs an atomic read-modify-write of groups.json under
@@ -327,7 +343,19 @@ func (c *Client) rotateMyKey(g *groupState) error {
 // retryGroupKey distributes an immutable, already committed snapshot outside
 // the config lock. Clear only that generation; newer rotations remain pending.
 func (c *Client) retryGroupKey(groupID string) error {
-	gs, err := loadGroups()
+	return c.retryGroupKeyWithSave(groupID, saveGroupsLocked)
+}
+
+func (c *Client) retryGroupKeyWithSave(groupID string, save func(map[string]*groupState) error) error {
+	var gs map[string]*groupState
+	err := withConfigLock(func() error {
+		var err error
+		gs, err = loadGroupsLocked()
+		if err != nil {
+			return err
+		}
+		return save(gs)
+	})
 	if err != nil {
 		return err
 	}
