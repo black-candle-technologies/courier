@@ -183,8 +183,6 @@ func (scope command) cmdGroup(args []string) error {
 	return nil
 }
 
-func cmdGroup(args []string) error { return (command{context: client.LegacyContext()}).cmdGroup(args) }
-
 // cmdGroupInbox syncs direct messages first (group invitations and
 // sender-key updates arrive as DMs), then reads the group's messages.
 func cmdGroupInbox(cl *client.Client, cfg *client.Config, groupID string) error {

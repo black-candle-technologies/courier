@@ -43,8 +43,6 @@ func (s Context) configLockPath() (string, error) {
 	return s.path("config.lock")
 }
 
-func configLockPath() (string, error) { return LegacyContext().configLockPath() }
-
 // acquireConfigLock opens (creating) the lock file and takes an
 // exclusive, blocking flock on it. The lock is advisory and only
 // coordinates Courier processes (which is the threat model here); a
@@ -92,5 +90,3 @@ func (s Context) withConfigLock(fn func() error) error {
 	}
 	return fn()
 }
-
-func withConfigLock(fn func() error) error { return LegacyContext().withConfigLock(fn) }

@@ -68,8 +68,6 @@ func (scope command) cmdWake(args []string) error {
 	return daemon.Run(ctx)
 }
 
-func cmdWake(args []string) error { return (command{context: client.LegacyContext()}).cmdWake(args) }
-
 // cmdWakeInstall writes a systemd user unit that runs the wake daemon
 // persistently. Installing is the explicit opt-in: wake never starts
 // on its own.

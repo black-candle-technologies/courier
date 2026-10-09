@@ -40,5 +40,3 @@ func (s Context) warnLegacyChannels() error {
 	fmt.Fprintln(os.Stderr, "warning: retired channels.json still contains channel history and secrets; see docs/legacy-channel-retirement.md for explicit export and cleanup. Courier does not migrate or delete it automatically.")
 	return nil
 }
-
-func warnLegacyChannels() error { return LegacyContext().warnLegacyChannels() }

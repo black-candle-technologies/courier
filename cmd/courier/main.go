@@ -346,8 +346,6 @@ func (scope command) cmdInit(args []string) error {
 	return nil
 }
 
-func cmdInit(args []string) error { return (command{context: client.LegacyContext()}).cmdInit(args) }
-
 // autoWakeDirective informs the installing agent that wake-on-message is an
 // opt-in feature: the agent must ask its user before enabling anything.
 func autoWakeDirective() string {
@@ -384,8 +382,6 @@ func (scope command) cmdAddress() error {
 	fmt.Println(cfg.Address)
 	return nil
 }
-
-func cmdAddress() error { return (command{context: client.LegacyContext()}).cmdAddress() }
 
 func (scope command) cmdSend(args []string) error {
 	fs := flag.NewFlagSet("send", flag.ContinueOnError)
@@ -548,8 +544,6 @@ func (scope command) cmdSend(args []string) error {
 	}
 	return nil
 }
-
-func cmdSend(args []string) error { return (command{context: client.LegacyContext()}).cmdSend(args) }
 
 // eqValue returns the value of a --name=value argument. An empty value
 // is rejected the same way a missing trailing value is: silently
@@ -928,8 +922,6 @@ func (scope command) cmdInbox(args []string) error {
 	return nil
 }
 
-func cmdInbox(args []string) error { return (command{context: client.LegacyContext()}).cmdInbox(args) }
-
 // ---- stdio bridge: JSON lines on stdin/stdout for agent integration ----
 
 type stdioReq struct {
@@ -1050,8 +1042,6 @@ func (scope command) cmdStdio() error {
 	return sc.Err()
 }
 
-func cmdStdio() error { return (command{context: client.LegacyContext()}).cmdStdio() }
-
 func bytesTrimSpace(b []byte) []byte {
 	return []byte(strings.TrimSpace(string(b)))
 }
@@ -1110,8 +1100,6 @@ func (scope command) cmdServe(args []string) error {
 	fmt.Printf("courier local server on http://%s\n", *listen)
 	return http.ListenAndServe(*listen, mux)
 }
-
-func cmdServe(args []string) error { return (command{context: client.LegacyContext()}).cmdServe(args) }
 
 func writeSvcJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -1453,10 +1441,6 @@ func (scope command) cmdReceipts(args []string) error {
 	return nil
 }
 
-func cmdReceipts(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdReceipts(args)
-}
-
 // ---- spam / abuse filtering CLI ----
 
 // cmdBlock blocks a sender, or lists the blocklist with `block list`.
@@ -1494,8 +1478,6 @@ func (scope command) cmdBlock(args []string) error {
 	return nil
 }
 
-func cmdBlock(args []string) error { return (command{context: client.LegacyContext()}).cmdBlock(args) }
-
 // cmdUnblock removes a sender from the blocklist.
 func (scope command) cmdUnblock(args []string) error {
 	if len(args) != 1 {
@@ -1519,10 +1501,6 @@ func (scope command) cmdUnblock(args []string) error {
 	return nil
 }
 
-func cmdUnblock(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdUnblock(args)
-}
-
 // cmdReportSpam files a signed spam report with the relay. Reports are
 // idempotent per (sender, reporter): only distinct reporters count
 // toward the relay's throttle threshold.
@@ -1543,10 +1521,6 @@ func (scope command) cmdReportSpam(args []string) error {
 	}
 	fmt.Printf("spam report filed for message #%d.\n", id)
 	return nil
-}
-
-func cmdReportSpam(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdReportSpam(args)
 }
 
 // ---- message requests ----
@@ -1640,10 +1614,6 @@ func (scope command) cmdRequest(args []string) error {
 	}
 }
 
-func cmdRequest(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdRequest(args)
-}
-
 // ---- v0.5.0: key rotation ----
 
 func (scope command) cmdRotate(args []string) error {
@@ -1668,10 +1638,6 @@ func (scope command) cmdRotate(args []string) error {
 	return nil
 }
 
-func cmdRotate(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdRotate(args)
-}
-
 func (scope command) cmdPublishKey() error {
 	cfg, err := scope.context.LoadConfig()
 	if err != nil {
@@ -1683,8 +1649,6 @@ func (scope command) cmdPublishKey() error {
 	fmt.Println("encryption key published to the relay.")
 	return nil
 }
-
-func cmdPublishKey() error { return (command{context: client.LegacyContext()}).cmdPublishKey() }
 
 // ---- v0.5.0: self-update ----
 
@@ -1721,8 +1685,6 @@ func (scope command) cmdUpdate() error {
 	fmt.Println(autoWakeDirective())
 	return nil
 }
-
-func cmdUpdate() error { return (command{context: client.LegacyContext()}).cmdUpdate() }
 
 // ---- v0.5.0: config ----
 
@@ -1812,10 +1774,6 @@ func (scope command) cmdConfig(args []string) error {
 	return nil
 }
 
-func cmdConfig(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdConfig(args)
-}
-
 // ---- v0.6.0: dashboard ----
 
 func (scope command) cmdDashboard(args []string) error {
@@ -1834,10 +1792,6 @@ func (scope command) cmdDashboard(args []string) error {
 	default:
 		return fmt.Errorf("unknown dashboard subcommand %q (setup|push|status|set-admin)", args[0])
 	}
-}
-
-func cmdDashboard(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdDashboard(args)
 }
 
 // cmdDashboardSetup registers the dashboard user. The agent obtains a
@@ -1887,10 +1841,6 @@ func (scope command) cmdDashboardSetup(args []string) error {
 	return nil
 }
 
-func cmdDashboardSetup(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdDashboardSetup(args)
-}
-
 // cmdDashboardPush forwards newly decrypted inbox messages to the
 // dashboard. With --follow it runs as a poller.
 func (scope command) cmdDashboardPush(args []string) error {
@@ -1929,10 +1879,6 @@ func (scope command) cmdDashboardPush(args []string) error {
 	return nil
 }
 
-func cmdDashboardPush(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdDashboardPush(args)
-}
-
 func (scope command) cmdDashboardStatus() error {
 	cfg, err := scope.context.LoadConfig()
 	if err != nil {
@@ -1948,10 +1894,6 @@ func (scope command) cmdDashboardStatus() error {
 	fmt.Printf("cursor:   %d (last pushed courier message id)\n", cfg.DashboardCursor)
 	fmt.Printf("sent:     %d (last pushed sent message id)\n", cfg.DashboardSentCursor)
 	return nil
-}
-
-func cmdDashboardStatus() error {
-	return (command{context: client.LegacyContext()}).cmdDashboardStatus()
 }
 
 // cmdDashboardSetAdmin grants or revokes dashboard admin rights (issue

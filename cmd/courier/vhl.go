@@ -70,8 +70,6 @@ func (scope command) cmdVHL(args []string) error {
 	}
 }
 
-func cmdVHL(args []string) error { return (command{context: client.LegacyContext()}).cmdVHL(args) }
-
 // cmdVHLApprover dispatches the approver subcommand group: add, list,
 // and remove replace the old top-level enroll/approvers/unenroll
 // commands (issue #146).

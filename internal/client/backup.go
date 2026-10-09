@@ -33,6 +33,9 @@ func defaultDeviceName() string {
 
 // backupPayload builds the inner envelope from the live config.
 func (c *Config) backupPayload(kind, device string) (*crypto.BackupPayload, error) {
+	if err := c.local().validateConfig(c); err != nil {
+		return nil, err
+	}
 	if kind != crypto.BackupKindBackup && kind != crypto.BackupKindSync {
 		return nil, fmt.Errorf("bad backup kind %q", kind)
 	}
@@ -192,6 +195,12 @@ func (c *Config) MergeSyncKeys(p *crypto.BackupPayload) (added int, err error) {
 	}
 	if p.Kind != crypto.BackupKindSync {
 		return 0, fmt.Errorf("not a sync envelope (kind %q): `backup import-sync` merges sync envelopes, `backup restore` installs backups", p.Kind)
+	}
+	if scope := c.local(); scope.principal != "" {
+		origin, e := NormalizeRelayOrigin(p.RelayURL)
+		if e != nil || origin != scope.binding.Endpoint || p.RelayFingerprint != scope.binding.Pin {
+			return 0, ErrContextMismatch
+		}
 	}
 	err = c.Update(func(fresh *Config) error {
 		if fresh.Address != p.Address {

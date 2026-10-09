@@ -103,10 +103,6 @@ func (scope command) cmdDirectory(args []string) error {
 	}
 }
 
-func cmdDirectory(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdDirectory(args)
-}
-
 func cmdDirectoryRegister(c *client.Client, args []string) error {
 	fs := flag.NewFlagSet("directory register", flag.ContinueOnError)
 	visibility := fs.String("visibility", "private", "public, unlisted, or private")

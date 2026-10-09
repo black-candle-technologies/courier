@@ -146,3 +146,39 @@ func TestHostsAliasesAndSecurityBindings(t *testing.T) {
 		t.Fatal("default gate bypassed")
 	}
 }
+
+func TestContextRequiredFSAndVHLDoNotCross(t *testing.T) {
+	a, b := Context{root: t.TempDir()}, Context{root: t.TempDir()}
+	first, err := NewIdentity("https://fixture.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewIdentity("https://fixture.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.localContext = &a
+	second.localContext = &b
+	if err = first.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err = second.Save(); err != nil {
+		t.Fatal(err)
+	}
+	ca, cb := New(first), New(second)
+	if err = ca.FSRequire(second.Address, true); err != nil {
+		t.Fatal(err)
+	}
+	if err = ca.VHLSetRequiredTier(1); err != nil {
+		t.Fatal(err)
+	}
+	if required, err := ca.FSRequired(second.Address); err != nil || !required {
+		t.Fatal(required, err)
+	}
+	if required, err := cb.FSRequired(second.Address); err != nil || required {
+		t.Fatal("FS policy leaked", err)
+	}
+	if tier, err := cb.VHLGetRequiredTier(); err != nil || tier != 0 {
+		t.Fatal("VHL policy leaked", err)
+	}
+}

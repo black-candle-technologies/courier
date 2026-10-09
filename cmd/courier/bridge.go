@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/black-candle-technologies/courier/internal/bridge"
-	"github.com/black-candle-technologies/courier/internal/client"
 )
 
 // defaultBridgeDB is the production bridge.db path. Overridable with
@@ -44,10 +43,6 @@ func (scope command) cmdBridge(args []string) error {
 	default:
 		return fmt.Errorf("unknown bridge subcommand %q (token|audit|trust)", args[0])
 	}
-}
-
-func cmdBridge(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdBridge(args)
 }
 
 func cmdBridgeToken(args []string) error {
@@ -348,8 +343,4 @@ func (scope command) cmdBridgeTrust(args []string) error {
 	fmt.Println("pinned bridge gateway:", addr)
 	fmt.Println("Messages from this address will be flagged as bridged (phase-2 rendering).")
 	return nil
-}
-
-func cmdBridgeTrust(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdBridgeTrust(args)
 }

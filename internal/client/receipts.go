@@ -192,8 +192,6 @@ func (s Context) loadReceiptsLocked() (*receiptStore, error) {
 	return &rs, nil
 }
 
-func loadReceiptsLocked() (*receiptStore, error) { return LegacyContext().loadReceiptsLocked() }
-
 func (s Context) saveReceiptsLocked(rs *receiptStore) error {
 	p, err := s.receiptsFilePath()
 	if err != nil {
@@ -226,8 +224,6 @@ func (s Context) saveReceiptsLocked(rs *receiptStore) error {
 	}
 	return os.Rename(tmpName, p)
 }
-
-func saveReceiptsLocked(rs *receiptStore) error { return LegacyContext().saveReceiptsLocked(rs) }
 
 // updateReceipts performs an atomic read-modify-write of receipts.json
 // under the cross-process config lock (same discipline as groups.json

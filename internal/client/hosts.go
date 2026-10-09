@@ -14,7 +14,7 @@ import (
 )
 
 var ErrContextsDisabled = errors.New("named Courier contexts are disabled")
-var ErrContextMismatch = errors.New("Courier context security binding mismatch")
+var ErrContextMismatch = errors.New("courier context security binding mismatch")
 
 // RelayBinding is public routing metadata, not credentials. ID is a stable local
 // identifier, independent of the host alias. Endpoint and Pin must be explicitly

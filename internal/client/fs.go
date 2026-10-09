@@ -334,8 +334,6 @@ func (s Context) fsFilePath() (string, error) {
 	return s.path("fs.json")
 }
 
-func fsFilePath() (string, error) { return LegacyContext().fsFilePath() }
-
 func (ff *fsFile) session(peer string) *fsSession {
 	if ff.Sessions == nil {
 		ff.Sessions = map[string]*fsSession{}
@@ -401,8 +399,6 @@ func (s Context) loadFSLocked() (*fsFile, error) {
 	return ff, nil
 }
 
-func loadFSLocked() (*fsFile, error) { return LegacyContext().loadFSLocked() }
-
 func (s Context) saveFSLocked(ff *fsFile) error {
 	p, err := s.fsFilePath()
 	if err != nil {
@@ -432,8 +428,6 @@ func (s Context) saveFSLocked(ff *fsFile) error {
 	}
 	return os.Rename(tmpName, p)
 }
-
-func saveFSLocked(ff *fsFile) error { return LegacyContext().saveFSLocked(ff) }
 
 // updateFS performs an atomic read-modify-write of fs.json under the
 // cross-process config lock (same discipline as updateState).
@@ -479,8 +473,6 @@ func (s Context) removeFSState() error {
 	}
 	return nil
 }
-
-func removeFSState() error { return LegacyContext().removeFSState() }
 
 // ---- helpers ----
 

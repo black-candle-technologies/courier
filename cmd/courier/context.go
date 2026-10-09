@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -56,6 +57,9 @@ func selectCommand(args []string) (command, []string, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&hosts); err != nil {
 		return scope, nil, err
+	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		return scope, nil, fmt.Errorf("hosts registry must contain exactly one JSON object")
 	}
 	ctx, err := hosts.Resolve(root, host, identity)
 	if err != nil {

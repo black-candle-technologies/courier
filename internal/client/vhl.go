@@ -68,8 +68,6 @@ func (s Context) vhlFilePath() (string, error) {
 	return s.path("vhl.json")
 }
 
-func vhlFilePath() (string, error) { return LegacyContext().vhlFilePath() }
-
 func newVHLFile() *vhlFile {
 	return &vhlFile{
 		Registry:     vhl.NewRegistry(),
@@ -118,8 +116,6 @@ func (s Context) loadVHLLocked() (*vhlFile, error) {
 	return ff, nil
 }
 
-func loadVHLLocked() (*vhlFile, error) { return LegacyContext().loadVHLLocked() }
-
 func (s Context) saveVHLLocked(ff *vhlFile) error {
 	p, err := s.vhlFilePath()
 	if err != nil {
@@ -156,8 +152,6 @@ func (s Context) saveVHLLocked(ff *vhlFile) error {
 	}
 	return os.Rename(tmpName, p)
 }
-
-func saveVHLLocked(ff *vhlFile) error { return LegacyContext().saveVHLLocked(ff) }
 
 // updateVHL performs an atomic read-modify-write of vhl.json under
 // the cross-process config lock (same discipline as updateFS).
@@ -204,8 +198,6 @@ func (s Context) removeVHLState() error {
 	}
 	return nil
 }
-
-func removeVHLState() error { return LegacyContext().removeVHLState() }
 
 // vhlBootIDOnce generates this process's VHL boot id. Session tokens
 // are bound to the boot id of the process that minted them; a restart

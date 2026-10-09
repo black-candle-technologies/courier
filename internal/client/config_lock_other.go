@@ -28,8 +28,6 @@ func (s Context) withConfigLock(fn func() error) error {
 	return fn()
 }
 
-func withConfigLock(fn func() error) error { return LegacyContext().withConfigLock(fn) }
-
 func (s Context) acquireConfigLock() (func(), error) {
 	return nil, fmt.Errorf("cross-process locks unavailable on this platform")
 }

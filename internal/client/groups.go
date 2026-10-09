@@ -100,8 +100,6 @@ func (s Context) groupsFilePath() (string, error) {
 	return s.path("groups.json")
 }
 
-func groupsFilePath() (string, error) { return LegacyContext().groupsFilePath() }
-
 func (s Context) loadGroupsLocked() (map[string]*groupState, error) {
 	p, err := s.groupsFilePath()
 	if err != nil {
@@ -120,8 +118,6 @@ func (s Context) loadGroupsLocked() (map[string]*groupState, error) {
 	}
 	return gs, nil
 }
-
-func loadGroupsLocked() (map[string]*groupState, error) { return LegacyContext().loadGroupsLocked() }
 
 func (s Context) saveGroupsLocked(gs map[string]*groupState) error {
 	p, err := s.groupsFilePath()
@@ -153,8 +149,6 @@ func (s Context) saveGroupsLocked(gs map[string]*groupState) error {
 	return os.Rename(tmpName, p)
 }
 
-func saveGroupsLocked(gs map[string]*groupState) error { return LegacyContext().saveGroupsLocked(gs) }
-
 // updateGroups performs an atomic read-modify-write of groups.json under
 // the cross-process config lock (same discipline as Config.Update).
 func (s Context) updateGroups(fn func(map[string]*groupState) error) error {
@@ -168,10 +162,6 @@ func (s Context) updateGroups(fn func(map[string]*groupState) error) error {
 		}
 		return s.saveGroupsLocked(gs)
 	})
-}
-
-func updateGroups(fn func(map[string]*groupState) error) error {
-	return LegacyContext().updateGroups(fn)
 }
 
 // loadGroups returns a copy of the local group records.

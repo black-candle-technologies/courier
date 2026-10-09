@@ -34,10 +34,6 @@ func (scope command) cmdAttachments(args []string) error {
 	}
 }
 
-func cmdAttachments(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdAttachments(args)
-}
-
 func (scope command) cmdAttachmentsFetch(args []string) error {
 	fs := flag.NewFlagSet("attachments fetch", flag.ContinueOnError)
 	msgID := fs.Int64("message", 0, "relay id of the already-delivered message to re-fetch")
@@ -97,8 +93,4 @@ func (scope command) cmdAttachmentsFetch(args []string) error {
 		return fmt.Errorf("some attachments of message #%d could not be downloaded", msg.ID)
 	}
 	return nil
-}
-
-func cmdAttachmentsFetch(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdAttachmentsFetch(args)
 }

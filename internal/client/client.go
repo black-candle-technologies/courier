@@ -226,8 +226,6 @@ func (s Context) loadConfigRaw() (*Config, error) {
 	return &c, nil
 }
 
-func loadConfigRaw() (*Config, error) { return LegacyContext().loadConfigRaw() }
-
 // seenConsumer identifies one of the independent consumers that read
 // the inbox. Each tracks its own replay-suppression set (issue #45):
 // the inbox poller and the dashboard pusher must never consume each
@@ -301,14 +299,14 @@ func migrateEncKeys(c *Config) error {
 
 // LoadConfig reads the local identity.
 func (s Context) LoadConfig() (*Config, error) {
+	c, err := s.loadConfigRaw()
+	if err != nil {
+		return nil, err
+	}
 	if err := s.warnLegacyChannels(); err != nil {
 		return nil, err
 	}
 	if err := s.maintainLegacyState(); err != nil {
-		return nil, err
-	}
-	c, err := s.loadConfigRaw()
-	if err != nil {
 		return nil, err
 	}
 	migrated := false
@@ -388,8 +386,11 @@ func (c *Config) saveAtomic() error {
 // otherwise fields another process changed meanwhile (e.g. rotated
 // encryption keys) are silently clobbered.
 func (c *Config) Save() error {
+	configMu.Lock()
 	c.bindLegacyContext()
-	return c.local().withConfigLock(func() error { return c.saveAtomic() })
+	scope := c.local()
+	configMu.Unlock()
+	return scope.withConfigLock(func() error { return c.saveAtomic() })
 }
 
 // Update performs an atomic read-modify-write: it takes the cross-process
@@ -399,8 +400,11 @@ func (c *Config) Save() error {
 // mutating a stale in-memory Config and calling Save would clobber fields
 // another process wrote meanwhile (v0.6.11 F5).
 func (c *Config) Update(fn func(*Config) error) error {
+	configMu.Lock()
 	c.bindLegacyContext()
-	return c.local().withConfigLock(func() error {
+	scope := c.local()
+	configMu.Unlock()
+	return scope.withConfigLock(func() error {
 		fresh, err := c.local().loadConfigRaw()
 		if err != nil {
 			return err
@@ -419,7 +423,7 @@ func (c *Config) Update(fn func(*Config) error) error {
 		if err := fresh.saveAtomic(); err != nil {
 			return err
 		}
-		*c = *fresh
+		c.refreshState(fresh)
 		return nil
 	})
 }
@@ -714,7 +718,9 @@ func (c *Client) RotateKey() (published bool, err error) {
 		return false, err
 	}
 
-	*c.cfg = *fresh
+	configMu.Lock()
+	c.cfg.refreshState(fresh)
+	configMu.Unlock()
 	if err := c.PublishKey(); err != nil {
 		return false, fmt.Errorf("key rotated locally but NOT published: %w (run `courier publish-key` to announce it)", err)
 	}
@@ -1554,8 +1560,6 @@ func (s Context) rewriteSentLogLocked(entries []SentEntry) error {
 	}
 	return os.Rename(tmpName, p)
 }
-
-func rewriteSentLog(entries []SentEntry) error { return LegacyContext().rewriteSentLog(entries) }
 
 // appendSentLog records a sent message, pruning the log to maxSentLog.
 func (s Context) appendSentLogLocked(e SentEntry) error {
@@ -2969,9 +2973,44 @@ func (s Context) readSentLog() (entries []SentEntry, err error) {
 	err = s.withConfigLock(func() error { var e error; entries, e = s.readSentLogLocked(); return e })
 	return
 }
-func (s Context) rewriteSentLog(entries []SentEntry) error {
-	return s.withConfigLock(func() error { return s.rewriteSentLogLocked(entries) })
-}
+
 func (s Context) appendSentLog(e SentEntry) error {
 	return s.withConfigLock(func() error { return s.appendSentLogLocked(e) })
+}
+
+// refreshState deliberately leaves the captured context immutable.
+// The caller holds configMu; only persisted fields are refreshed.
+func (c *Config) refreshState(fresh *Config) {
+	c.Version = fresh.Version
+	c.RelayURL = fresh.RelayURL
+	c.Seed = fresh.Seed
+	c.Address = fresh.Address
+	c.Cursor = fresh.Cursor
+	c.RelayFingerprint = fresh.RelayFingerprint
+	c.Contacts = fresh.Contacts
+	c.ContactVerifications = fresh.ContactVerifications
+	c.EncKeys = fresh.EncKeys
+	c.AutoUpdate = fresh.AutoUpdate
+	c.UpdateCheckedAt = fresh.UpdateCheckedAt
+	c.DashboardURL = fresh.DashboardURL
+	c.DashboardUser = fresh.DashboardUser
+	c.DashboardToken = fresh.DashboardToken
+	c.DashboardFingerprint = fresh.DashboardFingerprint
+	c.DashboardCursor = fresh.DashboardCursor
+	c.DashboardSentCursor = fresh.DashboardSentCursor
+	c.VerifiedKeyEpochs = fresh.VerifiedKeyEpochs
+	c.SeenEnvelopeHashes = fresh.SeenEnvelopeHashes
+	c.SeenInboxHashes = fresh.SeenInboxHashes
+	c.SeenPushHashes = fresh.SeenPushHashes
+	c.ReceiptContacts = fresh.ReceiptContacts
+	c.DMPolicy = fresh.DMPolicy
+	c.Blocked = fresh.Blocked
+	c.Dismissed = fresh.Dismissed
+	c.DirectoryHandle = fresh.DirectoryHandle
+	c.DirectoryEpoch = fresh.DirectoryEpoch
+	c.Introductions = fresh.Introductions
+	c.HandleCache = fresh.HandleCache
+	c.HandleRefreshAt = fresh.HandleRefreshAt
+	c.WakeCursor = fresh.WakeCursor
+	c.BridgeGateways = fresh.BridgeGateways
 }

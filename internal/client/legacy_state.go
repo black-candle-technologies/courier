@@ -187,5 +187,3 @@ func (s Context) maintainLegacyState() error {
 		return os.Rename(name, p)
 	})
 }
-
-func maintainLegacyState() error { return LegacyContext().maintainLegacyState() }

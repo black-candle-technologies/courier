@@ -37,8 +37,6 @@ func (s Context) configLockPath() (string, error) {
 	return s.path("config.lock")
 }
 
-func configLockPath() (string, error) { return LegacyContext().configLockPath() }
-
 // lockFileEx takes an exclusive LockFileEx over byte range [0,1) of f.
 // When blocking is false, LOCKFILE_FAIL_IMMEDIATELY is set so the call
 // returns ERROR_LOCK_VIOLATION instead of waiting for the lock.
@@ -105,5 +103,3 @@ func (s Context) withConfigLock(fn func() error) error {
 	}
 	return fn()
 }
-
-func withConfigLock(fn func() error) error { return LegacyContext().withConfigLock(fn) }

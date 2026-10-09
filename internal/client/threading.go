@@ -151,8 +151,6 @@ func (s Context) replyCachePath() (string, error) {
 	return s.path("thread_cache.jsonl")
 }
 
-func replyCachePath() (string, error) { return LegacyContext().replyCachePath() }
-
 // readReplyCache returns cached entries, oldest first. A missing or
 // corrupt file yields no entries, never an error: the cache is a
 // best-effort accelerator.

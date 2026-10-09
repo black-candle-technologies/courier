@@ -40,10 +40,6 @@ func (scope command) cmdBackup(args []string) error {
 	}
 }
 
-func cmdBackup(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdBackup(args)
-}
-
 // splitBackupArgs extracts the backup subcommand flags wherever they
 // appear. Go's flag package stops parsing at the first positional
 // argument, so `backup restore file --force` would otherwise break —
@@ -165,10 +161,6 @@ func (scope command) cmdBackupCreate(args []string) error {
 	return nil
 }
 
-func cmdBackupCreate(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdBackupCreate(args)
-}
-
 func (scope command) cmdBackupExportSync(args []string) error {
 	positionals, output, deviceName, passphraseEnv, _ := splitBackupArgs(args)
 	if len(positionals) != 0 {
@@ -196,10 +188,6 @@ func (scope command) cmdBackupExportSync(args []string) error {
 	fmt.Println("Move this file to your other device and run: courier backup import-sync <file>")
 	fmt.Println("Use the same passphrase on both devices.")
 	return nil
-}
-
-func cmdBackupExportSync(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdBackupExportSync(args)
 }
 
 func (scope command) cmdBackupRestore(args []string) error {
@@ -234,10 +222,6 @@ func (scope command) cmdBackupRestore(args []string) error {
 	return nil
 }
 
-func cmdBackupRestore(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdBackupRestore(args)
-}
-
 func (scope command) cmdBackupImportSync(args []string) error {
 	positionals, _, _, passphraseEnv, _ := splitBackupArgs(args)
 	if len(positionals) != 1 {
@@ -266,8 +250,4 @@ func (scope command) cmdBackupImportSync(args []string) error {
 	fmt.Printf("sync merged: %d new key(s), %d total\n", added, len(cfg.EncKeys))
 	fmt.Printf("  current key epoch: %d\n", cfg.EncKeys[0].Epoch)
 	return nil
-}
-
-func cmdBackupImportSync(args []string) error {
-	return (command{context: client.LegacyContext()}).cmdBackupImportSync(args)
 }
