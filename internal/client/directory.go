@@ -495,7 +495,9 @@ func (c *Client) LookupPeerHandle(address string) (string, error) {
 	if err == nil && len(profiles) > 0 {
 		handle = profiles[0].Handle
 	}
-	_ = c.cachePeerHandle(address, handle)
+	if err := c.cachePeerHandle(address, handle); err != nil {
+		return "", err
+	}
 	return handle, nil
 }
 

@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"time"
 
@@ -41,14 +42,23 @@ type PeerDiscoveryEntry struct {
 
 const maxPendingPeerDiscovery = 256
 
+var errDiscoveryUnchanged = errors.New("discovery already recorded")
+
 func (c *Client) queuePeerDiscovery(address string) error {
+	return c.queuePeerDiscoveryWithSave(address, (*Config).saveAtomic)
+}
+
+func (c *Client) queuePeerDiscoveryWithSave(address string, save func(*Config) error) error {
 	if _, err := crypto.ParseAddress(address); err != nil {
 		return err
 	}
-	return c.cfg.Update(func(fresh *Config) error {
+	err := c.cfg.updateWithSave(func(fresh *Config) error {
 		now := time.Now().Unix()
 		if entry, ok := fresh.HandleCache[address]; ok && now-entry.At < 24*3600 {
-			return nil
+			return errDiscoveryUnchanged
+		}
+		if _, ok := fresh.PendingPeerDiscovery[address]; ok {
+			return errDiscoveryUnchanged
 		}
 		if fresh.PendingPeerDiscovery == nil {
 			fresh.PendingPeerDiscovery = map[string]PeerDiscoveryEntry{}
@@ -66,7 +76,11 @@ func (c *Client) queuePeerDiscovery(address string) error {
 			delete(fresh.PendingPeerDiscovery, oldest)
 		}
 		return nil
-	})
+	}, false, save)
+	if errors.Is(err, errDiscoveryUnchanged) {
+		return nil
+	}
+	return err
 }
 
 // Aggregate all aliases; a stale verified alias dominates, and an unverified
