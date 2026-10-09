@@ -69,3 +69,71 @@ func TestPreferredContactAliasRepointAndFailedSave(t *testing.T) {
 		t.Fatal("obsolete preference retained")
 	}
 }
+
+func TestAliasMutationPreservesConcurrentState(t *testing.T) {
+	cfg := testConfig(t)
+	a, _ := NewIdentity("")
+	b, _ := NewIdentity("")
+	if err := cfg.AddContactAlias("peer", a.Address); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Update(func(f *Config) error {
+		f.EncKeys[0].Epoch++
+		f.VerifiedKeyEpochs = map[string]int64{a.Address: 123}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	epoch := cfg.EncKeys[0].Epoch
+	if err := stale.AddContactAlias("peer", b.Address); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.EncKeys[0].Epoch != epoch || fresh.VerifiedKeyEpochs[a.Address] != 123 || fresh.ContactNameForAddress(b.Address) != "peer" {
+		t.Fatal("alias lost concurrent state/preference")
+	}
+}
+
+func TestDiscoveredContactChecksFreshCollisions(t *testing.T) {
+	cfg := testConfig(t)
+	a, _ := NewIdentity("")
+	b, _ := NewIdentity("")
+	stale, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.AddContactAlias("alice", a.Address); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stale.AddDiscoveredContact("alice", b.Address); err == nil {
+		t.Fatal("stale discovery repointed saved identity")
+	}
+	fresh, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Contacts["alice"] != a.Address {
+		t.Fatal("collision mutated contact")
+	}
+	if err := cfg.AddContactAlias("private-bob", b.Address); err != nil {
+		t.Fatal(err)
+	}
+	name, err := stale.AddDiscoveredContact("bob", b.Address)
+	if err != nil || name != "private-bob" {
+		t.Fatal("concurrent alias not preserved", name, err)
+	}
+	fresh, err = LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fresh.Contacts) != 2 || fresh.ContactNameForAddress(b.Address) != "private-bob" {
+		t.Fatal("discovery added duplicate alias")
+	}
+}

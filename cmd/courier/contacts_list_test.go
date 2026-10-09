@@ -37,12 +37,26 @@ func TestContactsListVerifiedContactsNeverUseNetwork(t *testing.T) {
 		if err := cfg.AddContact(name, peer.Address); err != nil {
 			t.Fatal(err)
 		}
-		if i != 3 {
-			cfg.ContactVerifications[name] = client.ContactVerification{Address: peer.Address, KeyEpoch: 1, VerifiedAt: time.Now().Unix()}
-		}
-		cfg.HandleCache[peer.Address] = client.HandleCacheEntry{Handle: fmt.Sprintf("public%d", i), At: time.Now().Unix()}
-		if i == 2 {
-			cfg.VerifiedKeyEpochs[peer.Address] = 2
+		if err := cfg.Update(func(fresh *client.Config) error {
+			if fresh.ContactVerifications == nil {
+				fresh.ContactVerifications = map[string]client.ContactVerification{}
+			}
+			if fresh.VerifiedKeyEpochs == nil {
+				fresh.VerifiedKeyEpochs = map[string]int64{}
+			}
+			if fresh.HandleCache == nil {
+				fresh.HandleCache = map[string]client.HandleCacheEntry{}
+			}
+			if i != 3 {
+				fresh.ContactVerifications[name] = client.ContactVerification{Address: peer.Address, KeyEpoch: 1, VerifiedAt: time.Now().Unix()}
+			}
+			fresh.HandleCache[peer.Address] = client.HandleCacheEntry{Handle: fmt.Sprintf("public%d", i), At: time.Now().Unix()}
+			if i == 2 {
+				fresh.VerifiedKeyEpochs[peer.Address] = 2
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
 		}
 	}
 	if err := cfg.Save(); err != nil {

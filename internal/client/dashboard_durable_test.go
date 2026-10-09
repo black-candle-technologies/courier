@@ -367,3 +367,110 @@ func TestDashboardDiscoveryCachePersistenceFailureRetainsQueue(t *testing.T) {
 		t.Fatal("failed cache save appeared successful")
 	}
 }
+
+// Exercise the public contact lifecycle, including a dashboard populated by a
+// pre-snapshot client. Every identity and verification here is a disposable fixture.
+func TestDashboardTrustPublicContactLifecycle(t *testing.T) {
+	for _, mode := range []string{"remove", "repoint", "upgrade-remove", "shared-alias"} {
+		t.Run(mode, func(t *testing.T) {
+			e := newAttachTestEnv(t)
+			e.asSender()
+			if err := e.sender.PublishKey(); err != nil {
+				t.Fatal(err)
+			}
+			e.asRecipient()
+			if err := e.recipCfg.AddContactAlias("bob", e.senderCfg.Address); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.recipient.VerifyContact("bob"); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "shared-alias" {
+				if err := e.recipCfg.AddContactAlias("remaining", e.senderCfg.Address); err != nil {
+					t.Fatal(err)
+				}
+				if err := e.recipient.VerifyContact("remaining"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var mu sync.Mutex
+			badges := map[string]string{}
+			var requests []map[string]string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Verified map[string]string `json:"verified"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				mu.Lock()
+				requests = append(requests, body.Verified)
+				for address, status := range body.Verified {
+					if status == "" {
+						delete(badges, address)
+					} else {
+						badges[address] = status
+					}
+				}
+				mu.Unlock()
+				fmt.Fprint(w, `{"stored":0}`)
+			}))
+			defer srv.Close()
+			if err := e.recipCfg.Update(func(c *Config) error { c.DashboardURL = srv.URL; return nil }); err != nil {
+				t.Fatal(err)
+			}
+			e.recipient.refreshPeerHandles(srv.Client())
+			mu.Lock()
+			initial := badges[e.senderCfg.Address]
+			mu.Unlock()
+			if initial != "verified_cached" {
+				t.Fatalf("verification not published: %q", initial)
+			}
+			if mode == "upgrade-remove" {
+				if err := e.recipCfg.Update(func(c *Config) error { c.PublishedPeerTrust = nil; return nil }); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "repoint" {
+				if err := e.recipCfg.AddContactAlias("bob", e.snoopCfg.Address); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := e.recipCfg.RemoveContact("bob"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fresh, err := LoadConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode != "shared-alias" {
+				if fresh.PublishedPeerTrust[e.senderCfg.Address] != "pending-clear" {
+					t.Fatal("final identity removal did not persist a clear")
+				}
+				if fresh.HandleRefreshAt != 0 {
+					t.Fatal("identity change did not request refresh")
+				}
+			}
+			New(fresh).refreshPeerHandles(srv.Client())
+			mu.Lock()
+			defer mu.Unlock()
+			if mode == "shared-alias" {
+				if badges[e.senderCfg.Address] != "verified_cached" {
+					t.Fatal("remaining verified alias lost badge")
+				}
+				if requests[len(requests)-1][e.senderCfg.Address] != "verified_cached" {
+					t.Fatal("shared alias incorrectly cleared")
+				}
+			} else {
+				if _, exists := badges[e.senderCfg.Address]; exists {
+					t.Fatal("removed identity retained remote badge")
+				}
+				value, present := requests[len(requests)-1][e.senderCfg.Address]
+				if !present || value != "" {
+					t.Fatal("missing explicit clear")
+				}
+			}
+		})
+	}
+}
