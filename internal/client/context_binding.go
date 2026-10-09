@@ -61,7 +61,7 @@ func (s Context) checkMigrationCommitted() error {
 	root := s.installation()
 	raw, err := os.ReadFile(filepath.Join(root.root, "context-migration.json"))
 	if os.IsNotExist(err) {
-		return nil
+		return s.checkLegacyOverlap()
 	}
 	if err != nil {
 		return err
@@ -79,6 +79,36 @@ func (s Context) checkMigrationCommitted() error {
 	}
 	if active != s {
 		return ErrMigrationIncomplete
+	}
+	return nil
+}
+
+// Restoring a backup must not create a second store for the installation's
+// legacy principal. That transition belongs to the journaled migration path.
+func (s Context) checkLegacyOverlap() error {
+	root := s.installation()
+	raw, err := os.ReadFile(filepath.Join(root.root, "config.json"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var legacy struct {
+		Address string `json:"address"`
+	}
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		return err
+	}
+	if legacy.Address != s.principal {
+		return nil
+	}
+	active, err := root.ActiveContext()
+	if err != nil {
+		return err
+	}
+	if active != s {
+		return ErrMigrationRequired
 	}
 	return nil
 }

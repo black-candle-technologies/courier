@@ -223,6 +223,13 @@ func TestNamedContextBackupResetAndSyncBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	scoped := migrationTarget(t, legacy)
+	// Restore into a separate installation; the original fixture remains a
+	// different device. Same-installation duplication is rejected below.
+	separateRoot := t.TempDir()
+	scoped, err = scoped.manifest().resolve(separateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg.localContext = &scoped
 	if err = cfg.Save(); err != nil {
 		t.Fatal(err)
@@ -295,5 +302,29 @@ func TestPrincipalBindingSurvivesAliasRemoval(t *testing.T) {
 	}
 	if second.ConfigExists() {
 		t.Fatal("rejected binding wrote a config")
+	}
+}
+
+func TestNamedRestoreCannotBypassLegacyMigration(t *testing.T) {
+	legacy := Context{root: t.TempDir()}
+	cfg, err := NewIdentity("https://fixture.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.RelayFingerprint = strings.Repeat("a", 64)
+	cfg.localContext = &legacy
+	if err = cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	target := migrationTarget(t, legacy)
+	raw, err := cfg.CreateBackup([]byte("fixture-only-passphrase"), crypto.BackupKindBackup, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = target.RestoreBackup([]byte("fixture-only-passphrase"), raw, true); !errors.Is(err, ErrMigrationRequired) {
+		t.Fatal("backup bypassed migration", err)
+	}
+	if target.ConfigExists() {
+		t.Fatal("duplicate principal store created")
 	}
 }
