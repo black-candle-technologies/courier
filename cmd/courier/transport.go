@@ -76,13 +76,7 @@ func reviewTransport(cfg *client.Config, interactive bool, in io.Reader, out io.
 	if err != nil || strings.TrimSpace(line) != "keep" {
 		return fmt.Errorf("upgrade cancelled; transport settings unchanged")
 	}
-	return cfg.Update(func(fresh *client.Config) error {
-		if fresh.RelayURL != cfg.RelayURL || fresh.RelayFingerprint != cfg.RelayFingerprint || fresh.RelayTransport != cfg.RelayTransport || fresh.DashboardURL != cfg.DashboardURL || fresh.DashboardFingerprint != cfg.DashboardFingerprint || fresh.DashboardTransport != cfg.DashboardTransport {
-			return client.ErrContextMismatch
-		}
-		fresh.TransportReviewed = true
-		return nil
-	})
+	return cfg.AcknowledgeTransport()
 }
 
 // Updating the executable remains possible even when identity manifests are bad.

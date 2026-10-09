@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -145,5 +147,75 @@ func TestTransportBootstrapMismatchDoesNotRepin(t *testing.T) {
 	sum := sha256.Sum256(srv.Certificate().Raw)
 	if got, err := verifiedRelayFingerprint(srv.URL, hex.EncodeToString(sum[:])); err != nil || got != hex.EncodeToString(sum[:]) {
 		t.Fatal(got, err)
+	}
+}
+
+func TestUpgradeAcknowledgementDoesNotMigrateLegacyIdentity(t *testing.T) {
+	for _, seedKind := range []string{"missing", "malformed", "healthy"} {
+		t.Run(seedKind, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			ctx := client.LegacyContext()
+			root, _ := ctx.StateRoot()
+			if err := os.MkdirAll(root, 0700); err != nil {
+				t.Fatal(err)
+			}
+			fields := map[string]any{"version": 2, "seen_envelope_hashes": []string{"legacy-replay"}, "future_extension": map[string]any{"preserve": true}}
+			if seedKind == "malformed" {
+				fields["seed"] = "invalid"
+			}
+			if seedKind == "healthy" {
+				fixture, err := client.NewIdentity("")
+				if err != nil {
+					t.Fatal(err)
+				}
+				fields["seed"] = fixture.Seed
+				fields["address"] = fixture.Address
+			}
+			raw, _ := json.Marshal(fields)
+			path := filepath.Join(root, "config.json")
+			if err := os.WriteFile(path, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := ctx.LoadTransportConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if seedKind != "healthy" {
+				// Negative control: the generic mutator rejects this damaged identity.
+				if err := cfg.Update(func(*client.Config) error { return nil }); err == nil {
+					t.Fatal("fixture should fail lazy key migration")
+				}
+			}
+			if err := reviewTransport(cfg, true, strings.NewReader("keep\n"), io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(after, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got["transport_reviewed"] != true {
+				t.Fatal("missing acknowledgement")
+			}
+			delete(got, "transport_reviewed")
+			var want map[string]any
+			_ = json.Unmarshal(raw, &want)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("acknowledgement changed unrelated fields: got %v want %v", got, want)
+			}
+			if len(cfg.EncKeys) != 0 || len(cfg.SeenEnvelopeHashes) != 1 || len(cfg.SeenInboxHashes) != 0 {
+				t.Fatal("migrated in-memory legacy state")
+			}
+			info, _ := os.Stat(path)
+			if info.Mode().Perm() != 0600 {
+				t.Fatal("changed config permissions")
+			}
+			if err := reviewTransport(cfg, true, noRead{t}, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
