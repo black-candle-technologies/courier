@@ -354,7 +354,12 @@ automatic:
 - `courier contacts remove <name>` erases the peer's FS session only after
   the last alias is successfully removed or replaced (replaces `fs forget`).
   A failed save preserves the old session; cleanup failure after a replacement
-  reports that the contact was saved but the old session could not be erased.
+  reports that the contact was saved but the old session could not be erased. Both
+  removal and replacement failures print `courier contacts retry-fs-cleanup
+  <old-address>`. After fixing the reported local file error, that command
+  works after reopening Courier and can be repeated safely. It refuses erasure
+  if any saved alias now references the address. This is operator-driven repair,
+  not an automatic cleanup queue; a crash does not record pending intent.
 
 Handshake traffic never touches `~/.courier/sent.jsonl` (logSent=false,
 the existing `sendProtocolDM` pattern) — the dashboard shows only human

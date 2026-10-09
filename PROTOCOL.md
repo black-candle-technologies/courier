@@ -1123,7 +1123,11 @@ sent over FS, only their relay-side metadata (blob id, size, timing).
 Replacing a contact name with a different address also erases the old peer's
 FS state after saving, provided no other alias references that peer. A failed
 contact save preserves the old state; a subsequent cleanup failure reports
-that the contact was saved but erasure failed.
+that the contact was saved but erasure failed. Removal and replacement cleanup
+failures print `courier contacts retry-fs-cleanup <old-address>`. This explicit,
+idempotent retry works after reopening; the saved alias check and FS erasure
+share the config lock. A newly saved alias prevents erasure. There is no automatic
+cleanup queue or crash-durable pending intent.
 
 ### 15.8 CLI
 

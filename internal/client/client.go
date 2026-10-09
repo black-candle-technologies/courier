@@ -467,16 +467,10 @@ func (c *Config) AddContact(name, address string) error {
 		}
 		return err
 	}
-	// Persist the replacement before erasing the old identity's keys. Other
-	// aliases still referencing that identity keep its session and policy.
+	// Persist the replacement before erasure; retry checks the freshest aliases.
 	if replaced && oldAddress != address {
-		for _, other := range c.Contacts {
-			if other == oldAddress {
-				return nil
-			}
-		}
-		if err := New(c).FSForget(oldAddress); err != nil {
-			return fmt.Errorf("contact saved, but could not erase replaced contact's FS session: %w", err)
+		if _, err := New(c).FSCleanupOrphan(oldAddress); err != nil {
+			return fmt.Errorf("contact saved, but could not erase replaced contact's FS session; retry with courier contacts retry-fs-cleanup %s: %w", oldAddress, err)
 		}
 	}
 	return nil
@@ -487,12 +481,32 @@ func (c *Config) AddContact(name, address string) error {
 // its receipt opt-in (issue #52: no lingering activity-leak consent).
 // It is not an error if absent.
 func (c *Config) RemoveContact(name string) error {
-	if addr, ok := c.Contacts[name]; ok {
-		delete(c.ReceiptContacts, addr)
+	address, existed := c.Contacts[name]
+	verification, verified := c.ContactVerifications[name]
+	receipt, hadReceipt := c.ReceiptContacts[address]
+	if existed {
+		delete(c.ReceiptContacts, address)
 	}
 	delete(c.Contacts, name)
 	delete(c.ContactVerifications, name)
-	return c.Save()
+	if err := c.Save(); err != nil {
+		if existed {
+			c.Contacts[name] = address
+		}
+		if verified {
+			c.ContactVerifications[name] = verification
+		}
+		if hadReceipt {
+			c.ReceiptContacts[address] = receipt
+		}
+		return err
+	}
+	if existed {
+		if _, err := New(c).FSCleanupOrphan(address); err != nil {
+			return fmt.Errorf("contact removed, but could not erase its FS session; retry with courier contacts retry-fs-cleanup %s: %w", address, err)
+		}
+	}
+	return nil
 }
 
 // LookupContact returns the address for a contact name.
