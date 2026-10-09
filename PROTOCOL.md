@@ -16,7 +16,8 @@ core. §9 is the relay API reference. §10–§14 cover messaging machinery
 every endpoint relies on. §15–§22 specify optional protocol layers that
 ride inside ordinary envelopes. §23 covers the bridge boundary, §24 the
 dashboard, §25–§26 the security properties stated honestly, §27
-versioning. Appendix A is the canonical signature-domain registry;
+versioning; §28 specifies Verified Human in the Loop. Appendix A is
+the canonical signature-domain registry;
 Appendix B lists pending changes.
 
 ## 1. Overview
@@ -928,27 +929,32 @@ behavior.
 
 ### 15.2 Negotiation
 
-FS starts only with **positive knowledge** that the peer supports it
-— the client never probes unknown peers (a probe is a protocol DM a
-legacy client would display as chat garbage):
+Automatic FS initiation needs **positive knowledge** that the peer
+supports it. Unknown peers are not automatically probed: a legacy
+client would display the handshake protocol DM as chat garbage.
+Automatic initiation uses:
 
 1. **Directory capability:** the peer's directory profile lists the
    `fs` capability token (v0.11.0+ clients auto-include it on
    register/update). Positive results are cached 24h; negative
    results 10 minutes.
 2. **Handshake memory:** a previous successful handshake with the
-   address — no re-probing, ever.
+   address pins its capability even when the directory is unavailable.
 3. **Inbound proof:** receiving a valid `fs-init` proves the peer
    speaks FS; the client records it and answers — automatically, with
    no prompt.
 
 Peers with private handles (or no handle) cannot advertise `fs`
-through the directory; for them FS starts when they initiate (inbound
-proof) or once a handshake has been observed.
+through the directory. An operator who knows that a saved contact
+supports FS can authorize a probe with `courier contacts start-fs
+<name>` without changing send policy. `require-fs-on` also authorizes
+probes while enforcing fail-closed sends. Otherwise private peers
+bootstrap through inbound proof or prior handshake memory. Both
+peers must poll their inboxes to complete the exchange.
 
-There are no manual FS controls (#146): no opt-out, no per-peer
-modes. `courier contacts remove` erases the peer's FS session as part
-of contact removal.
+There is no legacy-only opt-out or `courier fs` command tree (#146).
+The remaining contact controls are listed in §15.8. Removing the last
+alias for a peer erases its FS session and policy.
 
 ### 15.3 Handshake (X3DH-shaped, no prekeys)
 The initiator generates `rk0` (32 random bytes), an ephemeral X25519
@@ -1032,10 +1038,23 @@ drop the message as undecryptable — self-healing without user action.
 Standard Signal-shaped, per conversation (`crypto.FSRootStep`,
 `crypto.FSChainStep`):
 
-- **Symmetric step** (every message)
+- **Symmetric step** (every message): derive the message key and next
+  chain key through the negotiated suite, then erase the used message
+  key and replace the previous chain key.
+- **DH step**: a new peer ratchet public key advances the receive root
+  and chain; a fresh local ratchet keypair then advances the send root
+  and chain. The old root, chain keys, and local ratchet private key
+  are erased after replacement.
+- **Rotation**: the initiator rotates on its first post-accept send.
+  Established senders also rotate after 100 messages or seven days
+  since rotation; a receive-side DH step prepares a fresh send key.
+- **Gaps**: `n` and `pn` support out-of-order delivery, with at most
+  100 skipped message keys. Used keys and keys from older chains are
+  erased; excessive gaps or delays can therefore be undecryptable.
+
 ### 15.5 Fail-open negotiation (stated plainly)
 
-**FS is opportunistic, not enforced.** This is the standard
+**FS is opportunistic by default; require-fs enforces fail-closed sends.** This is the standard
 opportunistic-encryption trade-off (cf. STARTTLS), and the spec states
 it without euphemism:
 
@@ -1101,10 +1120,23 @@ sent over FS, only their relay-side metadata (blob id, size, timing).
 
 ### 15.8 CLI
 
-There are no `courier fs` commands (#146) — forward secrecy is fully
-automatic. `courier contacts show <name>` reports `forward secrecy:
-active/inactive` for the peer, and `courier contacts remove <name>`
-erases the peer's FS session as part of contact removal.
+There are no `courier fs` commands (#146). Contact controls are:
+
+- `courier contacts start-fs <name>` explicitly probes a saved FS-capable
+  contact, including private/no-handle peers, without changing send
+  policy. Active sessions are preserved under the session lock. A
+  repeated command restarts a pending handshake with a fresh init;
+  both peers must poll their inboxes before FS becomes active.
+- `courier contacts require-fs-on <name>` opts into fail-closed sends
+  and authorizes handshake probes. Sends fail until a session exists.
+- `courier contacts require-fs-off <name>` restores opportunistic
+  fallback; it does not erase the session or capability pins.
+- `courier contacts show <name>` reports session and policy status.
+- `courier contacts remove <name>` erases the peer's FS state after
+  the last local alias is removed successfully.
+
+Explicit probing requires the operator to know that the peer supports
+FS; legacy clients can display the probe as raw protocol text.
 
 ## 16. Group messaging (issue #32)
 
@@ -1981,35 +2013,6 @@ Carried over from prior disclosures; each is tracked:
 cache insertion, dashboard publication, or channel mutation. Explicit fetch
 refuses these protocol frames. See [legacy archive retirement](docs/legacy-channel-retirement.md).
 
-## Appendix A. Canonical signature-domain registry
-
-All domains are defined in `internal/envelope/envelope.go`. `0x00`
-separates variable-length fields; `be64` is big-endian uint64.
-
-| Domain | Signed by | Covers |
-|---|---|---|
-| `courier-envelope-sig-v1` | DM sender | `to(32) \|\| from(32) \|\| eph(32) \|\| nonce(24) \|\| be64(sent_at) \|\| ct` |
-| `courier-group-envelope-v1` | group sender | `SHA256("courier-group-id-v1"\x00 \|\| groupID) \|\| from(32) \|\| be64(key_epoch) \|\| eph(32) \|\| nonce(24) \|\| be64(sent_at) \|\| ct` |
-| `courier-group-control-v1` | group admin | `groupID \|\| 0x00 \|\| action \|\| 0x00 \|\| target \|\| 0x00 \|\| admin \|\| 0x00 \|\| be64(epoch)` |
-| `courier-group-inbox-req-v1` | group member | `groupID \|\| 0x00 \|\| member(32) \|\| be64(after) \|\| be64(limit) \|\| be64(ts)` |
-| `courier-key-announce-v1` | identity owner | `address(32) \|\| x25519_pub(32) \|\| be64(epoch)` |
-| `courier-inbox-req-v1` | recipient | `address(32) \|\| be64(after) \|\| be64(limit) \|\| be64(ts)` |
-| `courier-subscribe-req-v1` | recipient | `address(32) \|\| be64(cursor) \|\| be64(ts)` |
-| `courier-spam-report-v1` | reporter | `reporter(32) \|\| be64(envelope_id) \|\| be64(ts)` |
-| `courier-blob-upload-v1` | uploader | `from(32) \|\| to(32) \|\| blob_id(32) \|\| be64(size) \|\| be64(ts)` |
-| `courier-blob-req-v1` | recipient | `address(32) \|\| blob_id(32) \|\| be64(ts)` |
-| `courier-dashboard-register-v1` | identity owner | `username \|\| 0x00 \|\| address(32)` |
-| `courier-directory-register-v1` | handle owner | `handle \|\| 0x00 \|\| address(32) \|\| be64(epoch) \|\| 0x00 \|\| visibility \|\| 0x00 \|\| contact_policy \|\| 0x00 \|\| capabilities joined by 0x00` |
-| `courier-directory-transfer-v1` | current holder | `handle \|\| 0x00 \|\| new_address(32) \|\| be64(epoch)` |
-| `courier-directory-deregister-v1` | handle owner | `handle \|\| 0x00 \|\| address(32) \|\| be64(epoch)` |
-| `courier-directory-query-v1` | querier | `querier(32) \|\| 0x00 \|\| op \|\| 0x00 \|\| query \|\| 0x00 \|\| be64(ts)` |
-| `courier-introduction-req-v1` | requester | `requester(32) \|\| introducer(32) \|\| handle \|\| 0x00 \|\| be64(ts)` |
-| `courier-introduction-v1` | introducer | `introducer(32) \|\| subject(32) \|\| recipient(32) \|\| be64(ts)` |
-
-Safety numbers (not a signature) use the hash domain
-`courier-safety-v1` over both parties' Ed25519 keys, X25519 keys,
-and key epochs (§18).
-
 ## 28. Verified Human in the Loop (issue #142)
 
 VHL lets a **receiver** verify that a message an agent sent was
@@ -2392,6 +2395,35 @@ an approver enrollment).
   dashboard session is visible to the relay's login gate. No proxy
   or production routing changes are part of this change — that is
   separate deploy work.
+
+## Appendix A. Canonical signature-domain registry
+
+All domains are defined in `internal/envelope/envelope.go`. `0x00`
+separates variable-length fields; `be64` is big-endian uint64.
+
+| Domain | Signed by | Covers |
+|---|---|---|
+| `courier-envelope-sig-v1` | DM sender | `to(32) \|\| from(32) \|\| eph(32) \|\| nonce(24) \|\| be64(sent_at) \|\| ct` |
+| `courier-group-envelope-v1` | group sender | `SHA256("courier-group-id-v1"\x00 \|\| groupID) \|\| from(32) \|\| be64(key_epoch) \|\| eph(32) \|\| nonce(24) \|\| be64(sent_at) \|\| ct` |
+| `courier-group-control-v1` | group admin | `groupID \|\| 0x00 \|\| action \|\| 0x00 \|\| target \|\| 0x00 \|\| admin \|\| 0x00 \|\| be64(epoch)` |
+| `courier-group-inbox-req-v1` | group member | `groupID \|\| 0x00 \|\| member(32) \|\| be64(after) \|\| be64(limit) \|\| be64(ts)` |
+| `courier-key-announce-v1` | identity owner | `address(32) \|\| x25519_pub(32) \|\| be64(epoch)` |
+| `courier-inbox-req-v1` | recipient | `address(32) \|\| be64(after) \|\| be64(limit) \|\| be64(ts)` |
+| `courier-subscribe-req-v1` | recipient | `address(32) \|\| be64(cursor) \|\| be64(ts)` |
+| `courier-spam-report-v1` | reporter | `reporter(32) \|\| be64(envelope_id) \|\| be64(ts)` |
+| `courier-blob-upload-v1` | uploader | `from(32) \|\| to(32) \|\| blob_id(32) \|\| be64(size) \|\| be64(ts)` |
+| `courier-blob-req-v1` | recipient | `address(32) \|\| blob_id(32) \|\| be64(ts)` |
+| `courier-dashboard-register-v1` | identity owner | `username \|\| 0x00 \|\| address(32)` |
+| `courier-directory-register-v1` | handle owner | `handle \|\| 0x00 \|\| address(32) \|\| be64(epoch) \|\| 0x00 \|\| visibility \|\| 0x00 \|\| contact_policy \|\| 0x00 \|\| capabilities joined by 0x00` |
+| `courier-directory-transfer-v1` | current holder | `handle \|\| 0x00 \|\| new_address(32) \|\| be64(epoch)` |
+| `courier-directory-deregister-v1` | handle owner | `handle \|\| 0x00 \|\| address(32) \|\| be64(epoch)` |
+| `courier-directory-query-v1` | querier | `querier(32) \|\| 0x00 \|\| op \|\| 0x00 \|\| query \|\| 0x00 \|\| be64(ts)` |
+| `courier-introduction-req-v1` | requester | `requester(32) \|\| introducer(32) \|\| handle \|\| 0x00 \|\| be64(ts)` |
+| `courier-introduction-v1` | introducer | `introducer(32) \|\| subject(32) \|\| recipient(32) \|\| be64(ts)` |
+
+Safety numbers (not a signature) use the hash domain
+`courier-safety-v1` over both parties' Ed25519 keys, X25519 keys,
+and key epochs (§18).
 
 ## Appendix B. In-flight work requiring spec updates after merge
 
