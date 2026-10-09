@@ -1975,6 +1975,13 @@ Carried over from prior disclosures; each is tracked:
 - All directory endpoints are additive; pre-v0.8.0 clients never call
   them.
 
+### Retired channel discriminator
+
+`cc:2` remains reserved for legacy `join-request`, `join-accept`, `msg`,
+`rekey`, and `leave` payloads. Updated clients consume them without chat output,
+cache insertion, dashboard publication, or channel mutation. Explicit fetch
+refuses these protocol frames. See [legacy archive retirement](docs/legacy-channel-retirement.md).
+
 ## Appendix A. Canonical signature-domain registry
 
 All domains are defined in `internal/envelope/envelope.go`. `0x00`
@@ -2428,10 +2435,3 @@ folded into this document when they merge:
 `github.com/black-candle-technologies/courier` at `origin/main`.
 Where this document and the code disagree, the code governs — and
 the discrepancy is a bug in this document.*
-
-### Retired channel discriminator
-
-`cc:2` remains reserved for legacy `join-request`, `join-accept`, `msg`,
-`rekey`, and `leave` payloads. Updated clients consume them without chat output,
-cache insertion, dashboard publication, or channel mutation. Explicit fetch
-refuses these protocol frames. See [legacy archive retirement](docs/legacy-channel-retirement.md).

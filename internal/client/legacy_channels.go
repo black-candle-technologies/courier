@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // The cc:2 discriminator stays reserved after channel retirement. In particular,
@@ -24,6 +25,8 @@ func isLegacyChannelPayload(plain []byte) bool {
 	return false
 }
 
+var legacyChannelWarnings sync.Map // archive paths already warned about in this process
+
 // Warn without opening or modifying sensitive legacy history. Retirement is an
 // explicit operator action because the file also holds non-expiring user data.
 func warnLegacyChannels() error {
@@ -36,6 +39,9 @@ func warnLegacyChannels() error {
 		return nil
 	} else if err != nil {
 		return err
+	}
+	if _, loaded := legacyChannelWarnings.LoadOrStore(p, struct{}{}); loaded {
+		return nil
 	}
 	fmt.Fprintln(os.Stderr, "warning: retired channels.json still contains channel history and secrets; see docs/legacy-channel-retirement.md for explicit export and cleanup. Courier does not migrate or delete it automatically.")
 	return nil
