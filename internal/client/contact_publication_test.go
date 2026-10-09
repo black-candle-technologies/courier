@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 )
 
 func TestOrphanCleanupRequiresDurableMapping(t *testing.T) {
@@ -17,6 +18,7 @@ func TestOrphanCleanupRequiresDurableMapping(t *testing.T) {
 					t.Fatal(err)
 				}
 				if err := updateFS(func(f *fsFile) error {
+					f.LastInitAt[a.Address] = time.Now().Unix()
 					f.RequireFS[a.Address] = true
 					f.Sessions[a.Address] = &fsSession{RootKey: "retained"}
 					return nil
@@ -52,7 +54,7 @@ func TestOrphanCleanupRequiresDurableMapping(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if !f.RequireFS[a.Address] || f.Sessions[a.Address] == nil {
+					if !f.RequireFS[a.Address] || f.Sessions[a.Address] == nil || f.LastInitAt[a.Address] == 0 {
 						t.Fatal("failed publication erased FS protection")
 					}
 				}
