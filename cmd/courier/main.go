@@ -1199,11 +1199,11 @@ func cmdContacts(args []string) error {
 		}
 		sort.Strings(names)
 		for _, n := range names {
-			st, _ := cl.ContactTrust(n)
+			st, _ := cl.CachedContactTrust(n)
 			var badge string
 			switch st {
 			case client.TrustVerified:
-				badge = "✓ verified"
+				badge = "✓ verified (cached; keys not revalidated)"
 			case client.TrustStale:
 				badge = "⚠ stale"
 			default:

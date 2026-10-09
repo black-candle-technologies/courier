@@ -1437,7 +1437,11 @@ reversible (`UntombstoneHandle`). Tombstoned **private** handles stay
   alphabetical ordering. Other saved aliases and their verification records
   remain intact. Re-adding a handle does not override the preference; removing
   or repointing the preferred alias clears it, with deterministic fallback to
-  the remaining saved names. Rendering does not query the directory.
+  the remaining saved names. Rendering does not query the directory. `contacts
+  list` also uses stored verification and locally observed key epochs only;
+  its verified badge explicitly says cached and that current keys were not
+  revalidated. Locally observed address/key changes appear as stale. Explicit
+  verification commands retain their live key checks.
 - `courier directory register <handle> [--public|--unlisted|--private]
   [--cap chat,...] [--contacts-only]` — register (default private).
 - `courier directory update ...` / `unregister` /
