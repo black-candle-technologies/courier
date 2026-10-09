@@ -26,7 +26,7 @@ func TestDashboardMetadataRefreshRenewsAndBacksOff(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		if failing.Load() {
-			http.Error(w, "temporary", 503)
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"results": []DirectoryProfile{profile}})
