@@ -262,3 +262,62 @@ func TestTeamReadmissionRequiresNewConsent(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+
+func TestTeamResourceBudgets(t *testing.T) {
+	r := teamTestRoster(t)
+	r.Signatures = []TeamSignature{teamTestSign(t, r, "owner", 1)}
+	next := teamTestNext(t, r)
+	next.Signatures = []TeamSignature{teamTestSign(t, next, "owner", 1)}
+	l := teamTestLimits()
+	l.MaxChainObjects = 1
+	if _, e := VerifyTeamChain(r.TeamRoot, []TeamRoster{r, next}, nil, nil, nil, teamTestNow(), l); !errors.Is(e, ErrTeamLimit) {
+		t.Fatal(e)
+	}
+	l = teamTestLimits()
+	l.MaxObjectBytes = 2048
+	l.MaxChainBytes = 2048
+	if _, e := VerifyTeamChain(r.TeamRoot, []TeamRoster{r, next}, nil, nil, nil, teamTestNow(), l); !errors.Is(e, ErrTeamLimit) {
+		t.Fatal(e)
+	}
+	l = teamTestLimits()
+	l.InvitationLifetimeSeconds = 3600
+	c := teamTestConsent(t, r.TeamRoot, 1, 2, "1", "alice", 1)
+	if e := VerifyTeamConsent(c.Invitation, c.Acceptance, r.TeamRoot, r.Owner, "1", teamTestNow(), l); !errors.Is(e, ErrTeamFreshness) {
+		t.Fatal(e)
+	}
+	l = teamTestLimits()
+	l.MaxMembers = 1
+	address, _ := teamTestKey(2)
+	r.Members = []TeamMember{{"a", r.Owner, r.GenesisRoot}, {"b", address, r.GenesisRoot}}
+	if _, e := CanonicalTeamPayload(r, l); !errors.Is(e, ErrTeamLimit) {
+		t.Fatal(e)
+	}
+}
+
+func TestTeamSignedCertificateMismatch(t *testing.T) {
+	r := teamTestRoster(t)
+	r.Signatures = []TeamSignature{teamTestSign(t, r, "owner", 1)}
+	for _, mutation := range []string{"version", "previous_roster", "new_epoch"} {
+		t.Run(mutation, func(t *testing.T) {
+			next, c := teamTestTransfer(t, r, 1, 3, nil)
+			switch mutation {
+			case "version":
+				c.EffectiveVersion = "3"
+			case "previous_roster":
+				c.PreviousRosterHash = r.GenesisRoot
+			case "new_epoch":
+				c.NewOwnerEpoch = "3"
+			}
+			c.Signatures = []TeamSignature{teamTestSign(t, c, "old_owner", 1), teamTestSign(t, c, "new_owner", 3)}
+			h, e := TeamPayloadHash(c, teamTestLimits())
+			if e != nil {
+				t.Fatal(e)
+			}
+			next.OwnerTransitionHash = &h
+			next.Signatures = []TeamSignature{teamTestSign(t, next, "old_owner", 1), teamTestSign(t, next, "new_owner", 3)}
+			if _, e = VerifyTeamChain(r.TeamRoot, []TeamRoster{r, next}, []TeamOwnerTransition{c}, nil, nil, teamTestNow(), teamTestLimits()); !errors.Is(e, ErrTeamChain) {
+				t.Fatal("fully signed mismatch", e)
+			}
+		})
+	}
+}

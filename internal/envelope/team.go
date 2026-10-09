@@ -431,6 +431,7 @@ func CanonicalTeamPayload(v TeamPayload, l TeamLimits) ([]byte, error) {
 		return nil, ErrTeamWire
 	}
 	switch x := v.(type) {
+	case TeamRoster, TeamInvitation, TeamAcceptance, TeamOwnerTransition:
 	case *TeamRoster:
 		if x == nil {
 			return nil, ErrTeamWire
@@ -447,6 +448,8 @@ func CanonicalTeamPayload(v TeamPayload, l TeamLimits) ([]byte, error) {
 		if x == nil {
 			return nil, ErrTeamWire
 		}
+	default:
+		return nil, ErrTeamWire
 	}
 	if e := v.validate(l, false); e != nil {
 		return nil, e
@@ -504,6 +507,9 @@ func MakeTeamSignature(v TeamPayload, role, address string, sign func([]byte) ([
 		return TeamSignature{}, e
 	}
 	s := TeamSignature{role, address, base64.RawURLEncoding.EncodeToString(sig)}
+	if e = teamSignatureShape([]TeamSignature{s}); e != nil {
+		return TeamSignature{}, e
+	}
 	if e = verifyTeamSignatures(v, []TeamSignature{s}, []TeamSignature{{Role: role, Address: address}}, l); e != nil {
 		return TeamSignature{}, e
 	}

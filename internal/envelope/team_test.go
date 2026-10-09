@@ -188,3 +188,13 @@ func TestTeamSignatureDomain(t *testing.T) {
 }
 
 func teamTestNow() time.Time { t, _ := time.Parse(time.RFC3339, "2026-10-08T12:00:00Z"); return t }
+
+func TestTeamRejectExtendedPayload(t *testing.T) {
+	type extended struct {
+		TeamRoster
+		Task string `json:"task"`
+	}
+	if _, e := CanonicalTeamPayload(extended{teamTestRoster(t), "execute"}, teamTestLimits()); !errors.Is(e, ErrTeamWire) {
+		t.Fatal("unreviewed wire extension", e)
+	}
+}
