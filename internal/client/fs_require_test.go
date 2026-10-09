@@ -120,3 +120,52 @@ func TestFSPrivateBootstrapWithoutRequiredPolicy(t *testing.T) {
 		t.Fatal(msgs)
 	}
 }
+
+func TestFSExplicitProbeSuppressesImmediateDowngrade(t *testing.T) {
+	h := newFSHarness(t)
+	bob := h.bobCfg.Address
+	h.doHandshake(t)
+	h.asAlice(func() {
+		if err := h.aliceCfg.AddContact("bob", bob); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.aliceCfg.RemoveContact("bob"); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.aliceCfg.AddContact("bob", bob); err != nil {
+			t.Fatal(err)
+		}
+		suppressDirectoryFor(t, bob)
+		if err := updateFS(func(ff *fsFile) error { ff.LastInitAt[bob] = time.Now().Unix() - fsInitRefreshSeconds - 1; return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.alice.FSStart("bob"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.alice.Send("bob", "probe in flight"); err != nil {
+			t.Fatal(err)
+		}
+		ff, err := loadFS()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ff.Downgrade[bob] != 0 {
+			t.Fatal("fresh explicit probe falsely persisted downgrade suspicion")
+		}
+		if ff.LastInitAt[bob] <= 0 || ff.LastInitAt[bob] != ff.session(bob).CreatedAt {
+			t.Fatal("explicit probe timestamp missing")
+		}
+	})
+	msgs := h.bobInbox(t)
+	if len(msgs) != 1 || msgs[0].Body != "probe in flight" {
+		t.Fatal(msgs)
+	}
+	if msgs := h.aliceInbox(t); len(msgs) != 0 {
+		t.Fatal(msgs)
+	}
+	h.asAlice(func() {
+		if active, err := h.alice.FSActive(bob); err != nil || !active {
+			t.Fatal("probe did not establish session", active, err)
+		}
+	})
+}
