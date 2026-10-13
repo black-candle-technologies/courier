@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -104,6 +105,9 @@ func main() {
 		}, dashboard.AuthLimitsFromEnv(), dashboard.BridgeAuditConfig{
 			URL:        *bridgeAuditURL,
 			AdminToken: *bridgeAuditToken,
+		}).WithMobileReads(dashboard.MobileReadConfig{
+			AuthURL: os.Getenv("MOBILE_AUTH_URL"), AuthAPIKey: os.Getenv("MOBILE_AUTH_API_KEY"),
+			ServiceKey: os.Getenv("MOBILE_BFF_READ_KEY"), ClientIDs: strings.Fields(os.Getenv("MOBILE_OAUTH_CLIENT_IDS")),
 		}).Routes()),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,

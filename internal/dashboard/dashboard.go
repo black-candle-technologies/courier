@@ -82,7 +82,8 @@ var usernameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{2,31}$`)
 
 // Server is the dashboard HTTP server.
 type Server struct {
-	store *store.Store
+	mobile MobileReadConfig
+	store  *store.Store
 	// bct is the optional Black Candle OAuth client. Nil unless the
 	// operator configured the identity provider: the OAuth feature is
 	// dormant in self-hosted installs.
@@ -164,6 +165,11 @@ func (s *Server) bridgeAuditEnabled() bool { return s.bridgeAudit != nil }
 // Routes returns the HTTP handler with all endpoints registered.
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
+	if s.mobileEnabled() {
+		mux.HandleFunc("GET /internal/mobile/v1/overview", s.mobileOverview)
+		mux.HandleFunc("GET /internal/mobile/v1/messages", s.mobileMessages)
+		mux.HandleFunc("GET /internal/mobile/v1/messages/{id}", s.mobileMessageDetail)
+	}
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 	// Agent APIs (JSON).
 	mux.HandleFunc("POST /v1/dashboard/register", s.handleRegister)
