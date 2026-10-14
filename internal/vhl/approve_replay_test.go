@@ -202,7 +202,7 @@ func TestEvaluatedSetOnEveryPath(t *testing.T) {
 	body := []byte("do the thing")
 
 	freshPIN := func() *Attestation {
-		a, err := NewTier2Attestation(body, addr, "req-e", ProofPIN, PresencePIN, Proof{}, nil, priv)
+		a, err := schemaTier2(body, addr, "req-e", priv)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -277,16 +277,13 @@ func TestTier2PINProofNeverAttests(t *testing.T) {
 	addr, pub, priv := testIdentity(t)
 	v := testVerifier(t, addr, pub)
 	body := []byte("spend 10 BTC")
-	a, err := NewTier2Attestation(body, addr, "req-pin", ProofPIN, PresencePIN, Proof{}, nil, priv)
-	if err != nil {
-		t.Fatal(err)
-	}
+	a := legacyTier2(t, body, addr, ProofPIN, priv)
 	out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "x", Now: time.Now().Unix(), EnvelopeID: 11})
 	if out.Verdict == VerdictAttested {
 		t.Fatal("PIN proof at tier 2 must never attest: the attestation signature is self-producible by the requesting agent")
 	}
-	if out.Verdict != VerdictInvalid || out.Reason != "unverifiable-proof" {
-		t.Fatalf("got %s (%s), want invalid/unverifiable-proof", out.Verdict, out.Reason)
+	if out.Verdict != VerdictInvalid || !strings.HasPrefix(out.Reason, "malformed:") {
+		t.Fatalf("got %s (%s), want invalid/malformed", out.Verdict, out.Reason)
 	}
 }
 
@@ -294,16 +291,12 @@ func TestTier2ChallengeProofNeverAttests(t *testing.T) {
 	addr, pub, priv := testIdentity(t)
 	v := testVerifier(t, addr, pub)
 	body := []byte("release v0.14.0")
-	a, err := NewTier2Attestation(body, addr, "req-ch", ProofChallenge, PresenceChallenge,
-		Proof{ChallengeID: "ch-123"}, nil, priv)
-	if err != nil {
-		t.Fatal(err)
-	}
+	a := legacyTier2(t, body, addr, ProofChallenge, priv)
 	out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "x", Now: time.Now().Unix(), EnvelopeID: 12})
 	if out.Verdict == VerdictAttested {
 		t.Fatal("challenge proof at tier 2 must never attest: the attestation signature is self-producible by the requesting agent")
 	}
-	if out.Verdict != VerdictInvalid || out.Reason != "unverifiable-proof" {
-		t.Fatalf("got %s (%s), want invalid/unverifiable-proof", out.Verdict, out.Reason)
+	if out.Verdict != VerdictInvalid || !strings.HasPrefix(out.Reason, "malformed:") {
+		t.Fatalf("got %s (%s), want invalid/malformed", out.Verdict, out.Reason)
 	}
 }

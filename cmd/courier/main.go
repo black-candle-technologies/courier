@@ -223,13 +223,12 @@ func usage() {
   courier vhl session status             show live session tokens
   courier vhl session revoke <id> [--broadcast]
                                          revoke a session token
-  courier vhl request new --tier 2 --message TEXT [--presence pin] [--to ADDR]
+  courier vhl request new --tier 2 --message TEXT [--presence fido2_uv] [--to ADDR]
                                          ask a human to approve exact bytes
   courier vhl request list               list pending approval requests
-  courier vhl approve <request-id> [--presence pin|challenge]
+  courier vhl approve <request-id> [--presence fido2_uv]
                                          review and approve exact bytes (interactive)
   courier vhl attestations               list received attestations
-  courier vhl challenge --action TEXT    mint an out-of-band challenge code
   courier backup create [--output f]     write an encrypted identity backup
                                          (seed + live keys, passphrase-protected)
   courier backup restore [--force] <file>

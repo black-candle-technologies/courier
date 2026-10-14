@@ -249,7 +249,7 @@ func TestAttestationBadSignature(t *testing.T) {
 	v := testVerifier(t, addr, pub)
 	body := []byte("spend 10 BTC")
 	// Signed by a key that is not enrolled.
-	a, err := NewTier2Attestation(body, addr, "req-test", ProofPIN, PresencePIN, Proof{}, nil, evilPriv)
+	a, err := schemaTier2(body, addr, "req-test", evilPriv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestAttestationUnknownApprover(t *testing.T) {
 	addr, _, priv := testIdentity(t)
 	v := &Verifier{Registry: NewRegistry(), Seen: NewSeenSet(), Revoked: NewRevocationSet()}
 	body := []byte("do the thing")
-	a, err := NewTier2Attestation(body, addr, "req-test", ProofPIN, PresencePIN, Proof{}, nil, priv)
+	a, err := schemaTier2(body, addr, "req-test", priv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,56 +350,17 @@ func TestTier1SessionFlow(t *testing.T) {
 	}
 }
 
-func TestChallengeFlow(t *testing.T) {
-	action := []byte("merge pull request #141")
-	ch, code, err := MintChallenge(action, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ch.BindsAction(action) {
-		t.Fatal("challenge should bind the action")
-	}
-	if ch.BindsAction([]byte("merge pull request #142")) {
-		t.Fatal("challenge must not bind other actions")
-	}
-	now := time.Now().Unix()
-	if err := ch.Verify(code, now); err != nil {
-		t.Fatal(err)
-	}
-	// Single-use.
-	if err := ch.Verify(code, now); err == nil {
-		t.Fatal("challenge code must be single-use")
-	}
-	// Wrong code fails (mint a fresh one since the first is used).
-	ch2, _, err := MintChallenge(action, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := ch2.Verify("wrongcode", now); err == nil {
-		t.Fatal("wrong code should fail")
-	}
-	// Expired fails.
-	if err := ch2.Verify("whatever", ch2.ExpiresAt+1); err == nil {
-		t.Fatal("expired challenge should fail")
-	}
-}
-
 func TestTier2ChallengeProofRejected(t *testing.T) {
 	// Challenge proofs fail closed at Tier 2 (issue #142 review):
 	// only FIDO2 assertions are cryptographically verifiable, and
 	// the Ed25519 attestation signature alone is self-producible
-	// by the requesting agent. Construction still works — the
-	// rejection happens at evaluation.
+	// by the requesting agent. Legacy artifacts now fail validation.
 	addr, pub, priv := testIdentity(t)
 	v := testVerifier(t, addr, pub)
 	body := []byte("release v0.14.0")
-	a, err := NewTier2Attestation(body, addr, "req-test", ProofChallenge, PresenceChallenge,
-		Proof{ChallengeID: "ch-123"}, nil, priv)
-	if err != nil {
-		t.Fatal(err)
-	}
+	a := legacyTier2(t, body, addr, ProofChallenge, priv)
 	out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "x", Now: time.Now().Unix()})
-	if out.Verdict != VerdictInvalid || out.Reason != "unverifiable-proof" {
+	if out.Verdict != VerdictInvalid || !strings.HasPrefix(out.Reason, "malformed:") {
 		t.Fatalf("challenge-proof tier 2 attestation should be rejected, got %v (%s)", out.Verdict, out.Reason)
 	}
 }
@@ -414,7 +375,7 @@ func TestFrames(t *testing.T) {
 	}
 	req := &ApprovalRequest{
 		ID: reqID, Tier: 2, MsgHash: b64.EncodeToString(h[:]),
-		Draft: draft, AgentNote: "payment", WantPresence: "pin",
+		Draft: draft, AgentNote: "payment", WantPresence: "fido2_uv",
 		ExpiresAt: time.Now().Add(RequestTTL).Unix(),
 	}
 	raw, err := EncodeApprovalRequest(req)
@@ -443,7 +404,7 @@ func TestFrames(t *testing.T) {
 	}
 	// Attest frame round-trip.
 	addr, _, priv := testIdentity(t)
-	a, err := NewTier2Attestation([]byte(draft), addr, "req-test", ProofPIN, PresencePIN, Proof{}, nil, priv)
+	a, err := schemaTier2([]byte(draft), addr, "req-test", priv)
 	if err != nil {
 		t.Fatal(err)
 	}

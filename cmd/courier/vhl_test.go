@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -101,6 +102,9 @@ func (f *fakeVHLClient) VHLUnenrollApprover(addrOrName string) error {
 }
 
 func (f *fakeVHLClient) VHLRequestApproval(humanAddr string, tier vhl.Tier, body string, presence vhl.PresenceStrength) (*vhl.ApprovalRequest, error) {
+	if tier == vhl.Tier2 && presence != vhl.PresenceFIDO2UV {
+		return nil, fmt.Errorf("unexpected default presence: %s", presence)
+	}
 	f.calls = append(f.calls, "VHLRequestApproval")
 	return &vhl.ApprovalRequest{ID: "req-test"}, nil
 }
@@ -108,11 +112,6 @@ func (f *fakeVHLClient) VHLRequestApproval(humanAddr string, tier vhl.Tier, body
 func (f *fakeVHLClient) VHLPendingRequests() ([]*client.VHLRequestRecord, error) {
 	f.calls = append(f.calls, "VHLPendingRequests")
 	return nil, nil
-}
-
-func (f *fakeVHLClient) VHLMintChallenge(action []byte) (*vhl.Challenge, string, error) {
-	f.calls = append(f.calls, "VHLMintChallenge:"+string(action))
-	return &vhl.Challenge{ID: "ch-test"}, "code-test", nil
 }
 
 // routedTo reports whether the fake saw a call whose name matches
@@ -213,36 +212,19 @@ func TestVHLRequestDispatch(t *testing.T) {
 	}
 }
 
-func TestVHLChallengeDispatch(t *testing.T) {
-	cases := []struct {
-		name     string
-		args     []string
-		wantCall string
-		wantErr  string
-	}{
-		{name: "flag form routes to challenge mint", args: []string{"--action", "rotate keys"}, wantCall: "VHLMintChallenge:rotate keys"},
-		{name: "equals form routes to challenge mint", args: []string{"--action=rotate keys"}, wantCall: "VHLMintChallenge:rotate keys"},
-		{name: "missing action is usage error", args: []string{}, wantErr: "--action is required"},
-		{name: "positional arg is usage error", args: []string{"rotate"}, wantErr: "usage: courier vhl challenge"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+func TestVHLTypedCeremoniesRejected(t *testing.T) {
+	for _, presence := range []string{"pin", "challenge", "fido2"} {
+		t.Run(presence, func(t *testing.T) {
 			f := &fakeVHLClient{}
-			err := cmdVHLChallenge(f, tc.args)
-			if tc.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("cmdVHLChallenge(%q) err = %v, want substring %q", tc.args, err, tc.wantErr)
-				}
-				if len(f.calls) != 0 {
-					t.Fatalf("cmdVHLChallenge(%q) made client calls %v on the error path", tc.args, f.calls)
-				}
-				return
+			if err := cmdVHLRequest(f, []string{"new", "--tier", "2", "--message", "action", "--presence", presence}); err == nil || !strings.Contains(err.Error(), "requires --presence fido2_uv") {
+				t.Fatalf("request: %v", err)
 			}
-			if err != nil {
-				t.Fatalf("cmdVHLChallenge(%q) err = %v", tc.args, err)
+			if len(f.calls) != 0 {
+				t.Fatalf("rejected request made calls: %v", f.calls)
 			}
-			if !f.routedTo(tc.wantCall) {
-				t.Fatalf("cmdVHLChallenge(%q) calls = %v, want call %q", tc.args, f.calls, tc.wantCall)
+			// Nil clients prove rejection precedes request lookup or ceremony work.
+			if err := cmdVHLApprove(nil, nil, []string{"request-id", "--presence=" + presence}); err == nil || !strings.Contains(err.Error(), "requires --presence fido2_uv") {
+				t.Fatalf("approve: %v", err)
 			}
 		})
 	}

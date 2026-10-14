@@ -148,11 +148,8 @@ func TestVHLMissingAttestationHeld(t *testing.T) {
 }
 
 // TestVHLTier2EndToEnd runs the whole Tier 2 loop: the sender's human
-// approves exact bytes locally, the attestation ships with the
-// message, and the recipient verifies it. A PIN proof is not
-// cryptographically verifiable by the receiver (issue #142 review),
-// so the recipient must hold it as unverifiable rather than report
-// it attested — the fail-closed path is the assertion here.
+// cannot mint or send a typed proof. Even a legacy artifact injected
+// below the send gate is held by the receiver, never reported attested.
 func TestVHLTier2EndToEnd(t *testing.T) {
 	env := newAttachTestEnv(t)
 	env.asRecipient()
@@ -162,16 +159,20 @@ func TestVHLTier2EndToEnd(t *testing.T) {
 	testEnrollApprover(t, env.senderCfg.Address, "sender")
 
 	env.asSender()
-	req, err := env.sender.VHLRequestApproval("", vhl.Tier2, "merge PR #142", vhl.PresencePIN)
-	if err != nil {
-		t.Fatalf("request approval: %v", err)
+	req, h := requestFixture(t, env.sender, "merge PR #142", vhl.PresenceFIDO2UV)
+	if _, err := env.sender.VHLApproveMint(req.ID, h, env.senderCfg.Address, vhl.Proof{Kind: vhl.ProofPIN}, vhl.PresencePIN, nil); err == nil {
+		t.Fatal("typed approval minted")
 	}
-	att, err := env.sender.VHLApproveMint(req.ID, vhl.MsgHashOf([]byte("merge PR #142")), env.senderCfg.Address, vhl.Proof{Kind: vhl.ProofPIN}, vhl.PresencePIN, nil)
-	if err != nil {
-		t.Fatalf("approve: %v", err)
+	att := legacyApproval(t, env.sender, "merge PR #142", vhl.ProofPIN)
+	if _, err := env.sender.SendTiered(env.recipCfg.Address, "merge PR #142", vhl.Tier2, att); err == nil {
+		t.Fatal("typed artifact sent")
 	}
-	if _, err := env.sender.SendTiered(env.recipCfg.Address, "merge PR #142", vhl.Tier2, att); err != nil {
-		t.Fatalf("send tier 2: %v", err)
+	plain, err := encodeMessageBodyVHL("merge PR #142", nil, 0, "", 0, vhl.Tier2, att)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.sender.sendSealed(env.recipCfg.Address, plain, "merge PR #142", 0, "", true, 0); err != nil {
+		t.Fatal(err)
 	}
 
 	env.asRecipient()
@@ -189,8 +190,9 @@ func TestVHLTier2EndToEnd(t *testing.T) {
 	if m.VHL == nil || m.VHL.Verdict != "invalid-attestation" || m.VHL.Tier != 2 {
 		t.Fatalf("VHL = %+v, want tier-2 invalid-attestation (PIN proof is unverifiable)", m.VHL)
 	}
-	if m.VHL.Approver != env.senderCfg.Address {
-		t.Fatalf("approver = %q, want sender", m.VHL.Approver)
+	// Structural rejection happens before trusting an approver identity.
+	if m.VHL.Approver != "" {
+		t.Fatalf("malformed proof unexpectedly named approver %q", m.VHL.Approver)
 	}
 }
 
@@ -207,11 +209,11 @@ func TestVHLTier2BaitAndSwitch(t *testing.T) {
 	testEnrollApprover(t, env.senderCfg.Address, "sender")
 
 	env.asSender()
-	req, err := env.sender.VHLRequestApproval("", vhl.Tier2, "review README", vhl.PresencePIN)
+	req, err := env.sender.VHLRequestApproval("", vhl.Tier2, "review README", vhl.PresenceFIDO2UV)
 	if err != nil {
 		t.Fatalf("request approval: %v", err)
 	}
-	att, err := env.sender.VHLApproveMint(req.ID, vhl.MsgHashOf([]byte("review README")), env.senderCfg.Address, vhl.Proof{Kind: vhl.ProofPIN}, vhl.PresencePIN, nil)
+	att, err := env.sender.VHLApproveMint(req.ID, vhl.MsgHashOf([]byte("review README")), env.senderCfg.Address, vhl.Proof{Kind: vhl.ProofFIDO2, CredentialID: "test-cred"}, vhl.PresenceFIDO2UV, make([]byte, 32))
 	if err != nil {
 		t.Fatalf("approve: %v", err)
 	}
@@ -311,7 +313,7 @@ func TestVHLApprovalRequestFrame(t *testing.T) {
 
 	// The agent sends an approval request frame to the human
 	// (recipient). The human's inbox stores it in their review queue.
-	if _, err := env.sender.VHLRequestApproval(env.recipCfg.Address, vhl.Tier2, "shut down the relay", vhl.PresencePIN); err != nil {
+	if _, err := env.sender.VHLRequestApproval(env.recipCfg.Address, vhl.Tier2, "shut down the relay", vhl.PresenceFIDO2UV); err != nil {
 		t.Fatalf("send request frame: %v", err)
 	}
 	env.asRecipient()
@@ -329,7 +331,7 @@ func TestVHLApprovalRequestFrame(t *testing.T) {
 	// The human approves; VHLApproveMint returns the frame to the
 	// agent over the native attestation frame, whose inbox stores
 	// it for later use.
-	if _, err := env.recipient.VHLApproveMint(reqs[0].Request.ID, vhl.MsgHashOf([]byte("shut down the relay")), env.senderCfg.Address, vhl.Proof{Kind: vhl.ProofPIN}, vhl.PresencePIN, nil); err != nil {
+	if _, err := env.recipient.VHLApproveMint(reqs[0].Request.ID, vhl.MsgHashOf([]byte("shut down the relay")), env.senderCfg.Address, vhl.Proof{Kind: vhl.ProofFIDO2, CredentialID: "test-cred"}, vhl.PresenceFIDO2UV, make([]byte, 32)); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 	env.asSender()

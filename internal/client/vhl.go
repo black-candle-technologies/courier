@@ -39,7 +39,7 @@ type vhlRequestRecord struct {
 type VHLRequestRecord = vhlRequestRecord
 
 // vhlFile is the local VHL state: the enrollment registry (the trust
-// root), the sealed session-token keystore, the sealed challenge
+// root), the sealed session-token keystore, the legacy sealed challenge
 // store, the seen-artifact replay set, the revocation set, pending
 // approval requests, and received attestations not yet attached to an
 // outgoing message.
@@ -307,48 +307,6 @@ func openTokensLocked(sealedB64 string, key [32]byte) ([]*vhl.SessionToken, erro
 	return toks, nil
 }
 
-// sealChallengesLocked / openChallengesLocked mirror the token
-// keystore for the challenge store (challenges are bearer-adjacent
-// secrets until consumed).
-func sealChallengesLocked(chs []*vhl.Challenge, key [32]byte) (string, error) {
-	raw, err := json.Marshal(chs)
-	if err != nil {
-		return "", err
-	}
-	sealed, err := vhl.SealTokens(raw, key)
-	for i := range raw {
-		raw[i] = 0
-	}
-	if err != nil {
-		return "", err
-	}
-	return b64.EncodeToString(sealed), nil
-}
-
-func openChallengesLocked(sealedB64 string, key [32]byte) ([]*vhl.Challenge, error) {
-	if sealedB64 == "" {
-		return nil, nil
-	}
-	sealed, err := b64.DecodeString(sealedB64)
-	if err != nil {
-		return nil, fmt.Errorf("challenge store: %w", err)
-	}
-	raw, err := vhl.OpenTokens(sealed, key)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		for i := range raw {
-			raw[i] = 0
-		}
-	}()
-	var chs []*vhl.Challenge
-	if err := json.Unmarshal(raw, &chs); err != nil {
-		return nil, fmt.Errorf("challenge store: %w", err)
-	}
-	return chs, nil
-}
-
 // vhlLiveTokens filters a keystore token list down to the tokens
 // usable now: structurally valid, minted on this boot, and
 // unexpired. Previous-boot tokens are dropped — restart revokes by
@@ -368,18 +326,6 @@ func vhlLiveTokens(toks []*vhl.SessionToken) []*vhl.SessionToken {
 			continue
 		}
 		live = append(live, t)
-	}
-	return live
-}
-
-// vhlLiveChallenges drops used and expired challenges.
-func vhlLiveChallenges(chs []*vhl.Challenge, now int64) []*vhl.Challenge {
-	var live []*vhl.Challenge
-	for _, ch := range chs {
-		if ch == nil || ch.Used || ch.ExpiresAt <= now {
-			continue
-		}
-		live = append(live, ch)
 	}
 	return live
 }
@@ -765,6 +711,9 @@ func (c *Client) vhlAttestForSend(tier vhl.Tier, body string, att *vhl.Attestati
 		}
 		if vhl.Tier(att.Tier) != vhl.Tier2 {
 			return nil, fmt.Errorf("tier 2 message with tier %d attestation", att.Tier)
+		}
+		if err := att.Validate(); err != nil {
+			return nil, fmt.Errorf("tier 2 attestation: %w", err)
 		}
 		// Fail fast: the attestation must bind these exact bytes,
 		// or the recipient will (correctly) reject it.
