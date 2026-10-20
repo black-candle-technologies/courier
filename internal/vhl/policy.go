@@ -527,9 +527,14 @@ func (v *Verifier) verifyFIDO2Proof(a *Attestation, actionHash []byte, envelopeI
 	if err != nil {
 		return fmt.Errorf("credential key: %w", err)
 	}
-	// FIDO2UV (user verification) demands the UV flag; plain FIDO2
-	// presence needs the UP flag.
-	requireUV := a.Proof.Strength == PresenceFIDO2UV.String()
+	// Tier 2 requires user verification structurally: the UV flag
+	// must be set regardless of the strength claimed inside the
+	// artifact. The claimed strength is data carried in the artifact;
+	// Evaluate's Validate gate forces it to fido2_uv today, but the
+	// verifier must not depend on that call order (PR #175 review).
+	// A fido2_uv claim on any other attestation still demands UV;
+	// plain FIDO2 presence otherwise needs only the UP flag.
+	requireUV := a.Tier == int(Tier2) || a.Proof.Strength == PresenceFIDO2UV.String()
 	signCount, err := verifyWebAuthnAssertion(credPub, a.Proof.Assertion, expectedChallenge[:], v.WebAuthn, requireUV)
 	if err != nil {
 		return err

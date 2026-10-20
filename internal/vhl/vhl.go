@@ -6,8 +6,9 @@
 // actually reviewed and approved by a human.
 //
 // Core principle: approval is an attestation, enforced by the receiver.
-// VHL is not a sending gate — it is a trust signal the receiving agent's
-// policy acts on. An instruction from another agent that carries a valid
+// Tiered sends reject missing or structurally invalid approval evidence;
+// the receiver independently verifies the trust signal. An instruction
+// from another agent that carries a valid
 // human attestation can be acted on; one without it is not. Routine
 // chatter flows unattested; anything instructing action on sensitive
 // things carries the attestation; the receiver decides the threshold.
@@ -24,15 +25,10 @@
 // Every message carries a small VHL tier tag (inside the E2E plaintext,
 // so it is authenticated — no silent downgrades by a middlebox).
 //
-// Ceremony ladder (ranked, strongest first):
-//
-//	fido2_uv   — FIDO2/WebAuthn with user verification (key PIN/biometric).
-//	             Required at the high tier: touch proves a human held the
-//	             key; user verification proves the enrolled human did.
-//	fido2      — FIDO2/WebAuthn with touch only.
-//	challenge  — challenge-response one-time code delivered out-of-band
-//	             (e.g. Discord), for rare sensitive actions only.
-//	pin        — local-device presence (PIN-equivalent); low-friction fallback.
+// Tier 2 requires FIDO2/WebAuthn with user verification (fido2_uv:
+// authenticator PIN or biometrics). Touch-only FIDO2 and typed PIN/code
+// ceremonies cannot satisfy Tier 2. Their historical presence constants
+// remain parseable but are not approval fallbacks.
 //
 // Drawn signatures are ceremony/UX only: they do not prove human
 // presence and are forgeable, so they are never a VHL proof kind.
@@ -96,12 +92,9 @@ func (t Tier) String() string {
 type PresenceStrength int
 
 const (
-	// PresencePIN is local-device presence (PIN-equivalent): the human
-	// operated their own enrolled device. Low-friction fallback.
+	// PresencePIN is a historical typed ceremony, never valid for Tier 2.
 	PresencePIN PresenceStrength = 0
-	// PresenceChallenge is a challenge-response one-time code delivered
-	// out-of-band. For rare sensitive actions only — frequent use
-	// trains fatigue, and fatigue kills the security.
+	// PresenceChallenge is a historical typed code, never valid for Tier 2.
 	PresenceChallenge PresenceStrength = 1
 	// PresenceFIDO2 is a FIDO2/WebAuthn assertion with touch. Proves a
 	// human held the key.

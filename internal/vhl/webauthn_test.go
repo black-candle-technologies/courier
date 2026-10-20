@@ -213,6 +213,38 @@ func TestFIDO2VerificationAccepts(t *testing.T) {
 	}
 }
 
+// TestEvaluateRejectsTier2UPOnlyDowngrade pins Lane's PR #175 review:
+// a properly signed Tier 2 attestation claiming only fido2 strength with a
+// genuine UP-only assertion must be rejected at the receiver gate. The
+// verifier itself must require UV for Tier 2 so this guarantee does not
+// depend on Validate running first.
+func TestEvaluateRejectsTier2UPOnlyDowngrade(t *testing.T) {
+	for _, check := range []string{"A_Evaluate", "B_VerifierRequiresUV"} {
+		t.Run(check, func(t *testing.T) {
+			// Each sub-check gets fresh nonce and counter state.
+			body := []byte("transfer the funds")
+			v, credPriv, idPriv, a, nonce := fido2TestSetup(t, body, PresenceFIDO2UV)
+			h := MsgHashOf(body)
+			challenge := ApprovalChallenge(h[:], nonce)
+			a.Proof.Assertion = craftAssertion(t, credPriv, challenge[:], "https://dashboard.test", "dashboard.test", authFlagUserPresent)
+			a.Proof.Strength = PresenceFIDO2.String()
+			resignAttestation(t, a, idPriv)
+
+			if check == "A_Evaluate" {
+				out := v.Evaluate(EvalInput{Tier: Tier2, Body: body, Attestation: a, Receiver: "r", Now: a.IssuedAt, EnvelopeID: 1})
+				if out.Verdict != VerdictInvalid {
+					t.Fatalf("verdict = %s (%s), want invalid", out.Verdict, out.Reason)
+				}
+			} else {
+				err := v.verifyFIDO2Proof(a, h[:], 1, false)
+				if err == nil || !strings.Contains(err.Error(), "user-verification") {
+					t.Fatalf("verifyFIDO2Proof error = %v, want user-verification error", err)
+				}
+			}
+		})
+	}
+}
+
 // TestFIDO2SameEnvelopeReevaluation pins the same-envelope
 // idempotency: two consumers (inbox CLI vs. dashboard push)
 // evaluating the same envelope must both see attested. The second

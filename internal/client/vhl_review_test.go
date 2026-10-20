@@ -208,7 +208,7 @@ func TestVHLHeldSenderFramesGated(t *testing.T) {
 	// A held sender's approval-request frame must not land in the
 	// recipient's review queue: it falls through to normal delivery
 	// as a held message.
-	if _, err := env.sender.VHLRequestApproval(env.recipCfg.Address, vhl.Tier2, "shut down the relay", vhl.PresencePIN); err != nil {
+	if _, err := env.sender.VHLRequestApproval(env.recipCfg.Address, vhl.Tier2, "shut down the relay", vhl.PresenceFIDO2UV); err != nil {
 		t.Fatalf("request frame: %v", err)
 	}
 	env.asRecipient()

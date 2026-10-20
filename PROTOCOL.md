@@ -2120,17 +2120,16 @@ locally enrolled signer key:
   consumes each nonce exactly once, so a captured assertion
   re-wrapped in a fresh attestation is still a replay — even against
   counterless authenticators and concurrent verifiers.
-- The presence ladder: hash-bound hold-and-release (challenge),
-  FIDO2/WebAuthn, out-of-band challenge-response, PIN fallback.
-  Proof kinds are `fido2`, `challenge`, `pin`, `session`; each maps
-  to a strength, and a ceremony must meet the requested strength —
-  the *performed* presence is checked against the request, never the
-  proof kind's ceiling, so there are no silent downgrades. Only
-  `fido2` proofs are cryptographically verifiable by the receiver;
-  Tier 2 attestations with `pin`/`challenge` proofs fail closed
-  (`unverifiable-proof`) — their Ed25519 attestation signature is
-  self-producible by the requesting agent, so the receiver never
-  reports them as attested.
+- Tier 2 requires a `fido2` proof with `fido2_uv` strength:
+  FIDO2/WebAuthn with user verification, through an enrolled hardware
+  credential (platform biometrics or a UV-capable security key).
+  There is no typed PIN or one-time-code fallback. Requests, minting,
+  artifact validation, and sending all reject `pin`/`challenge` and
+  UP-only `fido2` strength. These historical constants remain parseable
+  but cannot satisfy a Tier 2 gate. Their Ed25519 signature alone was
+  self-producible by the requesting agent, not evidence of human approval.
+  Legacy typed artifacts fail structural validation immediately; their
+  existing 15-minute lifetime bounds storage, with no migration.
 - The receiver enforces its own minimum tier
   (`courier vhl policy --require-tier N`, default 0 = off): a tier
   claim below the receiver's requirement is `invalid`
@@ -2192,9 +2191,9 @@ validity → tier match → approver enrollment in the
 can override it) → signature under an enrolled key → revocation →
 replay (attestation id, then — for Tier 2 FIDO2 — the approval
 nonce) → expiry → (Tier 2) action-hash match → (Tier 2) proof-kind
-verifiability: only `fido2` proofs verify cryptographically;
-`pin`/`challenge` Tier 2 attestations are `invalid`
-(`unverifiable-proof`) → (Tier 1) token validity, token issuer
+verifiability: only `fido2` proofs with user verification are accepted;
+`pin`/`challenge` Tier 2 attestations are already `invalid` at structural
+validation (`malformed:...`) → (Tier 1) token validity, token issuer
 signature, and the token's mint assertion: the embedded WebAuthn
 assertion must be a genuine UV assertion over the token's mint
 challenge from an enrolled WebAuthn credential for the issuer,
@@ -2292,12 +2291,14 @@ the VHL layer, never surfaced as chat):
 - `courier vhl request new --tier 2 --message TEXT [--to ADDR]` —
   file an approval request for exact bytes; `courier vhl request
   list` shows the pending queue; `courier vhl approve
-  <request-id> [--presence pin|challenge|fido2|fido2_uv]` shows the
-  human the exact bytes and the recomputed action hash before the
-  ceremony. `fido2`/`fido2_uv` run the relay-hosted `approve`
-  ceremony (§28.8): the human reviews the exact action context in
-  the browser and answers the nonce-bound approval challenge with
-  their security key. Approval is atomic: the displayed hash and
+  <request-id> [--presence fido2_uv]` shows the human the exact bytes
+  and the recomputed action hash before the ceremony. Both commands
+  default to `fido2_uv` and reject weaker ceremonies. Approval uses
+  the existing relay-hosted `approve` ceremony (§28.8): the human
+  reviews the exact action context in the browser and answers the
+  nonce-bound approval challenge with user verification on their
+  enrolled authenticator. Without an enrolled credential, first run
+  `courier vhl enroll-webauthn` — there is no typed fallback. Approval is atomic: the displayed hash and
   sender are bound to the minted attestation inside one locked
   update — if the request changed since display, nothing is
   minted — and the request is consumed as it is minted, so a
@@ -2307,21 +2308,18 @@ the VHL layer, never surfaced as chat):
   receiver-side minimum tier (see §28.3).
 - `courier send --tier 1|2 [--attestation <id>]` — tiered send.
   Tier 1 without a live session token fails closed; Tier 2 without
-  a human approval attestation for the exact bytes fails closed;
+  a structurally valid FIDO2/UV approval attestation for the exact
+  bytes fails closed. The receiver still independently verifies the
+  assertion, enrollment, signature, expiry, and replay;
   tiered sends refuse attachments (the approval hash binds the
   body bytes only).
-- `courier vhl challenge --action TEXT` — mint a one-time
-  out-of-band challenge code bound to the exact action bytes
-  (single-use, constant-time compare, 8 unambiguous characters
-  from a 32-symbol alphabet; 256 mod 32 == 0 so the modulo
-  sampling is unbiased).
 
 ### 28.7 Security properties stated honestly
 
-- The PIN ceremony is only as strong as the terminal it runs on:
-  typing `APPROVE <id>` proves a human is at *that* keyboard, not
-  which human. FIDO2/WebAuthn is the gold standard for approver
-  identity: the verifier checks real WebAuthn attestations and
+- Typed `APPROVE <id>` and same-client code challenges are not
+  verifiable human presence and are no longer approval ceremonies.
+  FIDO2/WebAuthn is the required proof of approver identity: the
+  verifier checks real WebAuthn attestations and
   assertions (exact challenge binding, origin allowlist, RP id
   hash, UP/UV flags, attested credential data, and the
   authenticator's attestation chain or assertion signature)
@@ -2335,8 +2333,8 @@ the VHL layer, never surfaced as chat):
   attestations are rejected outright, and enrollment fails closed
   when no roots are configured — anyone holding the ceremony
   challenge (including a compromised relay, which sees every
-  challenge) could forge those. The CLI currently performs PIN,
-  challenge, and WebAuthn ceremonies.
+  challenge) could forge those. Tier 2 approval requires WebAuthn
+  user verification (UV); a security-key touch without UV is insufficient.
 - Session tokens are bearer-adjacent: whoever holds the sealed
   token file and the process can mint Tier 1 attestations. The
   8-hour default, boot-id binding, and per-token revocation

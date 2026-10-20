@@ -3,9 +3,8 @@ package client
 // ---- Human workflows (issue #142) ----
 //
 // The methods below are the human-facing VHL operations. Interactive
-// ceremony steps (the human typing a confirmation, or relaying a
-// challenge code out-of-band) live in the CLI; these methods take the
-// ceremony result as input and do the cryptography and state changes.
+// WebAuthn ceremonies use the existing relay/browser transport; these
+// methods handle the ceremony results, cryptography, and state changes.
 
 import (
 	"crypto/ed25519"
@@ -20,88 +19,6 @@ import (
 	"github.com/black-candle-technologies/courier/internal/vhl"
 )
 
-// VHLMintChallenge mints an out-of-band challenge bound to the exact
-// action bytes and returns the challenge plus its one-time code. The
-// code is shown once: deliver it to the approver over an
-// out-of-band channel; the response step is VHLVerifyChallenge.
-func (c *Client) VHLMintChallenge(action []byte) (*vhl.Challenge, string, error) {
-	if len(action) == 0 {
-		return nil, "", fmt.Errorf("action bytes required")
-	}
-	key, err := c.vhlSealKey()
-	if err != nil {
-		return nil, "", err
-	}
-	ch, code, err := vhl.MintChallenge(action, 0)
-	if err != nil {
-		return nil, "", err
-	}
-	// Open, append, and reseal inside one lock-protected critical
-	// section: two concurrent mints must not lose one another's
-	// challenge (issue #142 review).
-	if err := c.cfg.local().updateVHL(func(ff *vhlFile) error {
-		chs, err := openChallengesLocked(ff.SealedChall, key)
-		if err != nil {
-			return err
-		}
-		live := append(vhlLiveChallenges(chs, time.Now().Unix()), ch)
-		sealed, err := sealChallengesLocked(live, key)
-		if err != nil {
-			return err
-		}
-		ff.SealedChall = sealed
-		return nil
-	}); err != nil {
-		return nil, "", err
-	}
-	return ch, code, nil
-}
-
-// VHLVerifyChallenge checks a challenge response code. Any attempt —
-// success or failure — consumes the challenge (single-use, no
-// brute-force retries against the code).
-func (c *Client) VHLVerifyChallenge(challengeID, code string) error {
-	key, err := c.vhlSealKey()
-	if err != nil {
-		return err
-	}
-	var verr error
-	// The lookup, the single-use consume, and the reseal happen in
-	// one lock-protected critical section: two concurrent
-	// verifications of the same challenge cannot both succeed
-	// (issue #142 review). Only the seal key derivation happens
-	// outside the lock — never network I/O.
-	if err := c.cfg.local().updateVHL(func(ff *vhlFile) error {
-		chs, err := openChallengesLocked(ff.SealedChall, key)
-		if err != nil {
-			return err
-		}
-		now := time.Now().Unix()
-		var found *vhl.Challenge
-		var rest []*vhl.Challenge
-		for _, ch := range vhlLiveChallenges(chs, now) {
-			if ch.ID == challengeID {
-				found = ch
-				continue
-			}
-			rest = append(rest, ch)
-		}
-		if found == nil {
-			return fmt.Errorf("unknown or expired challenge")
-		}
-		sealed, err := sealChallengesLocked(rest, key)
-		if err != nil {
-			return err
-		}
-		ff.SealedChall = sealed
-		verr = found.Verify(code, now)
-		return nil
-	}); err != nil {
-		return err
-	}
-	return verr
-}
-
 // VHLRequestApproval records an approval request for the human. When
 // humanAddr is empty or this agent's own address, the request is
 // stored locally (same-machine fast path); otherwise it is sent as
@@ -109,6 +26,9 @@ func (c *Client) VHLVerifyChallenge(challengeID, code string) error {
 func (c *Client) VHLRequestApproval(humanAddr string, tier vhl.Tier, body string, presence vhl.PresenceStrength) (*vhl.ApprovalRequest, error) {
 	if tier != vhl.Tier1 && tier != vhl.Tier2 {
 		return nil, fmt.Errorf("approval requests need tier 1 or 2")
+	}
+	if tier == vhl.Tier2 && presence != vhl.PresenceFIDO2UV {
+		return nil, fmt.Errorf("tier 2 requires fido2_uv; typed pin/challenge ceremonies are not supported")
 	}
 	if !presence.Valid() {
 		return nil, fmt.Errorf("unknown presence ceremony")
@@ -233,18 +153,17 @@ func (c *Client) VHLGetRequest(idOrPrefix string) (*vhlRequestRecord, error) {
 // For FIDO2 proofs, approvalNonce is the 32-byte fresh nonce the
 // ceremony answered (the WebAuthn challenge binds it); it must be
 // exactly 32 bytes and is embedded in the attestation so the receiver
-// can consume it exactly once. PIN/challenge proofs pass nil.
+// can consume it exactly once. Typed PIN/challenge proofs are rejected.
 func (c *Client) VHLApproveMint(requestID string, displayedHash [32]byte, displayedFrom string, proof vhl.Proof, presence vhl.PresenceStrength, approvalNonce []byte) (*vhl.Attestation, error) {
+	if proof.Kind != vhl.ProofFIDO2 || presence != vhl.PresenceFIDO2UV {
+		return nil, fmt.Errorf("tier 2 requires FIDO2 with user verification; typed pin/challenge proofs are not supported")
+	}
 	id, err := c.cfg.Identity()
 	if err != nil {
 		return nil, fmt.Errorf("identity: %w", err)
 	}
-	if proof.Kind == vhl.ProofFIDO2 {
-		if len(approvalNonce) != 32 {
-			return nil, fmt.Errorf("fido2 approval requires the 32-byte ceremony nonce")
-		}
-	} else if len(approvalNonce) != 0 {
-		return nil, fmt.Errorf("approval nonce is only valid for fido2 proofs")
+	if len(approvalNonce) != 32 {
+		return nil, fmt.Errorf("fido2 approval requires the 32-byte ceremony nonce")
 	}
 	var att *vhl.Attestation
 	var from string
@@ -267,6 +186,9 @@ func (c *Client) VHLApproveMint(requestID string, displayedHash [32]byte, displa
 		want, err := vhl.ParsePresence(req.WantPresence)
 		if err != nil {
 			return fmt.Errorf("request wants unknown presence: %w", err)
+		}
+		if want != vhl.PresenceFIDO2UV {
+			return fmt.Errorf("tier 2 request requires fido2_uv; create a new approval request")
 		}
 		if !presence.AtLeast(want) {
 			return fmt.Errorf("performed presence %q does not meet requested presence %q", presence, req.WantPresence)

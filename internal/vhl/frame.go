@@ -182,6 +182,9 @@ func (r *ApprovalRequest) Validate(now int64) error {
 	if _, err := ParsePresence(r.WantPresence); err != nil {
 		return fmt.Errorf("approval request: %w", err)
 	}
+	if r.Tier == 2 && r.WantPresence != PresenceFIDO2UV.String() {
+		return fmt.Errorf("tier 2 approval request requires fido2_uv")
+	}
 	if r.ExpiresAt <= now {
 		return fmt.Errorf("approval request expired")
 	}

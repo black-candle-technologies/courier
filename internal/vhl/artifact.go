@@ -288,35 +288,16 @@ func NewTier1Attestation(tok *SessionToken, priv ed25519.PrivateKey) (*Attestati
 	return a, nil
 }
 
-// NewTier2Attestation mints a per-message human approval for the
-// exact body bytes reviewed. presence names the ceremony that just
-// happened; kind selects the proof shape (fido2, challenge, or pin).
-// requestID binds the approval to the request that carried the draft;
-// it is part of the signed bytes, so it must be set before signing.
-//
-// FIDO2 callers: this constructor cannot mint fido2 proofs, and it
-// deliberately does not generate an approval nonce. The approval
-// ceremony generates the ceremony nonce before the attestation
-// exists — the assertion's WebAuthn challenge is
-// ApprovalChallenge(actionHash, nonce) — and the attestation must
-// carry that same nonce; auto-generating one here would desync the
-// two. For fido2, construct the Attestation directly, set
-// ApprovalNonce to the base64url ceremony nonce, then call Validate
-// and SignAttestation. (Validate rejects fido2 proofs without a
-// valid 32-byte nonce, so this constructor fails closed for them.)
-// NewTier2Attestation mints a Tier 2 attestation for the exact body
-// bytes. kind selects the proof (fido2, challenge, or pin); the
-// proof itself rides in proofExtras. For ProofFIDO2, approvalNonce
-// must be the 32-byte ceremony nonce the WebAuthn challenge was
-// bound to (see ApprovalChallenge): it is embedded in the
-// attestation BEFORE signing so the signature covers it, and
-// Validate requires it. For other proof kinds approvalNonce must
-// be empty.
+// NewTier2Attestation mints a Tier 2 attestation for the exact reviewed
+// bytes. Only ProofFIDO2 with PresenceFIDO2UV is accepted; proofExtras
+// carries the assertion. approvalNonce must be the 32-byte ceremony
+// nonce bound by ApprovalChallenge(actionHash, nonce). The nonce and
+// requestID are embedded before signing so the signature covers both.
+// This constructor checks structure; the ceremony and receiver verify
+// the assertion cryptographically against the enrolled credential.
 func NewTier2Attestation(body []byte, approver string, requestID string, kind ProofKind, presence PresenceStrength, proofExtras Proof, approvalNonce []byte, priv ed25519.PrivateKey) (*Attestation, error) {
-	switch kind {
-	case ProofFIDO2, ProofChallenge, ProofPIN:
-	default:
-		return nil, fmt.Errorf("tier 2 proof kind %q invalid (want fido2|challenge|pin)", kind)
+	if kind != ProofFIDO2 || presence != PresenceFIDO2UV {
+		return nil, fmt.Errorf("tier 2 requires FIDO2 with user verification; typed pin/challenge proofs are not supported")
 	}
 	if approver == "" {
 		return nil, fmt.Errorf("tier 2 attestation without approver")
@@ -340,14 +321,10 @@ func NewTier2Attestation(body []byte, approver string, requestID string, kind Pr
 		ExpiresAt: now + int64(Tier2Expiry/time.Second),
 		Proof:     proofExtras,
 	}
-	if kind == ProofFIDO2 {
-		if len(approvalNonce) != 32 {
-			return nil, fmt.Errorf("tier 2 fido2 attestation without 32-byte approval nonce")
-		}
-		a.ApprovalNonce = b64.EncodeToString(approvalNonce)
-	} else if len(approvalNonce) != 0 {
-		return nil, fmt.Errorf("approval nonce is only valid for fido2 proofs")
+	if len(approvalNonce) != 32 {
+		return nil, fmt.Errorf("tier 2 fido2 attestation without 32-byte approval nonce")
 	}
+	a.ApprovalNonce = b64.EncodeToString(approvalNonce)
 	if err := a.Validate(); err != nil {
 		return nil, err
 	}
@@ -370,6 +347,9 @@ func (a *Attestation) Validate() error {
 	}
 	if a.Tier != 1 && a.Tier != 2 {
 		return fmt.Errorf("attestation tier %d (want 1 or 2)", a.Tier)
+	}
+	if a.Tier == 2 && (a.Proof.Kind != ProofFIDO2 || a.Proof.Strength != PresenceFIDO2UV.String()) {
+		return fmt.Errorf("tier 2 requires FIDO2 with user verification; typed pin/challenge proofs are not supported")
 	}
 	if a.Approver == "" {
 		return fmt.Errorf("attestation without approver")
@@ -395,7 +375,7 @@ func (a *Attestation) Validate() error {
 		if err := a.Proof.Token.Validate(); err != nil {
 			return fmt.Errorf("session token: %w", err)
 		}
-	case ProofFIDO2, ProofChallenge, ProofPIN:
+	case ProofFIDO2:
 		if a.Tier != 2 {
 			return fmt.Errorf("%s proof on tier %d attestation", a.Proof.Kind, a.Tier)
 		}
@@ -413,9 +393,6 @@ func (a *Attestation) Validate() error {
 			if _, err := DecodeApprovalNonce(a.ApprovalNonce); err != nil {
 				return fmt.Errorf("fido2 proof without valid approval nonce: %w", err)
 			}
-		}
-		if a.Proof.Kind == ProofChallenge && a.Proof.ChallengeID == "" {
-			return fmt.Errorf("challenge proof without challenge id")
 		}
 	default:
 		return fmt.Errorf("unknown proof kind %q", a.Proof.Kind)

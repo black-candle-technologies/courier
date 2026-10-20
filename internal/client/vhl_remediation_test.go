@@ -38,7 +38,7 @@ func TestVHLApproveMintPresenceDowngradeRejected(t *testing.T) {
 	// want=fido2_uv, performed presence=fido2 -> must be rejected.
 	req, h := requestFixture(t, env.sender, "downgrade me", vhl.PresenceFIDO2UV)
 	_, err := env.sender.VHLApproveMint(req.ID, h, env.senderCfg.Address, proof, vhl.PresenceFIDO2, nonce[:])
-	if err == nil || !strings.Contains(err.Error(), "does not meet requested presence") {
+	if err == nil || !strings.Contains(err.Error(), "requires FIDO2 with user verification") {
 		t.Fatalf("downgrade approve = %v, want presence-downgrade rejection", err)
 	}
 	// The rejected request is NOT consumed: the human can still
@@ -47,9 +47,9 @@ func TestVHLApproveMintPresenceDowngradeRejected(t *testing.T) {
 		t.Fatalf("rejected request should still be pending: %v", err)
 	}
 
-	// want=fido2, performed presence=fido2 -> accepted.
-	req2, h2 := requestFixture(t, env.sender, "matching strength", vhl.PresenceFIDO2)
-	att, err := env.sender.VHLApproveMint(req2.ID, h2, env.senderCfg.Address, proof, vhl.PresenceFIDO2, nonce[:])
+	// Matching UV strength is accepted.
+	req2, h2 := requestFixture(t, env.sender, "matching strength", vhl.PresenceFIDO2UV)
+	att, err := env.sender.VHLApproveMint(req2.ID, h2, env.senderCfg.Address, proof, vhl.PresenceFIDO2UV, nonce[:])
 	if err != nil {
 		t.Fatalf("matching-strength approve: %v", err)
 	}
@@ -70,14 +70,15 @@ func TestVHLApproveMintPresenceDowngradeRejected(t *testing.T) {
 func TestVHLApproveMintTOCTOU(t *testing.T) {
 	env := newAttachTestEnv(t)
 	env.asSender()
-	pin := vhl.Proof{Kind: vhl.ProofPIN}
+	proof := vhl.Proof{Kind: vhl.ProofFIDO2, CredentialID: "test-cred"}
+	nonce := make([]byte, 32)
 
 	t.Run("hash mismatch", func(t *testing.T) {
-		req, _ := requestFixture(t, env.sender, "the real action", vhl.PresencePIN)
+		req, _ := requestFixture(t, env.sender, "the real action", vhl.PresenceFIDO2UV)
 		var wrong [32]byte
 		wrong[0] = 0xff
-		if _, err := env.sender.VHLApproveMint(req.ID, wrong, env.senderCfg.Address, pin, vhl.PresencePIN, nil); err == nil {
-			t.Fatal("mismatched displayed hash should fail")
+		if _, err := env.sender.VHLApproveMint(req.ID, wrong, env.senderCfg.Address, proof, vhl.PresenceFIDO2UV, nonce); err == nil || !strings.Contains(err.Error(), "changed since it was displayed") {
+			t.Fatalf("mismatched displayed hash: %v", err)
 		}
 		if _, err := env.sender.VHLGetRequest(req.ID); err != nil {
 			t.Fatalf("failed mint must not consume the request: %v", err)
@@ -85,9 +86,9 @@ func TestVHLApproveMintTOCTOU(t *testing.T) {
 	})
 
 	t.Run("sender mismatch", func(t *testing.T) {
-		req, h := requestFixture(t, env.sender, "another action", vhl.PresencePIN)
-		if _, err := env.sender.VHLApproveMint(req.ID, h, "ed25519:impostor", pin, vhl.PresencePIN, nil); err == nil {
-			t.Fatal("mismatched displayed sender should fail")
+		req, h := requestFixture(t, env.sender, "another action", vhl.PresenceFIDO2UV)
+		if _, err := env.sender.VHLApproveMint(req.ID, h, "ed25519:impostor", proof, vhl.PresenceFIDO2UV, nonce); err == nil || !strings.Contains(err.Error(), "sender changed") {
+			t.Fatalf("mismatched displayed sender: %v", err)
 		}
 		if _, err := env.sender.VHLGetRequest(req.ID); err != nil {
 			t.Fatalf("failed mint must not consume the request: %v", err)
@@ -96,16 +97,16 @@ func TestVHLApproveMintTOCTOU(t *testing.T) {
 
 	t.Run("unknown request", func(t *testing.T) {
 		var h [32]byte
-		if _, err := env.sender.VHLApproveMint("no-such-request", h, env.senderCfg.Address, pin, vhl.PresencePIN, nil); err == nil {
+		if _, err := env.sender.VHLApproveMint("no-such-request", h, env.senderCfg.Address, proof, vhl.PresenceFIDO2UV, nonce); err == nil {
 			t.Fatal("unknown request id should fail")
 		}
 	})
 
 	t.Run("fido2 without 32-byte nonce", func(t *testing.T) {
-		req, h := requestFixture(t, env.sender, "fido action", vhl.PresenceFIDO2)
+		req, h := requestFixture(t, env.sender, "fido action", vhl.PresenceFIDO2UV)
 		fido := vhl.Proof{Kind: vhl.ProofFIDO2, CredentialID: "test-cred"}
 		for _, nonce := range [][]byte{nil, {1, 2, 3}, make([]byte, 31), make([]byte, 33)} {
-			if _, err := env.sender.VHLApproveMint(req.ID, h, env.senderCfg.Address, fido, vhl.PresenceFIDO2, nonce); err == nil {
+			if _, err := env.sender.VHLApproveMint(req.ID, h, env.senderCfg.Address, fido, vhl.PresenceFIDO2UV, nonce); err == nil {
 				t.Fatalf("fido2 with %d-byte nonce should fail", len(nonce))
 			}
 		}
@@ -115,20 +116,20 @@ func TestVHLApproveMintTOCTOU(t *testing.T) {
 	})
 
 	t.Run("pin with stray nonce", func(t *testing.T) {
-		req, h := requestFixture(t, env.sender, "pin action", vhl.PresencePIN)
-		if _, err := env.sender.VHLApproveMint(req.ID, h, env.senderCfg.Address, pin, vhl.PresencePIN, make([]byte, 32)); err == nil {
+		req, h := requestFixture(t, env.sender, "pin action", vhl.PresenceFIDO2UV)
+		if _, err := env.sender.VHLApproveMint(req.ID, h, env.senderCfg.Address, vhl.Proof{Kind: vhl.ProofPIN}, vhl.PresencePIN, make([]byte, 32)); err == nil {
 			t.Fatal("pin proof with a nonce should fail closed")
 		}
 	})
 
 	t.Run("happy path", func(t *testing.T) {
-		req, h := requestFixture(t, env.sender, "final action", vhl.PresencePIN)
-		att, err := env.sender.VHLApproveMint(req.ID, h, env.senderCfg.Address, pin, vhl.PresencePIN, nil)
+		req, h := requestFixture(t, env.sender, "final action", vhl.PresenceFIDO2UV)
+		att, err := env.sender.VHLApproveMint(req.ID, h, env.senderCfg.Address, proof, vhl.PresenceFIDO2UV, nonce)
 		if err != nil {
 			t.Fatalf("approve: %v", err)
 		}
-		if att.ApprovalNonce != "" {
-			t.Fatalf("pin attestation should carry no approval nonce, got %q", att.ApprovalNonce)
+		if att.ApprovalNonce != b64.EncodeToString(nonce) {
+			t.Fatalf("approval nonce mismatch: %q", att.ApprovalNonce)
 		}
 		if _, err := env.sender.VHLGetRequest(req.ID); err == nil {
 			t.Fatal("approved request should be consumed")
@@ -156,7 +157,7 @@ func TestHandleVHLFrameDuplicateRequestID(t *testing.T) {
 			Tier:         int(vhl.Tier2),
 			MsgHash:      b64.EncodeToString(h[:]),
 			Draft:        draft,
-			WantPresence: vhl.PresencePIN.String(),
+			WantPresence: vhl.PresenceFIDO2UV.String(),
 			ExpiresAt:    9999999999,
 		}
 	}

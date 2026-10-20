@@ -20,7 +20,7 @@ import (
 // functions below depend on these interfaces rather than the
 // concrete *client.Client, so CLI routing is testable hermetically
 // — without a live relay, local config, or handler side effects
-// (issue #146 review). *client.Client satisfies all three.
+// (issue #146 review). *client.Client satisfies these interfaces.
 type vhlApproverClient interface {
 	VHLEnrollApproverCeremony(approverAddress string, printf func(string, ...any)) (*vhl.EnrollmentArtifact, error)
 	VHLEnrollApprover(address, name string, art *vhl.EnrollmentArtifact) error
@@ -33,13 +33,9 @@ type vhlRequestClient interface {
 	VHLPendingRequests() ([]*client.VHLRequestRecord, error)
 }
 
-type vhlChallengeClient interface {
-	VHLMintChallenge(action []byte) (*vhl.Challenge, string, error)
-}
-
 func (scope command) cmdVHL(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: courier vhl <approver|enroll-webauthn|rp|session|request|approve|attestations|challenge|policy> [args]")
+		return fmt.Errorf("usage: courier vhl <approver|enroll-webauthn|rp|session|request|approve|attestations|policy> [args]")
 	}
 	cfg, err := scope.context.LoadConfig()
 	if err != nil {
@@ -61,12 +57,10 @@ func (scope command) cmdVHL(args []string) error {
 		return cmdVHLApprove(cfg, c, args[1:])
 	case "attestations":
 		return cmdVHLAttestations(c)
-	case "challenge":
-		return cmdVHLChallenge(c, args[1:])
 	case "policy":
 		return cmdVHLPolicy(c, args[1:])
 	default:
-		return fmt.Errorf("usage: courier vhl <approver|enroll-webauthn|rp|session|request|approve|attestations|challenge|policy> [args]")
+		return fmt.Errorf("usage: courier vhl <approver|enroll-webauthn|rp|session|request|approve|attestations|policy> [args]")
 	}
 }
 
@@ -100,14 +94,10 @@ func cmdVHLApprover(c vhlApproverClient, args []string) error {
 }
 
 // confirmTyping prompts the human and requires them to type expect.
-// The typing itself is the local presence signal for PIN-grade
-// ceremonies. It fails closed unless stdin is an interactive
-// terminal: a canned response piped into stdin would authorize
-// enrollment, minting, or approval signing with zero human
-// involvement, defeating the presence signal entirely. This stops
-// the trivial pipe attack — it does not stop a co-located adversary
-// driving a pty. PIN-grade ceremonies attest local presence only;
-// FIDO2 hardware and remote-approver flows are the strong paths.
+// This is a revocation/unenrollment UX safeguard only, not proof of
+// human presence. It is never used for enrollment, minting or approval.
+// Requiring a terminal stops accidental piped confirmations but cannot
+// stop a co-located process driving a PTY.
 //
 // Declared as a variable (not a func) so CLI dispatch tests can stub
 // the human-confirmation step hermetically; production always uses
@@ -460,7 +450,7 @@ func cmdVHLRequestNew(c vhlRequestClient, args []string) error {
 		case strings.HasPrefix(args[i], "--to="):
 			human = strings.TrimPrefix(args[i], "--to=")
 		default:
-			return fmt.Errorf("usage: courier vhl request new --tier 2 --message TEXT [--presence pin] [--to HUMAN-ADDRESS]")
+			return fmt.Errorf("usage: courier vhl request new --tier 2 --message TEXT [--presence fido2_uv] [--to HUMAN-ADDRESS]")
 		}
 	}
 	// Tier 1 approvals are session-scoped: VHLApproveMint rejects
@@ -476,13 +466,16 @@ func cmdVHLRequestNew(c vhlRequestClient, args []string) error {
 	if strings.TrimSpace(message) == "" {
 		return fmt.Errorf("--message is required: the exact draft the human will review")
 	}
-	presence := vhl.PresencePIN
+	presence := vhl.PresenceFIDO2UV
 	if presenceStr != "" {
 		var err error
 		presence, err = vhl.ParsePresence(presenceStr)
 		if err != nil {
 			return err
 		}
+	}
+	if tier == vhl.Tier2 && presence != vhl.PresenceFIDO2UV {
+		return fmt.Errorf("tier 2 requires --presence fido2_uv; typed pin/challenge ceremonies are not supported")
 	}
 	req, err := c.VHLRequestApproval(human, tier, message, presence)
 	if err != nil {
@@ -514,7 +507,13 @@ func cmdVHLRequestList(c vhlRequestClient) error {
 	return nil
 }
 
-func cmdVHLApprove(cfg *client.Config, c *client.Client, args []string) error {
+type vhlApprovalClient interface {
+	VHLGetRequest(string) (*client.VHLRequestRecord, error)
+	VHLApproveFIDO2Ceremony([]byte, []byte, string, string, string, func(string, ...any)) (vhl.Proof, error)
+	VHLApproveMint(string, [32]byte, string, vhl.Proof, vhl.PresenceStrength, []byte) (*vhl.Attestation, error)
+}
+
+func cmdVHLApprove(cfg *client.Config, c vhlApprovalClient, args []string) error {
 	var presenceStr string
 	var rest []string
 	for i := 0; i < len(args); i++ {
@@ -528,15 +527,11 @@ func cmdVHLApprove(cfg *client.Config, c *client.Client, args []string) error {
 		}
 	}
 	if len(rest) < 1 {
-		return fmt.Errorf("usage: courier vhl approve <request-id> [--presence pin|challenge|fido2|fido2_uv]")
+		return fmt.Errorf("usage: courier vhl approve <request-id> [--presence fido2_uv]")
 	}
-	presence := vhl.PresencePIN
-	if presenceStr != "" {
-		var err error
-		presence, err = vhl.ParsePresence(presenceStr)
-		if err != nil {
-			return err
-		}
+	presence := vhl.PresenceFIDO2UV
+	if presenceStr != "" && presenceStr != "fido2_uv" {
+		return fmt.Errorf("tier 2 approval requires --presence fido2_uv; typed pin/challenge ceremonies are not supported")
 	}
 	rec, err := c.VHLGetRequest(rest[0])
 	if err != nil {
@@ -552,66 +547,22 @@ func cmdVHLApprove(cfg *client.Config, c *client.Client, args []string) error {
 	fmt.Printf("action hash: %x\n", h)
 	fmt.Printf("draft:\n---\n%s\n---\n", sanitizeForTerminal(q.Draft))
 
-	var proof vhl.Proof
-	var approvalNonce []byte
-	switch presence {
-	case vhl.PresencePIN:
-		// The PIN-grade ceremony: the human types the approval at
-		// their own terminal after reviewing the exact bytes above.
-		if !confirmTyping(fmt.Sprintf("approve these exact bytes (type APPROVE %s to confirm)", q.ID[:8]), "APPROVE "+q.ID[:8]) {
-			return fmt.Errorf("cancelled")
-		}
-		proof = vhl.Proof{Kind: vhl.ProofPIN}
-	case vhl.PresenceChallenge:
-		// The challenge ceremony: a one-time code is minted for
-		// these exact bytes. Deliver it out-of-band; the response
-		// typed here models the human answering on the approving
-		// device.
-		ch, code, err := c.VHLMintChallenge([]byte(q.Draft))
-		if err != nil {
-			return err
-		}
-		fmt.Printf("challenge %s minted for this action.\n", ch.ID)
-		fmt.Printf("one-time code (deliver OUT-OF-BAND, then enter it here): %s\n", code)
-		// The response models the human answering on the approving
-		// device; a piped code is not a human response.
-		if !stdinIsTerminal() {
-			return fmt.Errorf("refusing: the challenge ceremony requires an interactive terminal (stdin is not a terminal)")
-		}
-		fmt.Fprintf(os.Stderr, "enter code: ")
-		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-		if err != nil {
-			return err
-		}
-		if err := c.VHLVerifyChallenge(ch.ID, strings.TrimSpace(line)); err != nil {
-			return fmt.Errorf("challenge failed: %w", err)
-		}
-		proof = vhl.Proof{Kind: vhl.ProofChallenge, ChallengeID: ch.ID}
-	case vhl.PresenceFIDO2, vhl.PresenceFIDO2UV:
-		// The FIDO2 ceremony: a fresh 32-byte nonce binds this
-		// approval's WebAuthn challenge (see
-		// vhl.ApprovalChallenge), and the human completes the
-		// ceremony in their browser with their enrolled security
-		// key. The returned proof carries the assertion; the nonce
-		// is embedded in the attestation so the receiver can
-		// consume it exactly once (the replay control).
-		var nonce [32]byte
-		if _, err := rand.Read(nonce[:]); err != nil {
-			return fmt.Errorf("approval nonce: %w", err)
-		}
-		printf := func(format string, a ...any) { fmt.Printf(format, a...) }
-		p, err := c.VHLApproveFIDO2Ceremony(nonce[:], h[:], q.ID, cfg.Address, q.Draft, printf)
-		if err != nil {
-			return err
-		}
-		proof, approvalNonce = p, nonce[:]
-	default:
-		return fmt.Errorf("unknown presence %q", presence)
+	// A fresh nonce binds this approval's WebAuthn challenge. The human
+	// completes user verification in the browser with their enrolled
+	// authenticator. The receiver consumes the signed nonce exactly once.
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return fmt.Errorf("approval nonce: %w", err)
+	}
+	printf := func(format string, a ...any) { fmt.Printf(format, a...) }
+	proof, err := c.VHLApproveFIDO2Ceremony(nonce[:], h[:], q.ID, cfg.Address, q.Draft, printf)
+	if err != nil {
+		return err
 	}
 	// displayedHash and displayedFrom are the action hash and sender
 	// printed above: VHLApproveMint re-checks them against the stored
 	// request inside one atomic critical section before minting.
-	att, err := c.VHLApproveMint(q.ID, h, rec.From, proof, presence, approvalNonce)
+	att, err := c.VHLApproveMint(q.ID, h, rec.From, proof, presence, nonce[:])
 	if err != nil {
 		return err
 	}
@@ -673,35 +624,5 @@ func cmdVHLPolicy(c *client.Client, args []string) error {
 		return err
 	}
 	fmt.Printf("required tier set to %d\n", tier)
-	return nil
-}
-
-// cmdVHLChallenge mints a one-time challenge code in flag form
-// (issue #146): `courier vhl challenge --action TEXT`. There is no
-// verify subcommand on this branch — challenge verification happens
-// inside `courier vhl approve --presence challenge`.
-func cmdVHLChallenge(c vhlChallengeClient, args []string) error {
-	var action string
-	for i := 0; i < len(args); i++ {
-		switch {
-		case args[i] == "--action" && i+1 < len(args):
-			action, i = args[i+1], i+1
-		case strings.HasPrefix(args[i], "--action="):
-			action = strings.TrimPrefix(args[i], "--action=")
-		default:
-			return fmt.Errorf("usage: courier vhl challenge --action TEXT")
-		}
-	}
-	if strings.TrimSpace(action) == "" {
-		return fmt.Errorf("--action is required")
-	}
-	ch, code, err := c.VHLMintChallenge([]byte(action))
-	if err != nil {
-		return err
-	}
-	h := vhl.MsgHashOf([]byte(action))
-	fmt.Printf("challenge %s minted for action hash %x (expires %s)\n", ch.ID, h,
-		time.Unix(ch.ExpiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"))
-	fmt.Printf("one-time code (show once, deliver out-of-band): %s\n", code)
 	return nil
 }
